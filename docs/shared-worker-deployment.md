@@ -1,0 +1,403 @@
+# Shared worker deployment and upgrade
+
+An unconfigured `combined` process serves HTTP/WebSocket requests and executes
+accepted tasks locally, so wheel installs can start without Redis. Published
+backend images are preconfigured with `XAGENT_WORKER_COUNT=2` and therefore use
+shared execution with Redis. Configuring `XAGENT_WORKER_COUNT`, or selecting the
+`web` or `worker` role, enables shared execution for compatibility with existing
+deployments. `XAGENT_SHARED_TASK_EXECUTION_ENABLED` can explicitly pin either
+mode. Celery workers handle background jobs and are not substitutes for the
+standalone Agent worker.
+
+## Combined process launcher
+
+Set `XAGENT_TASK_EXECUTION_ROLE=combined` and `XAGENT_WORKER_COUNT=4`, then run
+`python -m xagent.web` (or `xagent-web`) to launch one web process and four
+standalone Agent worker processes. The Docker backend uses this same entrypoint.
+Shared execution must be enabled. Redis, the database, encryption key and file
+storage configuration are inherited by every child process.
+
+Open-source backend images built from the current source default to two Agent
+workers. When `ENCRYPTION_KEY` is absent, the image entrypoint creates a private
+Fernet key in the persistent `xagent_secrets` volume and every Xagent service
+reuses it. Back up this volume with the database: deleting or replacing the key
+makes encrypted runtime values unreadable. An explicit `ENCRYPTION_KEY` always
+takes precedence. The checked-in Compose file uses fixed release tags, so this
+default takes effect after its backend image is bumped to a release containing
+this change. Set `XAGENT_WORKER_COUNT=` and
+`XAGENT_SHARED_TASK_EXECUTION_ENABLED=false` together to opt that Compose
+deployment back into single-process local execution.
+
+The web process completes normal startup, including database migrations, before
+workers start. It serves HTTP/WebSocket and designated channel ingress without
+executing Agent tasks. Workers use the existing durable task queue and lease
+routing. The count controls processes, not task concurrency or even distribution.
+When sandboxing is enabled, configure a stable `XAGENT_SANDBOX_WORKER_ID` for this
+launcher: the web process retains that ID and workers use `<base>-worker-1`
+through `<base>-worker-N`. Use distinct base IDs for concurrent launchers sharing
+one sandbox namespace, and keep them unchanged across restarts.
+
+SIGINT or SIGTERM stops the whole group and gives children 30 seconds to shut
+down before terminating remaining processes. An unexpected child exit stops the
+other children and fails the launcher; restart the launcher to recover the group.
+An unset or empty count retains the existing single-process combined behavior.
+The count must be a positive integer and cannot be combined with `--reload`,
+`web`/`worker` roles, or disabled shared execution. Direct ASGI server invocations
+do not run this CLI launcher; use the existing separate web/worker deployment
+when managing processes externally.
+
+## Configuration and upgrade
+
+1. Stop old application processes before upgrading the database. Back up the
+   database and retain the existing private encryption key. Do not run old local
+   executors alongside shared executors against the same database.
+2. Set `XAGENT_SHARED_TASK_EXECUTION_ENABLED=true` (recommended even though a
+   worker count or split role also selects it), then configure the same
+   `DATABASE_URL`, `XAGENT_REDIS_URL`, private `ENCRYPTION_KEY`, and
+   `XAGENT_TASK_EVENT_CHANNEL_PREFIX` on web and execution hosts. Generate a
+   Fernet key for a new deployment with:
+   `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`.
+   The empty example value and published development keys are rejected. Preserve
+   the key on restart; replacing it makes existing encrypted values unreadable.
+3. Mount the same task storage and upload storage at the same paths on all hosts.
+   Set `XAGENT_STORAGE_ROOT` and `XAGENT_UPLOADS_DIR` accordingly. Redis alone does
+   not share files. Use a distinct event prefix for each deployment: Redis Pub/Sub
+   does not isolate channels by logical database number.
+4. Start one web/combined process first to apply the application's database
+   migrations, then start standalone workers using the same application version.
+   The migrations include task command, runtime credential, and channel delivery
+   tables. Standalone workers require the migrated schema.
+5. Set `XAGENT_TASK_EXECUTION_ROLE=web` for acceptance-only hosts, `worker` for
+   `python -m xagent.web.worker`, or `combined` for a host doing both. Start web
+   hosts with `python -m xagent.web`.
+6. For Telegram, Feishu, or Slack, set `XAGENT_CHANNEL_INGRESS_ENABLED=true` on
+   exactly one designated web/combined process. All others keep it `false`.
+   This is an operational designation, not automatic leader election. If it is
+   disabled everywhere, no bot connection starts; startup logs state this.
+
+Single-process local deployment is the default when no shared topology is
+configured. Set
+`XAGENT_SHARED_TASK_EXECUTION_ENABLED=false` explicitly if the deployment should
+pin that mode, and use the `combined` role. Shared execution requirements do not
+apply in local mode.
+
+## Command ownership upgrade
+
+Shared workers process and settle commands under the task coordinator's owner
+attempt. The Registry continues renewing task ownership in batches; shared
+commands no longer have an independent processing lease or heartbeat.
+`retry_available_at` records a business retry delay and is never heartbeat-renewed.
+
+Stop all old executors before applying `20260918_command_retry_at`. The migration
+copies pending commands' retry deadlines into `retry_available_at` and preserves
+processing commands, results, attempt counters, and input-delivery evidence.
+Do not reset processing commands to pending or clear task leases in bulk. On
+startup, task ownership follows the existing lease-recovery rules; recovered
+commands keep their identity and pass through their existing application/replay
+checks. A completed START or reply handoff is not replayed simply because its
+execution worker died. Expired RUNNING tasks retain the existing failure/recovery
+semantics rather than automatically rerunning external side effects.
+
+All executors against one database must use the same execution mode. The local
+`shared=false` mode retains command claims. Restoring an old binary after shared
+workers have processed commands is not a supported in-place rollback; stop the
+new processes and restore a consistent pre-upgrade backup instead.
+
+## Sandbox ownership
+
+Every concurrent execution process using Docker or BoxLite must have its own
+stable `XAGENT_SANDBOX_WORKER_ID`, such as `worker-1` and `worker-2`. Reuse an ID
+when restarting its process, and stop the old process before reusing that ID.
+Do not copy one ID across replicas or derive it from a new random process ID.
+The ID must match `[a-z0-9][a-z0-9_-]*`: lowercase letters, digits, dashes and
+underscores, beginning with a lowercase letter or digit. Dots and uppercase
+letters are rejected, so validate generated host/pod identities before using them.
+
+Docker also requires a stable deployment `XAGENT_SANDBOX_NAMESPACE`. Container
+names, ownership labels, and SQL metadata use a scope derived from both values.
+BoxLite uses a separate home directory and SQL metadata scope per worker ID.
+The Compose sandbox overlays supply role-specific identities for their fixed
+single instances. Additional execution replicas must supply distinct identities.
+
+A replacement worker creates its own sandbox resources; it does not adopt or
+clean up another worker's resources. Workspace files remain shared. Existing
+unscoped sandbox resources from local mode need operator cleanup after draining
+that deployment; changing an identity does not migrate those resources.
+
+The SQL metadata needs the same upgrade cleanup. Old `sandbox_info.name` and
+`sandbox_snapshot.snapshot_id` values have no worker namespace prefix. New
+stores use `<scope>::<logical-name>` keys, so normal lookups/deletes cannot reach
+those old rows; they are not automatically migrated or deleted. After draining
+all processes using the old resources and backing up the database, inspect:
+
+```sql
+SELECT id, sandbox_type, name, state FROM sandbox_info ORDER BY id;
+SELECT id, sandbox_type, snapshot_id FROM sandbox_snapshot ORDER BY id;
+```
+
+Match the records to the retired deployment's container/snapshot inventory,
+remove those physical resources, then delete only the reviewed metadata rows
+by their exact primary-key IDs using your database administration tool. Retain
+rows belonging to other deployments or current worker scopes. Do not infer
+ownership merely from the presence of `::`: legacy logical names can contain
+that separator too. Deleting metadata alone does not remove containers or
+snapshot images, and adding a prefix does not transfer resource ownership.
+
+## Channel replies and failure recovery
+
+Accepted channel commands and final-reply destinations are committed together.
+The designated ingress checks pending final replies every 30 seconds, including
+after restart. A separate delivery claim prevents ordinary concurrent sends;
+its 60-second lease is renewed during delivery. Platform failures retry after
+30 seconds without running the Agent again. Recovery selects the earliest eligible
+retry time, with new replies first, so failing destinations do not monopolize a
+batch. After 10 failed delivery attempts the row becomes `failed` and automatic
+retries stop; the stored task result remains available. A warning and the
+`xagent.channel.delivery` counter record the terminal outcome. Waiting for an
+unfinished execution does not consume this budget. Channel access is checked
+again before recovery sends a stored answer. Revoked sender access or changed
+ownership permanently discards the reply with a logged/counted reason. An
+unavailable channel configuration is retried within the same failure budget,
+allowing a temporarily disabled channel to recover after it is re-enabled.
+
+The guarantee is at-least-once delivery while access remains authorized and the
+platform accepts the reply before the retry budget is exhausted. If the platform receives a reply just
+before ingress crashes or its delivery acknowledgement cannot be saved, a retry
+may repeat the reply or attachments. Platform sends and database commits cannot
+be made one transaction. Reusing the loading message where supported reduces
+visible duplicates, but does not eliminate this failure window.
+
+If waiting for execution reaches `XAGENT_TASK_REPLY_WAIT_TIMEOUT_SECONDS`, ingress
+posts an accepted/still-processing notice and leaves the final reply pending.
+A temporary database read failure retries within the same deadline. Loss of the
+progress route disables progress forwarding for that turn after the first
+failure; it does not repeatedly delay execution. Final replies use durable
+recovery rather than the old in-memory progress route.
+
+Stopping a newly selected task or closing it after failed acceptance leaves it
+paused with its uploaded files, so it can be continued. Cleanup applies only to
+the original unaccepted selection; it cannot modify a newer replacement run.
+
+## Runtime credential lifetime
+
+Run-scoped credentials remain encrypted while a task is paused or waiting for
+user input. `XAGENT_TASK_RUNTIME_SECRETS_TTL_SECONDS` is a positive integer,
+defaulting to 86400 (24 hours), measured from acceptance. Resume does not extend
+this lifetime. Reads reject expired credentials immediately, even before the
+cleanup sweep deletes them. Finished and replaced runs are also cleaned up.
+After expiration, submit fresh runtime credentials with a new request; an old
+run cannot silently reuse expired values.
+
+## A2A first-message retries
+
+Shared A2A requests without `taskId` retain the original acceptance under the
+Agent, authenticated owner's stable identity, API key identity, and `messageId`. Repeating the
+same text and explicit `contextId` returns the original task's current state,
+including a completed or failed state, without creating another task. Reusing
+that identity with different text or explicit context returns `INVALID_ARGUMENT`.
+A new message ID represents a new input even when its text is identical.
+Different API keys have independent retry histories; rotating a key starts a new
+history. The public key prefix identifies the key; the secret is never stored in
+the receipt. If the first request omits `contextId`, a retry may include the
+server-assigned context ID returned for that task. A different context still
+conflicts; an explicitly supplied initial context must be repeated unchanged.
+
+Apply `20260919_task_input_receipts` with all old application processes stopped.
+The receipt, task, message and START command commit together. Existing inputs
+cannot be backfilled because their original message IDs were not retained.
+Existing-task continuation and paused/waiting replies keep their current
+protocol; local execution with shared mode disabled is unchanged.
+
+Receipts have no heartbeat, processing state or automatic expiry. They retain
+only hashed input identity/content and task/command references, not message text
+or credentials. Deleting the task or command leaves a receipt tombstone; an
+identical retry returns `NOT_FOUND` rather than resurrecting work. Normal current
+authentication and task ownership checks still apply to replayed requests.
+Dropping this table, including migration downgrade, discards the retry history
+and removes the corresponding deduplication guarantee. This is acceptance
+idempotency, not an exactly-once guarantee for external tools or message sends.
+
+
+### Channel input acceptance foundation
+
+The internal `channel_input_acceptance` service supports committing physical-input
+receipts, task selection, attachment bindings, the user transcript, START, and the
+reply destination in one transaction. Input identity includes the owner subject,
+channel, sender, provider scope, and physical message ID. An identical retry uses
+the original command; changed content conflicts, and a deleted target is not recreated.
+
+Batch lookup separates new inputs, original commands to replay, and rejected old
+receipts. Newly accepted inputs in one batch share one START and use the last new
+input's reply destination. Concurrent overlapping batches must look up and partition
+again when acceptance reports `ChannelInputBatchChanged`. Lookup batches must be
+nonempty and belong to one owner, channel, sender, source, and provider scope.
+Lookup and acceptance reject mixed channel/sender/source/scope batches with
+`TaskTurnError("input_batch_invalid")` before accessing the database. Lookup also
+rejects an owner change while resolving a batch. Attachments
+must already be durably staged; acceptance binds their metadata atomically, while
+callers remain responsible for compensating unreferenced staged objects after failure.
+
+When a commit acknowledgement is lost, the service first checks whether this
+attempt's receipt and command were committed. For a batch, recovery checks only
+the primary input receipt and its command identity, relying on atomic acceptance;
+it does not scan all secondary receipts for competing acceptances. Confirming
+that outcome does not re-authorize the already accepted request against later channel configuration.
+Replaying a competing request still requires current authorization. Only receipt
+primary-key conflicts trigger repartition; unrelated integrity failures propagate.
+`ChannelInputBatchChanged` is a retry signal for the caller's partition loop, not a
+user-facing `TaskTurnError`.
+
+Slack, Feishu and Telegram use this foundation in shared execution mode.
+
+
+### Slack input acceptance
+
+In shared execution mode, Slack messages use durable receipts keyed by the
+workspace, channel, sender and physical message timestamp. Message and mention
+redeliveries reuse the original task and command, including after ingress restart.
+Authorization is checked again before replay. Attachments are staged before task
+selection and committed with the receipt, transcript, START and reply destination;
+an unavailable attachment prevents acceptance of that input.
+
+Slack keeps its existing progress filtering and three-second tool-status cadence.
+Selected display updates share the durable delivery claim with final replies, and
+the loading-message timestamp is persisted for observers and recovery. Local
+execution and control commands retain their existing behavior.
+
+### Accepted channel command observation and progress
+
+An accepted input can construct a `SharedChannelTurn` using `as_turn()` and call
+`observe()` to attach a reply route and wait for the existing command. Observation
+does not create another START, transcript message, or receipt. The existing
+`execute()` entry point continues to accept new work and uses the same result wait.
+The caller closes the observer to release its local event route. Reply timeout
+returns the accepted/pending result; final delivery can recover independently.
+
+`DurableChannelProgress` is an explicit sender, not a trace handler. Channel
+handlers filter, aggregate and rate-limit trace events before calling `send()`,
+so ignored events do not acquire a delivery claim. This does not reduce worker
+trace routing or Redis traffic. Final delivery remains independent of filtering.
+
+It sends progress and final replies through the existing
+delivery claim. Progress callbacks update `delivery.destination` with platform
+loading-message identifiers; settlement persists them under the claim token so
+later observers and final recovery reuse that destination. An active claim blocks
+both kinds of send. Successful progress releases the claim without a poll delay,
+allowing an ordinary final send or recovery to run immediately. Pending notices
+and result polling retain their existing delay. Progress can bypass a pending
+poll delay when no send has failed, but respects failed-send backoff. Progress-send failures defer further
+sends without consuming the final reply retry budget; final-send failures retain
+the bounded retry budget. Platform sends remain at least once
+when acknowledgement or destination persistence is uncertain.
+
+Worker progress forwarding runs outside the agent's trace dispatch wait. Each
+execution allows one in-flight send and up to 128 queued events. Events are sent
+in order; a full queue applies backpressure instead of dropping healthy progress.
+Connection failures discard the queued backlog and retain the retry policy below.
+Normal execution drains progress for up to five seconds before committing its
+final result, then cancels any remaining send. Cancellation or execution errors
+abort forwarding immediately. Cleanup drains the owned send in all cases.
+Final results keep their independent durable delivery path.
+
+Worker progress retries connection failures on subsequent trace events with an
+exponential delay from one to thirty seconds, reset after successful delivery.
+This includes missing or closed routes, dead ingress hosts and lost acknowledgements,
+so replacement observers can resume progress. Already emitted progress is not
+replayed. Non-connection errors still disable the progress forwarder.
+
+Commit recovery counts an observed competing receipt before checking current
+authorization. A competing batch requests repartition immediately, consistently
+with receipt conflicts during flush; the next lookup must still authorize the
+caller. Single-message replay also retains its authorization checks.
+
+
+### Feishu and Telegram batch controls
+
+Feishu and Telegram collect ordinary messages into short batches and continue
+processing messages received while the preceding batch runs. Control commands
+are handled outside that queue. Feishu supports `/start`, `/help`, `/new`,
+`/stop` and `/pause`; state-changing commands authorize the sender before acting.
+`/stop` clears pending input and requests a pause while retaining the current
+task. `/new` saves a new-conversation selection before clearing queued input and
+stopping the old turn; late preparation cannot restore the previous selection.
+Messages arriving while a Feishu control command is being authorized wait until
+that command finishes; they are then queued in arrival order. A command clears
+only earlier pending input. If a new-conversation selection is saved but cleanup
+of previous replies fails, Feishu reports that the new conversation is selected.
+
+Telegram retains its task-switching, agent selection and voice behavior. Both
+channels also signal a preparing request when a retained previous shared turn
+accepts a stop; previously Telegram could miss that newer preparation.
+
+These controls retain the existing per-user conversation scope and active-task
+file formats. They do not add cross-chat isolation or durable pending-input
+storage. Platform sends already in flight may complete after a control command.
+
+
+### Feishu input acceptance
+
+In shared execution mode, Feishu identifies each physical input by its configured
+channel, authorized sender, chat and message ID. Retries after ingress restart
+reuse the original task and START. Overlapping batches replay existing commands
+and accept only new inputs; changed or deleted original inputs are reported
+without preventing unrelated new inputs from being accepted. Messages from
+different chats are accepted in separate batches while retaining the existing
+per-user task selection.
+
+Attachments are staged before acceptance and their metadata commits together
+with receipts, transcript, START and reply destination. Attachment failure
+(including a missing provider file key) prevents acceptance of all new messages
+in that contiguous chat group; the user must resend the group together. Later
+chat groups continue independently. Progress and final output share the durable
+delivery claim and retain the saved loading-message ID across observers.
+
+Database acceptance is authoritative. If saving the local current-task file
+fails afterwards, the accepted task remains valid and the user is told so;
+retrying the same physical message reuses that task. The task selection remains
+in memory, but a restart can lose that unsaved selection. The file format and
+per-user conversation scope are unchanged. `/new` still saves its selection
+before stopping old work; failure at that earlier boundary leaves old work intact.
+
+Shared ordinary messages predating ingress startup are checked against receipts;
+old control commands remain filtered to prevent replaying `/new` or `/stop`.
+Controls interrupt unaccepted preparation or request a pause if acceptance has
+already committed, and `/new` suppresses the old result. Ingress shutdown detaches
+observers without pausing accepted worker tasks, including acceptance that commits
+while shutdown is draining. Explicit user controls still take effect during that
+drain. Observation failures after acceptance are logged without reporting a failed
+request; durable result recovery continues when an active channel bot is running.
+Deactivating the channel suspends that delivery recovery until it is active again.
+Local execution keeps
+its previous behavior. Inputs still waiting in the in-memory queue are not made
+durable by this change; external sends remain at least once.
+
+
+### Telegram input acceptance
+
+Shared Telegram inputs use durable receipts keyed by configured channel, sender,
+chat, topic and physical message ID. Attachment fingerprints use `file_unique_id`;
+downloads use `file_id`. Replays reuse the original command before downloading or
+resolving speech recognition, even when the current Agent or ASR configuration
+has changed. Authorization is checked again on replay.
+
+Contiguous chat/topic groups are accepted separately. All new inputs in a group
+are rejected together if an attachment cannot be downloaded or a voice message
+cannot be transcribed; resend the group together. Later groups continue. Voice
+messages are transcribed in message order; regular audio remains an attachment.
+Files, transcript, receipt, START and reply destination commit together. A local
+conversation-map save failure does not undo an accepted request.
+
+Loading messages, progress and final output use the durable delivery claim.
+Recovery can create a loading message when acceptance committed before the
+initial send. `/stop` pauses work while preserving its answer; `/new`, `/switch`
+and Agent selection suppress abandoned replies. Shutdown detaches observation
+without cancelling accepted worker work. Local execution behavior is unchanged.
+
+Shared startup retains Telegram's pending ordinary messages. Commands and text
+stop aliases predating startup are ignored. Telegram message timestamps have
+second precision, so controls in the same second as startup are conservatively
+ignored too. Agent selection and pagination keyboards from previous bot starts
+expire; send `/agents` for a new menu. Local startup still clears pending updates.
+This does not make aiogram's in-memory queue a durable inbox: messages already
+acknowledged to Telegram but not accepted into the database can still be lost
+on a crash. Platform sends remain at least once.

@@ -17,6 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 from starlette.requests import Request
 
+from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRef
 from xagent.core.tools.adapters.vibe.mcp_adapter import (
     MCPFailurePhase,
     MCPLoadResult,
@@ -330,9 +331,11 @@ async def test_get_mcp_server_tools_injects_runtime_oauth_grant(
     db.add(grant)
     db.commit()
     captured_connections = []
+    captured_connector_refs = []
 
-    async def fake_load_tools(connections, name_prefix):
+    async def fake_load_tools(connections, name_prefix, connector_refs=None):
         captured_connections.append(connections)
+        captured_connector_refs.append(connector_refs)
         return MCPLoadResult(
             tools=(
                 SimpleNamespace(name="search_records", description="Search records"),
@@ -352,6 +355,12 @@ async def test_get_mcp_server_tools_injects_runtime_oauth_grant(
     connection = captured_connections[0]["records"]
     assert connection["headers"]["Authorization"] == "Bearer runtime-token"
     assert connection["headers"]["X-Request-Source"] == "xagent"
+    # This listing seam carries the persisted server id like every other MCP
+    # materialization seam, so a gated call built here could never fail
+    # closed for want of a connector identity; the transport mapping itself
+    # stays id-free.
+    assert captured_connector_refs[0] == {"records": ConnectorRef("mcp", server.id)}
+    assert "id" not in connection
 
 
 @pytest.mark.asyncio

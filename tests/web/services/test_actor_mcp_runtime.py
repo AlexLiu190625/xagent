@@ -21,6 +21,7 @@ from xagent.core.tools.adapters.vibe.config import (
     ACTOR_STDIO_SHADOWED_REASON,
 )
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
+from xagent.core.tools.adapters.vibe.mcp_approval_gate import MCPApprovalGateTool
 from xagent.core.tools.adapters.vibe.sandboxed_tool.chrome_session import (
     ChromeExecutionSessionPool,
 )
@@ -1491,7 +1492,15 @@ async def test_session_and_per_call_tools_are_both_preserved(
         actor_stdio_session_consumer=consume,
     )
 
-    assert tools == [session_tool, per_call_tool]
+    # Both preserved, in order. The session consumer bypasses the generic MCP
+    # loader, so the factory gates its tools at the consumption site; the
+    # per-call tool here comes from a stubbed loader, which is where the
+    # production loader would have gated it.
+    assert [getattr(tool, "target", tool) for tool in tools] == [
+        session_tool,
+        per_call_tool,
+    ]
+    assert isinstance(tools[0], MCPApprovalGateTool)
 
 
 @pytest.mark.asyncio

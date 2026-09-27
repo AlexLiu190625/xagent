@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 
 import requests
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from ....config import get_tool_max_output_length
 from .utils import setup_proxy_env, success_with_capped_dict, url_path_id
@@ -42,6 +43,150 @@ def _success(**payload: Any) -> str:
 
 def _error(message: str) -> str:
     return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
+
+
+def _record_response(context: str, result: Any, *, field_name: str = "record") -> str:
+    """Wrap a single dict-shaped Deputy API response, or an error if it
+    isn't one. Shared by every tool that expects exactly one record back
+    (deputy_get_current_user's "/me", deputy_get_resource's/
+    deputy_create_resource's/deputy_update_resource's {resource}/
+    deputy_add_employee's "Employee"), which otherwise repeat this same
+    isinstance-check-then-cap shape verbatim.
+
+    ``context`` is the resource name (or "/me") to name in the error
+    message on a malformed response -- not necessarily the same string as
+    ``field_name``, which is the JSON key the record is nested under on
+    success.
+    """
+    if not isinstance(result, dict):
+        return _error(f"Deputy returned an unexpected response for {context}")
+    return success_with_capped_dict(field_name, result)
+
+
+def _empty_create_response(subject: str) -> str:
+    """Shared by every create tool (deputy_create_resource,
+    deputy_add_employee): an empty ``{}`` (a 204, or a 200 with no body --
+    both normalized by ``_request``) after an otherwise-successful POST is
+    a genuine "we don't know" for a create -- unlike a get/list, an empty
+    response here isn't a valid "no data" result, but it's also not
+    necessarily a failure, since Deputy already returned a non-error
+    status. A flat ``_error`` here would be misleading (it reads as
+    "nothing happened, safe to retry"), which is exactly the wrong signal
+    for a non-idempotent write -- so this stays a success, with an
+    explicit warning instead of a silent, confident-looking blank record.
+    """
+    return _success(
+        record={},
+        warning=(
+            f"Deputy returned no content for this {subject} create -- the "
+            "record may or may not have been created, and its id is "
+            "unknown. Use deputy_query_resource to check before retrying."
+        ),
+    )
+
+
+def _verify_created_record(resource: str, safe_resource: str, result: Any) -> str:
+    """Confirm a just-created record is actually retrievable before
+    reporting success, rather than trusting the create response at face
+    value. Deputy's create endpoints can return a 200 with a plausible,
+    fully-formed record body (Id, timestamps, ...) for a record that
+    turns out to be permission-orphaned and unreadable by every other
+    endpoint -- confirmed in a 2026-09-21 production incident, where a
+    bare POST /resource/Employee did exactly this twice (see
+    deputy_create_resource's Employee rejection and deputy_add_employee).
+    Shared by both create tools rather than duplicated, since the same
+    "success" response shape can mislead regardless of which endpoint
+    produced it.
+
+    ``safe_resource`` is the already-``url_path_id``-sanitized form of
+    ``resource``, passed in rather than re-derived here: both callers have
+    already computed it for their own POST, and a caller that ever
+    sanitizes ``resource`` differently before its POST than what it hands
+    this helper (e.g. adds trimming/casefolding to one call site only)
+    should not be able to silently point the readback GET somewhere other
+    than the record it just created.
+    """
+    if not isinstance(result, dict):
+        # A malformed response _record_response already errors on.
+        return _record_response(resource, result)
+    if result.get("Id") is None:
+        # Already-empty ({}) is handled by each caller before this is
+        # reached, so this is a non-empty body with nothing to read back
+        # and verify against -- not a different, safer case than a
+        # present-but-orphaned Id, just a differently-shaped instance of
+        # the same "can't confirm this succeeded" risk this function
+        # exists to catch. This matters most for deputy_add_employee:
+        # Deputy's own OpenAPI spec documents POST /supervise/employee's
+        # response as an undocumented, empty schema (unlike the Resource
+        # API's Employee object, which always has an Id), so a body
+        # that comes back anyway without an Id is exactly the
+        # unconfirmed-shape case, not a clean pass-through.
+        warning = (
+            f"Unconfirmed Deputy {resource} create -- verify directly in "
+            "Deputy before relying on it. The create response had no Id "
+            "to read back and confirm."
+        )
+        return success_with_capped_dict(
+            "record", result, critical_fields={"warning": warning}
+        )
+    record_id = result["Id"]
+    detail: str | None = None
+    readback: Any = None
+    try:
+        safe_id = url_path_id(str(record_id), "resource_id")
+        readback = _request("GET", f"/resource/{safe_resource}/{safe_id}")
+        verified = isinstance(readback, dict) and bool(readback)
+    except Exception as e:
+        verified = False
+        # `str(e)` is "" for an exception raised with no args (e.g. a bare
+        # `raise SomeError()`) -- `detail` would then be falsy even though
+        # an exception genuinely happened, so this is checked with
+        # `detail is not None` below rather than truthiness, and falls
+        # back to the exception's type name so "failed: " is never
+        # followed by nothing.
+        detail = str(e) or type(e).__name__
+        logger.warning(
+            f"Deputy readback failed for {resource} Id {record_id}: {detail}",
+            exc_info=True,
+        )
+    if verified:
+        # The freshly-read record, not the create response: Deputy may
+        # normalize or default fields between the write and this read, and
+        # since a full GET is already being paid for, there's no reason to
+        # return the staler of the two.
+        return _record_response(resource, readback)
+    if detail is not None:
+        reason = f"failed: {detail}"
+    elif not readback:
+        reason = "returned no record"
+    else:
+        # verified is False here only because readback wasn't a dict (see
+        # the isinstance check above) -- something came back, just not
+        # record-shaped, which is a different, more informative case than
+        # a plain empty response.
+        reason = "returned an unexpected response shape"
+    # The actionable instruction comes first and the (potentially long,
+    # up to MAX_ERROR_RESPONSE_TEXT_CHARS) diagnostic detail comes last:
+    # success_with_capped_dict's last-resort fallback cuts an oversized
+    # critical field from the end, so if this ever needs shortening, it
+    # must eat into "reason" -- not into the one instruction a caller
+    # actually needs to act on. "Do not retry" is explicit rather than
+    # implied by "verify directly": the POST that got this far already
+    # returned an Id, so Deputy most likely did create the record --
+    # retrying the create on an unconfirmed *readback* risks a genuine
+    # duplicate, not just a redundant no-op.
+    warning = (
+        f"Unconfirmed Deputy {resource} create (Id {record_id}) -- verify "
+        "directly in Deputy before relying on it; do not retry the create, "
+        f"which likely already succeeded. Reading it back {reason}."
+    )
+    # critical_fields, not extra_fields: this warning is the entire point
+    # of this function, so it must survive even success_with_capped_dict's
+    # last-resort truncation fallback, which otherwise drops ordinary
+    # extra_fields to make room.
+    return success_with_capped_dict(
+        "record", result, critical_fields={"warning": warning}
+    )
 
 
 def _success_with_capped_list(
@@ -205,9 +350,7 @@ def deputy_get_current_user() -> str:
     """
     try:
         result = _request("GET", "/me")
-        if not isinstance(result, dict):
-            return _error("Deputy returned an unexpected response for /me")
-        return success_with_capped_dict("user", result)
+        return _record_response("/me", result, field_name="user")
     except Exception as e:
         logger.error(f"Error fetching authenticated Deputy user: {e}", exc_info=True)
         return _error(str(e))
@@ -266,13 +409,34 @@ def deputy_get_resource(resource: str, resource_id: str) -> str:
         safe_resource = url_path_id(resource, "resource")
         safe_resource_id = url_path_id(resource_id, "resource_id")
         result = _request("GET", f"/resource/{safe_resource}/{safe_resource_id}")
-        if not isinstance(result, dict):
-            return _error(f"Deputy returned an unexpected response for {resource}")
-        return success_with_capped_dict("record", result)
+        return _record_response(resource, result)
     except Exception as e:
         logger.error(
             f"Error fetching Deputy {resource} record {resource_id}: {e}",
             exc_info=True,
+        )
+        return _error(str(e))
+
+
+@mcp.tool()
+def deputy_resource_info(resource: str) -> str:
+    """
+    Get the field list, types, and associations Deputy defines for a
+    resource type (GET /resource/{resource}/INFO). Use this before
+    deputy_create_resource/deputy_update_resource to learn what fields
+    Deputy expects -- especially for the first record of a type, when
+    there's no existing record yet for deputy_get_resource/
+    deputy_list_resource/deputy_query_resource to show you.
+    resource: a Deputy Resource API object name, e.g. "Employee", "Roster",
+    "Timesheet", or "Leave".
+    """
+    try:
+        safe_resource = url_path_id(resource, "resource")
+        result = _request("GET", f"/resource/{safe_resource}/INFO")
+        return _record_response(resource, result, field_name="info")
+    except Exception as e:
+        logger.error(
+            f"Error fetching Deputy resource info for {resource}: {e}", exc_info=True
         )
         return _error(str(e))
 
@@ -323,6 +487,270 @@ def deputy_query_resource(
         return _success_with_capped_list("records", result)
     except Exception as e:
         logger.error(f"Error querying Deputy resource {resource}: {e}", exc_info=True)
+        return _error(str(e))
+
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False))
+def deputy_create_resource(resource: str, data: dict[str, Any]) -> str:
+    """
+    Create a new record (POST /resource/{resource}).
+    resource: a Deputy Resource API object name, e.g. "Roster", "Timesheet",
+    "Leave", or "Contact" -- NOT "Employee": use deputy_add_employee for
+    that instead, which this tool refuses (see its docstring for why).
+    data: field name -> value pairs for the new record. Use
+    deputy_resource_info first to learn Deputy's required/optional fields
+    for a resource type -- deputy_get_resource needs an id, which isn't
+    available yet when creating the first record of a type.
+    This is not idempotent: retrying after a timeout or connection error
+    can create a duplicate record. Use deputy_query_resource to check
+    whether the record already exists before retrying a failed call.
+    After Deputy reports success, this reads the new record back before
+    confirming -- if that fails, the result is still returned but with a
+    "warning" field flagging it as unconfirmed; treat that the same as a
+    failure until you've verified it directly in Deputy.
+    """
+    try:
+        # Case/whitespace-insensitive: Deputy's own resource-name routing
+        # is not guaranteed to be case-sensitive, and an LLM caller
+        # guessing "employee"/"EMPLOYEE" instead of the exact string
+        # "Employee" must not bypass this guard and reproduce the exact
+        # incident it exists to prevent.
+        if resource.strip().casefold() == "employee":
+            # A bare POST /resource/Employee inserts an Employee row with
+            # no location/workplace membership -- Deputy's permission
+            # model is scoped by location, so the resulting record is then
+            # neither listable nor directly readable (a 403 "Access to
+            # object denied", not a 404) even though Deputy accepted the
+            # write and returned a plausible-looking record with an id.
+            # That's indistinguishable from "nothing was created" to both
+            # the caller and Deputy's own UI (root-caused from a
+            # production incident on 2026-09-21, where this produced two
+            # such orphaned records). deputy_add_employee wraps Deputy's
+            # own recommended management/supervise endpoint instead, which
+            # sets up that membership as part of the same call.
+            return _error(
+                "Employee creation isn't supported here -- use "
+                "deputy_add_employee instead. A bare POST /resource/Employee "
+                "creates a record with no location/workplace membership, "
+                "which Deputy's permission model then hides from list/get "
+                "calls even though the write itself succeeds."
+            )
+        # "Id" is server-assigned on create; dropping any caller-supplied
+        # value rather than forwarding it removes any ambiguity about
+        # whether Deputy would honor, ignore, or reject a client-chosen
+        # id (undocumented), matching deputy_update_resource's own
+        # protection of "Id" against caller override. Stripped before the
+        # empty-data check so a data={"Id": ...}-only call is correctly
+        # rejected as no real data provided, not silently posted empty.
+        create_data = {k: v for k, v in data.items() if k != "Id"}
+        if not create_data:
+            return _error("No data provided to create record")
+        safe_resource = url_path_id(resource, "resource")
+        result = _request("POST", f"/resource/{safe_resource}", json_data=create_data)
+        if isinstance(result, dict) and not result:
+            return _empty_create_response(resource)
+        return _verify_created_record(resource, safe_resource, result)
+    except Exception as e:
+        logger.error(f"Error creating Deputy {resource} record: {e}", exc_info=True)
+        return _error(str(e))
+
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False))
+def deputy_add_employee(
+    first_name: str,
+    last_name: str,
+    company_id: int,
+    *,
+    email: str | None = None,
+    mobile_phone: str | None = None,
+    role_id: int | None = None,
+    stress_profile_id: int | None = None,
+    start_date: str | None = None,
+    date_of_birth: str | None = None,
+    gender: int | None = None,
+    country_code: str | None = None,
+    payroll_id: str | None = None,
+    weekday_rate: float | None = None,
+    send_invite: bool = False,
+) -> str:
+    """
+    Add a new employee (POST /supervise/employee) -- Deputy's own docs
+    recommend this management endpoint for adding employees, not the
+    generic Resource API. deputy_create_resource refuses resource=
+    "Employee" for exactly this reason: a bare POST /resource/Employee
+    inserts a row with no location/workplace membership, and Deputy's
+    permission model is scoped by location, so the record gets created but
+    is then neither listable nor directly readable -- indistinguishable
+    from "nothing was created" to both the caller and Deputy's own UI.
+
+    first_name, last_name: the employee's name.
+    company_id: the Deputy Company (location) id to add the employee to --
+    look one up first (e.g. via deputy_list_resource("Company")) rather
+    than guessing.
+    email: primary email address, if any.
+    mobile_phone: mobile phone number, if any.
+    role_id: the EmployeeRole (access level) id to grant -- look one up
+    via deputy_list_resource("EmployeeRole") if unsure.
+    stress_profile_id: the working-hours/StressProfile id to assign --
+    look one up via deputy_list_resource("StressProfile") if unsure.
+    start_date, date_of_birth: "YYYY-MM-DD".
+    gender: 0 = prefer not to say, 1 = male, 2 = female, 3 = non-binary.
+    country_code: country code for the employee's address.
+    payroll_id: external payroll id to set.
+    weekday_rate: weekday pay rate.
+    send_invite: if true, Deputy emails the employee an invitation to set
+    up their own Deputy login. Defaults to false -- only set true once
+    the caller has confirmed this employee should get app access.
+
+    This endpoint has no field for AllowAppraisal (or any Employee field
+    outside the ones listed above) -- to set those, follow up with
+    deputy_update_resource("Employee", <new id>, {...}) after this call.
+
+    Deputy's official field reference for this endpoint
+    (developer.deputy.com/reference/addanemployee) does not document
+    email/role/stress-profile/invite fields at all; the names used here
+    (strEmail, intRoleId, intStressProfile, blnSendInvite) come from a
+    separate example in Deputy's own docs that is not confirmed against a
+    live account. If a create reports success but email/role/stress
+    profile/invite don't show up on the resulting record, Deputy is
+    silently ignoring that field -- verify with deputy_get_resource
+    afterward rather than trusting this call's reported success alone.
+
+    This is not idempotent: retrying after a timeout or connection error
+    can create a duplicate record. Use deputy_query_resource("Employee",
+    ...) to check whether the record already exists before retrying a
+    failed call.
+    After Deputy reports success, this reads the new employee back before
+    confirming -- if that fails, the result is still returned but with a
+    "warning" field flagging it as unconfirmed; treat that the same as a
+    failure until you've verified it directly in Deputy.
+    """
+    try:
+        # Flattened, individually-named parameters rather than a generic
+        # data: dict[str, Any] (unlike deputy_create_resource): Deputy's
+        # supervise/employee field names (strFirstName, intCompanyId,
+        # intStressProfile, ...) don't match the Resource API's Employee
+        # field names (FirstName, Company, StressProfile), and the
+        # incident this tool fixes was partly caused by the caller
+        # guessing at a field name ("Stress Profile" with a space) that
+        # silently didn't match what Deputy expected. Typed keyword
+        # arguments make that whole class of mistake impossible.
+        body: dict[str, Any] = {
+            "strFirstName": first_name,
+            "strLastName": last_name,
+            "intCompanyId": company_id,
+            # Sent explicitly either way, rather than omitted when False,
+            # so this call's behavior doesn't depend on Deputy's own
+            # undocumented default for an absent field.
+            "blnSendInvite": 1 if send_invite else 0,
+        }
+        if email is not None:
+            body["strEmail"] = email
+        if mobile_phone is not None:
+            body["strMobilePhone"] = mobile_phone
+        if role_id is not None:
+            body["intRoleId"] = role_id
+        if stress_profile_id is not None:
+            body["intStressProfile"] = stress_profile_id
+        if start_date is not None:
+            body["strStartDate"] = start_date
+        if date_of_birth is not None:
+            body["strDob"] = date_of_birth
+        if gender is not None:
+            body["intGender"] = gender
+        if country_code is not None:
+            body["strCountryCode"] = country_code
+        if payroll_id is not None:
+            body["strPayrollId"] = payroll_id
+        if weekday_rate is not None:
+            body["fltWeekDayRate"] = weekday_rate
+        result = _request("POST", "/supervise/employee", json_data=body)
+        if isinstance(result, dict) and not result:
+            return _empty_create_response("employee")
+        return _verify_created_record("Employee", "Employee", result)
+    except Exception as e:
+        logger.error(f"Error adding Deputy employee: {e}", exc_info=True)
+        return _error(str(e))
+
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=True))
+def deputy_update_resource(
+    resource: str, resource_id: str, data: dict[str, Any]
+) -> str:
+    """
+    Update an existing record. Only the fields provided are changed --
+    internally this reads the current record and writes the merged
+    result back, since Deputy has no partial-update support here (see
+    deputy_get_resource first if you need to know a field's current
+    value). A concurrent edit to the same record landing while this
+    runs (elsewhere, or another call) can be silently overwritten;
+    there is no conflict detection or retry.
+    resource: a Deputy Resource API object name, e.g. "Employee", "Roster",
+    "Timesheet", or "Leave".
+    resource_id: the record's numeric id, as a string (e.g. "123").
+    data: field name -> value pairs to change, e.g. {"Active": False} to
+    deactivate an Employee. For "Employee", fields like "Company",
+    "Contact", "Role", and "StressProfile" are ids referencing other
+    records, not literal values -- look up a valid id first (e.g. via
+    deputy_list_resource) rather than guessing one.
+    """
+    try:
+        # "Id" is identified by resource_id/the URL, not data: the URL's
+        # resource_id is what actually identifies the record being
+        # written, and letting a caller-supplied "Id" in data silently
+        # ride along in the body would decouple what the body claims to
+        # be from what the URL targets, for no legitimate reason a
+        # partial update would ever need. Dropped unconditionally rather
+        # than only re-asserted from the fetched record (which would
+        # leave a caller-supplied Id unprotected whenever the fetched
+        # record happens to lack an "Id" key) -- matches
+        # deputy_create_resource's own protection. Stripped before the
+        # empty-data check so a data={"Id": ...}-only call is correctly
+        # rejected as no real change requested, not turned into a
+        # needless no-op GET+POST round trip.
+        update_data = {k: v for k, v in data.items() if k != "Id"}
+        if not update_data:
+            return _error("No data provided to update")
+        safe_resource = url_path_id(resource, "resource")
+        safe_resource_id = url_path_id(resource_id, "resource_id")
+        # Deputy's V1 Resource API requires the complete object on
+        # POST /resource/{resource}/{id} -- it has no partial-update
+        # support (Deputy's own V2 employee endpoint exists specifically
+        # to add that for Employee; V1 has no equivalent for other
+        # resource types) -- so fetch the current record and merge
+        # `update_data` into it before writing the full object back,
+        # rather than sending `update_data` alone. This is a GET-then-POST
+        # with no retry: a concurrent edit landing between the two is a
+        # lost-update race this function doesn't detect or retry on.
+        # Not unique to this connector (myob.py's own generic full-object
+        # update has the same tradeoff), so left as a known limitation
+        # rather than solved here.
+        current = _request("GET", f"/resource/{safe_resource}/{safe_resource_id}")
+        # Both checks needed, not just one: `not current` alone lets a
+        # truthy non-dict (e.g. a bare list) through to the dict-spread
+        # below; `isinstance` alone lets an empty {} through -- _request
+        # returns {} on a 204/empty response, and {**{}, **update_data}
+        # would otherwise silently POST only the caller's partial fields
+        # as if they were the whole record, wiping every other field
+        # Deputy has for it. Matches myob.py's _update_resource, which
+        # guards the same way for the same reason.
+        if not current or not isinstance(current, dict):
+            return _error(
+                f"Deputy returned no existing record to update for {resource}"
+                f" {resource_id}"
+            )
+        merged = {**current, **update_data}
+        result = _request(
+            "POST",
+            f"/resource/{safe_resource}/{safe_resource_id}",
+            json_data=merged,
+        )
+        return _record_response(resource, result)
+    except Exception as e:
+        logger.error(
+            f"Error updating Deputy {resource} record {resource_id}: {e}",
+            exc_info=True,
+        )
         return _error(str(e))
 
 

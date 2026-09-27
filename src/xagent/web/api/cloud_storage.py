@@ -65,6 +65,11 @@ def get_google_credentials(
         raise HTTPException(
             status_code=401, detail="Google Drive account not connected"
         )
+    if not oauth_account.access_token:
+        raise HTTPException(
+            status_code=401,
+            detail="Google Drive session expired. Please reconnect.",
+        )
 
     client_id, client_secret = get_google_oauth_config(db)
     if not client_id or not client_secret:
@@ -120,6 +125,8 @@ async def list_connected_accounts(
     if provider:
         query = query.filter(UserOAuth.provider == provider)
 
+    query = query.filter(UserOAuth.access_token != "")
+
     accounts = query.all()
 
     return [
@@ -150,8 +157,32 @@ async def delete_connected_account(
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
 
+    # Snapshot before the delete: it's a bulk-free single-row delete here,
+    # but the same "read the token before it's gone" constraint applies as
+    # in mcp.py's disconnect endpoints -- this must run before db.delete,
+    # while the row (and its access_token) still exists.
+    from .auth import resolve_builtin_oauth_revocation
+
+    revocation = resolve_builtin_oauth_revocation(
+        db,
+        provider=str(account.provider),
+        access_token=str(account.access_token) if account.access_token else "",
+        provider_user_id=(
+            str(account.provider_user_id)
+            if account.provider_user_id is not None
+            else None
+        ),
+    )
+
     db.delete(account)
     db.commit()
+
+    if revocation is not None:
+        from .auth import revoke_builtin_oauth_grants
+
+        await revoke_builtin_oauth_grants(
+            db, [revocation], context=f"deleting connected account {account_id}"
+        )
 
     return {"success": True, "message": "Account deleted successfully"}
 

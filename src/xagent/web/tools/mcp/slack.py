@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -31,6 +32,10 @@ MAX_RETRY_AFTER_SECONDS = 30
 # and each one is a separate conversations.replies call.
 MAX_SEARCH_THREADS = 20
 _UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_SLACK_FILE_ALLOWED_DIRS"
+_CHANNEL_ACCESS_POLICY_ENV_VAR = "XAGENT_SLACK_CHANNEL_ACCESS_POLICY"
+_READ_CAPABILITY = "read"
+_WRITE_CAPABILITY = "write"
+_SUPPORTED_POLICY_CAPABILITIES = frozenset({_READ_CAPABILITY})
 
 # Slack conversation ids are uppercase alphanumerics prefixed by their
 # conversation type: "C" (public channel), "G" (private channel or
@@ -49,6 +54,71 @@ _SLACK_ID_PATTERN = re.compile(r"^[CGD][A-Z0-9]{5,}$")
 # post into a DM, so that id must pass through unchanged rather than being
 # misread as a bare channel name and prefixed with "#" (which 404s).
 _SLACK_ANY_ID_PATTERN = re.compile(r"^[A-Z][A-Z0-9]{5,}$")
+
+
+class _SlackChannelAccessDenied(PermissionError):
+    """A trusted runtime policy denied or could not authorize an operation."""
+
+
+def _policy_now() -> float:
+    return time.time()
+
+
+def _channel_access_policy(
+    required_capability: str = _READ_CAPABILITY,
+) -> frozenset[str] | None:
+    """Load the trusted child policy; absence preserves standalone behavior."""
+
+    raw = os.environ.get(_CHANNEL_ACCESS_POLICY_ENV_VAR)
+    if raw is None:
+        return None
+    try:
+        payload = json.loads(raw)
+        if type(payload) is not dict:
+            raise ValueError
+        channel_ids = payload["channel_ids"]
+        expires_at = payload["expires_at"]
+        capabilities = payload["capabilities"]
+        if (
+            type(payload.get("version")) is not int
+            or payload["version"] != 2
+            or type(channel_ids) is not list
+            or any(
+                not isinstance(channel_id, str)
+                or not _SLACK_ID_PATTERN.fullmatch(channel_id)
+                for channel_id in channel_ids
+            )
+            or len(channel_ids) != len(set(channel_ids))
+            or isinstance(expires_at, bool)
+            or not isinstance(expires_at, (int, float))
+            or not math.isfinite(float(expires_at))
+            or _policy_now() >= float(expires_at)
+            or type(capabilities) is not list
+            or any(not isinstance(capability, str) for capability in capabilities)
+            or len(capabilities) != len(set(capabilities))
+            or frozenset(capabilities) != _SUPPORTED_POLICY_CAPABILITIES
+        ):
+            raise ValueError
+        if required_capability not in capabilities:
+            raise _SlackChannelAccessDenied(
+                "Slack runtime policy does not allow this operation"
+            )
+        return frozenset(channel_ids)
+    except _SlackChannelAccessDenied:
+        raise
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        raise _SlackChannelAccessDenied(
+            "Slack channel access policy is unavailable or expired"
+        ) from None
+
+
+def _authorize_channel_id(channel_id: str) -> str:
+    policy = _channel_access_policy()
+    if policy is not None and channel_id not in policy:
+        raise _SlackChannelAccessDenied(
+            "Slack channel access policy does not allow this channel"
+        )
+    return channel_id
 
 
 def _success(**payload: Any) -> str:
@@ -88,7 +158,7 @@ def _resolve_channel_id(channel: str) -> str:
     """
     value = channel.strip()
     if _SLACK_ID_PATTERN.match(value):
-        return value
+        return _authorize_channel_id(value)
     name = value.lstrip("#").lower()
     if not name:
         raise ValueError("channel must not be empty")
@@ -104,7 +174,7 @@ def _resolve_channel_id(channel: str) -> str:
         result = _request("GET", "conversations.list", params=params)
         for candidate in result.get("channels") or []:
             if str(candidate.get("name") or "").lower() == name:
-                return str(candidate.get("id"))
+                return _authorize_channel_id(str(candidate.get("id")))
         cursor = (result.get("response_metadata") or {}).get("next_cursor")
         if not cursor:
             break
@@ -238,6 +308,19 @@ def _request(
     with a small Retry-After, wait once and retry instead of failing.
     """
     for attempt in (0, 1):
+        # Re-read immediately before every network attempt. A policy can
+        # expire between tool entry, pagination requests, or a 429 retry.
+        _channel_access_policy()
+        # Defense in depth at the common Web API boundary: every current
+        # channel-scoped endpoint uses one of these exact request fields.
+        # Tool-level resolution is still required so names become real ids
+        # before this check and listings can be filtered rather than denied.
+        request_data = json_data if json_data is not None else params
+        if isinstance(request_data, dict):
+            for channel_key in ("channel", "channel_id"):
+                request_channel = request_data.get(channel_key)
+                if isinstance(request_channel, str):
+                    _authorize_channel_id(request_channel)
         response = requests.request(
             method=method,
             url=f"{SLACK_BASE_URL}/{path}",
@@ -246,6 +329,9 @@ def _request(
             json=json_data,
             timeout=DEFAULT_TIMEOUT_SECONDS,
         )
+        # Never consume a response received after the grant expired while the
+        # request was in flight, including a 429 that would otherwise sleep.
+        _channel_access_policy()
         if response.status_code == 429 and attempt == 0:
             try:
                 retry_after = int(response.headers.get("Retry-After", "0"))
@@ -307,6 +393,21 @@ def _request(
 # channel". The raised message below is worded to cover both rather than
 # asserting the membership explanation outright.
 #
+# Production has since surfaced conversations.history and files.completeUploadExternal
+# also returning "channel_not_found", for a channel id that was never real to
+# begin with (an agent passed a fabricated id shaped like a real one —
+# concretely, another Slack id with its prefix swapped for a channel one).
+# _resolve_channel_id's pattern check confirms only the *shape* of a passed-in
+# id, never that Slack actually has such a conversation, so a fabricated id
+# reaches the API unresolved and this is the first place anything notices.
+# Slack's own docs already list channel_not_found for both endpoints
+# alongside not_in_channel — e.g. files.completeUploadExternal's own error
+# table: "channel_not_found: Value passed for `channel_id` was invalid."
+# Nothing was contradicted here; both were simply left out of this table's
+# original classification, under-scoped the same way conversations.info was
+# below. Both now join the same ambiguous-channel_not_found group as the
+# four below instead of staying on the unambiguous default.
+#
 # channel_not_found is deliberately NOT added for chat.postMessage: Slack's
 # own docs say a DM target returns channel_not_found specifically when the
 # app lacks permission to open that DM — a case slack_join_channel (which
@@ -320,10 +421,10 @@ def _request(
 # wrong guess here is exactly how conversations.info was first classified
 # (left off this table entirely, on the mistaken assumption that its
 # non-member error was no_permission rather than channel_not_found like its
-# siblings below). All four paths happen to share the same documented code
-# set today (none of them document not_in_channel), so this table doesn't
-# yet need per-path variation — but the shape is what a future endpoint
-# with a genuinely different set would extend, not a boolean flag.
+# siblings below). All six paths map to the same {not_in_channel,
+# no_permission, channel_not_found} set today, so this table doesn't yet
+# need per-path variation — but the shape is what a future endpoint with a
+# genuinely different set would extend, not a boolean flag.
 _DEFAULT_NOT_A_MEMBER_CODES = frozenset({"not_in_channel", "no_permission"})
 # Derived from _DEFAULT_NOT_A_MEMBER_CODES rather than re-listing both its
 # members: the two are meant to always differ by exactly channel_not_found,
@@ -339,6 +440,8 @@ _NOT_A_MEMBER_CODES_BY_PATH: dict[str, frozenset[str]] = dict.fromkeys(
         "conversations.info",
         "reactions.add",
         "reactions.remove",
+        "conversations.history",
+        "files.completeUploadExternal",
     ),
     _ALSO_OVERLOADS_CHANNEL_NOT_FOUND,
 )
@@ -457,6 +560,7 @@ def slack_join_channel(channel: str) -> str:
     to run `/invite @<this app's bot name>` instead.
     """
     try:
+        _channel_access_policy(_WRITE_CAPABILITY)
         channel_id = _resolve_channel_id(channel)
         # A missing_scope failure here (e.g. a connection that hasn't been
         # reconnected since channels:join was added) already gets a
@@ -537,6 +641,7 @@ def slack_list_channels(
     truncated = False
     pages_scanned = 0
     try:
+        policy = _channel_access_policy()
         for _ in range(MAX_PAGES):
             params: dict[str, Any] = {
                 "types": "public_channel",
@@ -551,6 +656,8 @@ def slack_list_channels(
             try:
                 result = _request("GET", "conversations.list", params=params)
             except Exception as page_exc:
+                if isinstance(page_exc, _SlackChannelAccessDenied):
+                    raise
                 if not pages_scanned:
                     raise
                 # A mid-pagination failure (e.g. a rate limit that outlived
@@ -563,6 +670,8 @@ def slack_list_channels(
             pages_scanned += 1
             raw_channels = result.get("channels") or []
             for index, channel in enumerate(raw_channels):
+                if policy is not None and channel.get("id") not in policy:
+                    continue
                 name = str(channel.get("name") or "")
                 if needle and needle not in name.lower():
                     continue
@@ -615,8 +724,14 @@ def slack_post_message(channel: str, text: str, thread_ts: str = "") -> str:
     fails with not_in_channel; ask a member to `/invite` the bot there.
     """
     try:
+        policy = _channel_access_policy(_WRITE_CAPABILITY)
+        resolved_channel = (
+            _normalize_channel(channel)
+            if policy is None
+            else _resolve_channel_id(channel)
+        )
         json_data: dict[str, Any] = {
-            "channel": _normalize_channel(channel),
+            "channel": resolved_channel,
             "text": text,
         }
         if thread_ts:
@@ -814,6 +929,7 @@ def slack_list_direct_messages(limit: int = 200) -> str:
     truncated = False
     pages_scanned = 0
     try:
+        policy = _channel_access_policy()
         for _ in range(MAX_PAGES):
             params: dict[str, Any] = {
                 "types": "im,mpim",
@@ -825,6 +941,8 @@ def slack_list_direct_messages(limit: int = 200) -> str:
             try:
                 result = _request("GET", "conversations.list", params=params)
             except Exception as page_exc:
+                if isinstance(page_exc, _SlackChannelAccessDenied):
+                    raise
                 if not pages_scanned:
                     raise
                 # Mirrors slack_list_channels: a mid-pagination failure (e.g.
@@ -837,6 +955,8 @@ def slack_list_direct_messages(limit: int = 200) -> str:
             pages_scanned += 1
             raw_conversations = result.get("channels") or []
             for index, conv in enumerate(raw_conversations):
+                if policy is not None and conv.get("id") not in policy:
+                    continue
                 entry: dict[str, Any] = {
                     "id": conv.get("id"),
                     "is_group_dm": bool(conv.get("is_mpim")),
@@ -946,6 +1066,8 @@ def slack_search_messages(
                     "GET", "conversations.history", params=params
                 )
             except Exception as page_exc:
+                if isinstance(page_exc, _SlackChannelAccessDenied):
+                    raise
                 if cursor is None:
                     raise
                 # Mirrors slack_list_channels/slack_list_direct_messages: a
@@ -1007,6 +1129,8 @@ def slack_search_messages(
                         membership_already_proven=True,
                     )
                 except Exception as thread_exc:
+                    if isinstance(thread_exc, _SlackChannelAccessDenied):
+                        raise
                     logger.warning(
                         f"Slack thread search failed for {thread_ts}: {thread_exc}"
                     )
@@ -1088,6 +1212,7 @@ def _set_reaction(action: str, channel: str, timestamp: str, emoji_name: str) ->
     action: the Slack API method suffix — "add" or "remove"."""
     name = emoji_name.strip().strip(":")
     try:
+        _channel_access_policy(_WRITE_CAPABILITY)
         channel_id = _resolve_channel_id(channel)
         _request_requiring_membership(
             "POST",
@@ -1160,8 +1285,9 @@ def slack_upload_file(
     storage.
     """
     try:
-        local_path = _resolve_allowed_file_path(file_path)
+        _channel_access_policy(_WRITE_CAPABILITY)
         channel_id = _resolve_channel_id(channel)
+        local_path = _resolve_allowed_file_path(file_path)
         resolved_filename = filename.strip() or local_path.name
 
         # Size and upload both read from the same open handle (rather than a
@@ -1184,6 +1310,10 @@ def slack_upload_file(
             if not upload_url or not file_id:
                 raise ValueError("Slack did not return an upload URL")
 
+            # File reading and upload URL allocation can take long enough for
+            # the execution grant to expire. Recheck before sending bytes to
+            # Slack's pre-authenticated upload endpoint.
+            _authorize_channel_id(channel_id)
             # Per Slack's files.completeUploadExternal migration guide, the
             # returned upload_url is a pre-authenticated endpoint that takes
             # the raw file as multipart form data under the "file" field —

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Set, Union
 
 from ..storage.contracts import DocumentRecord
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from sqlalchemy.orm import Session
 
     from xagent.web.models.uploaded_file import UploadedFile
@@ -70,6 +72,11 @@ class KBFileCompatibilityFacade:
             collection_name=collection_name,
         )
 
+    def find_referenced_file_ids(self, file_ids: Iterable[str]) -> set[str]:
+        from xagent.web.services.kb_file_service import _find_referenced_file_ids_impl
+
+        return _find_referenced_file_ids_impl(file_ids)
+
     def build_uploaded_filename_map(
         self, db: Session, *, user_id: Optional[int], file_ids: List[str]
     ) -> Dict[str, str]:
@@ -111,6 +118,7 @@ class KBFileCompatibilityFacade:
         file_id: str,
         user_id: Optional[int],
         remaining_file_ids: set[str],
+        after_commit: Optional[List[tuple[str, Callable[[], None]]]] = None,
     ) -> bool:
         from xagent.web.services.kb_file_service import (
             _delete_uploaded_file_if_orphaned_impl,
@@ -121,6 +129,7 @@ class KBFileCompatibilityFacade:
             file_id=file_id,
             user_id=user_id,
             remaining_file_ids=remaining_file_ids,
+            after_commit=after_commit,
         )
 
     def list_collection_uploaded_file_owner_ids(
@@ -161,6 +170,7 @@ class KBFileCompatibilityFacade:
         collection_file_ids: Set[str],
         remaining_file_ids: Set[str],
         collection_dir: Optional[Path],
+        after_commit: List[tuple[str, Callable[[], None]]],
     ) -> int:
         from xagent.web.services.kb_collection_service import (
             _delete_collection_uploaded_files_impl,
@@ -172,6 +182,7 @@ class KBFileCompatibilityFacade:
             collection_file_ids=collection_file_ids,
             remaining_file_ids=remaining_file_ids,
             collection_dir=collection_dir,
+            after_commit=after_commit,
         )
 
     def rename_collection_storage(
@@ -235,27 +246,6 @@ class KBFileCompatibilityFacade:
             stale_ttl_hours=stale_ttl_hours,
             delete_stale=delete_stale,
             deletable_statuses=deletable_statuses,
-        )
-
-    def compensate_new_uploaded_file(
-        self,
-        db: Session,
-        *,
-        file_id: str,
-        user_id: Optional[int] = None,
-        delete_local: bool = True,
-        local_root: Optional[Path] = None,
-    ) -> FileCompensationResult:
-        from xagent.web.services.kb_file_service import (
-            _compensate_new_uploaded_file_impl,
-        )
-
-        return _compensate_new_uploaded_file_impl(
-            db,
-            file_id=file_id,
-            user_id=user_id,
-            delete_local=delete_local,
-            local_root=local_root,
         )
 
     def cleanup_local_copied_file(

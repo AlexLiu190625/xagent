@@ -72,6 +72,28 @@ class MemoryComponent:
 
 
 @dataclass
+class SpillRegistryComponent:
+    """Files this execution stored oversized tool results into."""
+
+    records: list[dict[str, Any]] = field(default_factory=list)
+
+    def clone(self) -> "SpillRegistryComponent":
+        return SpillRegistryComponent(records=copy.deepcopy(self.records))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"records": self.records}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "SpillRegistryComponent":
+        raw = data.get("records")
+        return cls(
+            records=[r for r in raw if isinstance(r, dict)]
+            if isinstance(raw, list)
+            else []
+        )
+
+
+@dataclass
 class GenericComponent:
     """Fallback component for unknown serialized component payloads."""
 
@@ -87,6 +109,7 @@ class GenericComponent:
 COMPONENT_LOADERS: dict[str, Callable[[dict[str, Any]], ExecutionComponent]] = {
     "workspace": WorkspaceComponent.from_dict,
     "memory": MemoryComponent.from_dict,
+    "spilled_results": SpillRegistryComponent.from_dict,
 }
 
 

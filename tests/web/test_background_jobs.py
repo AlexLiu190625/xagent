@@ -903,6 +903,59 @@ def test_kb_document_job_exception_keeps_previous_config_before_retry(
         db.close()
 
 
+def test_kb_document_job_without_target_path_fails_before_ingestion(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+
+    from xagent.web.jobs.exceptions import BackgroundJobHandlerError
+    from xagent.web.jobs.kb_tasks import handle_kb_ingest_document
+
+    SessionLocal = _init_test_db(tmp_path / "kb-no-target-path.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="kb-no-target-path-test")
+        stored_file = tmp_path / "uploads" / "doc.txt"
+        stored_file.parent.mkdir(parents=True)
+        stored_file.write_text("stored content", encoding="utf-8")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_DOCUMENT,
+            payload={
+                "collection": "existing-kb",
+                "source_path": str(stored_file),
+                "file_id": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                "filename": "doc.txt",
+                "user_id": int(user.id),
+                "is_admin": False,
+                "ingestion_config": IngestionConfig().model_dump(mode="json"),
+                "collection_existed_before": True,
+            },
+        )
+        # Final attempt: a failed staged run would now unlink source_path.
+        job.attempts = job.max_attempts
+        ingest = MagicMock(side_effect=RuntimeError("ingestion ran"))
+        monkeypatch.setattr("xagent.web.jobs.kb_tasks.run_document_ingestion", ingest)
+
+        # Broad on purpose: the file check must still run if the fake's error escapes.
+        with pytest.raises(RuntimeError) as info:
+            handle_kb_ingest_document(db, job)
+
+        assert stored_file.read_text(encoding="utf-8") == "stored content"
+        ingest.assert_not_called()
+        assert isinstance(info.value, BackgroundJobHandlerError)
+        assert info.value.retryable is False
+        assert str(info.value) == (
+            "Document ingest job payload has no target_path; resubmit the upload"
+        )
+        db.refresh(job)
+        assert job.progress["message"] == "Queued"
+    finally:
+        db.close()
+
+
 def test_background_job_progress_manager_mirrors_rag_progress(tmp_path, monkeypatch):
     monkeypatch.setenv(CELERY_ENABLED, "false")
     monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
@@ -1406,9 +1459,7 @@ def test_kb_web_job_zero_pages_without_failures_fails(tmp_path, monkeypatch):
         db.close()
 
 
-def test_background_web_file_new_branch_returns_rollback_callback(
-    tmp_path, monkeypatch
-):
+def test_background_web_file_new_branch_compensates_on_failure(tmp_path, monkeypatch):
     from xagent.core.file_storage.factory import get_unscoped_file_storage
     from xagent.web.jobs.kb_tasks import _handle_web_file
 
@@ -1456,9 +1507,22 @@ def test_background_web_file_new_branch_returns_rollback_callback(
                 is_admin=False,
                 processed_urls={},
             )
-            assert callable(result["rollback_on_failure"])
+            from xagent.core.tools.core.RAG_tools.kb import get_kb_coordinator
+            from xagent.core.tools.core.RAG_tools.pipelines.web_ingestion import (
+                _run_file_handler_compensation,
+            )
 
-            result["rollback_on_failure"](None)
+            assert (
+                _run_file_handler_compensation(
+                    pipeline_facade=get_kb_coordinator().pipeline,
+                    page_operation=None,
+                    file_info=result,
+                    collection="web-kb",
+                    url="https://example.com/page",
+                    warnings=[],
+                )
+                is None
+            )
 
         verify_db = SessionLocal()
         try:

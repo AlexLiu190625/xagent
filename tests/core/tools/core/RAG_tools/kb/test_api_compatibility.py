@@ -16,6 +16,7 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
 from xagent.core.tools.core.RAG_tools.kb import (
     CompensationStep,
     KBApiCompatibilityFacade,
+    KBApiFailedIngestCleanupDecision,
     KBApiOperationResult,
     KBCoordinator,
     KBOperationCompatibilityFacade,
@@ -1130,3 +1131,18 @@ def test_failed_ingest_cleanup_decision_uses_operation_outcome() -> None:
     # When no opaque rollback_complete flag is set, fall back to
     # operation_outcome.side_effects_may_remain
     assert decision.side_effects_may_remain is False
+
+
+@pytest.mark.parametrize(
+    ("successful_documents", "side_effects_may_remain", "keeps"),
+    [(0, False, False), (1, False, True), (0, True, True), (2, True, True)],
+)
+def test_failed_ingest_cleanup_decision_keeps_new_collection_metadata(
+    successful_documents: int, side_effects_may_remain: bool, keeps: bool
+) -> None:
+    decision = KBApiFailedIngestCleanupDecision(
+        successful_documents=successful_documents,
+        side_effects_may_remain=side_effects_may_remain,
+    )
+
+    assert decision.keeps_new_collection_metadata is keeps

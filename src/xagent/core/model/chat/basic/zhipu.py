@@ -12,6 +12,7 @@ except ImportError:
     # Fallback for when zai SDK is not available
     ZhipuAiClient = None
 
+from ..error import retry_on
 from ..exceptions import LLMRetryableError, LLMTimeoutError
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage, extract_cached_input_tokens
@@ -132,6 +133,11 @@ class ZhipuLLM(BaseLLM):
             self._client = ZhipuAiClient(
                 api_key=self.api_key,
                 base_url=self.base_url,
+                # Retry policy lives in the shared RetryWrapper only. The zai
+                # SDK defaults to three retries of its own, so left alone this
+                # client would issue four requests inside every attempt we
+                # make. See ``OpenAICompatibleLLM._ensure_client``.
+                max_retries=0,
             )
 
     async def chat(
@@ -758,6 +764,16 @@ class ZhipuLLM(BaseLLM):
             raise LLMRetryableError("Streaming timeout exceeded")
 
         except Exception as e:
+            # Streaming swallowed every provider failure into an ERROR chunk,
+            # so the shared RetryWrapper never saw one and the zai SDK's own
+            # budget (three retries) was the only cover a streaming call had.
+            # That budget is now zero (see ``_ensure_client``), so a transient
+            # failure has to raise for the wrapper to retry it. Classified by
+            # the same predicate the wrapper uses, so producer and consumer
+            # cannot drift; permanent failures keep the ERROR chunk.
+            if retry_on(e):
+                raise LLMRetryableError(f"Zhipu streaming API error: {str(e)}") from e
+
             logger.error(f"Zhipu streaming API error: {str(e)}")
             yield StreamChunk(
                 type=ChunkType.ERROR,

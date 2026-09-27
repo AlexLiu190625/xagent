@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from mcp.types import Tool as MCPTool
 
+from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRef
 from xagent.core.tools.adapters.vibe.mcp_adapter import (
     MCPFailurePhase,
     MCPLoadResult,
@@ -127,7 +128,8 @@ class TestLoadMcpToolsAsAgentTools:
                 sandbox=sandbox,
             )
 
-        assert result.tools == (wrapped_tool,)
+        assert len(result.tools) == 1
+        assert result.tools[0].target is wrapped_tool
         assert result.loaded_servers == ("demo",)
         assert result.failures == ()
         mock_list.assert_awaited_once_with(sandbox, connection)
@@ -162,7 +164,8 @@ class TestLoadMcpToolsAsAgentTools:
                 sandbox=MagicMock(),
             )
 
-        assert result.tools == (direct_tool,)
+        assert len(result.tools) == 1
+        assert result.tools[0].target is direct_tool
         assert result.loaded_servers == ("demo",)
         assert result.failures == ()
         mock_direct.assert_awaited_once()
@@ -266,7 +269,8 @@ class TestLoadMcpToolsAsAgentTools:
                 {"demo": connection}, sandbox=sandbox
             )
 
-        assert result.tools == (wrapped_tool,)
+        assert len(result.tools) == 1
+        assert result.tools[0].target is wrapped_tool
         assert result.loaded_servers == ("demo",)
         assert len(result.failures) == 1
         assert result.failures[0].phase is MCPFailurePhase.SANDBOX_TOOL_WRAP
@@ -385,3 +389,93 @@ class TestLoadMcpToolsAsAgentTools:
         assert len(result.failures) == 1
         assert result.failures[0].phase is MCPFailurePhase.NO_TOOLS_RETURNED
         assert result.failures[0].error_type is None
+
+
+class TestLoadMcpToolsConnectorRefs:
+    """The loader's gate wrapping must carry the persisted connector identity.
+
+    A gated call whose wrapper holds no ``ConnectorRef`` fails closed, so an
+    unidentified sandbox seam would be an outage the moment a host registers
+    a gate for that source. The sandbox path is covered here; the database
+    path is covered by ``test_mcp_database_integration.py`` and the
+    config-driven path by ``test_mcp_gate_loader_wiring.py``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_sandboxed_tools_carry_the_supplied_connector_ref(self):
+        connection: Connection = {
+            "transport": "stdio",
+            "command": "npx",
+            "args": ["demo"],
+        }
+        sandbox = MagicMock(name="sandbox")
+        mcp_tool = MCPTool(
+            name="echo",
+            description="Echo",
+            inputSchema={"type": "object", "properties": {}},
+        )
+        wrapped_tool = MagicMock()
+
+        with (
+            patch(
+                "xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper.list_tools_in_sandbox",
+                new=AsyncMock(return_value=[mcp_tool]),
+            ),
+            patch(
+                "xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper.create_sandboxed_tool",
+                new=AsyncMock(return_value=wrapped_tool),
+            ),
+            patch(
+                "xagent.core.tools.adapters.vibe.mcp_adapter._load_direct_mcp_tools",
+                new=AsyncMock(),
+            ),
+        ):
+            result = await load_mcp_tools_as_agent_tools(
+                {"demo": connection},
+                connector_refs={"demo": ConnectorRef("mcp", 77)},
+                sandbox=sandbox,
+            )
+
+        assert len(result.tools) == 1
+        assert result.tools[0]._connector_ref == ConnectorRef("mcp", 77)
+        # The transport mapping the sandbox guest receives stays ID-free:
+        # host authorization identity must not cross into the guest.
+        assert "id" not in connection
+
+    @pytest.mark.asyncio
+    async def test_connector_ref_is_scoped_to_its_own_server(self):
+        """A ref registered for another server never lands on this one."""
+
+        connection: Connection = {
+            "transport": "stdio",
+            "command": "npx",
+            "args": ["demo"],
+        }
+        sandbox = MagicMock(name="sandbox")
+        mcp_tool = MCPTool(
+            name="echo",
+            description="Echo",
+            inputSchema={"type": "object", "properties": {}},
+        )
+
+        with (
+            patch(
+                "xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper.list_tools_in_sandbox",
+                new=AsyncMock(return_value=[mcp_tool]),
+            ),
+            patch(
+                "xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper.create_sandboxed_tool",
+                new=AsyncMock(return_value=MagicMock()),
+            ),
+            patch(
+                "xagent.core.tools.adapters.vibe.mcp_adapter._load_direct_mcp_tools",
+                new=AsyncMock(),
+            ),
+        ):
+            result = await load_mcp_tools_as_agent_tools(
+                {"demo": connection},
+                connector_refs={"other": ConnectorRef("mcp", 77)},
+                sandbox=sandbox,
+            )
+
+        assert result.tools[0]._connector_ref is None

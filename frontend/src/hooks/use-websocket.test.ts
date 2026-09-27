@@ -620,6 +620,26 @@ describe("useWebSocket message delivery", () => {
     })
   })
 
+  it("forwards a personal unknown notice after inbox acceptance without resending", async () => {
+    const onMessage = vi.fn()
+    const { result } = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1, onMessage }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+    const delivery = result.current.sendChatMessage("uncertain", undefined, false, "original-id")
+    act(() => socket.receive({ type: "message_accepted", client_message_id: "original-id" }))
+    await delivery
+    act(() => {
+      socket.receive({ type: "message_rejected", client_message_id: "original-id", rejection_outcome: "outcome_unknown", error_code: "message_outcome_unknown" })
+      socket.receive({ type: "error", task_id: 1, client_message_id: "original-id", turn_id: "original-id", error_code: "message_outcome_unknown" })
+    })
+    expect(onMessage).toHaveBeenCalledWith(expect.objectContaining({
+      type: "error", task_id: 1,
+      data: expect.objectContaining({ client_message_id: "original-id", error_code: "message_outcome_unknown" }),
+    }))
+    expect(socket.send).toHaveBeenCalledTimes(1)
+  })
+
   it("allows the same text to be sent again after the first ack", async () => {
     const { result } = renderHook(() => useWebSocket({
       url: "ws://localhost",

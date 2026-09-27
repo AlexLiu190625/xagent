@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from xagent.core.execution_scope import ExecutionScope
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web import mcp_apps
 from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
@@ -22,7 +23,15 @@ from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services import connector_team_scope
 from xagent.web.services.mcp_runtime import (
     MCPActorAuthorizationPolicy,
+    MCPActorExecutionIdentity,
     MCPBuiltinOAuthActorPolicy,
+)
+from xagent.web.services.slack_actor_runtime import (
+    SLACK_ACTOR_RUNTIME_REFRESH_KEY,
+    SLACK_CHANNEL_ACCESS_POLICY_ENV,
+    SlackActorRuntimeGrant,
+    SlackChannelAccessPolicy,
+    set_slack_actor_runtime_grant_resolver,
 )
 from xagent.web.tools import config as web_tools_config
 from xagent.web.tools.config import (
@@ -76,6 +85,7 @@ def db_session(tmp_path, monkeypatch):
         yield SimpleNamespace(db=db, user=user, session_factory=session_factory)
     finally:
         connector_team_scope.set_connector_team_hooks()
+        set_slack_actor_runtime_grant_resolver(None)
         db.close()
         engine.dispose()
 
@@ -231,6 +241,8 @@ def _config(
     policy: MCPBuiltinOAuthActorPolicy | None,
     connector_team_id: int | None = None,
     mcp_auth_context: dict | None = None,
+    execution_identity: MCPActorExecutionIdentity | None = None,
+    execution_scope: ExecutionScope | None = None,
 ) -> WebToolConfig:
     return WebToolConfig(
         db=seeded.db,
@@ -242,7 +254,43 @@ def _config(
         connector_team_id=connector_team_id,
         mcp_auth_context=mcp_auth_context,
         mcp_runtime_authorization_policy=policy,
+        mcp_actor_execution_identity=execution_identity,
+        execution_scope=execution_scope,
     )
+
+
+def _execution_identity() -> MCPActorExecutionIdentity:
+    return MCPActorExecutionIdentity(
+        task_id=1,
+        run_id="run-1",
+        turn_id="turn-1",
+        lease_attempt_id="attempt-1",
+    )
+
+
+def _add_slack_builtin_server(db: Session, user: User) -> MCPServer:
+    app = get_builtin_public_mcp_app("slack")
+    assert app is not None
+    db.add(PublicMCPApp(**app))
+    server = MCPServer(
+        name="Slack",
+        description="Canonical Slack server",
+        managed="external",
+        transport="oauth",
+        auth={"app_id": "slack", "provider": "slack"},
+    )
+    db.add(server)
+    db.flush()
+    db.add(
+        UserMCPServer(
+            user_id=int(user.id),
+            mcpserver_id=int(server.id),
+            is_owner=False,
+            is_active=True,
+        )
+    )
+    db.commit()
+    return server
 
 
 def _token(config: dict) -> str:
@@ -287,6 +335,19 @@ def test_actor_policy_rejects_non_boolean_stdio_capability(value: object) -> Non
 def test_actor_policy_rejects_invalid_owner(value: object) -> None:
     with pytest.raises((TypeError, ValueError)):
         MCPBuiltinOAuthActorPolicy(resource_owner_key=value)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "capabilities",
+    [frozenset(), frozenset({"write"}), frozenset({"read", "write"}), {"read"}],
+)
+def test_slack_runtime_policy_rejects_non_read_capabilities(capabilities) -> None:
+    with pytest.raises(ValueError, match="only the read capability"):
+        SlackChannelAccessPolicy(
+            channel_ids=frozenset({"C0123456789"}),
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+            capabilities=capabilities,
+        )
 
 
 def test_actor_remote_legacy_classification_queries_each_live_view(db_session) -> None:
@@ -1144,6 +1205,237 @@ async def test_actor_builtin_missing_exact_credential_does_not_fallback(
     assert "actor-b-token" not in str(configs)
     assert OWNER_A not in str(configs)
     assert OWNER_A not in str(tool_config.get_mcp_oauth_diagnostics())
+
+
+@pytest.mark.asyncio
+async def test_actor_slack_missing_credential_uses_paired_trusted_grant(
+    db_session,
+) -> None:
+    _add_slack_builtin_server(db_session.db, db_session.user)
+    execution_identity = _execution_identity()
+    seen = []
+
+    async def resolver(request):
+        await asyncio.sleep(0)
+        seen.append(request)
+        return SlackActorRuntimeGrant(
+            access_token="workspace-slack-token",
+            channel_access=SlackChannelAccessPolicy(
+                channel_ids=frozenset({"C0123456789"}),
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+                capabilities=frozenset({"read"}),
+            ),
+        )
+
+    set_slack_actor_runtime_grant_resolver(resolver)
+    configs = await _config(
+        db_session,
+        policy=_policy(),
+        execution_identity=execution_identity,
+    ).get_mcp_server_configs()
+
+    assert len(seen) == 1
+    request = seen[0]
+    assert request.user_id == db_session.user.id
+    assert request.resource_owner_key == OWNER_A
+    assert request.execution_identity == execution_identity
+    assert request.builtin_app_id == "slack"
+    assert configs[0]["config"]["env"]["SLACK_ACCESS_TOKEN"] == (
+        "workspace-slack-token"
+    )
+    serialized = configs[0]["config"]["env"][SLACK_CHANNEL_ACCESS_POLICY_ENV]
+    assert "C0123456789" in serialized
+    assert OWNER_A not in repr(request)
+    assert "run-1" not in repr(request)
+    assert "workspace-slack-token" not in str(configs)
+    assert "C0123456789" not in str(configs)
+    assert '"version":2' in serialized
+    assert '"capabilities":["read"]' in serialized
+    assert callable(configs[0]["config"][SLACK_ACTOR_RUNTIME_REFRESH_KEY])
+
+
+@pytest.mark.asyncio
+async def test_actor_slack_invocation_refresh_keeps_actor_and_scope_isolated(
+    db_session,
+) -> None:
+    _add_slack_builtin_server(db_session.db, db_session.user)
+    identity_a = _execution_identity()
+    identity_b = MCPActorExecutionIdentity(
+        task_id=2,
+        run_id="run-2",
+        turn_id="turn-2",
+        lease_attempt_id="attempt-2",
+    )
+    scope_a = ExecutionScope(sandbox_key_suffix="scope-a")
+    scope_b = ExecutionScope(sandbox_key_suffix="scope-b")
+    seen = []
+
+    def resolver(request):
+        seen.append(request)
+        suffix = request.execution_identity.turn_id
+        return SlackActorRuntimeGrant(
+            access_token=f"token-{suffix}-{len(seen)}",
+            channel_access=SlackChannelAccessPolicy(
+                channel_ids=frozenset({"C0123456789"}),
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+                capabilities=frozenset({"read"}),
+            ),
+        )
+
+    set_slack_actor_runtime_grant_resolver(resolver)
+    configs_a = await _config(
+        db_session,
+        policy=_policy(OWNER_A),
+        execution_identity=identity_a,
+        execution_scope=scope_a,
+    ).get_mcp_server_configs()
+    configs_b = await _config(
+        db_session,
+        policy=_policy(OWNER_B),
+        execution_identity=identity_b,
+        execution_scope=scope_b,
+    ).get_mcp_server_configs()
+
+    refresh_a = configs_a[0]["config"][SLACK_ACTOR_RUNTIME_REFRESH_KEY]
+    refresh_b = configs_b[0]["config"][SLACK_ACTOR_RUNTIME_REFRESH_KEY]
+    assert refresh_a.__closure__ is None
+    assert refresh_b.__closure__ is None
+    connection_a = await refresh_a()
+    connection_b = await refresh_b()
+
+    assert [request.resource_owner_key for request in seen] == [
+        OWNER_A,
+        OWNER_B,
+        OWNER_A,
+        OWNER_B,
+    ]
+    assert [request.execution_identity for request in seen] == [
+        identity_a,
+        identity_b,
+        identity_a,
+        identity_b,
+    ]
+    assert [request.scope for request in seen] == [scope_a, scope_b, scope_a, scope_b]
+    assert connection_a["env"]["SLACK_ACCESS_TOKEN"] == "token-turn-1-3"
+    assert connection_b["env"]["SLACK_ACCESS_TOKEN"] == "token-turn-2-4"
+    assert SLACK_ACTOR_RUNTIME_REFRESH_KEY not in connection_a
+    assert SLACK_ACTOR_RUNTIME_REFRESH_KEY not in connection_b
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("token", ["actor-token", ""])
+async def test_actor_slack_existing_exact_row_never_uses_fallback(
+    db_session, token
+) -> None:
+    _add_slack_builtin_server(db_session.db, db_session.user)
+    db_session.db.add(
+        UserOAuth(
+            user_id=int(db_session.user.id),
+            provider="slack",
+            resource_owner_key=OWNER_A,
+            access_token=token,
+            provider_user_id="slack-user",
+        )
+    )
+    db_session.db.commit()
+    calls = 0
+
+    def resolver(_request):
+        nonlocal calls
+        calls += 1
+        return SlackActorRuntimeGrant(
+            access_token="workspace-slack-token",
+            channel_access=SlackChannelAccessPolicy(
+                channel_ids=frozenset({"C0123456789"}),
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+                capabilities=frozenset({"read"}),
+            ),
+        )
+
+    set_slack_actor_runtime_grant_resolver(resolver)
+    configs = await _config(
+        db_session,
+        policy=_policy(),
+        execution_identity=_execution_identity(),
+    ).get_mcp_server_configs()
+
+    assert calls == 0
+    if token:
+        assert configs[0]["config"]["env"]["SLACK_ACCESS_TOKEN"] == token
+        assert SLACK_CHANNEL_ACCESS_POLICY_ENV not in configs[0]["config"]["env"]
+        assert SLACK_ACTOR_RUNTIME_REFRESH_KEY not in configs[0]["config"]
+    else:
+        assert configs[0]["transport"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_actor_slack_rejects_expired_fallback_grant(db_session) -> None:
+    _add_slack_builtin_server(db_session.db, db_session.user)
+    set_slack_actor_runtime_grant_resolver(
+        lambda _request: SlackActorRuntimeGrant(
+            access_token="workspace-slack-token",
+            channel_access=SlackChannelAccessPolicy(
+                channel_ids=frozenset({"C0123456789"}),
+                expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+                capabilities=frozenset({"read"}),
+            ),
+        )
+    )
+
+    configs = await _config(
+        db_session,
+        policy=_policy(),
+        execution_identity=_execution_identity(),
+    ).get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    assert configs[0]["config"]["reason"] == "oauth_token_required"
+    assert "workspace-slack-token" not in str(configs)
+
+
+@pytest.mark.asyncio
+async def test_actor_slack_refresh_failure_never_uses_fallback(
+    db_session, monkeypatch
+) -> None:
+    _add_slack_builtin_server(db_session.db, db_session.user)
+    account = UserOAuth(
+        user_id=int(db_session.user.id),
+        provider="slack",
+        resource_owner_key=OWNER_A,
+        access_token="expired-actor-token",
+        refresh_token="refresh-token",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        provider_user_id="slack-user",
+    )
+    db_session.db.add(account)
+    db_session.db.commit()
+    calls = 0
+
+    async def transient_refresh_failure(_db, resolved_account, _provider):
+        assert resolved_account.id == account.id
+        return False
+
+    def resolver(_request):
+        nonlocal calls
+        calls += 1
+        return None
+
+    monkeypatch.setattr(
+        web_tools_config,
+        "refresh_oauth_token_if_needed",
+        transient_refresh_failure,
+    )
+    set_slack_actor_runtime_grant_resolver(resolver)
+
+    configs = await _config(
+        db_session,
+        policy=_policy(),
+        execution_identity=_execution_identity(),
+    ).get_mcp_server_configs()
+
+    assert calls == 0
+    assert configs[0]["transport"] == "unavailable"
+    assert configs[0]["config"]["reason"] == "oauth_token_refresh_failed"
 
 
 @pytest.mark.asyncio

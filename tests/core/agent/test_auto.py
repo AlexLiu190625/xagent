@@ -688,6 +688,8 @@ class RecordingTracer:
         task_id: str | None = None,
         step_id: str | None = None,
         data: dict[str, Any] | None = None,
+        # Mirrors the real ``Tracer.trace_event``; see test_runtime.py.
+        require_persisted: bool = False,
     ) -> str:
         self.events.append(
             {
@@ -1036,6 +1038,42 @@ async def test_auto_decision_prompt_exposes_execution_tool_names() -> None:
 
 
 @pytest.mark.asyncio
+async def test_auto_decision_prompt_leaves_out_the_stored_result_reader(
+    tmp_path: Path,
+) -> None:
+    """The router sees the real file tool set minus read_tool_result, in both
+    the count and the name list: ReAct offers the reader per turn once the
+    run's registry holds a record, and the router's list is not gated on the
+    registry."""
+    from xagent.core.tools.adapters.vibe.workspace_file_tool import (
+        create_workspace_file_tools,
+    )
+    from xagent.core.tools.tool_result_spill import SPILL_READ_TOOL_NAME
+    from xagent.core.workspace import TaskWorkspace
+
+    tools = create_workspace_file_tools(TaskWorkspace("auto-tools", str(tmp_path)))
+    all_names = [tool.metadata.name for tool in tools]
+    other_names = [name for name in all_names if name != SPILL_READ_TOOL_NAME]
+    assert SPILL_READ_TOOL_NAME in all_names
+    llm = FakeLLM([decision_tool_response("react", "Needs file tools.")])
+    pattern = AutoPattern(react_pattern=CapturingChildPattern())  # type: ignore[arg-type]
+    context = ExecutionContext()
+    context.add_user_message("Tidy up the output files")
+
+    result = await pattern.run(
+        context=context, tools=tools, llm=llm, runtime=PatternRuntime()
+    )
+
+    assert result["success"] is True
+    decision_prompt = llm.calls[0]["messages"][-1]["content"]
+    assert f"{len(other_names)} execution tools are available" in decision_prompt
+    assert (
+        f"Available execution tool names: {', '.join(other_names)}." in decision_prompt
+    )
+    assert SPILL_READ_TOOL_NAME not in decision_prompt
+
+
+@pytest.mark.asyncio
 async def test_auto_decision_prompt_includes_grounding_rule() -> None:
     llm = FakeLLM([decision_tool_response("react", "Needs an execution tool.")])
     child = CapturingChildPattern()
@@ -1131,10 +1169,12 @@ async def test_auto_pattern_does_not_emit_general_task_start_or_completion() -> 
     )
 
     assert result["success"] is True
+    # The checkpoint now rides the canonical system-scoped envelope rather
+    # than a task-scoped progress event, so no general task event is emitted.
     assert {event["event_type"] for event in tracer.events} == {
         "action_start_llm",
         "action_end_llm",
-        "task_update_general",
+        "system_update_general",
     }
 
 
@@ -2537,3 +2577,27 @@ def test_auto_child_runtime_forwards_dag_turn_resolution() -> None:
     # with a default is what hides a raising property, so the assertion has
     # to go through the same access to catch a regression.
     assert getattr(step_runtime, "active_turn_id", None) == "turn-42"
+
+
+def test_routing_prompt_is_rebuilt_with_the_marker_on_every_parse_retry() -> None:
+    """The marker is read inside the retry loop, not hoisted above it.
+
+    A compaction between two parse attempts must reach the second prompt.
+    Hoisting the read is the cheap "optimization" that would drop it silently,
+    so the source position is asserted rather than left to a comment.
+    """
+    source = inspect.getsource(AutoPattern._decide)
+    loop_body = source.split("while attempt < MAX_DECISION_PARSE_ATTEMPTS:", 1)[1]
+    assert "evidence_state=tool_evidence_state(context)" in loop_body
+
+
+def test_the_routing_prompt_has_no_second_default_for_the_marker() -> None:
+    """The read function holds the default, so the prompt builder must not.
+
+    Two holders of the same default drift: a caller that forgets to pass the
+    state renders main's wording on a run that really did lose observations.
+    """
+    parameter = inspect.signature(AutoPattern._decision_prompt).parameters[
+        "evidence_state"
+    ]
+    assert parameter.default is inspect.Parameter.empty

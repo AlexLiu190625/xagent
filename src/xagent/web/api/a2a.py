@@ -203,6 +203,7 @@ async def _start_a2a_turn(
     agent_execution_mode: str,
     text: str,
     message_id: str,
+    key_prefix: str,
     context_id: str | None,
     task_id: int | None,
 ) -> A2ATaskSnapshot:
@@ -213,12 +214,23 @@ async def _start_a2a_turn(
             agent_execution_mode=agent_execution_mode,
             text=text,
             message_id=message_id,
+            key_prefix=key_prefix,
             context_id=context_id,
             task_id=task_id,
         )
     except TaskTurnNotFoundError as exc:
         raise a2a_error("task_not_found", "Task not found.", status_code=404) from exc
     except task_start_service.TaskStartRejected as exc:
+        if exc.reason == "a2a_input_conflict":
+            raise a2a_error(
+                "invalid_argument",
+                "messageId was already accepted with different input.",
+                status_code=400,
+            ) from exc
+        if exc.reason == "a2a_input_unavailable":
+            raise a2a_error(
+                "task_not_found", "Task not found.", status_code=404
+            ) from exc
         if exc.reason == "a2a_context_mismatch":
             raise a2a_error(
                 "invalid_argument",
@@ -239,10 +251,19 @@ async def _start_a2a_turn(
     except task_resume_service.TaskResumeOutcomeUnknownError as exc:
         raise a2a_error(
             "reply_outcome_unknown",
-            "Reply was accepted but preparation has not finished. "
-            "Check task status before sending another reply.",
+            "Reply was accepted but its outcome is unknown. "
+            "Check task status; do not resend automatically.",
             status_code=504,
-            details={"accepted": True, "taskId": task_id},
+            details={"accepted": True, "taskId": task_id, "commandId": exc.command_id},
+        ) from exc
+    except task_resume_service.TaskResumeNotAcceptedError as exc:
+        # Nothing was written for this messageId, and replaying it returns
+        # this same answer: the client must resend under a new messageId.
+        raise a2a_error(
+            "unsupported_operation",
+            "The message was not accepted. Resend it with a new messageId.",
+            status_code=400,
+            details={"taskId": task_id, "accepted": False, "retryWithNewId": True},
         ) from exc
     except task_resume_service.TaskResumeBusyError as exc:
         raise a2a_error(
@@ -565,6 +586,7 @@ async def send_message(
         agent_execution_mode=agent_execution_mode,
         text=text,
         message_id=message_id,
+        key_prefix=key_prefix,
         context_id=context_id,
         task_id=task_id,
     )
@@ -601,6 +623,7 @@ async def stream_message(
         agent_execution_mode=agent_execution_mode,
         text=text,
         message_id=message_id,
+        key_prefix=key_prefix,
         context_id=context_id,
         task_id=task_id,
     )
@@ -608,7 +631,7 @@ async def stream_message(
     return _task_stream_response(bound_agent_id, task)
 
 
-@router.get("/agents/{agent_id}/tasks/{task_id}")
+@router.get("/agents/{agent_id}/tasks/{task_id:int}")
 async def get_task(
     agent_id: int,
     task_id: int,

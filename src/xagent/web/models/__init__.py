@@ -8,6 +8,7 @@ from .chat_message import TaskChatMessage
 from .custom_api import CustomApi, UserCustomApi
 from .database import Base, get_db, get_engine, get_session_local
 from .deployment import Deployment, DeploymentOwnerType
+from .global_memory_embedding_authority import GlobalMemoryEmbeddingAuthority
 from .gmail_watch import GmailWatchState
 from .kb_ingest_target import KBIngestTarget
 from .mcp import MCPServer, UserMCPServer
@@ -20,9 +21,14 @@ from .sandbox import DurableSandboxLifecycle, SandboxInfo, SandboxSnapshot
 from .skill import UserSkill, UserSkillFile
 from .system_setting import SystemSetting
 from .task import DAGExecution, Task, TaskConnectorRuntimeContext
+from .task_admission import TaskAdmissionBucket, TaskAdmissionTicket
+from .task_admission_pacing import TaskAdmissionPacing
+from .task_channel_delivery import TaskChannelDelivery
+from .task_cleanup_obligation import TaskCleanupObligation
 from .task_command import TaskExecutionCommand
 from .task_command_terminal_event import TaskCommandTerminalEvent
 from .task_execution_event import TaskExecutionEvent
+from .task_input_receipt import TaskInputReceipt
 from .task_interaction import TaskInteractionRequest
 from .task_runtime_secret import TaskRuntimeSecret
 from .template_stats import TemplateStats, UserTemplateRelation
@@ -45,6 +51,8 @@ from .user_oauth import UserOAuth
 from .workforce import Workforce, WorkforceAgent, WorkforceBuilderMessage, WorkforceRun
 
 __all__ = [
+    "TaskChannelDelivery",
+    "TaskCleanupObligation",
     "Base",
     "ActorOAuthFlowState",
     "ActorMCPServerConnection",
@@ -70,7 +78,11 @@ __all__ = [
     "Deployment",
     "DeploymentOwnerType",
     "Task",
+    "TaskAdmissionPacing",
+    "TaskAdmissionBucket",
+    "TaskAdmissionTicket",
     "TaskExecutionCommand",
+    "TaskInputReceipt",
     "TaskCommandTerminalEvent",
     "TaskExecutionEvent",
     "TaskInteractionRequest",
@@ -97,6 +109,7 @@ __all__ = [
     "BackgroundJobStatus",
     "BackgroundJobType",
     "GmailWatchState",
+    "GlobalMemoryEmbeddingAuthority",
     "KBIngestTarget",
     "TaskChatMessage",
     "UploadedFile",

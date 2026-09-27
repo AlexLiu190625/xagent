@@ -1,5 +1,13 @@
 # Deployment changes
 
+## LanceDB memory compatibility
+
+The declared LanceDB dependency range is the one in `pyproject.toml`; this
+section does not restate it. CI exercises three representatives of that range:
+the declared minimum, the version pinned in `uv.lock`, and the newest minor
+tested so far. It does not claim that every intervening release is tested
+individually.
+
 ## 2026-08-11 — New public-task File Operation isolation
 
 ### Deployment impact
@@ -329,3 +337,149 @@ Valid only until step 8 restarts the writers. Until that point a v17 server has 
 Roll back rather than repair in place when verification fails after a partial restore under v17. A cluster left half-populated by an interrupted restore is not a state to diagnose during an outage. If the v16 volume copy is unavailable, restore the verified dump from step 3 onto a v16 cluster initialized from `16-bookworm`.
 
 After v17 accepts writes the volume copy is stale, and restoring it discards everything written since the cutover. Recovery from that point means taking a fresh v17 backup and reconciling the two, not a copy-back.
+
+## 2026-09-15 — LanceDB FTS index rebuild for the jieba tokenizer
+
+### Deployment impact
+
+The knowledge-base full-text index now builds with the `jieba/default` tokenizer. The tokenizer is written into the index at build time and is never read back out, so an index built before this release keeps segmenting queries the old way until it is rebuilt. Chinese keyword search stays degraded on those tables, and nothing in the running system repairs them: `ensure_indexes` only creates an index that is missing, and the automatic rebuild inside `compact_tables` needs fresh ingestion plus a fragment or version threshold. A knowledge base that is only read from never reaches either, so a quiescent deployment stays on the old tokenizer indefinitely.
+
+Existing deployments therefore need one manual run of the migration below. New installations do not: their first index build already uses the new tokenizer.
+
+Embeddings tables are named `embeddings_<model>`, one per embedding model and shared by every tenant in that database, so the rebuild covers all tenants at once and the table count matches the number of models in use, not the number of collections.
+
+### Prerequisites and configuration
+
+The script talks to the same database as the application, so it must run with the same `LANCEDB_DIR` the backend uses. When `LANCEDB_DIR` is unset, both fall back to `~/.xagent/data/lancedb` inside the process's own home directory — which is the `xagent_data` volume in the container and a different directory on the host. Run it inside the `backend` container, or export `LANCEDB_DIR` explicitly, rather than relying on that default matching.
+
+Rebuilding reads every indexed row of a table and writes a new index, so size the window by row count, not by table count. It does not rewrite the data files and does not compact: compaction remains the ingestion path's job.
+
+The rebuild takes the same per-table lock that compaction uses, so a table being compacted by a concurrent ingestion is reported as unfinished rather than rebuilt. That lock is an advisory lock file inside a local `LANCEDB_DIR`: against a remote URI, a directory that is not local, or when the lock file cannot be created, both the rebuild and compaction proceed unlocked and can overlap. Run this while ingestion is idle, or re-run afterwards for the tables that were busy. Search keeps serving the old index until the new one commits; no maintenance window is required for readers.
+
+### Deployment and migration steps
+
+Deploy the release first, then run the migration once per database:
+
+```bash
+# 1. List what would be rebuilt, changing nothing
+docker compose exec backend python -m xagent.migrations.lancedb.rebuild_fts_indexes --dry-run
+
+# 2. Rebuild
+docker compose exec backend python -m xagent.migrations.lancedb.rebuild_fts_indexes
+
+# Optional: one table at a time
+docker compose exec backend python -m xagent.migrations.lancedb.rebuild_fts_indexes --table embeddings_<model>
+```
+
+The dry run classifies every `embeddings_*` table as would-rebuild, would-skip (no full-text index on the `text` column, so there is nothing to replace), or unreadable, and the real run acts on that same classification.
+
+Exit codes:
+
+- `0` — every table that needed a rebuild was rebuilt.
+- `1` — at least one table was not rebuilt: the rebuild raised, the table's lock was held elsewhere, or the table could not be read at all. The other tables still completed. An unreadable table is classified before any rebuild runs, so `--dry-run` also exits `1` when one is present.
+- `2` — the run never started, for example an unreadable database or a `--table` value that is not an embeddings table.
+
+The script is safe to re-run and rebuilding an already-rebuilt index is not an error, so recovery from exit code 1 is to fix the cause and run it again; with `--table` to retry only what failed.
+
+### Verification and monitoring
+
+Each table is logged with its index state before and after, so the run itself is the record: compare `version` and `indexed_rows` in the two lines, and confirm the closing summary reports the table under `Succeeded`. A rebuilt table normally reports `unindexed_rows: 0` afterwards, but treat the `Succeeded` list as the verdict: when the statistics cannot be read the entry carries `stats_error` instead of row counts, which says nothing about the rebuild.
+
+The tokenizer cannot be read back out of a built index, so there is no stored value to assert against. The behavioural check is a Chinese multi-word keyword search against a collection on that table: before the rebuild it returns nothing or unrelated hits, after it returns the documents containing those words.
+
+### Rollback
+
+No rollback path and none needed: the previous index is replaced by one built from the same rows, and the schema, the data files and the row contents are untouched. Reverting the application code leaves the new index in place and searching it with the old tokenizer restores the previous behavior, which is the degraded one this rebuild fixes.
+
+## 2026-09-23 — Retention purge job
+
+The purge that acts on the retention predicate. It starts only when a retention period is configured (see `example.env`), and no deployment configures one yet, so this change is inert on its own.
+
+
+### Enabling the purge
+
+The job is gated on `XAGENT_CONVERSATION_RETENTION_DAYS` / `XAGENT_TRACE_RETENTION_DAYS` (see `example.env`), and it refuses to start on anything but PostgreSQL — the row lock its eligibility check depends on is compiled away on SQLite, so an assessment there is not a deletion licence. The refusal is logged once and the loop exits; it is not retried, because configuration cannot change under a running process.
+
+**Every retention setting takes effect at process start, and only there.** `.env` is read once and nothing mutates the environment afterwards, so changing a period, the dry-run flag or the kill switch requires a restart. The kill switch exists so that stopping expiry does not mean editing the periods — not so that a running sweep can be halted from outside.
+
+Before setting a period anywhere, work through the enablement gate on the retention tracking issue.
+
+### Mixed-version rollouts and rollbacks
+
+A binary older than the `tasks.last_activity_at` migration writes transcript messages without advancing the anchor. That happens during a rolling deploy, while old workers are still running after the backfill, and for as long as a deployment runs such a binary after rolling back past it. Either way the stored anchor can end up older than the task's newest message.
+
+No drain or reconciliation step is needed for this. Before deleting anything, the purge measures each task from the later of the stored anchor and the task's newest message. It reads both under the task's row lock, and a message insert for that task waits on the lock, so a stale stored anchor cannot expire a conversation early, whichever version wrote the message.
+
+The lock covers message inserts only because `task_chat_messages.task_id` has a foreign key to `tasks.id`. Every supported initialization path creates it, but the revision that introduced the table adds it only when `tasks` already existed. Confirm it on the target database before enabling a period; the query must return one row:
+
+```sql
+SELECT conname
+FROM pg_constraint
+WHERE contype = 'f'
+  AND conrelid = 'task_chat_messages'::regclass
+  AND confrelid = 'tasks'::regclass;
+```
+
+A stale anchor still affects `xagent retention preview` and the purge's candidate scan, which read the stored value only. Both can treat such a task as older than the purge will: the preview over-counts, never under-counts, and the scan hands the purge a candidate it then keeps (`skipped_busy`) or expires only the trace of (`purged_traces`), where the stored anchor alone would have expired the whole conversation. Because the stored anchor is not repaired, the scan keeps selecting such a task on every sweep: it goes on reporting `skipped_busy`, or `nothing_to_purge` once its trace is gone, until its newest message itself passes the conversation period.
+
+Recommended first run: set the period together with `XAGENT_RETENTION_DRY_RUN=true`, restart, read the audit line, and only then clear the dry-run flag and restart again. A value the parser does not recognise resolves to a dry run rather than a deletion, but do not rely on that instead of checking the log line.
+
+### Multiple web replicas
+
+One purge loop starts per web process, so a deployment running several of them sweeps several times over. That is safe rather than merely tolerated: two purges that select the same task serialize on its row lock. On the conversation path the loser then finds no row and reports the task as not eligible. On the trace path the row survives, so the loser runs its deletes against a trace that is already gone; they remove nothing and it is counted as `nothing_to_purge` rather than as an expiry. Either way no accepted work is lost and no counter claims work that did not happen.
+
+What it costs is duplicated scanning, which is why there is no advisory lock here. If that becomes visible on a large `tasks` table, set the retention variables on one replica only; the loop starts from configuration, so an unconfigured replica starts nothing.
+
+### Verification and monitoring
+
+`xagent retention preview --days N` reports what a period would expire without touching anything. Once the job runs, each *batch* logs one line beginning `retention purge` — a sweep that drains a backlog logs one per page, not one in total — counting `scanned`, `purged_conversations`, `purged_traces`, `skipped_busy`, `skipped_active_interaction`, `nothing_to_purge`, `failed` and `cleanup_owed`.
+
+`scanned` is how many candidates the batch selected, not how many proved expirable — the locked assessment can still refuse any of them. `skipped_busy` covers every such refusal, which is usually a task that is genuinely not quiescent but also includes a row that vanished between the scan and the lock (normal with more than one replica), a task whose newest message is more recent than its stored anchor, and a task with no anchor at all. `nothing_to_purge` is a trace-expiry candidate whose trace was already gone by the time the lock was taken — either removed between the scan and the lock, or, for a task whose stored anchor lags its newest message, removed by an earlier sweep. `failed` is a task whose own purge raised: it is logged with its id and traceback, the sweep carries on, and the task is retried on the next pass.
+
+Those field names deliberately differ from the ones sketched on the tracking issue (`eligible / deleted / skipped-busy / external-pending`): `deleted` is split because the two paths delete different things and an operator needs to know which ran, `skipped_active_interaction` names the one refusal that is permanent rather than transient, and `external-pending` became `cleanup_owed`: the external cleanup of the conversations the batch expired, which the job records for the cleanup retry driver rather than performs (see the 2026-09-25 entry below).
+
+A persistently high `skipped_busy` means the batch is dominated by tasks that are not actually quiescent. A persistently high `skipped_active_interaction` means tasks are holding interaction rows that nothing is closing, which is worth investigating on its own — the purge will keep skipping them. Any non-zero `failed` deserves the log line that accompanies it: the purge no longer stops on such a task, so the only symptom is that counter.
+
+Bulk deletion pressures autovacuum and can extend replication lag. Watch `n_dead_tup` on `tasks`, `trace_events` and the two `trace_*_blobs` tables while an initial backlog drains, raise `XAGENT_RETENTION_BATCH_PAUSE_SECONDS` if it is too aggressive, and plan a one-off `pg_repack` afterwards — deleting rows does not return storage to the filesystem.
+
+### Rollback
+
+`XAGENT_RETENTION_ENABLED=false` followed by a restart stops the job without changing the configured periods; unsetting the periods does the same. Neither restores deleted rows — recovery from an over-broad period is a database restore, which is what makes the dry run the step worth not skipping.
+
+This change adds no migration and no index.
+
+## 2026-09-25 — Task cleanup obligations and retry driver
+
+Task deletion commits its rows before it releases what those rows located — the task's workspace directory and any runtime-extension state — because the rows are how the resources are found and a rollback cannot restore a removed directory. A release that failed, or a process that died between the commit and the release, used to leave nothing behind but a log line. Each such release is now recorded in `task_cleanup_obligations`, in the same transaction as the row deletion, and deleted once the resource is gone.
+
+### Deployment impact
+
+- Migration `20260925_task_cleanup_obligations` adds the table. It has no foreign keys and waits for no other table.
+- Every web process starts a retry driver, whatever the retention settings. On-demand task and account deletion record obligations on any store, SQLite included. The driver claims each obligation with a compare-and-set, so several replicas can run it at once.
+- The retention purge now records the workspace and bound extensions of every conversation it expires. It still releases nothing itself, because it holds the task's row lock; the driver releases them afterwards. The purge's audit line gains `cleanup_owed`.
+- `on_task_deleted` can now run after the task row is gone: the driver dispatches it for everything the purge records and for any binding whose provider is not registered in the deleting process. The extensions an admin force-deleted past a *failing* provider are recorded but never retried.
+- Both deletion endpoints add `external_cleanup_pending` to their response, next to `workspace_cleanup_pending`. It is true when the workspace or any runtime-extension state is still owed. An out-of-tree provider must not need the task row to release its state (see `TaskRuntimeExtensionProvider` in `src/xagent/core/task_runtime.py`).
+
+### Prerequisites and configuration
+
+**Workspace directories must be visible to every replica.** The driver on one replica may retry a removal recorded on another. A replica that cannot see the directory finds nothing, and finding nothing counts as success. A deployment that keeps workspaces on per-node local disks would therefore report leaked directories as removed. Such a deployment needs a host-affinity change before it relies on this record.
+
+`XAGENT_TASK_CLEANUP_RETRY_INTERVAL_SECONDS` (default 300) sets how often an idle driver looks for due obligations. `XAGENT_TASK_CLEANUP_MAX_ATTEMPTS` (default 8) sets the attempt budget. Retries back off exponentially from five minutes, doubling each time (5, 10, 20, ..., 320 minutes for the default eight attempts) up to a six-hour cap the default budget never actually reaches, so it keeps retrying for roughly ten and a half hours in total.
+
+### Verification and monitoring
+
+A batch that claimed anything logs one line beginning `task cleanup retry`, counting `claimed`, `completed`, `retrying`, `exhausted` and `abandoned`.
+
+`xagent retention cleanup-pending` opens the database read-only. It prints how many obligations are still being retried and lists the ones retrying will not finish:
+
+- **`exhausted`** — the attempt budget ran out.
+- **`abandoned`** — deliberately not retried. This covers three cases: an admin's force delete, a workspace whose execution scope could not be resolved before its rows were deleted (the unscoped candidates were cleared, but a scoped workspace cannot be located), and a task id that belongs to a live task again. SQLite reuses the highest deleted id, so an old obligation must not remove the new task's directory.
+
+Add `--all` to include the obligations that are still pending. Reconcile each listed row by hand, then delete it from the table.
+
+A runtime-extension obligation whose provider is not registered in this process is not listed as `exhausted` or `abandoned`: it stays `pending` and is rechecked hourly, without spending its attempt budget, until a process that has the provider registered claims it. Such rows show under `--all`, not in the default list.
+
+### Rollback
+
+Rolling back the application leaves the table in place and unread. Downgrading the migration drops it, and with it the record of every cleanup still owed. Export `xagent retention cleanup-pending --all` first.
+

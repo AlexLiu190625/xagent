@@ -1,5 +1,6 @@
 """Unit tests for web ingestion pipeline."""
 
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -12,8 +13,15 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
     IngestionResult,
     WebCrawlConfig,
 )
+from xagent.core.tools.core.RAG_tools.kb import (
+    KBOperationCompatibilityFacade,
+    KBPipelineCompatibilityFacade,
+    RollbackStatus,
+    SideEffectPlane,
+)
 from xagent.core.tools.core.RAG_tools.pipelines.web_ingestion import (
     _callback_accepts_ingestion_result,
+    _log_kept_path_only_file,
     run_web_ingestion,
 )
 from xagent.core.tools.core.RAG_tools.utils.string_utils import sanitize_for_doc_id
@@ -1050,9 +1058,7 @@ class TestWebIngestionFileHandler:
             return {
                 "file_path": str(temp_file_path),
                 "file_id": "file-1",
-                "rollback_on_failure": lambda result=None: events.append(
-                    ("rollback", result)
-                ),
+                "file_compensation": lambda: events.append(("rollback", None)),
                 "commit_on_success": lambda result=None: events.append(
                     ("commit", result)
                 ),
@@ -1080,7 +1086,7 @@ class TestWebIngestionFileHandler:
                 )
 
         assert result.status == "error"
-        assert events == [("rollback", failed_ingestion)]
+        assert events == [("rollback", None)]
 
     @pytest.mark.asyncio
     async def test_file_handler_rollback_runs_on_ingestion_exception(
@@ -1106,9 +1112,7 @@ class TestWebIngestionFileHandler:
             return {
                 "file_path": str(temp_file_path),
                 "file_id": "file-1",
-                "rollback_on_failure": lambda result=None: events.append(
-                    ("rollback", result)
-                ),
+                "file_compensation": lambda: events.append(("rollback", None)),
                 "commit_on_success": lambda result=None: events.append(
                     ("commit", result)
                 ),
@@ -1179,7 +1183,7 @@ class TestWebIngestionFileHandler:
             message="embedding failed",
         )
 
-        def rollback(_result=None):
+        def rollback():
             raise RuntimeError("rollback exploded")
 
         def file_handler(
@@ -1188,7 +1192,7 @@ class TestWebIngestionFileHandler:
             return {
                 "file_path": str(temp_file_path),
                 "file_id": "file-1",
-                "rollback_on_failure": rollback,
+                "file_compensation": rollback,
             }
 
         with patch(
@@ -1218,9 +1222,12 @@ class TestWebIngestionFileHandler:
         assert (
             result.message
             == "Web ingestion rollback failed for https://example.com/page2: "
-            "rollback exploded"
+            "FILE boundary compensation failed: rollback exploded"
         )
-        assert any("rollback_on_failure failed" in item for item in result.warnings)
+        assert (
+            "Web rollback FILE compensation failed for https://example.com/page2: "
+            "rollback exploded"
+        ) in result.warnings
 
     @pytest.mark.asyncio
     async def test_async_file_handler_rollback_is_reported_as_failure(
@@ -1244,7 +1251,7 @@ class TestWebIngestionFileHandler:
         )
         events: list[str] = []
 
-        async def rollback(_result=None):
+        async def rollback():
             events.append("rollback")
 
         def file_handler(
@@ -1253,7 +1260,7 @@ class TestWebIngestionFileHandler:
             return {
                 "file_path": str(temp_file_path),
                 "file_id": "file-1",
-                "rollback_on_failure": rollback,
+                "file_compensation": rollback,
             }
 
         with patch(
@@ -1281,7 +1288,7 @@ class TestWebIngestionFileHandler:
         assert result.status == "error"
         assert result.side_effects_may_remain is True
         assert any(
-            "Async rollback_on_failure callback is not supported" in item
+            "Async compensation callback is not supported" in item
             for item in result.warnings
         )
         assert not any("was never awaited" in str(item.message) for item in recwarn)
@@ -1319,9 +1326,7 @@ class TestWebIngestionFileHandler:
             return {
                 "file_path": str(temp_file_path),
                 "file_id": "file-1",
-                "rollback_on_failure": lambda result=None: events.append(
-                    ("rollback", result)
-                ),
+                "file_compensation": lambda: events.append(("rollback", None)),
                 "commit_on_success": lambda result=None: events.append(
                     ("commit", result)
                 ),
@@ -1350,6 +1355,100 @@ class TestWebIngestionFileHandler:
 
         assert result.status == "success"
         assert events == [("commit", successful_ingestion)]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "variant", ["callback_only", "none_value", "with_file_compensation"]
+    )
+    async def test_file_handler_returning_rollback_on_failure_fails_the_page(
+        self, crawl_config, ingestion_config, tmp_path, variant
+    ):
+        """The retired key fails the page before FILE registration or ingestion."""
+        operation_facade = KBOperationCompatibilityFacade()
+        pipeline_facade = KBPipelineCompatibilityFacade(
+            operation_compatibility=operation_facade
+        )
+        events: list[str] = []
+        stored_file = tmp_path / "stored.md"
+        stored_file.write_text("user data")
+        legacy_keys: dict[str, Any] = {
+            "callback_only": {
+                "rollback_on_failure": lambda result=None: events.append("rollback")
+            },
+            "none_value": {"rollback_on_failure": None},
+            "with_file_compensation": {
+                "rollback_on_failure": lambda result=None: events.append("rollback"),
+                "file_compensation": lambda: events.append("file"),
+            },
+        }[variant]
+        mock_crawl_results = [
+            MagicMock(
+                url="https://example.com/page1",
+                title="Page 1",
+                content_markdown="# Page 1\n\nContent.",
+                status="success",
+                depth=0,
+                timestamp=datetime(2025, 1, 1, 12, 0, 0),
+                content_length=20,
+            )
+        ]
+
+        def file_handler(
+            temp_file_path: Path, title: str, collection: str, url: str
+        ) -> dict[str, Any]:
+            return {"file_path": str(stored_file), "file_id": "file-1", **legacy_keys}
+
+        with (
+            patch(
+                "xagent.core.tools.core.RAG_tools.pipelines.web_ingestion.WebCrawler"
+            ) as mock_crawler_class,
+            patch(
+                "xagent.core.tools.core.RAG_tools.pipelines.web_ingestion."
+                "_get_pipeline_compatibility_facade",
+                return_value=pipeline_facade,
+            ),
+        ):
+            mock_crawler = MagicMock()
+            mock_crawler.crawl = AsyncMock(return_value=mock_crawl_results)
+            mock_crawler.total_urls_found = 1
+            mock_crawler.failed_urls = {}
+            mock_crawler_class.return_value = mock_crawler
+
+            with patch(
+                "xagent.core.tools.core.RAG_tools.pipelines.web_ingestion."
+                "run_document_ingestion",
+                return_value=IngestionResult(
+                    status="error",
+                    doc_id="doc1",
+                    parse_hash="hash1",
+                    message="embedding failed",
+                ),
+            ) as mock_ingest:
+                result = await run_web_ingestion(
+                    collection="test_collection",
+                    crawl_config=crawl_config,
+                    ingestion_config=ingestion_config,
+                    file_handler=file_handler,
+                )
+
+        mock_ingest.assert_not_called()
+        assert events == []
+        assert stored_file.read_text() == "user data"
+        assert result.status == "error"
+        rejection = (
+            "File persistence failed for https://example.com/page1: "
+            "rollback_on_failure is no longer supported; return per-boundary "
+            "callbacks such as file_compensation instead"
+        )
+        assert result.failed_urls == {"https://example.com/page1": rejection}
+        assert rejection in result.warnings
+        assert result.side_effects_may_remain is True
+        outcome = operation_facade.last_outcome
+        assert outcome is not None
+        (child,) = outcome.child_outcomes
+        assert [step.payload["reason"] for step in child.compensation_steps] == [
+            "file_handler_failed"
+        ]
 
 
 class TestCrawlStopReasonDrivesStatus:
@@ -1497,3 +1596,150 @@ class TestCrawlStopReasonDrivesStatus:
         )
 
         assert result.status == "success"
+
+
+class TestHandlerWithoutFileCompensation:
+    """A handler that declares no file_compensation owns its file_path."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("file_id", "callbacks", "expected"),
+        [
+            pytest.param(
+                "file-1",
+                {},
+                (True, RollbackStatus.INCOMPLETE, [SideEffectPlane.FILE]),
+                id="path_only-file-1",
+            ),
+            pytest.param(
+                None,
+                {},
+                (True, RollbackStatus.INCOMPLETE, [SideEffectPlane.FILE]),
+                id="path_only-None",
+            ),
+            pytest.param(
+                "file-1",
+                {
+                    "document_compensation": lambda result=None: (lambda: None),
+                    "status_compensation": lambda result=None: (lambda: None),
+                },
+                (
+                    False,
+                    RollbackStatus.COMPLETE,
+                    [SideEffectPlane.DOCUMENT, SideEffectPlane.STATUS],
+                ),
+                id="reuse",
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("failure", ["error_result", "exception"])
+    async def test_failed_page_keeps_the_file_and_reports_it(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        failure: str,
+        file_id: Optional[str],
+        callbacks: dict[str, Any],
+        expected: tuple[bool, RollbackStatus, list[SideEffectPlane]],
+    ) -> None:
+        remains, rollback_status, planes = expected
+        operation_facade = KBOperationCompatibilityFacade()
+        pipeline_facade = KBPipelineCompatibilityFacade(
+            operation_compatibility=operation_facade
+        )
+        stored_file = tmp_path / "stored.md"
+        stored_file.write_text("user data", encoding="utf-8")
+        url = "https://example.com/page1"
+        ingest_patch: dict[str, Any] = {
+            "error_result": {
+                "return_value": IngestionResult(
+                    status="error", doc_id="doc1", message="embedding failed"
+                )
+            },
+            "exception": {"side_effect": RuntimeError("boom")},
+        }[failure]
+        reason, warning_prefix = {
+            "error_result": ("embedding failed", "Partial ingestion for"),
+            "exception": ("boom", "Failed to ingest"),
+        }[failure]
+
+        def file_handler(
+            temp_file_path: Path, title: str, collection: str, url: str
+        ) -> dict[str, Any]:
+            return {"file_path": str(stored_file), "file_id": file_id, **callbacks}
+
+        module = "xagent.core.tools.core.RAG_tools.pipelines.web_ingestion"
+        caplog.set_level(logging.WARNING, logger=module)
+        with (
+            patch(f"{module}.WebCrawler") as mock_crawler_class,
+            patch(
+                f"{module}._get_pipeline_compatibility_facade",
+                return_value=pipeline_facade,
+            ),
+            patch(f"{module}.run_document_ingestion", **ingest_patch),
+        ):
+            mock_crawler = MagicMock()
+            mock_crawler.crawl = AsyncMock(
+                return_value=[
+                    MagicMock(
+                        url=url,
+                        title="Page 1",
+                        content_markdown="# Page 1",
+                        status="success",
+                        depth=0,
+                        timestamp=datetime(2025, 1, 1, 12, 0, 0),
+                        content_length=8,
+                    )
+                ]
+            )
+            mock_crawler.total_urls_found = 1
+            mock_crawler.failed_urls = {}
+            mock_crawler_class.return_value = mock_crawler
+            result = await run_web_ingestion(
+                collection="test_collection",
+                crawl_config=WebCrawlConfig(start_url="https://example.com"),
+                file_handler=file_handler,
+            )
+
+        assert stored_file.read_text(encoding="utf-8") == "user data"
+        assert result.status == "error"
+        assert result.message == f"Web ingestion failed: {url} returned {reason}"
+        assert result.warnings == [f"{warning_prefix} {url}: {reason}"]
+        assert result.side_effects_may_remain is remains
+        outcome = operation_facade.last_outcome
+        assert outcome is not None
+        (child,) = outcome.child_outcomes
+        assert [step.plane for step in child.compensation_steps] == planes
+        assert (child.side_effects_may_remain, child.rollback_status) == (
+            remains,
+            rollback_status,
+        )
+        kept_logs = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+            and str(stored_file) in record.getMessage()
+        ]
+        assert kept_logs == (
+            []
+            if callbacks
+            else [
+                f"Kept file_handler file {stored_file} after ingestion of {url} "
+                "failed; declare file_compensation if it should be removed"
+            ]
+        )
+
+    def test_pipeline_temp_file_is_not_reported_as_kept(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        temp_file = tmp_path / "0_page.md"
+        module = "xagent.core.tools.core.RAG_tools.pipelines.web_ingestion"
+        with caplog.at_level(logging.WARNING, logger=module):
+            _log_kept_path_only_file(
+                {"file_path": str(temp_file), "file_id": "file-1"},
+                temp_file,
+                str(tmp_path),
+                "https://example.com/page1",
+            )
+
+        assert caplog.records == []

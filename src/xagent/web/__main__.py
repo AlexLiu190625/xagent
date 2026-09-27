@@ -17,7 +17,7 @@ from typing import cast
 import uvicorn
 from dotenv import load_dotenv
 
-from ..config import get_default_task_execution_mode
+from ..config import get_default_task_execution_mode, get_worker_count
 from .logging_config import LogLevel, setup_logging
 
 # Load environment variables from .env file
@@ -93,6 +93,7 @@ Examples:
     python -m xagent.web --host 0.0.0.0      # Listen on all interfaces
     python -m xagent.web --debug             # Enable verbose logging (LLM responses, etc.)
     python -m xagent.web migrate --help      # Import agents from OpenClaw or Hermes
+    python -m xagent.web retention --help    # Read-only retention diagnostics
         """,
     )
 
@@ -122,13 +123,19 @@ Examples:
 def main() -> None:
     """Main function.
 
-    ``xagent migrate ...`` dispatches to the migration CLI; every other
+    ``xagent migrate ...`` dispatches to the migration CLI and ``xagent
+    retention ...`` to the read-only retention diagnostics; every other
     invocation starts the web service (the historical behavior).
     """
     if len(sys.argv) > 1 and sys.argv[1] == "migrate":
         from ..migration.cli import main as migrate_main
 
         raise SystemExit(migrate_main(sys.argv[2:]))
+
+    if len(sys.argv) > 1 and sys.argv[1] == "retention":
+        from .retention_cli import main as retention_main
+
+        raise SystemExit(retention_main(sys.argv[2:]))
 
     args = parse_args()
 
@@ -159,6 +166,19 @@ def main() -> None:
         logger.info("🐛 Debug mode: verbose logging enabled")
 
     try:
+        worker_count = get_worker_count()
+        if worker_count is not None:
+            if args.reload:
+                raise ValueError("XAGENT_WORKER_COUNT cannot be used with --reload")
+            from .worker_pool import run_combined_worker_pool
+
+            run_combined_worker_pool(
+                worker_count=worker_count,
+                host=args.host,
+                port=args.port,
+                log_level=log_level.lower() if log_level else None,
+            )
+            return
         uvicorn.run(
             "xagent.web.app:app",
             host=args.host,

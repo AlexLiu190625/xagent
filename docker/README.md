@@ -51,6 +51,14 @@ DEEPSEEK_API_KEY="your-deepseek-api-key"
 POSTGRES_PASSWORD="xagent_password"
 ```
 
+Backend images built from the current source start one web process and two Agent
+workers. If `ENCRYPTION_KEY` is empty, the image creates one in the persistent
+`xagent_secrets` volume; keep that volume with database backups. The checked-in
+Compose file uses fixed release image tags, so this behavior begins when those
+tags are bumped to a release containing the worker-pool default. To run that
+image as a local single-process backend instead, set `XAGENT_WORKER_COUNT=` and
+`XAGENT_SHARED_TASK_EXECUTION_ENABLED=false` in `.env`.
+
 Optional Gmail incoming-email trigger provisioning:
 
 ```bash
@@ -597,6 +605,20 @@ docker compose exec postgres pg_dump -U xagent xagent > backup.sql
 # Restore database
 docker compose exec -T postgres psql -U xagent xagent < backup.sql
 ```
+
+### LanceDB full-text index rebuild
+
+Knowledge-base full-text indexes store their tokenizer at build time, so a database created before the jieba tokenizer switch keeps the old one until the index is rebuilt, and no ingestion or maintenance path rebuilds it on its own. Existing deployments run this once; new installations do not need it.
+
+```bash
+# Report what would be rebuilt
+docker compose exec backend python -m xagent.migrations.lancedb.rebuild_fts_indexes --dry-run
+
+# Rebuild (exit 1 means at least one table was not rebuilt; safe to re-run)
+docker compose exec backend python -m xagent.migrations.lancedb.rebuild_fts_indexes
+```
+
+Run it inside `backend` so it uses the same `LANCEDB_DIR` as the application. Full context, exit codes and verification are the dated entry in [`docs/deployment.md`](../docs/deployment.md).
 
 ### PostgreSQL major version upgrade (16 to 17)
 

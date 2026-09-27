@@ -1,5 +1,6 @@
 """Unit tests for core/config.py configuration functions."""
 
+import logging
 import os
 import subprocess
 import sys
@@ -2362,6 +2363,91 @@ class TestOrphanUploadGcConfig:
         assert get_orphan_upload_sweep_interval_seconds() == 900
 
 
+class TestTaskCleanupRetryConfig:
+    """Config for retrying the external cleanup a task deletion owes (#2587)."""
+
+    def test_retry_interval_default(self, monkeypatch):
+        from xagent.config import get_task_cleanup_retry_interval_seconds
+
+        monkeypatch.delenv("XAGENT_TASK_CLEANUP_RETRY_INTERVAL_SECONDS", raising=False)
+        assert get_task_cleanup_retry_interval_seconds() == 300
+
+    def test_retry_interval_env_override(self, monkeypatch):
+        from xagent.config import get_task_cleanup_retry_interval_seconds
+
+        monkeypatch.setenv("XAGENT_TASK_CLEANUP_RETRY_INTERVAL_SECONDS", "120")
+        assert get_task_cleanup_retry_interval_seconds() == 120
+
+    def test_retry_interval_below_minimum_falls_back_to_default(self, monkeypatch):
+        from xagent.config import get_task_cleanup_retry_interval_seconds
+
+        monkeypatch.setenv("XAGENT_TASK_CLEANUP_RETRY_INTERVAL_SECONDS", "1")
+        assert get_task_cleanup_retry_interval_seconds() == 300
+
+    def test_max_attempts_default(self, monkeypatch):
+        from xagent.config import get_task_cleanup_max_attempts
+
+        monkeypatch.delenv("XAGENT_TASK_CLEANUP_MAX_ATTEMPTS", raising=False)
+        assert get_task_cleanup_max_attempts() == 8
+
+    def test_max_attempts_env_override(self, monkeypatch):
+        from xagent.config import get_task_cleanup_max_attempts
+
+        monkeypatch.setenv("XAGENT_TASK_CLEANUP_MAX_ATTEMPTS", "3")
+        assert get_task_cleanup_max_attempts() == 3
+
+    def test_max_attempts_zero_falls_back_to_default(self, monkeypatch):
+        from xagent.config import get_task_cleanup_max_attempts
+
+        monkeypatch.setenv("XAGENT_TASK_CLEANUP_MAX_ATTEMPTS", "0")
+        assert get_task_cleanup_max_attempts() == 8
+
+
+class TestLlmRetryBudgetConfig:
+    """#2605: the two bounds that attempt counting cannot express."""
+
+    def test_deadline_default(self, monkeypatch):
+        from xagent.config import get_llm_retry_deadline_seconds
+
+        monkeypatch.delenv("XAGENT_LLM_RETRY_DEADLINE_SECONDS", raising=False)
+        assert get_llm_retry_deadline_seconds() == 300.0
+
+    def test_deadline_env_override(self, monkeypatch):
+        from xagent.config import get_llm_retry_deadline_seconds
+
+        monkeypatch.setenv("XAGENT_LLM_RETRY_DEADLINE_SECONDS", "45.5")
+        assert get_llm_retry_deadline_seconds() == 45.5
+
+    @pytest.mark.parametrize(
+        "value", ["", "   ", "not-a-number", "0", "-5", "nan", "inf"]
+    )
+    def test_deadline_rejects_unusable_values(self, monkeypatch, value):
+        """An unbounded loop is the bug; never let bad config reintroduce it."""
+        from xagent.config import get_llm_retry_deadline_seconds
+
+        monkeypatch.setenv("XAGENT_LLM_RETRY_DEADLINE_SECONDS", value)
+        assert get_llm_retry_deadline_seconds() == 300.0
+
+    def test_capacity_attempts_default(self, monkeypatch):
+        from xagent.config import get_llm_capacity_max_attempts
+
+        monkeypatch.delenv("XAGENT_LLM_CAPACITY_MAX_ATTEMPTS", raising=False)
+        assert get_llm_capacity_max_attempts() == 2
+
+    def test_capacity_attempts_env_override(self, monkeypatch):
+        from xagent.config import get_llm_capacity_max_attempts
+
+        monkeypatch.setenv("XAGENT_LLM_CAPACITY_MAX_ATTEMPTS", "1")
+        assert get_llm_capacity_max_attempts() == 1
+
+    @pytest.mark.parametrize("value", ["", "1.5", "not-a-number", "0", "-3"])
+    def test_capacity_attempts_rejects_unusable_values(self, monkeypatch, value):
+        from xagent.config import get_llm_capacity_max_attempts
+
+        monkeypatch.setenv("XAGENT_LLM_CAPACITY_MAX_ATTEMPTS", value)
+        assert get_llm_capacity_max_attempts() == 2
+
+
 class TestWorkforcePreviewRunReapConfig:
     """PR #1060 review: get_workforce_preview_run_stale_seconds() had no
     test, unlike its sibling TTL config functions above."""
@@ -2685,6 +2771,38 @@ class TestGetSandboxAllowLocalFallbackOnCapacity:
             assert get_sandbox_allow_local_fallback_on_capacity() is False
 
 
+class TestCheckpointGateStallWarningConfig:
+    """Config for reporting a long-held exclusive checkpoint section."""
+
+    def test_defaults_to_30_seconds(self, monkeypatch):
+        from xagent.config import (
+            CHECKPOINT_GATE_STALL_WARNING_SECONDS,
+            get_checkpoint_gate_stall_warning_seconds,
+        )
+
+        monkeypatch.delenv(CHECKPOINT_GATE_STALL_WARNING_SECONDS, raising=False)
+        assert get_checkpoint_gate_stall_warning_seconds() == 30.0
+
+    def test_env_override(self, monkeypatch):
+        from xagent.config import (
+            CHECKPOINT_GATE_STALL_WARNING_SECONDS,
+            get_checkpoint_gate_stall_warning_seconds,
+        )
+
+        monkeypatch.setenv(CHECKPOINT_GATE_STALL_WARNING_SECONDS, "2.5")
+        assert get_checkpoint_gate_stall_warning_seconds() == 2.5
+
+    @pytest.mark.parametrize("value", ["abc", "0", "-1", "nan", "inf"])
+    def test_invalid_values_fall_back(self, monkeypatch, value):
+        from xagent.config import (
+            CHECKPOINT_GATE_STALL_WARNING_SECONDS,
+            get_checkpoint_gate_stall_warning_seconds,
+        )
+
+        monkeypatch.setenv(CHECKPOINT_GATE_STALL_WARNING_SECONDS, value)
+        assert get_checkpoint_gate_stall_warning_seconds() == 30.0
+
+
 class TestCompactThresholdConfig:
     """Config for context-compaction threshold derivation."""
 
@@ -2858,6 +2976,23 @@ def test_toby_personal_stdio_is_disabled_by_default(monkeypatch):
     assert config.get_toby_personal_stdio_enabled() is False
 
 
+def test_trace_database_defaults_and_opt_in(monkeypatch):
+    monkeypatch.delenv(config.ASYNC_TRACE_DB_ENABLED, raising=False)
+    monkeypatch.delenv(config.TRACE_DB_MAX_INFLIGHT, raising=False)
+    assert config.get_async_trace_db_enabled() is True
+    assert config.get_trace_db_max_inflight() == 4
+    monkeypatch.setenv(config.ASYNC_TRACE_DB_ENABLED, "true")
+    monkeypatch.setenv(config.TRACE_DB_MAX_INFLIGHT, "8")
+    assert config.get_async_trace_db_enabled() is True
+    assert config.get_trace_db_max_inflight() == 8
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "invalid"])
+def test_trace_database_invalid_admission_limit_falls_back(monkeypatch, value):
+    monkeypatch.setenv(config.TRACE_DB_MAX_INFLIGHT, value)
+    assert config.get_trace_db_max_inflight() == 4
+
+
 @pytest.mark.parametrize("value", ["1", "true", "YES", "on"])
 def test_toby_personal_stdio_explicit_opt_in(monkeypatch, value):
     monkeypatch.setenv(config.TOBY_PERSONAL_STDIO_ENABLED, value)
@@ -2865,14 +3000,72 @@ def test_toby_personal_stdio_explicit_opt_in(monkeypatch, value):
     assert config.get_toby_personal_stdio_enabled() is True
 
 
-@pytest.mark.parametrize(
-    "value,expected", [(None, False), ("true", True), ("false", False)]
-)
-def test_shared_task_execution_is_dormant_by_default(monkeypatch, value, expected):
+@pytest.mark.parametrize("value,expected", [("true", True), ("false", False)])
+def test_shared_task_execution_explicit_setting_wins(monkeypatch, value, expected):
     monkeypatch.delenv(config.SHARED_TASK_EXECUTION_ENABLED, raising=False)
-    if value is not None:
-        monkeypatch.setenv(config.SHARED_TASK_EXECUTION_ENABLED, value)
+    monkeypatch.setenv(config.WORKER_COUNT, "4")
+    monkeypatch.setenv(config.SHARED_TASK_EXECUTION_ENABLED, value)
     assert config.get_shared_task_execution_enabled() is expected
+
+
+@pytest.mark.parametrize("value", ["", " "])
+@pytest.mark.parametrize(
+    "role,worker_count",
+    [("combined", "4"), ("web", None), ("worker", None)],
+)
+def test_blank_shared_task_execution_setting_uses_topology(
+    monkeypatch, value, role, worker_count
+):
+    monkeypatch.setenv(config.SHARED_TASK_EXECUTION_ENABLED, value)
+    monkeypatch.setenv(config.TASK_EXECUTION_ROLE, role)
+    monkeypatch.delenv(config.WORKER_COUNT, raising=False)
+    if worker_count is not None:
+        monkeypatch.setenv(config.WORKER_COUNT, worker_count)
+
+    assert config.get_shared_task_execution_enabled() is True
+
+
+@pytest.mark.parametrize(
+    "role,worker_count,expected",
+    [
+        ("combined", None, False),
+        ("combined", "4", True),
+        ("web", None, True),
+        ("worker", None, True),
+    ],
+)
+def test_shared_task_execution_default_follows_topology(
+    monkeypatch, role, worker_count, expected
+):
+    monkeypatch.delenv(config.SHARED_TASK_EXECUTION_ENABLED, raising=False)
+    monkeypatch.setenv(config.TASK_EXECUTION_ROLE, role)
+    monkeypatch.delenv(config.WORKER_COUNT, raising=False)
+    if worker_count is not None:
+        monkeypatch.setenv(config.WORKER_COUNT, worker_count)
+
+    assert config.get_shared_task_execution_enabled() is expected
+
+
+def test_default_task_execution_host_configuration_is_self_contained(monkeypatch):
+    monkeypatch.delenv(config.SHARED_TASK_EXECUTION_ENABLED, raising=False)
+    monkeypatch.delenv(config.TASK_EXECUTION_ROLE, raising=False)
+    monkeypatch.delenv(config.WORKER_COUNT, raising=False)
+    monkeypatch.delenv(config.REDIS_URL, raising=False)
+    monkeypatch.delenv(config.ENCRYPTION_KEY, raising=False)
+
+    assert config.get_shared_task_execution_enabled() is False
+    assert config.get_task_execution_role() == "combined"
+    assert config.get_channel_ingress_enabled() is False
+    config.validate_task_execution_host_config()
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "invalid"])
+def test_local_host_rejects_invalid_runtime_secret_ttl_at_startup(monkeypatch, value):
+    monkeypatch.setenv(config.SHARED_TASK_EXECUTION_ENABLED, "false")
+    monkeypatch.setenv(config.TASK_EXECUTION_ROLE, "combined")
+    monkeypatch.setenv(config.TASK_RUNTIME_SECRETS_TTL_SECONDS, value)
+    with pytest.raises(ValueError):
+        config.validate_task_execution_host_config()
 
 
 @pytest.mark.parametrize("value", ["", " ", "deployment/channel"])
@@ -2889,14 +3082,21 @@ def test_task_event_channel_prefix_default_and_override(monkeypatch):
     assert config.get_task_event_channel_prefix() == "xagent:staging:v1"
 
 
-@pytest.mark.parametrize(
-    "key", [None, "", "RQMpe38gK3m0szjpSmTNw_sP3Y54r6hDc6JewBoPKXc="]
-)
-def test_task_runtime_secrets_reject_unconfigured_or_public_key(monkeypatch, key):
+@pytest.mark.parametrize("key", [None, ""])
+def test_task_runtime_secrets_reject_unconfigured_key(monkeypatch, key):
     monkeypatch.delenv(config.ENCRYPTION_KEY, raising=False)
     if key is not None:
         monkeypatch.setenv(config.ENCRYPTION_KEY, key)
     assert config.get_task_runtime_secrets_encryption_key() is None
+
+
+def test_task_runtime_secrets_use_explicit_fallback_key(monkeypatch):
+    monkeypatch.setenv(config.ENCRYPTION_KEY, config.DEV_FALLBACK_ENCRYPTION_KEY)
+
+    assert (
+        config.get_task_runtime_secrets_encryption_key()
+        == config.DEV_FALLBACK_ENCRYPTION_KEY
+    )
 
 
 def test_task_runtime_secrets_use_explicit_key(monkeypatch):
@@ -2917,3 +3117,421 @@ def test_task_reply_wait_timeout(value, expected, monkeypatch):
     if value is not None:
         monkeypatch.setenv("XAGENT_TASK_REPLY_WAIT_TIMEOUT_SECONDS", value)
     assert get_task_reply_wait_timeout_seconds() == expected
+
+
+@pytest.mark.parametrize(
+    "shared,role,override,expected",
+    [
+        (False, "combined", None, True),
+        (True, "combined", None, False),
+        (True, "web", "true", True),
+        (True, "web", "false", False),
+        (True, "worker", "true", False),
+    ],
+)
+def test_designated_channel_ingress(monkeypatch, shared, role, override, expected):
+    monkeypatch.setenv(config.SHARED_TASK_EXECUTION_ENABLED, str(shared).lower())
+    monkeypatch.setenv(config.TASK_EXECUTION_ROLE, role)
+    monkeypatch.delenv(config.CHANNEL_INGRESS_ENABLED, raising=False)
+    if override is not None:
+        monkeypatch.setenv(config.CHANNEL_INGRESS_ENABLED, override)
+    assert config.get_channel_ingress_enabled() is expected
+
+
+@pytest.mark.parametrize("role", ["combined", "web", "worker"])
+def test_shared_host_configuration(monkeypatch, role):
+    from cryptography.fernet import Fernet
+
+    monkeypatch.setenv(config.SHARED_TASK_EXECUTION_ENABLED, "true")
+    monkeypatch.setenv(config.TASK_EXECUTION_ROLE, role)
+    monkeypatch.setenv(config.REDIS_URL, "redis://localhost:6379/0")
+    monkeypatch.setenv(config.ENCRYPTION_KEY, Fernet.generate_key().decode())
+    config.validate_task_execution_host_config()
+    monkeypatch.setenv(config.ENCRYPTION_KEY, config.DEV_FALLBACK_ENCRYPTION_KEY)
+    config.validate_task_execution_host_config()
+    monkeypatch.delenv(config.ENCRYPTION_KEY)
+    with pytest.raises(ValueError, match="private common ENCRYPTION_KEY"):
+        config.validate_task_execution_host_config()
+    monkeypatch.setenv(config.SHARED_TASK_EXECUTION_ENABLED, "false")
+    if role == "combined":
+        config.validate_task_execution_host_config()
+    else:
+        with pytest.raises(ValueError, match="requires"):
+            config.validate_task_execution_host_config()
+
+
+def test_unknown_task_execution_role_rejected(monkeypatch):
+    monkeypatch.setenv(config.TASK_EXECUTION_ROLE, "other")
+    with pytest.raises(ValueError, match="combined, web or worker"):
+        config.validate_task_execution_host_config()
+
+
+@pytest.mark.parametrize("configured_home", [None, "/custom/boxlite"])
+def test_shared_boxlite_home_is_scoped_to_worker(
+    monkeypatch, tmp_path, configured_home
+):
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setenv("XAGENT_SANDBOX_WORKER_ID", "worker-1")
+    monkeypatch.setenv("XAGENT_STORAGE_ROOT", str(tmp_path))
+    if configured_home is None:
+        monkeypatch.delenv(BOXLITE_HOME_DIR, raising=False)
+    else:
+        monkeypatch.setenv(BOXLITE_HOME_DIR, configured_home)
+    expected_root = Path(configured_home) if configured_home else tmp_path / "boxlite"
+    assert get_boxlite_home_dir() == expected_root / "worker-1"
+
+
+@pytest.mark.parametrize(
+    "value,expected", [(None, None), ("", None), ("1", 1), ("4", 4)]
+)
+def test_worker_count_optional_positive_integer(monkeypatch, value, expected):
+    monkeypatch.delenv(config.WORKER_COUNT, raising=False)
+    if value is not None:
+        monkeypatch.setenv(config.WORKER_COUNT, value)
+    assert config.get_worker_count() == expected
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "1.5", "invalid"])
+def test_worker_count_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv(config.WORKER_COUNT, value)
+    with pytest.raises(
+        ValueError, match="XAGENT_WORKER_COUNT must be a positive integer"
+    ):
+        config.get_worker_count()
+
+
+# ---------------------------------------------------------------------------
+# Conversation data retention (#2563).
+#
+# Two properties run through these cases, and every test here is one of them:
+# a period that cannot be read disables the leg it configures rather than
+# falling back to a number of days, and a switch that cannot be read resolves
+# to whichever side deletes nothing.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def no_retention_env(monkeypatch):
+    """Clear every retention variable, so no case inherits another's state.
+
+    Driven from ``config.RETENTION_ENV_VARS`` rather than a list written here,
+    so a setting added without a test cannot silently inherit whatever the
+    surrounding suite left behind.
+    """
+    for name in config.RETENTION_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    return monkeypatch
+
+
+def _warnings(caplog) -> list[str]:
+    return [record.getMessage() for record in caplog.records]
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, None),
+        ("", None),
+        ("   ", None),
+        ("0", None),
+        ("365", 365),
+        ("1", 1),
+        (str(config.MAX_RETENTION_DAYS), config.MAX_RETENTION_DAYS),
+        # Every one of these is a mistake, and must disable rather than fall
+        # back to some working number of days.
+        ("-1", None),
+        ("90d", None),
+        ("ninety", None),
+        ("9.5", None),
+        # An operator pasting a date. Parses as an integer, and no date can
+        # express it -- `now - timedelta(days=20260923)` raises OverflowError,
+        # which a consumer would hit on every use.
+        ("20260923", None),
+        ("1000000000", None),
+        (str(config.MAX_RETENTION_DAYS + 1), None),
+    ],
+)
+def test_conversation_retention_days(no_retention_env, value, expected):
+    if value is not None:
+        no_retention_env.setenv(config.CONVERSATION_RETENTION_DAYS, value)
+    assert config.get_conversation_retention_days() == expected
+
+
+def test_an_accepted_period_can_always_be_expressed_as_a_date(no_retention_env):
+    """The bound is only correct if everything under it actually works.
+
+    Pinned against the arithmetic it protects rather than against a number
+    written twice: ``retention_cutoff`` is what raises, so it decides whether
+    ``MAX_RETENTION_DAYS`` is set right. This caught the first value written.
+    """
+    from datetime import datetime, timezone
+
+    from xagent.web.services.task_retention import retention_cutoff
+
+    no_retention_env.setenv(
+        config.CONVERSATION_RETENTION_DAYS, str(config.MAX_RETENTION_DAYS)
+    )
+    parsed = config.get_conversation_retention_days()
+
+    assert parsed == config.MAX_RETENTION_DAYS
+    assert retention_cutoff(now=datetime.now(timezone.utc), days=parsed) is not None
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        # Every spelling of zero inherits the conversation period, because "0"
+        # means "same as the conversation period" and ``int`` is the authority
+        # on what zero is. Comparing the raw string against "0" instead
+        # disagreed with ``int`` about these, and silently disabled traces.
+        ("0", 365),
+        (" 0 ", 365),
+        ("00", 365),
+        ("-0", 365),
+        # Absent, likewise inherits.
+        ("", 365),
+        ("   ", 365),
+        ("90", 90),
+        # Longer than the conversation period: accepted, and inert.
+        ("3650", 3650),
+        # Unusable: disables the leg being configured rather than inheriting.
+        ("0.0", None),
+        ("90d", None),
+        ("-5", None),
+        ("800000", None),
+    ],
+)
+def test_trace_period_reads_every_spelling_the_way_int_does(
+    no_retention_env, raw, expected
+):
+    no_retention_env.setenv(config.CONVERSATION_RETENTION_DAYS, "365")
+    no_retention_env.setenv(config.TRACE_RETENTION_DAYS, raw)
+
+    assert config.get_trace_retention_days() == expected
+
+
+def test_trace_alone_expires_traces_while_conversations_are_kept(no_retention_env):
+    """A supported shape, not an accident: traces are most of the bytes."""
+    no_retention_env.setenv(config.TRACE_RETENTION_DAYS, "90")
+
+    assert config.get_trace_retention_days() == 90
+    assert config.get_conversation_retention_days() is None
+
+
+def test_an_unusable_conversation_period_does_not_reach_the_trace_leg(
+    no_retention_env,
+):
+    """Each leg is disabled on its own; neither failure contaminates the other."""
+    no_retention_env.setenv(config.CONVERSATION_RETENTION_DAYS, "90d")
+
+    assert config.get_conversation_retention_days() is None
+    assert config.get_trace_retention_days() is None
+
+    no_retention_env.setenv(config.TRACE_RETENTION_DAYS, "30")
+    assert config.get_trace_retention_days() == 30
+
+
+def test_both_periods_zero_disables_everything(no_retention_env):
+    no_retention_env.setenv(config.CONVERSATION_RETENTION_DAYS, "0")
+    no_retention_env.setenv(config.TRACE_RETENTION_DAYS, "0")
+
+    assert config.get_conversation_retention_days() is None
+    assert config.get_trace_retention_days() is None
+
+
+@pytest.mark.parametrize("value", ["-1", "90d", str(config.MAX_RETENTION_DAYS + 1)])
+def test_an_unusable_period_warns(no_retention_env, caplog, value):
+    no_retention_env.setenv(config.CONVERSATION_RETENTION_DAYS, value)
+    with caplog.at_level(logging.WARNING, logger="xagent.config"):
+        config.get_conversation_retention_days()
+
+    assert any(config.CONVERSATION_RETENTION_DAYS in m for m in _warnings(caplog))
+
+
+@pytest.mark.parametrize("value", ["0", "", "   ", "365"])
+def test_a_usable_or_absent_period_does_not_warn(no_retention_env, caplog, value):
+    """Zero and blank are documented spellings, not mistakes."""
+    no_retention_env.setenv(config.CONVERSATION_RETENTION_DAYS, value)
+    with caplog.at_level(logging.WARNING, logger="xagent.config"):
+        config.get_conversation_retention_days()
+
+    assert _warnings(caplog) == []
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, False),
+        ("true", True),
+        ("TRUE", True),
+        (" yes ", True),
+        ("1", True),
+        ("y", True),
+        ("false", False),
+        ("n", False),
+        ("off", False),
+        # Unrecognised: this is the setting an operator reaches for before a
+        # first real run, so the failure direction is "reported, not deleted".
+        ("enabled", True),
+        ("maybe", True),
+        # Blank is unset, not a typo: a compose file interpolating an unset
+        # shell variable passes an empty string, which says nothing.
+        ("", False),
+        ("   ", False),
+    ],
+)
+def test_dry_run_resolves_an_unrecognised_value_to_dry(
+    no_retention_env, value, expected
+):
+    if value is not None:
+        no_retention_env.setenv(config.RETENTION_DRY_RUN, value)
+    assert config.get_retention_dry_run() is expected
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, True),
+        ("true", True),
+        ("y", True),
+        (" ON ", True),
+        ("false", False),
+        ("off", False),
+        ("n", False),
+        # Unrecognised resolves to "stopped": for a kill switch, refusing to
+        # act is the side that cannot delete anything.
+        ("enabled", False),
+        ("t", False),
+        # Blank is unset, so it must not read as a deliberate stop.
+        ("", True),
+        ("   ", True),
+    ],
+)
+def test_kill_switch_resolves_an_unrecognised_value_to_stopped(
+    no_retention_env, value, expected
+):
+    if value is not None:
+        no_retention_env.setenv(config.RETENTION_ENABLED, value)
+    assert config.get_retention_enabled() is expected
+
+
+@pytest.mark.parametrize("name", [config.RETENTION_DRY_RUN, config.RETENTION_ENABLED])
+def test_an_unrecognised_switch_warns(no_retention_env, caplog, name):
+    """Unlike a period, there is no legitimate spelling a switch rejects."""
+    no_retention_env.setenv(name, "enabled")
+    with caplog.at_level(logging.WARNING, logger="xagent.config"):
+        config.get_retention_dry_run()
+        config.get_retention_enabled()
+
+    assert any(name in message for message in _warnings(caplog))
+
+
+@pytest.mark.parametrize("name", [config.RETENTION_DRY_RUN, config.RETENTION_ENABLED])
+@pytest.mark.parametrize("value", ["", "   ", "true", "no"])
+def test_a_readable_or_blank_switch_does_not_warn(
+    no_retention_env, caplog, name, value
+):
+    no_retention_env.setenv(name, value)
+    with caplog.at_level(logging.WARNING, logger="xagent.config"):
+        config.get_retention_dry_run()
+        config.get_retention_enabled()
+
+    assert _warnings(caplog) == []
+
+
+def test_blank_is_unset_for_every_setting(no_retention_env):
+    """All four parsers must agree about what an empty value means.
+
+    They did not at first: the periods read blank as unset while the switches
+    read it as an unrecognised value and the batch size read it as invalid.
+    The visible consequence was a compose file interpolating an unset shell
+    variable turning into a deliberate stop, warning on every read.
+    """
+    for name in config.RETENTION_ENV_VARS:
+        no_retention_env.setenv(name, "")
+
+    assert config.get_conversation_retention_days() is None
+    assert config.get_trace_retention_days() is None
+    assert config.get_retention_enabled() is True
+    assert config.get_retention_dry_run() is False
+    assert config.get_retention_batch_size() == 100
+    assert config.get_retention_sweep_interval_seconds() == 86400.0
+    assert config.get_retention_batch_pause_seconds() == 5.0
+
+
+@pytest.mark.parametrize(
+    "value,expected", [(None, 100), ("250", 250), ("0", 100), ("nope", 100), ("", 100)]
+)
+def test_retention_batch_size(no_retention_env, value, expected):
+    if value is not None:
+        no_retention_env.setenv(config.RETENTION_BATCH_SIZE, value)
+    assert config.get_retention_batch_size() == expected
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [(None, 86400.0), ("60", 60.0), ("0", 86400.0), ("-1", 86400.0), ("x", 86400.0)],
+)
+def test_retention_sweep_interval(no_retention_env, value, expected):
+    if value is not None:
+        no_retention_env.setenv(config.RETENTION_SWEEP_INTERVAL_SECONDS, value)
+    assert config.get_retention_sweep_interval_seconds() == expected
+
+
+@pytest.mark.parametrize(
+    "value,expected", [(None, 5.0), ("0.5", 0.5), ("0", 5.0), ("nope", 5.0)]
+)
+def test_retention_batch_pause(no_retention_env, value, expected):
+    if value is not None:
+        no_retention_env.setenv(config.RETENTION_BATCH_PAUSE_SECONDS, value)
+    assert config.get_retention_batch_pause_seconds() == expected
+
+
+def test_no_module_assigns_a_retention_environment_variable():
+    """Pins the claim the section comment makes about needing a restart.
+
+    That claim holds only while nothing writes these names into the
+    environment, and other code in this repository does write ``os.environ``
+    (``worker_pool`` sets the execution role for the processes it spawns), so
+    it has to be checked rather than assumed.
+
+    The scan is a heuristic and says so: it covers assignment, ``update``,
+    ``setdefault``, ``putenv`` and ``load_dotenv(override=True)``, spelled
+    through either the literal name or the constant. A computed key would slip
+    past it. It is worth having anyway -- every way this claim has actually
+    been broken in review is on the list -- but it is a tripwire, not a proof.
+    """
+    import re
+    from pathlib import Path as _Path
+
+    source_root = _Path(config.__file__).parent
+    names = "|".join(
+        [re.escape(name) for name in config.RETENTION_ENV_VARS]
+        + [
+            re.escape(name.removeprefix("XAGENT_"))
+            for name in config.RETENTION_ENV_VARS
+        ]
+    )
+    quoted = rf"""["']?({names})["']?"""
+    pattern = re.compile(
+        "|".join(
+            [
+                rf"environ\[\s*{quoted}\s*\]\s*=",
+                rf"environ\.setdefault\(\s*{quoted}",
+                rf"putenv\(\s*{quoted}",
+                rf"environ\.update\([^)]*{quoted}",
+                r"load_dotenv\([^)]*override\s*=\s*True",
+            ]
+        )
+    )
+
+    offenders = sorted(
+        str(path.relative_to(source_root))
+        for path in source_root.rglob("*.py")
+        if pattern.search(path.read_text(encoding="utf-8", errors="ignore"))
+    )
+
+    assert offenders == [], (
+        "these modules can change a retention variable after start-up, which "
+        f"breaks the documented 'takes a restart' guarantee: {offenders}"
+    )

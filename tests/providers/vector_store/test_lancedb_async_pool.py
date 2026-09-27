@@ -71,6 +71,20 @@ def _run_in_own_loop(coro_factory, results: list, errors: list) -> threading.Thr
     return thread
 
 
+def test_async_connection_installs_the_jieba_dictionary(tmp_path, monkeypatch) -> None:
+    """Placed off the event loop: copying 5 MB would otherwise block it."""
+    from xagent.core.tools.core.RAG_tools.LanceDB import jieba_dictionary
+
+    monkeypatch.setenv("LANCE_LANGUAGE_MODEL_HOME", str(tmp_path / "lm"))
+    monkeypatch.setattr(jieba_dictionary, "_installed", False)
+    connect_async, _ = _slow_connect_async(delay=0)
+
+    with patch.object(lancedb_module.lancedb, "connect_async", connect_async):
+        asyncio.run(get_async_connection_from_env())
+
+    assert (tmp_path / "lm" / "jieba" / "default" / "dict.txt").exists()
+
+
 def test_concurrent_init_from_two_loops_does_not_deadlock() -> None:
     """Two threads, two loops, one uninitialized pool entry: both must return."""
     connect_async, created = _slow_connect_async()

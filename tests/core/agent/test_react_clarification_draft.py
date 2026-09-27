@@ -324,14 +324,11 @@ async def test_marker_survives_trace_serialization_of_a_dirty_interaction_id() -
     to this module's own ``_marker_clean``, so a *core*-side narrowing of
     ``_MARKER_KEEP`` would apply identically on both sides of the comparison
     and never show up as a mismatch. The direct equality assertion below
-    closes that gap by pinning ``_MARKER_KEEP`` against the literal
-    keep-set read out of ``clean_string``'s real source.
+    closes that gap by pinning ``_MARKER_KEEP`` against the actual serializer's
+    behavior for every C0 control character.
     """
 
-    import ast
-    import inspect
     import json
-    import re
 
     from xagent.core.agent.checkpoint import TraceCheckpointStore
     from xagent.core.agent.clarification import _MARKER_KEEP
@@ -416,17 +413,12 @@ async def test_marker_survives_trace_serialization_of_a_dirty_interaction_id() -
 
     assert marker_after == marker_before
 
-    # Direct pin, independent of the before/after comparison above: read
-    # ``clean_string``'s keep-set literal out of the real
-    # ``DatabaseTraceHandler._serialize_data_for_json`` source and assert it
-    # matches ``_MARKER_KEEP`` character-for-character. A core-side edit
-    # that narrows or widens ``_MARKER_KEEP`` shows up here even though it
-    # cannot show up in the before/after comparison.
-    web_source = inspect.getsource(DatabaseTraceHandler._serialize_data_for_json)
-    keep_set_match = re.search(r'char in ("(?:[^"\\]|\\.)*")', web_source)
-    assert keep_set_match is not None, "clean_string keep-set literal not found"
-    web_keep_set = ast.literal_eval(keep_set_match.group(1))
-    assert _MARKER_KEEP == web_keep_set
+    # Pin the actual C0-control behavior rather than the implementation syntax.
+    # This independently detects either side narrowing or widening its keep set.
+    controls = "".join(chr(value) for value in range(32))
+    preserved = handler._serialize_data_for_json({"value": controls})["value"]
+    assert set(preserved) == set(_MARKER_KEEP)
+    assert preserved == "\t\n\r"
 
 
 def test_marker_distinguishes_requests_with_ambiguous_raw_concatenation() -> None:

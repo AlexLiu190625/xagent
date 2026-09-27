@@ -402,3 +402,37 @@ class TestContentCleaner:
 
         assert "cdn.example.test" not in content
         assert "Before." in content and "After." in content
+
+    def test_link_nested_in_emphasis_keeps_the_space_before_it(self):
+        """A link inside bold/italic must not fuse with the word before it."""
+        cleaner = ContentCleaner()
+
+        html = """
+        <html>
+            <body>
+                <p>It can now <b>return to the <a href="/j">Job Board</a></b>, free.</p>
+                <p>Open the <strong>new <a href="/j">Job Board</a></strong> today.</p>
+                <p>Open the <i>new <a href="/j">Job Board</a></i> tonight.</p>
+                <p>Open the <em>new <a href="/j">Job Board</a></em> tomorrow.</p>
+                <p>Open the <span>new <a href="/j">Job Board</a></span> today.</p>
+                <p>Go to <a href="/j">the <b>Job Board</b></a> today.</p>
+                <p>See <a href="/d">docs</a>, then stop.</p>
+                <p>go (<b>see <a href="/d">docs</a></b>) now.</p>
+                <p>点击 <b>保存 <a href="/x">按钮</a></b>，然后继续。</p>
+            </body>
+        </html>
+        """
+
+        content = cleaner.clean_and_convert(html, "https://example.com")[
+            "content_markdown"
+        ]
+
+        assert "**return to the Job Board**, free." in content
+        assert "**new Job Board** today." in content
+        assert "_new Job Board_ tonight." in content
+        assert "_new Job Board_ tomorrow." in content
+        assert "new Job Board today." in content
+        assert "Go to the **Job Board** today." in content
+        assert "See docs, then stop." in content
+        assert "go (**see docs**) now." in content
+        assert "**保存 按钮**，然后继续。" in content

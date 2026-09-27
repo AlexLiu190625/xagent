@@ -16,6 +16,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
 from tests.shared.postgres_disposable import disposable_database_factory
+from tests.web.services.coordinator_command_shared import claim_task_command
 from xagent.web.models.agent import Agent
 from xagent.web.models.database import Base, get_engine, get_session_local, init_db
 from xagent.web.models.task import Task, TaskStatus
@@ -102,7 +103,7 @@ async def host(tmp_path, monkeypatch, database_url):
     get_engine().dispose()
 
 
-def claim(task_id):
+async def claim(task_id):
     with get_session_local()() as db:
         row = (
             db.query(TaskExecutionCommand)
@@ -113,7 +114,7 @@ def claim(task_id):
         return (
             None
             if row is None
-            else task_command_transport.claim_task_command(
+            else await claim_task_command(
                 db, runner_id="worker-1", command_db_id=row.id
             )
         )
@@ -205,7 +206,9 @@ async def test_remote_append_preserves_owner_until_real_finalizer_and_cleanup_ex
     monkeypatch.setattr(task_execution, "execute_task_background", execute)
     first = await create(host)
     assert first.status == TaskStatus.PENDING
-    await task_command_execution.execute_durable_task_command(claim(first.task_id))
+    await task_command_execution.execute_durable_task_command(
+        await claim(first.task_id)
+    )
     await asyncio.wait_for(terminal.wait(), 10)
     script = """
 import asyncio, json, sys
@@ -256,7 +259,9 @@ asyncio.run(main())
         finally:
             await other.close()
         followup = asyncio.create_task(
-            task_command_execution.execute_durable_task_command(claim(first.task_id))
+            task_command_execution.execute_durable_task_command(
+                await claim(first.task_id)
+            )
         )
         await asyncio.sleep(0.1)
         assert not followup.done()
@@ -304,17 +309,100 @@ def test_completion_poll_does_not_contend_with_unrelated_sqlite_writer(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["after_post", "during_post"])
+@pytest.mark.parametrize(
+    "source,failure",
+    [
+        ("sdk", "after_post"),
+        ("sdk", "during_post"),
+        ("sdk", "unknown_result"),
+        ("sdk", "guard_cancel"),
+        ("a2a", "guard_cancel"),
+    ],
+)
 async def test_unknown_reply_returns_original_identity_without_reinjection(
-    host, monkeypatch, failure
+    host, monkeypatch, source, failure
 ):
     ctx = waiting_task(host)
+    if source == "a2a":
+        from uuid import NAMESPACE_URL, uuid5
+
+        with get_session_local()() as db:
+            db.get(Task, ctx.task_id).source = "a2a"
+            db.commit()
+        ctx = replace(
+            ctx,
+            command_id=uuid5(
+                NAMESPACE_URL, f"a2a-reply:{ctx.task_id}:original-reply"
+            ).hex,
+        )
+
+    async def reply(status=TaskStatus.WAITING_FOR_USER):
+        if source == "sdk":
+            return await task_resume.resume_task_reply(replace(ctx, status=status))
+        return await task_resume.resume_a2a_task(
+            agent_id=ctx.agent_id,
+            task_owner_user_id=ctx.task_owner_user_id,
+            task_id=ctx.task_id,
+            previous_run_id=ctx.run_id,
+            resumable_status=TaskStatus.WAITING_FOR_USER,
+            text=ctx.text,
+            message_id="original-reply",
+        )
+
     error = OperationalError(
         "UPDATE tasks", None, RuntimeError("connection interrupted")
     )
-    post = AsyncMock(return_value=True)
-    if failure == "during_post":
-        post.side_effect = error
+    from xagent.core.agent.runner import UserMessageInjectionOutcome
+
+    post = AsyncMock(return_value=UserMessageInjectionOutcome.POSTED_FRESH)
+    cancelled_tasks: list[asyncio.Task] = []
+    if failure == "unknown_result":
+        post.return_value = UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+    elif failure in {"during_post", "guard_cancel"}:
+        from xagent.core.agent.context import ContextManager
+        from xagent.core.agent.registry import ExecutionRegistry
+        from xagent.core.agent.runner import AgentRunner
+
+        execution_id = str(ctx.task_id)
+        manager = ContextManager()
+        manager.create_context(execution_id).add_user_message("original")
+        tracer = SimpleNamespace(
+            load_latest_checkpoint=AsyncMock(return_value=None), checkpoint=AsyncMock()
+        )
+        runner = AgentRunner(
+            SimpleNamespace(llm=None), tracer=tracer, context_manager=manager
+        )
+        registry = ExecutionRegistry()
+        registry.register(execution_id, runner)
+        if failure == "during_post":
+
+            async def write(**payload):
+                tracer.load_latest_checkpoint.side_effect = error
+                raise error
+
+            tracer.checkpoint.side_effect = write
+
+        async def inject(execution_id, **kwargs):
+            return (await registry.post_user_message(execution_id, **kwargs)).outcome
+
+        post.side_effect = inject
+        if failure == "guard_cancel":
+            guard = task_resume.run_while_task_lease_owned
+
+            async def cancel_at_child_completion(operation, heartbeat):
+                parent = asyncio.current_task()
+                cancelled_tasks.append(parent)
+
+                async def child():
+                    value = await operation
+                    parent.cancel()
+                    return value
+
+                return await guard(child(), heartbeat)
+
+            monkeypatch.setattr(
+                task_resume, "run_while_task_lease_owned", cancel_at_child_completion
+            )
     else:
         monkeypatch.setattr(
             task_resume, "_update_reply_input_sync", Mock(side_effect=error)
@@ -327,25 +415,127 @@ async def test_unknown_reply_returns_original_identity_without_reinjection(
     monkeypatch.setattr(
         task_resume.agent_runtime_service, "get_agent_manager", lambda: manager
     )
-    request = asyncio.create_task(task_resume.resume_task_reply(ctx))
+    request = asyncio.create_task(reply())
     try:
         await eventually(lambda: _has_pending(ctx.task_id))
-        command = claim(ctx.task_id)
+        command = await claim(ctx.task_id)
         await task_command_execution.execute_durable_task_command(command)
+        if failure == "guard_cancel":
+            # The real resume_task_reply / resume_a2a_task call site settled
+            # the cancellation as unknown and consumed the request.
+            assert len(cancelled_tasks) == 1
+            assert cancelled_tasks[0].cancelling() == 0
         with pytest.raises(task_resume.TaskResumeOutcomeUnknownError) as unknown:
             await asyncio.wait_for(request, 10)
         assert unknown.value.command_id == ctx.command_id
-        assert (
-            task_resume_command._read_reply_outcome(command.id)["outcome"] == "unknown"
-        )
+        stored = task_resume_command._read_reply_outcome(command.id)
+        assert stored["outcome"] == "unknown"
         with pytest.raises(task_resume.TaskResumeOutcomeUnknownError):
-            await task_resume.resume_task_reply(replace(ctx, status=TaskStatus.RUNNING))
+            await reply(TaskStatus.RUNNING)
         post.assert_awaited_once()
+        if failure not in {"after_post", "guard_cancel"}:
+            # The reply outcome precedes the coordinator's asynchronous idle
+            # release. Observe that release without forcing coordinator shutdown.
+            await eventually(
+                lambda: task_completion._is_run_finished(ctx.task_id, stored["run_id"])
+            )
         with get_session_local()() as db:
             task = db.get(Task, ctx.task_id)
-            assert task.status == TaskStatus.RUNNING
-            assert task.lease_attempt_id is not None
+            if failure in {"after_post", "guard_cancel"}:
+                # The reply was accepted before the handoff was interrupted:
+                # the owner keeps the lease for recovery. It is never paused
+                # as an unknown input.
+                assert task.status == TaskStatus.RUNNING
+                assert task.lease_attempt_id is not None
+            else:
+                assert task.status == TaskStatus.PAUSED
+                assert task.lease_attempt_id is None
             assert db.query(TaskExecutionCommand).count() == 1
+    finally:
+        if not request.done():
+            request.cancel()
+        await asyncio.gather(request, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["sdk", "a2a"])
+async def test_reply_accepted_before_registry_error_is_accepted(
+    host, monkeypatch, source
+):
+    """A post-write registry error cannot turn an accepted reply unknown."""
+    from xagent.core.agent.context import ContextManager
+    from xagent.core.agent.registry import ExecutionRegistry
+    from xagent.core.agent.runner import AgentRunner
+
+    ctx = waiting_task(host)
+    if source == "a2a":
+        with get_session_local()() as db:
+            db.get(Task, ctx.task_id).source = "a2a"
+            db.commit()
+    execution_id = str(ctx.task_id)
+    contexts = ContextManager()
+    contexts.create_context(execution_id).add_user_message("original")
+    tracer = SimpleNamespace(
+        load_latest_checkpoint=AsyncMock(return_value=None), checkpoint=AsyncMock()
+    )
+    runner = AgentRunner(
+        SimpleNamespace(llm=None), tracer=tracer, context_manager=contexts
+    )
+    registry = ExecutionRegistry()
+    registry.register(execution_id, runner)
+    token = registry.subscribe(lambda _: registry.unsubscribe(token))
+
+    async def inject(execution_id, **kwargs):
+        return (await registry.post_user_message(execution_id, **kwargs)).outcome
+
+    post = AsyncMock(side_effect=inject)
+    monkeypatch.setattr(
+        task_resume.agent_runtime_service,
+        "get_agent_manager",
+        lambda: SimpleNamespace(
+            get_agent_for_task=AsyncMock(
+                return_value=SimpleNamespace(post_user_message=post)
+            )
+        ),
+    )
+    scheduled = []
+
+    async def schedule(**kwargs):
+        # Stand in for the resume: take ownership of the heartbeat.
+        scheduled.append(kwargs["task_id"])
+        kwargs["heartbeat_stop"].set()
+        await kwargs["heartbeat_task"]
+
+    monkeypatch.setattr(task_resume, "_schedule_waiting_reply_resume", schedule)
+    monkeypatch.setattr(task_resume, "_schedule_waiting_a2a_resume", schedule)
+
+    async def reply():
+        if source == "sdk":
+            return await task_resume.resume_task_reply(ctx)
+        return await task_resume.resume_a2a_task(
+            agent_id=ctx.agent_id,
+            task_owner_user_id=ctx.task_owner_user_id,
+            task_id=ctx.task_id,
+            previous_run_id=ctx.run_id,
+            resumable_status=TaskStatus.WAITING_FOR_USER,
+            text=ctx.text,
+            message_id="accepted-reply",
+        )
+
+    request = asyncio.create_task(reply())
+    try:
+        await eventually(lambda: _has_pending(ctx.task_id))
+        command = await claim(ctx.task_id)
+        await task_command_execution.execute_durable_task_command(command)
+        await asyncio.wait_for(request, 10)
+        assert (
+            task_resume_command._read_reply_outcome(command.id)["outcome"] == "accepted"
+        )
+        post.assert_awaited_once()
+        assert scheduled == [ctx.task_id]
+        assert contexts.get_context(execution_id).messages[-1].content == ctx.text
+        with get_session_local()() as db:
+            assert db.get(Task, ctx.task_id).status == TaskStatus.RUNNING
     finally:
         if not request.done():
             request.cancel()
@@ -408,7 +598,7 @@ async def test_reply_carries_authenticated_actor_after_agent_owner_transfer(
     command_id = task_resume_command._admit_reply(ctx, "sdk", "", "reply")
     prepare = AsyncMock()
     monkeypatch.setattr(task_resume, "resume_task_reply", prepare)
-    await task_command_execution.execute_durable_task_command(claim(ctx.task_id))
+    await task_command_execution.execute_durable_task_command(await claim(ctx.task_id))
     delivered = prepare.call_args.args[0]
     assert delivered.actor_user_id == actor_id
     assert delivered.task_owner_user_id == host.owner
@@ -442,7 +632,9 @@ async def test_controls_apply_while_execution_is_running(host, monkeypatch):
     from xagent.web.services import task_start_consumer
 
     monkeypatch.setattr(task_start_consumer, "_schedule_committed_turn", schedule)
-    await task_command_execution.execute_durable_task_command(claim(first.task_id))
+    await task_command_execution.execute_durable_task_command(
+        await claim(first.task_id)
+    )
     await asyncio.wait_for(started.wait(), 5)
     with get_session_local()() as db:
         task_command_transport.stage_task_command(
@@ -460,7 +652,10 @@ async def test_controls_apply_while_execution_is_running(host, monkeypatch):
     )
     try:
         await asyncio.wait_for(
-            task_command_execution.execute_durable_task_command(claim(first.task_id)), 2
+            task_command_execution.execute_durable_task_command(
+                await claim(first.task_id)
+            ),
+            2,
         )
         control.assert_awaited_once()
         assert not finish.is_set()
@@ -488,7 +683,7 @@ async def test_shutdown_drains_command_waiting_for_execution_cleanup(host):
     previous = asyncio.create_task(previous_execution())
     coordinator.track_execution(previous)
     await cleanup_entered.wait()
-    command = claim(first.task_id)
+    command = await claim(first.task_id)
     apply = AsyncMock()
     pending = asyncio.create_task(coordinator.execute_command(command, apply))
     await eventually(coordinator._command_lock.locked)
@@ -501,3 +696,162 @@ async def test_shutdown_drains_command_waiting_for_execution_cleanup(host):
     with get_session_local()() as db:
         assert db.get(Task, first.task_id).runner_id is None
         assert db.get(TaskExecutionCommand, command.id).status == "processing"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["start", "resume_input"])
+async def test_real_claim_during_committed_handoff_keeps_lease_and_waits(
+    host, monkeypatch, kind
+):
+    from xagent.web.services import task_command_execution
+    from xagent.web.services import task_command_transport as transport
+    from xagent.web.services import task_coordinator_runtime as runtime
+    from xagent.web.services import task_resume_command, task_start_consumer
+
+    first = await create(host)
+    coordinator = await runtime.get_task_coordinator_registry().ensure(first.task_id)
+    initial = await claim(first.task_id)
+    committed, register, child_end, applied = (asyncio.Event() for _ in range(4))
+
+    async def handoff():
+        result = await asyncio.to_thread(
+            task_start_consumer._commit_handoff, initial, coordinator.lease
+        )
+        assert result.claimed.task_lease is not None
+        committed.set()
+        await register.wait()
+        coordinator.track_execution(asyncio.create_task(child_end.wait()))
+
+    original = asyncio.create_task(coordinator.execute_command(initial, handoff))
+    await asyncio.wait_for(committed.wait(), 5)
+    with get_session_local()() as db:
+        row = db.get(Task, first.task_id)
+        before = (row.run_id, row.runner_id, row.lease_attempt_id)
+        transport.stage_task_command(
+            db,
+            task_id=first.task_id,
+            actor_user_id=host.owner,
+            command_id="competing",
+            kind=transport.TaskCommandKind(kind),
+            payload={},
+            target_run_id=row.run_id,
+        )
+        db.commit()
+    competitor = await claim(first.task_id)
+    assert competitor is not None
+    with get_session_local()() as db:
+        row = db.get(Task, first.task_id)
+        assert (row.run_id, row.runner_id, row.lease_attempt_id) == before
+
+    async def apply(command):
+        applied.set()
+
+    module, name = (
+        (task_start_consumer, "execute_task_start")
+        if kind == "start"
+        else (task_resume_command, "execute_resume_input")
+    )
+    monkeypatch.setattr(module, name, apply)
+    competing = asyncio.create_task(
+        task_command_execution.execute_durable_task_command(competitor)
+    )
+    try:
+        await asyncio.sleep(0.05)
+        assert not applied.is_set()
+        register.set()
+        await original
+        await asyncio.sleep(0.05)
+        assert not applied.is_set()
+        child_end.set()
+        await asyncio.wait_for(competing, 5)
+        assert applied.is_set()
+    finally:
+        register.set()
+        child_end.set()
+        await asyncio.gather(original, competing, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["sdk", "a2a"])
+async def test_proven_absent_reply_replays_retry_with_new_id_for_same_identity(
+    host, monkeypatch, source
+):
+    """A not-accepted reply is settled "busy" with the new-id instruction.
+
+    Retrying the same identity replays that answer without a successor
+    command or a second injection; only a new identity is a new attempt.
+    """
+    from xagent.core.agent.context import ContextManager
+    from xagent.core.agent.runner import AgentRunner
+
+    ctx = waiting_task(host)
+    if source == "a2a":
+        with get_session_local()() as db:
+            db.get(Task, ctx.task_id).source = "a2a"
+            db.commit()
+    execution_id = str(ctx.task_id)
+    contexts = ContextManager()
+    contexts.create_context(execution_id).add_user_message("original")
+    tracer = SimpleNamespace(
+        load_latest_checkpoint=AsyncMock(return_value=None),
+        checkpoint=AsyncMock(side_effect=RuntimeError("lost write")),
+    )
+    runner = AgentRunner(
+        SimpleNamespace(llm=None), tracer=tracer, context_manager=contexts
+    )
+
+    async def inject(execution_id, **kwargs):
+        return (await runner.inject_user_message(execution_id, **kwargs)).outcome
+
+    post = AsyncMock(side_effect=inject)
+    monkeypatch.setattr(
+        task_resume.agent_runtime_service,
+        "get_agent_manager",
+        lambda: SimpleNamespace(
+            get_agent_for_task=AsyncMock(
+                return_value=SimpleNamespace(post_user_message=post)
+            )
+        ),
+    )
+
+    async def reply():
+        if source == "sdk":
+            return await task_resume.resume_task_reply(ctx)
+        return await task_resume.resume_a2a_task(
+            agent_id=ctx.agent_id,
+            task_owner_user_id=ctx.task_owner_user_id,
+            task_id=ctx.task_id,
+            previous_run_id=ctx.run_id,
+            resumable_status=TaskStatus.WAITING_FOR_USER,
+            text=ctx.text,
+            message_id="absent-reply",
+        )
+
+    request = asyncio.create_task(reply())
+    try:
+        await eventually(lambda: _has_pending(ctx.task_id))
+        command = await claim(ctx.task_id)
+        await task_command_execution.execute_durable_task_command(command)
+        with pytest.raises(task_resume.TaskResumeNotAcceptedError):
+            await asyncio.wait_for(request, 10)
+        stored = task_resume_command._read_reply_outcome(command.id)
+        assert stored["outcome"] == "busy"
+        assert stored["retry_with_new_id"] is True
+        await eventually(
+            lambda: task_completion._is_run_finished(ctx.task_id, stored["run_id"])
+        )
+        with get_session_local()() as db:
+            task = db.get(Task, ctx.task_id)
+            assert task.status == TaskStatus.WAITING_FOR_USER
+            assert task.lease_attempt_id is None
+        # The same identity replays the stored answer.
+        with pytest.raises(task_resume.TaskResumeNotAcceptedError):
+            await asyncio.wait_for(reply(), 10)
+        post.assert_awaited_once()
+        assert tracer.checkpoint.await_count == 1
+        with get_session_local()() as db:
+            assert db.query(TaskExecutionCommand).count() == 1
+    finally:
+        if not request.done():
+            request.cancel()
+        await asyncio.gather(request, return_exceptions=True)

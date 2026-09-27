@@ -1,6 +1,7 @@
 import type { TranslationKey } from "@/i18n/translations"
 
 export const CLIENT_ERROR_CODES = [
+  "execution_queue_full",
   "message_processing_failed",
   "task_execution_failed",
   "guidance_in_progress",
@@ -20,6 +21,7 @@ export const CLIENT_ERROR_CODES = [
   "authentication_required",
   "task_access_denied",
   "invalid_message",
+  "message_outcome_unknown",
   "upload_too_large",
   "upload_proxy_error",
   "upload_failed",
@@ -54,6 +56,7 @@ export const CLIENT_ERROR_CODES = [
 export type ClientErrorCode = (typeof CLIENT_ERROR_CODES)[number]
 
 const CLIENT_ERROR_TRANSLATION_KEYS: Record<ClientErrorCode, TranslationKey> = {
+  execution_queue_full: "clientErrors.executionQueueFull",
   message_processing_failed: "clientErrors.messageProcessingFailed",
   task_execution_failed: "clientErrors.taskExecutionFailed",
   guidance_in_progress: "clientErrors.guidanceInProgress",
@@ -73,6 +76,7 @@ const CLIENT_ERROR_TRANSLATION_KEYS: Record<ClientErrorCode, TranslationKey> = {
   authentication_required: "clientErrors.authenticationRequired",
   task_access_denied: "clientErrors.taskAccessDenied",
   invalid_message: "clientErrors.invalidMessage",
+  message_outcome_unknown: "clientErrors.messageOutcomeUnknown",
   upload_too_large: "clientErrors.uploadTooLarge",
   upload_proxy_error: "clientErrors.uploadProxyError",
   upload_failed: "clientErrors.uploadFailed",
@@ -84,6 +88,7 @@ const CLIENT_ERROR_TRANSLATION_KEYS: Record<ClientErrorCode, TranslationKey> = {
 }
 
 const CLIENT_ERROR_FALLBACKS: Record<ClientErrorCode, string> = {
+  execution_queue_full: "The team execution queue is full. Please retry shortly.",
   message_processing_failed: "The message could not be processed. Please try again.",
   task_execution_failed: "Task execution failed.",
   guidance_in_progress: "A previous guidance message is still being applied. Please wait for it to finish.",
@@ -103,6 +108,7 @@ const CLIENT_ERROR_FALLBACKS: Record<ClientErrorCode, string> = {
   authentication_required: "Authentication is required to send this message.",
   task_access_denied: "You do not have access to this task.",
   invalid_message: "The message format is invalid.",
+  message_outcome_unknown: "The message may or may not have been applied. Check the conversation before sending it again.",
   upload_too_large: "File is too large. Please reduce the upload size and try again.",
   upload_proxy_error: "Upload failed before reaching the application. Please check the server upload limit.",
   upload_failed: "Upload failed. Please try again.",

@@ -41,6 +41,7 @@ class PendingUserResponse:
     answer: str
     question: str
     message_type: str
+    step_id: str | None = None
 
 
 def pending_user_response(message: Any) -> PendingUserResponse | None:
@@ -69,7 +70,9 @@ def pending_user_response(message: Any) -> PendingUserResponse | None:
         answer = getattr(message, "content", "")
     if not isinstance(answer, str):
         return None
-    return PendingUserResponse(answer, question, message_type)
+    raw_step_id = marker.get("step_id")
+    step_id = raw_step_id if isinstance(raw_step_id, str) and raw_step_id else None
+    return PendingUserResponse(answer, question, message_type, step_id)
 
 
 def pending_user_response_lifecycle(message: Any) -> dict[str, Any] | None:
@@ -89,12 +92,19 @@ def pending_user_response_lifecycle(message: Any) -> dict[str, Any] | None:
     return marker
 
 
-def latest_pending_user_response(context: Any) -> PendingUserResponse | None:
-    for message in reversed(getattr(context, "messages", []) or []):
+def pending_user_responses(context: Any) -> list[PendingUserResponse]:
+    """Every answered waiting question in the context, in message order."""
+    responses = []
+    for message in getattr(context, "messages", []) or []:
         response = pending_user_response(message)
         if response is not None:
-            return response
-    return None
+            responses.append(response)
+    return responses
+
+
+def latest_pending_user_response(context: Any) -> PendingUserResponse | None:
+    responses = pending_user_responses(context)
+    return responses[-1] if responses else None
 
 
 def pending_user_response_marker(waiting_request: Any) -> dict[str, Any] | None:

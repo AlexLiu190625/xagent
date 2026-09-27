@@ -162,6 +162,12 @@ class AgentExecutionAdapter:
         # Carry the mid-run quota checker into the resumed run too, so a
         # paused-and-resumed continuation is gated like a fresh run.
         kwargs.setdefault("interrupt_checker", self.config.interrupt_checker)
+        # The handle may have been built by post_user_message before the
+        # host installed the outbound handler, so re-read it from config
+        # for the resumed run (#1328).
+        kwargs.setdefault(
+            "outbound_message_handler", self.config.outbound_message_handler
+        )
         resume_metadata = dict(kwargs.get("metadata") or {})
         preferred_modalities = normalize_input_modalities(
             self.config.preferred_input_modalities
@@ -179,6 +185,9 @@ class AgentExecutionAdapter:
                 metadata=self._execution_metadata(execution_type=execution_type),
             )
         else:
+            # AgentService may have rebuilt the tool objects after a connection
+            # or policy change. A paused runner still holds the previous list.
+            handle.runner.agent.tools = self.config.tools
             execution_type = str(
                 handle.metadata.get("execution_type") or self._execution_type()
             )
@@ -333,6 +342,12 @@ class AgentExecutionAdapter:
         if self.config.pattern == "single_call":
             return (
                 ReActPattern(
+                    # Two counted iterations: the tool call and the answer.
+                    # Each stored-result read on the forced answer turn, and
+                    # each read refused there because its path is not a
+                    # stored result, adds one more on top
+                    # (forced_answer_extra_iterations), so a read does not use
+                    # up the answer's iteration.
                     max_iterations=2,
                     finalize_after_tool_result=True,
                     tool_parallel_enabled=self.config.tool_parallel_enabled,
@@ -440,11 +455,16 @@ class AgentExecutionAdapter:
                 "task_id": execution_id,
             },
             "agent_result": result,
+            "injection_outcome_unknown": result.get("injection_outcome_unknown", False),
         }
         completion_outcome = result.get("completion_outcome")
         if completion_outcome in {"completed", "partial", "blocked"}:
             normalized["completion_outcome"] = completion_outcome
             normalized["metadata"]["completion_outcome"] = completion_outcome
+        termination_reason = result.get("termination_reason")
+        if termination_reason in ("max_iterations", "step_failed"):
+            normalized["termination_reason"] = termination_reason
+            normalized["metadata"]["termination_reason"] = termination_reason
         if status == "waiting_for_user":
             message = str(result.get("message") or output or "")
             interactions = result.get("interactions")

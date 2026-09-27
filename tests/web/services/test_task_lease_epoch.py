@@ -6,10 +6,8 @@ from datetime import timedelta
 import pytest
 from sqlalchemy.orm import sessionmaker
 
-from tests.web.services.test_task_execution_event_store import engine as engine_fixture
-from tests.web.services.test_task_execution_event_store import (
-    task_id as task_id_fixture,
-)
+from tests.web.services.task_database_shared import engine as engine_fixture
+from tests.web.services.task_database_shared import task_id as task_id_fixture
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.services import agent_service_manager as agent_runtime_service
 from xagent.web.services import task_execution as task_execution_service
@@ -29,6 +27,22 @@ def lease_database(engine, task_id, monkeypatch):
         "xagent.web.services.trace_handlers.get_db", lambda: iter([factory()])
     )
     return factory, task_id
+
+
+def test_failed_release_rolls_back_work_staged_with_it(lease_database):
+    factory, tid = lease_database
+    with factory() as db:
+        old = leases.acquire_task_lease(db, tid, runner_id="worker", new_run=True)
+        leases.acquire_task_lease(
+            db, tid, runner_id="worker", expected_run_id=old.run_id
+        )
+        before = db.get(Task, tid).title
+    with factory() as db:
+        db.get(Task, tid).title = "staged by a superseded holder"
+        db.flush()
+        assert not leases.release_task_lease(db, old, status=TaskStatus.PAUSED)
+    with factory() as db:
+        assert db.get(Task, tid).title == before
 
 
 @pytest.mark.parametrize("change", ["none", "state_version", "expired", "waiting"])

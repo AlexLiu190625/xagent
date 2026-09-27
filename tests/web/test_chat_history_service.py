@@ -21,6 +21,7 @@ from xagent.web.services.chat_history_service import (
     DELIVERY_COMPLETED,
     DELIVERY_DISPATCHED,
     DELIVERY_FAILED,
+    DELIVERY_OUTCOME_UNKNOWN,
     claim_user_message_delivery,
     get_latest_waiting_question,
     inspect_user_message_delivery,
@@ -1090,3 +1091,33 @@ def test_persist_user_message_preserves_empty_attachments_list_as_empty_list():
         assert row.attachments == []  # not None
     finally:
         db_session.close()
+
+
+@pytest.mark.parametrize(
+    "later_status", [DELIVERY_DISPATCHED, DELIVERY_COMPLETED, DELIVERY_FAILED]
+)
+def test_unknown_delivery_cannot_be_overwritten_by_task_result(later_status):
+    db = _create_db_session()
+    try:
+        task = _create_task(db)
+        claim_user_message_delivery(
+            db,
+            int(task.id),
+            int(task.user_id),
+            "uncertain input",
+            turn_id="unknown-turn",
+        )
+        mark_user_message_delivery(
+            db,
+            task_id=int(task.id),
+            turn_id="unknown-turn",
+            status=DELIVERY_OUTCOME_UNKNOWN,
+        )
+        db.commit()
+        result = mark_user_message_delivery(
+            db, task_id=int(task.id), turn_id="unknown-turn", status=later_status
+        )
+        assert result.outcome == "conflict"
+        assert result.status == DELIVERY_OUTCOME_UNKNOWN
+    finally:
+        db.close()

@@ -25,6 +25,15 @@ from ..models.uploaded_file import UploadedFile
 from ..models.user import User
 from ..schemas.user import UserListResponse, UserResponse
 from ..services.model_store import ModelStore
+from ..services.task_cleanup_obligations import (
+    CleanupObligation,
+    RecordedCleanupObligation,
+    describe_cleanup_failure,
+    extension_obligation,
+    record_cleanup_obligations_no_commit,
+    settle_cleanup_attempts_sync,
+    workspace_obligation,
+)
 from ..services.task_interaction_schema import interaction_requests_table_exists
 from ..services.task_runtime import (
     TaskRuntimeExtensionError,
@@ -32,6 +41,12 @@ from ..services.task_runtime import (
     registered_task_extensions,
     store_task_extension_bindings,
     task_extension_bindings_from_agent_config,
+)
+from ..services.task_workspace_cleanup import (
+    WorkspaceCleanupTarget,
+    capture_workspace_cleanup_target_best_effort,
+    remove_task_workspace,
+    unscoped_workspace_cleanup_target,
 )
 from ..services.user_admin_scope import hidden_user_ids
 
@@ -210,8 +225,91 @@ def _record_settled_bindings_sync(
         record_db.close()
 
 
-def _delete_user_rows_sync(*, user_id: int) -> bool:
-    """Delete one user and every row it owns in an operation-local session."""
+def _capture_page_workspace_targets_sync(
+    task_rows: list[tuple[int, int, str | None, object]],
+) -> tuple[list[WorkspaceCleanupTarget], set[int]]:
+    """Capture one page's cleanup targets, and count the ones that failed.
+
+    A task whose scope will not resolve loses only its own directory; it must
+    not cost the account's other workspaces or the deletion itself. The count
+    is returned rather than swallowed because a dropped target is a directory
+    nothing downstream can find: reporting the account as fully cleaned would
+    make the response silent in exactly the case it is meant to surface.
+
+    One resolution per task, which is a read per task on a path that is already
+    O(tasks) -- and the reason this runs in a worker thread rather than on the
+    event loop. Reusing the ``agent_config`` this page already read would avoid
+    the per-task read; see #2598.
+    """
+
+    targets: list[WorkspaceCleanupTarget] = []
+    dropped: set[int] = set()
+    for task_id, task_user_id, _source, _agent_config in task_rows:
+        target = capture_workspace_cleanup_target_best_effort(
+            int(task_id),
+            int(task_user_id),
+            # Many tasks, so no single activated scope can be theirs.
+            prefer_active_scope=False,
+        )
+        if target is None:
+            # Degrade to the unscoped candidates rather than abandoning the
+            # task: that is the set the task-level path falls back to when it
+            # re-captures after the row is gone, so both paths reclaim the same
+            # directories. Still counted as dropped -- what these candidates
+            # cannot name is a workspace under a scope segment, which is
+            # precisely the leak the failed capture predicts.
+            dropped.add(int(task_id))
+            targets.append(
+                unscoped_workspace_cleanup_target(int(task_id), int(task_user_id))
+            )
+        else:
+            targets.append(target)
+    return targets, dropped
+
+
+def _remove_workspaces_sync(
+    *, targets: list[WorkspaceCleanupTarget], user_id: int
+) -> dict[int, str]:
+    """Remove the captured workspaces, returning the error for each left behind.
+
+    Runs after the rows are committed as deleted, so nothing here can fail the
+    request: a raised error would tell the admin the account still exists.
+    What it could not remove stays owed -- the obligation was recorded with the
+    deletion -- and the retry driver takes it from there.
+    """
+
+    failures: dict[int, str] = {}
+    for target in targets:
+        try:
+            remove_task_workspace(target)
+        except Exception as exc:
+            failures[target.task_id] = describe_cleanup_failure(exc)
+            logger.error(
+                "User %s was deleted but the workspace of task %s could not be "
+                "removed; the retry driver will re-attempt it",
+                user_id,
+                target.task_id,
+                exc_info=True,
+            )
+    return failures
+
+
+def _delete_user_rows_sync(
+    *,
+    user_id: int,
+    workspaces: list[CleanupObligation] | None = None,
+    extensions: list[CleanupObligation] | None = None,
+) -> list[RecordedCleanupObligation] | None:
+    """Delete one user and every row it owns in an operation-local session.
+
+    The external cleanup the deleted tasks will owe commits with the rows, so
+    a crash before the workspaces are removed still leaves it on record. The
+    recorded workspace obligations are returned for the caller to settle after
+    its inline removal, and are not due for the retry driver before then; the
+    extensions are nothing this caller will attempt, so they are due at once.
+
+    Returns ``None`` when the user no longer exists.
+    """
 
     from ..models.auto_model import AutoModelCandidate, AutoModelConfig
     from ..models.mcp import UserMCPServer
@@ -224,7 +322,7 @@ def _delete_user_rows_sync(*, user_id: int) -> bool:
     try:
         user = delete_db.query(User).filter(User.id == user_id).first()
         if user is None:
-            return False
+            return None
 
         # Existing deployments may still have the removed Text2SQL table. Clean
         # it up by table name so user deletion keeps working under strict FKs.
@@ -275,9 +373,13 @@ def _delete_user_rows_sync(*, user_id: int) -> bool:
             changed_configs.add(int(config.id))
             delete_db.delete(candidate)
         ModelStore(delete_db).refresh_auto_model_abilities(list(changed_configs))
+        recorded = record_cleanup_obligations_no_commit(
+            delete_db, workspaces or (), inline_attempt=True
+        )
+        record_cleanup_obligations_no_commit(delete_db, extensions or ())
         delete_db.commit()
         ModelStore(delete_db).invalidate_after_user_delete()
-        return True
+        return recorded
     except Exception:
         delete_db.rollback()
         raise
@@ -334,7 +436,7 @@ async def delete_user(
     user_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-) -> dict[str, str]:
+) -> dict[str, object]:
     """Delete a user (admin only)"""
     if not current_user.is_admin:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -353,105 +455,205 @@ async def delete_user(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    if registered_task_extensions():
-        session_factory = get_session_local()
-        cleanup_semaphore = asyncio.Semaphore(_TASK_RUNTIME_DELETE_CONCURRENCY)
+    # Captured while the rows still exist, because a workspace's base
+    # directory comes from its task's execution scope and that scope is only
+    # readable from the row. Removal happens after the deletion commits, at
+    # the bottom of this function: every exit between here and there leaves
+    # the account alive, and a workspace removed on one of those paths would
+    # be destroying a live user's files.
+    #
+    # One walk serves both. Where a provider is registered this is the walk
+    # that cleanup already ran, and a second pass would double an unbounded
+    # admin path's page SELECTs. Where none is registered there was no walk at
+    # all before, and this is a new cost: enumerating the account's tasks is
+    # the only way to name the directories they own. #2598 removes the
+    # per-task read that cost currently carries.
+    #
+    # This does weaken the walk's own "keyset pages bound memory" property: the
+    # targets outlive their page, so the list is O(tasks). It is the narrowest
+    # thing that can be held -- an id, an owner and the base dirs, no row --
+    # and it is held because removal cannot happen until the deletion commits,
+    # by which point no page can be re-read.
+    workspace_targets: list[WorkspaceCleanupTarget] = []
+    workspace_capture_failures: set[int] = set()
+    # Bindings whose provider is not registered in this process: nothing here
+    # can release them, so they are recorded and stay owed until one can.
+    extensions_owed: list[CleanupObligation] = []
+    extension_cleanup_required = bool(registered_task_extensions())
+    session_factory = get_session_local()
+    cleanup_semaphore = asyncio.Semaphore(_TASK_RUNTIME_DELETE_CONCURRENCY)
 
-        async def _cleanup_context(
-            context: TaskRuntimeContext,
-            bound_extensions: tuple[str, ...],
-        ) -> tuple[str, ...]:
-            async with cleanup_semaphore:
-                return await delete_task_extensions(
-                    context,
-                    bound_extensions=bound_extensions,
-                )
-
-        # Keyset pages bound memory and gather fan-out without growing a NOT IN
-        # parameter list. New tasks receive higher ids and are picked up by the
-        # next page after provider cleanup awaits external systems.
-        last_seen_task_id = 0
-        while True:
-            release_db_connection_if_clean(db)
-            task_rows = await asyncio.to_thread(
-                _load_task_page_sync,
-                user_id=user_id,
-                last_seen_task_id=last_seen_task_id,
-                page_size=_TASK_RUNTIME_DELETE_PAGE_SIZE,
+    async def _cleanup_context(
+        context: TaskRuntimeContext,
+        bound_extensions: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        async with cleanup_semaphore:
+            return await delete_task_extensions(
+                context,
+                bound_extensions=bound_extensions,
             )
-            if not task_rows:
-                break
-            last_seen_task_id = max(int(row[0]) for row in task_rows)
-            page = [
-                (
-                    TaskRuntimeContext(
-                        task_id=int(task_id),
-                        user_id=int(task_user_id),
-                        source=str(source) if source is not None else None,
-                        session_factory=session_factory,
-                    ),
-                    task_extension_bindings_from_agent_config(agent_config),
+
+    # Keyset pages bound memory and gather fan-out without growing a NOT IN
+    # parameter list. New tasks receive higher ids and are picked up by the
+    # next page after provider cleanup awaits external systems.
+    last_seen_task_id = 0
+    while True:
+        release_db_connection_if_clean(db)
+        task_rows = await asyncio.to_thread(
+            _load_task_page_sync,
+            user_id=user_id,
+            last_seen_task_id=last_seen_task_id,
+            page_size=_TASK_RUNTIME_DELETE_PAGE_SIZE,
+        )
+        if not task_rows:
+            break
+        last_seen_task_id = max(int(row[0]) for row in task_rows)
+        page_targets, page_dropped = await asyncio.to_thread(
+            _capture_page_workspace_targets_sync, task_rows
+        )
+        workspace_targets.extend(page_targets)
+        workspace_capture_failures |= page_dropped
+        if not extension_cleanup_required:
+            # No provider is registered in this process, so none can be
+            # dispatched -- but a bound task's provider state still exists
+            # wherever that provider keeps it. Owed, like any binding whose
+            # provider is not registered, rather than dropped with the rows.
+            extensions_owed.extend(
+                extension_obligation(
+                    task_id=int(task_id),
+                    user_id=int(task_user_id),
+                    source=source,
+                    extension=name,
                 )
                 for task_id, task_user_id, source, agent_config in task_rows
-            ]
-            # Tasks with no binding record own nothing in any provider; skip
-            # them entirely so a broken extension cannot block the account.
-            bound_page = [(context, bindings) for context, bindings in page if bindings]
-            if not bound_page:
-                continue
-            release_db_connection_if_clean(db)
-            cleanup_results = await asyncio.gather(
-                *(
-                    _cleanup_context(context, bindings)
-                    for context, bindings in bound_page
-                ),
-                return_exceptions=True,
+                for name in task_extension_bindings_from_agent_config(agent_config)
             )
-            for result in cleanup_results:
-                if isinstance(result, asyncio.CancelledError):
-                    raise result
+            continue
+        page = [
+            (
+                TaskRuntimeContext(
+                    task_id=int(task_id),
+                    user_id=int(task_user_id),
+                    source=str(source) if source is not None else None,
+                    session_factory=session_factory,
+                ),
+                task_extension_bindings_from_agent_config(agent_config),
+            )
+            for task_id, task_user_id, source, agent_config in task_rows
+        ]
+        # Tasks with no binding record own nothing in any provider; skip
+        # them entirely so a broken extension cannot block the account.
+        bound_page = [(context, bindings) for context, bindings in page if bindings]
+        if not bound_page:
+            continue
+        release_db_connection_if_clean(db)
+        cleanup_results = await asyncio.gather(
+            *(_cleanup_context(context, bindings) for context, bindings in bound_page),
+            return_exceptions=True,
+        )
+        for result in cleanup_results:
+            if isinstance(result, asyncio.CancelledError):
+                raise result
 
-            # Narrow every task's binding record to what is still held before
-            # deciding whether to abort. Without this, a failure on a later page
-            # would leave earlier pages' tasks with released provider bindings,
-            # no DB-visible marker, and a retry that re-dispatches them.
-            settled: list[tuple[int, tuple[str, ...]]] = []
-            cleanup_failures: list[tuple[int, BaseException]] = []
-            for (context, _bindings), result in zip(
-                bound_page, cleanup_results, strict=True
-            ):
-                if isinstance(result, TaskRuntimeExtensionError):
-                    settled.append((context.task_id, result.unreleased_extensions))
-                    cleanup_failures.append((context.task_id, result))
-                elif isinstance(result, BaseException):
-                    # Unknown failure: assume nothing was released.
-                    cleanup_failures.append((context.task_id, result))
-                else:
-                    settled.append((context.task_id, tuple(result)))
-            await asyncio.to_thread(_record_settled_bindings_sync, settled=settled)
-
-            if cleanup_failures:
-                for failed_task_id, failure in cleanup_failures:
-                    logger.error(
-                        "Runtime extension cleanup failed; preserving user %s "
-                        "and task %s for retry: %s",
-                        user_id,
-                        failed_task_id,
-                        failure,
+        # Narrow every task's binding record to what is still held before
+        # deciding whether to abort. Without this, a failure on a later page
+        # would leave earlier pages' tasks with released provider bindings,
+        # no DB-visible marker, and a retry that re-dispatches them.
+        settled: list[tuple[int, tuple[str, ...]]] = []
+        cleanup_failures: list[tuple[int, BaseException]] = []
+        for (context, _bindings), result in zip(
+            bound_page, cleanup_results, strict=True
+        ):
+            if isinstance(result, TaskRuntimeExtensionError):
+                settled.append((context.task_id, result.unreleased_extensions))
+                cleanup_failures.append((context.task_id, result))
+            elif isinstance(result, BaseException):
+                # Unknown failure: assume nothing was released.
+                cleanup_failures.append((context.task_id, result))
+            else:
+                settled.append((context.task_id, tuple(result)))
+                extensions_owed.extend(
+                    extension_obligation(
+                        task_id=context.task_id,
+                        user_id=context.user_id,
+                        source=context.source,
+                        extension=name,
                     )
-                raise HTTPException(
-                    status_code=503,
-                    detail=(
-                        "Runtime extension cleanup failed; the user was not deleted"
-                    ),
+                    for name in result
                 )
+        await asyncio.to_thread(_record_settled_bindings_sync, settled=settled)
+
+        if cleanup_failures:
+            for failed_task_id, failure in cleanup_failures:
+                logger.error(
+                    "Runtime extension cleanup failed; preserving user %s "
+                    "and task %s for retry: %s",
+                    user_id,
+                    failed_task_id,
+                    failure,
+                )
+            raise HTTPException(
+                status_code=503,
+                detail=("Runtime extension cleanup failed; the user was not deleted"),
+            )
 
     # The rest of user deletion is synchronous ORM/DBAPI work whose cost scales
     # with the user's task count. Run it in a worker thread and in its own
     # session so an admin deleting a large account cannot stall the event loop.
+    # A task whose scope did not resolve is recorded with the unscoped
+    # candidates and marked, so that clearing them ends on the operator's list
+    # rather than passing for a full cleanup.
+    workspaces_owed = [
+        workspace_obligation(
+            target, scope_resolved=target.task_id not in workspace_capture_failures
+        )
+        for target in workspace_targets
+    ]
+
     release_db_connection_if_clean(db)
-    deleted = await asyncio.to_thread(_delete_user_rows_sync, user_id=user_id)
-    if not deleted:
+    recorded_workspaces = await asyncio.to_thread(
+        _delete_user_rows_sync,
+        user_id=user_id,
+        workspaces=workspaces_owed,
+        extensions=extensions_owed,
+    )
+    if recorded_workspaces is None:
         raise HTTPException(status_code=404, detail="User not found")
 
-    return {"message": "User deleted successfully"}
+    removal_failures = await asyncio.to_thread(
+        _remove_workspaces_sync, targets=workspace_targets, user_id=user_id
+    )
+    # Task ids rather than a count: pending is whatever is still owed after
+    # settling, whichever of a failed removal or an unresolved scope made it so.
+    statuses = await asyncio.to_thread(
+        settle_cleanup_attempts_sync,
+        session_factory,
+        [(owed, removal_failures.get(owed.task_id)) for owed in recorded_workspaces],
+    )
+    pending = {
+        owed.task_id
+        for owed, status in zip(recorded_workspaces, statuses, strict=True)
+        if status is not None
+    }
+
+    if pending:
+        logger.error(
+            "User %s was deleted with %d of %d task workspace(s) left on disk",
+            user_id,
+            len(pending),
+            len(workspace_targets),
+        )
+
+    return {
+        "message": "User deleted successfully",
+        # Always present, for the same reason as on the task-level delete: the
+        # account really was deleted, so failing the request would be a lie,
+        # and an admin who is told only "deleted" has no way to learn that
+        # directories are still on disk. A bool, not the count, so the field
+        # means the same thing on both endpoints; the count is in the log line
+        # above, which is where an operator reconciling them is looking.
+        "workspace_cleanup_pending": bool(pending),
+        # The workspaces or any runtime-extension state still owed, as on the
+        # task-level delete.
+        "external_cleanup_pending": bool(pending) or bool(extensions_owed),
+    }

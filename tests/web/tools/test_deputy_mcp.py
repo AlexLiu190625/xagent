@@ -2,6 +2,7 @@ import json
 from unittest.mock import Mock
 
 import pytest
+import requests
 
 from xagent.web.tools.mcp import deputy
 from xagent.web.tools.mcp import utils as mcp_utils
@@ -425,6 +426,64 @@ def test_get_resource_rejects_invalid_ids_without_raising(
 
 
 # ---------------------------------------------------------------------------
+# deputy_resource_info
+# ---------------------------------------------------------------------------
+
+
+def test_resource_info_returns_field_metadata(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"FirstName": {"type": "String", "required": True}}
+        )
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(deputy.deputy_resource_info("Employee"))
+
+    assert result["status"] == "success"
+    assert result["info"] == {"FirstName": {"type": "String", "required": True}}
+    assert mock_request.call_args.kwargs["url"] == (
+        "https://acme.au.deputy.com/api/v1/resource/Employee/INFO"
+    )
+    assert mock_request.call_args.kwargs["method"] == "GET"
+
+
+def test_resource_info_returns_error_on_failure(monkeypatch):
+    monkeypatch.setattr(
+        deputy.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=404, json_data={"error": "gone"})),
+    )
+
+    result = json.loads(deputy.deputy_resource_info("Employee"))
+
+    assert result["status"] == "error"
+    assert "gone" in result["message"]
+
+
+def test_resource_info_rejects_non_dict_response(monkeypatch):
+    monkeypatch.setattr(
+        deputy.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=["unexpected"])),
+    )
+
+    result = json.loads(deputy.deputy_resource_info("Employee"))
+
+    assert result["status"] == "error"
+
+
+def test_resource_info_rejects_invalid_resource_without_raising(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(deputy.deputy_resource_info(" Employee"))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # deputy_query_resource
 # ---------------------------------------------------------------------------
 
@@ -544,6 +603,766 @@ def test_query_resource_rejects_surrounding_whitespace_resource_without_raising(
 
 
 # ---------------------------------------------------------------------------
+# deputy_create_resource
+# ---------------------------------------------------------------------------
+
+
+def test_create_resource_sends_data_and_returns_record(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"Id": 123, "FirstName": "Peter"})
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(deputy.deputy_create_resource("Roster", {"FirstName": "Peter"}))
+
+    assert result["status"] == "success"
+    assert result["record"] == {"Id": 123, "FirstName": "Peter"}
+    create_call = mock_request.call_args_list[0]
+    assert create_call.kwargs["url"] == (
+        "https://acme.au.deputy.com/api/v1/resource/Roster"
+    )
+    assert create_call.kwargs["method"] == "POST"
+    assert create_call.kwargs["json"] == {"FirstName": "Peter"}
+    # The successful create is read back to confirm it's really there
+    # before reporting success (see _verify_created_record).
+    verify_call = mock_request.call_args_list[1]
+    assert verify_call.kwargs["url"] == (
+        "https://acme.au.deputy.com/api/v1/resource/Roster/123"
+    )
+    assert verify_call.kwargs["method"] == "GET"
+
+
+def test_create_resource_rejects_employee_without_calling_api(monkeypatch):
+    """Employee must go through deputy_add_employee instead: a bare
+    POST /resource/Employee inserts a row with no location/workplace
+    membership, which Deputy's permission model then hides from list/get
+    calls (403 "Access to object denied") even though the write itself
+    succeeded and returned an id -- see incident from 2026-09-21."""
+    mock_request = Mock()
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(
+        deputy.deputy_create_resource("Employee", {"FirstName": "Peter"})
+    )
+
+    assert result["status"] == "error"
+    assert "deputy_add_employee" in result["message"]
+    mock_request.assert_not_called()
+
+
+@pytest.mark.parametrize("resource", ["employee", "EMPLOYEE", " Employee", "Employee "])
+def test_create_resource_rejects_employee_regardless_of_case_or_whitespace(
+    monkeypatch, resource
+):
+    """The guard must not be an exact-string match a caller can bypass by
+    guessing a different casing -- that would silently fall through to a
+    live POST and reproduce the exact incident this rejection exists to
+    prevent."""
+    mock_request = Mock()
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(deputy.deputy_create_resource(resource, {"FirstName": "Peter"}))
+
+    assert result["status"] == "error"
+    assert "deputy_add_employee" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_create_resource_returns_error_on_failure(monkeypatch):
+    monkeypatch.setattr(
+        deputy.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=400, json_data={"error": "invalid field"}
+            )
+        ),
+    )
+
+    result = json.loads(deputy.deputy_create_resource("Roster", {"Bad": "x"}))
+
+    assert result["status"] == "error"
+    assert "invalid field" in result["message"]
+
+
+def test_create_resource_rejects_non_dict_response(monkeypatch):
+    monkeypatch.setattr(
+        deputy.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=["unexpected"])),
+    )
+
+    result = json.loads(deputy.deputy_create_resource("Roster", {"FirstName": "P"}))
+
+    assert result["status"] == "error"
+
+
+def test_create_resource_rejects_invalid_resource_without_raising(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(deputy.deputy_create_resource(" Roster", {"FirstName": "P"}))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_create_resource_rejects_empty_data_without_calling_api(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(deputy.deputy_create_resource("Roster", {}))
+
+    assert result["status"] == "error"
+    assert "No data provided" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_create_resource_strips_caller_supplied_id(monkeypatch):
+    """ "Id" is server-assigned on create; a caller-supplied value must not
+    be forwarded, since whether Deputy would honor, ignore, or reject a
+    client-chosen id is undocumented."""
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"Id": 123, "FirstName": "Peter"})
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    deputy.deputy_create_resource("Roster", {"Id": 999, "FirstName": "Peter"})
+
+    assert mock_request.call_args_list[0].kwargs["json"] == {"FirstName": "Peter"}
+
+
+def test_create_resource_rejects_id_only_data_without_calling_api(monkeypatch):
+    """An "Id"-only data dict has nothing left to create once "Id" is
+    stripped -- must be rejected the same as genuinely empty data, not
+    silently posted as an empty body."""
+    mock_request = Mock()
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(deputy.deputy_create_resource("Roster", {"Id": 999}))
+
+    assert result["status"] == "error"
+    assert "No data provided" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_create_resource_warns_instead_of_confident_success_on_empty_response(
+    monkeypatch,
+):
+    """A 204/empty response (_request normalizes both to {}) after an
+    otherwise-successful POST means the record may exist with no id to
+    confirm or safely retry against -- must not be reported as a plain,
+    confident success with no signal that the id is unknown."""
+    monkeypatch.setattr(
+        deputy.requests, "request", Mock(return_value=MockResponse(status_code=204))
+    )
+
+    result = json.loads(deputy.deputy_create_resource("Roster", {"FirstName": "Peter"}))
+
+    assert result["status"] == "success"
+    assert result["record"] == {}
+    assert "warning" in result
+    assert "deputy_query_resource" in result["warning"]
+
+
+def test_create_resource_downgrades_to_warning_when_readback_fails(monkeypatch):
+    """Deputy's create response is not trusted at face value: a
+    2026-09-21 incident saw Deputy return a fully-formed 200 success body
+    for a record that turned out to be permission-orphaned and
+    unreadable. If the post-create readback errors, the create result
+    must still come back (nothing here says the create itself failed),
+    but flagged as unconfirmed rather than a plain success."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Id": 123, "FirstName": "Peter"}),
+            MockResponse(
+                status_code=403,
+                json_data={"error": {"message": "Access to object denied"}},
+            ),
+        ]
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(deputy.deputy_create_resource("Roster", {"FirstName": "Peter"}))
+
+    assert result["status"] == "success"
+    assert result["record"] == {"Id": 123, "FirstName": "Peter"}
+    assert "warning" in result
+    assert "123" in result["warning"]
+    assert mock_request.call_count == 2
+
+
+def test_create_resource_returns_the_freshly_read_record_when_verified(monkeypatch):
+    """A verified create returns what the readback GET actually found, not
+    the stale POST response -- since a full GET is already being paid for
+    to verify existence, prefer it over data Deputy may have normalized or
+    defaulted differently by the time it's read back."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Id": 123, "FirstName": "Peter"}),
+            MockResponse(json_data={"Id": 123, "FirstName": "Peter", "Active": True}),
+        ]
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(deputy.deputy_create_resource("Roster", {"FirstName": "Peter"}))
+
+    assert result["status"] == "success"
+    assert result["record"] == {"Id": 123, "FirstName": "Peter", "Active": True}
+    assert "warning" not in result
+
+
+def test_create_resource_downgrades_to_warning_when_readback_returns_empty(
+    monkeypatch,
+):
+    """A readback that succeeds but comes back empty (Deputy's own {}
+    normalization for a 204/empty body) is just as unconfirmed as one
+    that errors outright -- must not be silently treated as verified."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Id": 123, "FirstName": "Peter"}),
+            MockResponse(status_code=204),
+        ]
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(deputy.deputy_create_resource("Roster", {"FirstName": "Peter"}))
+
+    assert result["status"] == "success"
+    assert "warning" in result
+    assert "returned no record" in result["warning"]
+
+
+def test_create_resource_warning_distinguishes_unexpected_shape_from_empty(
+    monkeypatch,
+):
+    """A readback that succeeds and returns *something* -- just not a
+    record (e.g. a list) -- is a different, more informative diagnostic
+    than a plain empty response; the warning text must say so rather than
+    claiming "no record" when something was in fact returned."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Id": 123, "FirstName": "Peter"}),
+            MockResponse(json_data=["unexpected", "list"]),
+        ]
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(deputy.deputy_create_resource("Roster", {"FirstName": "Peter"}))
+
+    assert result["status"] == "success"
+    assert "unexpected response shape" in result["warning"]
+    assert "no record" not in result["warning"]
+
+
+def test_create_resource_warns_when_response_has_no_id(monkeypatch):
+    """Nothing to read back without an id -- must not raise or attempt a
+    verification call, but also must not be silently treated as a clean
+    success: a non-empty create response missing the one field this
+    check relies on is exactly the same "can't confirm this succeeded"
+    situation as a present-but-unreadable one, just shaped differently."""
+    mock_request = Mock(return_value=MockResponse(json_data={"FirstName": "Peter"}))
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(deputy.deputy_create_resource("Roster", {"FirstName": "Peter"}))
+
+    assert result["status"] == "success"
+    assert "warning" in result
+    assert "no Id" in result["warning"]
+    mock_request.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# deputy_add_employee
+# ---------------------------------------------------------------------------
+
+
+def test_add_employee_sends_required_fields_and_returns_record(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"Id": 5, "DisplayName": "Peter Parker"})
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(deputy.deputy_add_employee("Peter", "Parker", 1))
+
+    assert result["status"] == "success"
+    assert result["record"] == {"Id": 5, "DisplayName": "Peter Parker"}
+    create_call = mock_request.call_args_list[0]
+    assert create_call.kwargs["url"] == (
+        "https://acme.au.deputy.com/api/v1/supervise/employee"
+    )
+    assert create_call.kwargs["method"] == "POST"
+    assert create_call.kwargs["json"] == {
+        "strFirstName": "Peter",
+        "strLastName": "Parker",
+        "intCompanyId": 1,
+        "blnSendInvite": 0,
+    }
+    # The successful create is read back to confirm it's really there
+    # before reporting success (see _verify_created_record) -- this is
+    # exactly the check that was missing during the 2026-09-21 incident.
+    verify_call = mock_request.call_args_list[1]
+    assert verify_call.kwargs["url"] == (
+        "https://acme.au.deputy.com/api/v1/resource/Employee/5"
+    )
+    assert verify_call.kwargs["method"] == "GET"
+
+
+def test_add_employee_includes_optional_fields_when_given(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"Id": 5}))
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    deputy.deputy_add_employee(
+        "Peter",
+        "Parker",
+        1,
+        email="peter.parker@example.com",
+        mobile_phone="639322112345",
+        role_id=50,
+        stress_profile_id=2,
+        start_date="2026-09-21",
+        date_of_birth="1990-01-01",
+        gender=1,
+        country_code="AU",
+        payroll_id="P123",
+        weekday_rate=30.5,
+        send_invite=True,
+    )
+
+    assert mock_request.call_args_list[0].kwargs["json"] == {
+        "strFirstName": "Peter",
+        "strLastName": "Parker",
+        "intCompanyId": 1,
+        "blnSendInvite": 1,
+        "strEmail": "peter.parker@example.com",
+        "strMobilePhone": "639322112345",
+        "intRoleId": 50,
+        "intStressProfile": 2,
+        "strStartDate": "2026-09-21",
+        "strDob": "1990-01-01",
+        "intGender": 1,
+        "strCountryCode": "AU",
+        "strPayrollId": "P123",
+        "fltWeekDayRate": 30.5,
+    }
+
+
+def test_add_employee_omits_unset_optional_fields(monkeypatch):
+    """An optional field left as its default None must not appear in the
+    request body at all -- Deputy should see the same request whether the
+    caller omitted a field or the tool merely defaults it, not a field
+    explicitly set to null."""
+    mock_request = Mock(return_value=MockResponse(json_data={"Id": 5}))
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    deputy.deputy_add_employee("Peter", "Parker", 1)
+
+    sent = mock_request.call_args_list[0].kwargs["json"]
+    for optional_key in (
+        "strEmail",
+        "strMobilePhone",
+        "intRoleId",
+        "intStressProfile",
+        "strStartDate",
+        "strDob",
+        "intGender",
+        "strCountryCode",
+        "strPayrollId",
+        "fltWeekDayRate",
+    ):
+        assert optional_key not in sent
+
+
+def test_add_employee_returns_error_on_failure(monkeypatch):
+    monkeypatch.setattr(
+        deputy.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=417, json_data={"error": {"message": "bad payload"}}
+            )
+        ),
+    )
+
+    result = json.loads(deputy.deputy_add_employee("Peter", "Parker", 1))
+
+    assert result["status"] == "error"
+
+
+def test_add_employee_rejects_non_dict_response(monkeypatch):
+    monkeypatch.setattr(
+        deputy.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=["unexpected"])),
+    )
+
+    result = json.loads(deputy.deputy_add_employee("Peter", "Parker", 1))
+
+    assert result["status"] == "error"
+
+
+def test_add_employee_warns_instead_of_confident_success_on_empty_response(
+    monkeypatch,
+):
+    """Mirrors deputy_create_resource's identical empty-response handling
+    -- this create is equally non-idempotent, so a 204/empty body must not
+    read as a plain, confident success with no signal the id is unknown."""
+    monkeypatch.setattr(
+        deputy.requests, "request", Mock(return_value=MockResponse(status_code=204))
+    )
+
+    result = json.loads(deputy.deputy_add_employee("Peter", "Parker", 1))
+
+    assert result["status"] == "success"
+    assert result["record"] == {}
+    assert "warning" in result
+    assert "deputy_query_resource" in result["warning"]
+
+
+def test_add_employee_downgrades_to_warning_when_readback_fails(monkeypatch):
+    """Same protection as deputy_create_resource: this is exactly the
+    scenario from the 2026-09-21 incident (Deputy accepted the create and
+    returned an Id, but the record was permission-orphaned and
+    unreadable) -- must surface as an unconfirmed success, not a plain
+    one."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Id": 5, "DisplayName": "Peter Parker"}),
+            MockResponse(
+                status_code=403,
+                json_data={"error": {"message": "Access to object denied"}},
+            ),
+        ]
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(deputy.deputy_add_employee("Peter", "Parker", 1))
+
+    assert result["status"] == "success"
+    assert result["record"] == {"Id": 5, "DisplayName": "Peter Parker"}
+    assert "warning" in result
+    assert "5" in result["warning"]
+
+
+def test_add_employee_downgrades_to_warning_when_readback_returns_empty(monkeypatch):
+    """A readback that succeeds but comes back empty is just as
+    unconfirmed as one that errors outright -- mirrors
+    deputy_create_resource's identical case, which _verify_created_record
+    handles the same way for both callers."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Id": 5, "DisplayName": "Peter Parker"}),
+            MockResponse(status_code=204),
+        ]
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(deputy.deputy_add_employee("Peter", "Parker", 1))
+
+    assert result["status"] == "success"
+    assert "warning" in result
+    assert "returned no record" in result["warning"]
+
+
+def test_add_employee_warns_when_response_has_no_id(monkeypatch):
+    """POST /supervise/employee's response schema is undocumented in
+    Deputy's own OpenAPI spec (unlike the Resource API's Employee object,
+    which always has an Id) -- a body that comes back anyway without an
+    Id must still be flagged as unconfirmed, not treated as a clean
+    pass-through, since there was never anything to verify it against."""
+    monkeypatch.setattr(
+        deputy.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data={"DisplayName": "Peter Parker"})),
+    )
+
+    result = json.loads(deputy.deputy_add_employee("Peter", "Parker", 1))
+
+    assert result["status"] == "success"
+    assert "warning" in result
+    assert "no Id" in result["warning"]
+
+
+def test_add_employee_downgrades_to_warning_on_transport_exception(monkeypatch):
+    """A readback that fails before ever getting a response (a timeout or
+    connection error, not a 4xx/5xx Deputy responded with) must be caught
+    the same way as any other unconfirmed readback -- exercises a genuine
+    ``requests`` exception raised directly by the HTTP call, distinct from
+    the RuntimeError _request raises itself for an error status."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Id": 5, "DisplayName": "Peter Parker"}),
+            requests.exceptions.ConnectionError("Connection refused"),
+        ]
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(deputy.deputy_add_employee("Peter", "Parker", 1))
+
+    assert result["status"] == "success"
+    assert "warning" in result
+    assert "failed: Connection refused" in result["warning"]
+
+
+def test_add_employee_is_annotated_as_non_idempotent_non_destructive_write():
+    """Must declare idempotentHint=False (a retried create on a timeout
+    can duplicate the employee, like deputy_create_resource) so the ReAct
+    duplicate-write guard enrolls it, and destructiveHint=False to match
+    deputy_create_resource -- this is a pure additive create (per
+    mcp_adapter.py's own definition, "destructiveHint false = only
+    additive updates"), not an overwrite of an existing record like
+    deputy_update_resource."""
+    tool = deputy.mcp._tool_manager.get_tool("deputy_add_employee")
+
+    assert tool.annotations is not None
+    assert tool.annotations.idempotentHint is False
+    assert tool.annotations.destructiveHint is False
+
+
+# ---------------------------------------------------------------------------
+# deputy_update_resource
+# ---------------------------------------------------------------------------
+
+
+def test_update_resource_merges_data_into_the_fetched_record(monkeypatch):
+    """Deputy's V1 Resource API requires the full object on update, with
+    no partial-update support -- so deputy_update_resource must fetch the
+    current record first and merge `data` into it, not send `data` alone,
+    or every field the caller didn't mention would be dropped/reset."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Id": 123, "FirstName": "Ada", "Active": True}),
+            MockResponse(json_data={"Id": 123, "FirstName": "Ada", "Active": False}),
+        ]
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(
+        deputy.deputy_update_resource("Employee", "123", {"Active": False})
+    )
+
+    assert result["status"] == "success"
+    assert result["record"] == {"Id": 123, "FirstName": "Ada", "Active": False}
+    assert mock_request.call_count == 2
+
+    get_call, post_call = mock_request.call_args_list
+    assert get_call.kwargs["method"] == "GET"
+    assert get_call.kwargs["url"] == (
+        "https://acme.au.deputy.com/api/v1/resource/Employee/123"
+    )
+    assert post_call.kwargs["method"] == "POST"
+    assert post_call.kwargs["url"] == (
+        "https://acme.au.deputy.com/api/v1/resource/Employee/123"
+    )
+    # The fetched record's other fields (FirstName) are preserved in the
+    # write, not dropped just because the caller only mentioned Active.
+    assert post_call.kwargs["json"] == {
+        "Id": 123,
+        "FirstName": "Ada",
+        "Active": False,
+    }
+
+
+def test_update_resource_ignores_caller_supplied_id(monkeypatch):
+    """The URL's resource_id is what actually identifies the record being
+    written; a caller-supplied "Id" in data must not override the fetched
+    record's own Id and decouple the body from what the URL targets."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Id": 123, "Active": True}),
+            MockResponse(json_data={"Id": 123, "Active": False}),
+        ]
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    deputy.deputy_update_resource("Employee", "123", {"Id": 999, "Active": False})
+
+    post_call = mock_request.call_args_list[1]
+    assert post_call.kwargs["json"] == {"Id": 123, "Active": False}
+
+
+def test_update_resource_ignores_caller_supplied_id_even_when_current_lacks_one(
+    monkeypatch,
+):
+    """The old conditional re-add (`{"Id": current["Id"]} if "Id" in
+    current else {}`) only protected Id when the fetched record itself
+    had one -- stripping it from data unconditionally must protect it
+    even when current doesn't have an "Id" key at all."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Active": True}),
+            MockResponse(json_data={"Active": False}),
+        ]
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    deputy.deputy_update_resource("Employee", "123", {"Id": 999, "Active": False})
+
+    post_call = mock_request.call_args_list[1]
+    assert post_call.kwargs["json"] == {"Active": False}
+
+
+def test_update_resource_rejects_id_only_data_without_calling_api(monkeypatch):
+    """An "Id"-only data dict has nothing left to change once "Id" is
+    stripped -- must be rejected the same as genuinely empty data,
+    not turned into a needless no-op GET+POST round trip."""
+    mock_request = Mock()
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(deputy.deputy_update_resource("Employee", "123", {"Id": 999}))
+
+    assert result["status"] == "error"
+    assert "No data provided" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_update_resource_rejects_empty_fetch_response(monkeypatch):
+    """_request normalizes a 204/empty response to {} -- an empty dict
+    passes a bare isinstance(current, dict) check, which would silently
+    collapse the merge to just `data` and wipe every other field on the
+    record. Must be rejected the same as a non-dict response."""
+    mock_request = Mock(return_value=MockResponse(status_code=204))
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(
+        deputy.deputy_update_resource("Employee", "123", {"Active": False})
+    )
+
+    assert result["status"] == "error"
+    mock_request.assert_called_once()
+
+
+def test_update_resource_rejects_empty_data_without_calling_api(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(deputy.deputy_update_resource("Employee", "123", {}))
+
+    assert result["status"] == "error"
+    assert "No data provided" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_update_resource_returns_error_when_fetch_fails(monkeypatch):
+    monkeypatch.setattr(
+        deputy.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=404, json_data={"error": "gone"})),
+    )
+
+    result = json.loads(
+        deputy.deputy_update_resource("Employee", "999", {"Active": False})
+    )
+
+    assert result["status"] == "error"
+    assert "gone" in result["message"]
+
+
+def test_update_resource_returns_error_when_write_fails_after_fetch(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Id": 123, "Active": True}),
+            MockResponse(status_code=400, json_data={"error": "invalid"}),
+        ]
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(
+        deputy.deputy_update_resource("Employee", "123", {"Active": False})
+    )
+
+    assert result["status"] == "error"
+    assert "invalid" in result["message"]
+    assert mock_request.call_count == 2
+
+
+def test_update_resource_rejects_non_dict_fetch_response(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data=["unexpected"]))
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(
+        deputy.deputy_update_resource("Employee", "123", {"Active": False})
+    )
+
+    assert result["status"] == "error"
+    # The write must never be attempted once the fetch itself is
+    # malformed -- only the GET should have happened.
+    mock_request.assert_called_once()
+
+
+def test_update_resource_rejects_non_dict_write_response(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Id": 123, "Active": True}),
+            MockResponse(json_data=["unexpected"]),
+        ]
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(
+        deputy.deputy_update_resource("Employee", "123", {"Active": False})
+    )
+
+    assert result["status"] == "error"
+
+
+@pytest.mark.parametrize(
+    "resource,resource_id",
+    [
+        (" Employee", "123"),
+        ("", "123"),
+        ("Employee", " 123"),
+        ("Employee", ""),
+    ],
+)
+def test_update_resource_rejects_invalid_ids_without_raising(
+    monkeypatch, resource, resource_id
+):
+    mock_request = Mock()
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(
+        deputy.deputy_update_resource(resource, resource_id, {"Active": False})
+    )
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# deputy_create_resource / deputy_update_resource tool annotations
+# ---------------------------------------------------------------------------
+
+
+def test_create_resource_is_annotated_as_non_idempotent_write():
+    """deputy_create_resource must declare idempotentHint=False so the
+    ReAct duplicate-write guard (classify_non_idempotent_write) enrolls it
+    -- a retried create on a timeout/connection error is not safe to
+    silently repeat. A future accidental edit that swaps this tool's
+    annotations with deputy_update_resource's (or drops them) would
+    otherwise leave create unprotected without any test catching it."""
+    tool = deputy.mcp._tool_manager.get_tool("deputy_create_resource")
+
+    assert tool.annotations is not None
+    assert tool.annotations.idempotentHint is False
+    assert tool.annotations.destructiveHint is False
+
+
+def test_update_resource_is_annotated_as_idempotent_destructive_write():
+    """deputy_update_resource must declare idempotentHint=True (repeating
+    the same update has no additional effect, so it's safe to retry and
+    must NOT be enrolled in the duplicate-write guard) and
+    destructiveHint=True (it overwrites existing field values -- e.g.
+    deactivating an employee or rewriting a timesheet -- so it is not a
+    purely additive write like create)."""
+    tool = deputy.mcp._tool_manager.get_tool("deputy_update_resource")
+
+    assert tool.annotations is not None
+    assert tool.annotations.idempotentHint is True
+    assert tool.annotations.destructiveHint is True
+
+
+# ---------------------------------------------------------------------------
 # _success_with_capped_list
 # ---------------------------------------------------------------------------
 
@@ -607,3 +1426,39 @@ def test_get_current_user_caps_output_size(monkeypatch):
     assert len(raw) <= 200
     assert result["status"] == "success"
     assert result["truncated"] is True
+
+
+def test_create_resource_warning_survives_truncation_with_instruction_intact(
+    monkeypatch,
+):
+    """The instruction a caller actually needs to act on ("verify directly
+    in Deputy") must be at the front of the warning, not the end -- the
+    truncation marker cuts from the end, so if the fixed instruction were
+    last (as an earlier version of this message had it), truncation would
+    strip exactly the part of the message that matters most. 180 is sized
+    to fit the fixed instruction but not the full variable-length Deputy
+    error detail appended after it -- tight enough to force a real cut,
+    loose enough that the instruction itself isn't also a casualty."""
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 180)
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Id": 1, "FirstName": "Peter"}),
+            MockResponse(
+                status_code=403,
+                json_data={
+                    "error": {
+                        "message": "Access to object denied because of an "
+                        "extremely long, detailed diagnostic explanation "
+                        "that goes on for quite a while about permissions"
+                    }
+                },
+            ),
+        ]
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(deputy.deputy_create_resource("Roster", {"FirstName": "Peter"}))
+
+    assert result["status"] == "success"
+    assert "verify directly in Deputy" in result["warning"]
+    assert "Unconfirmed Deputy Roster create" in result["warning"]

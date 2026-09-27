@@ -198,24 +198,30 @@ class ContentCleaner:
             if isinstance(following, Tag) and following.name in ("a", "img"):
                 element.insert_after(NavigableString(" "))
 
+        # Runs after the adjacency guard above: unwrapping first would fuse
+        # <a>One</a><a>Two</a> into "OneTwo".
+        # Drops the URL and keeps its text, and unlike html2text's ignore_links it
+        # also keeps the space before a link nested in emphasis.
+        for element in soup.find_all("a"):
+            element.unwrap()
+
         h2t = html2text.HTML2Text()
         h2t.body_width = 0  # No line wrapping
-        # Drop URLs, keep their text: a signed CDN link is hundreds of characters
-        # of noise that nobody searches for, and it crowds the prose out of a chunk.
         # images_to_alt rather than ignore_images so alt text still reaches the index;
         # it is nested under `not ignore_images`, so that flag must stay False.
         h2t.ignore_images = False
         h2t.images_to_alt = True
         h2t.ignore_emphasis = False
-        h2t.ignore_links = True
         h2t.ignore_tables = False
 
         markdown = h2t.handle(str(soup))
-        # h2t only drops the href/src attribute. Anchor text and alt text that are
-        # themselves URLs (autolinks, tracking-pixel alts) survive it, so strip those too.
+        # Unwrapping and images_to_alt only drop the href/src. Anchor text and alt text
+        # that are themselves URLs (autolinks, tracking-pixel alts) survive, so strip those.
         markdown = _BARE_URL.sub("", markdown)
         markdown = re.sub(r"[ \t]{2,}", " ", markdown)
-        markdown = re.sub(r" +([,.;:!?])", r"\1", markdown)
+        # Full-width variants included: html2text leaves a space after an emphasis
+        # run, which in CJK prose lands right before the sentence punctuation.
+        markdown = re.sub(r" +([,.;:!?，。；：！？、])", r"\1", markdown)
         return markdown.strip()
 
     def is_valid_content(self, content: str, min_length: int = 100) -> bool:

@@ -80,6 +80,10 @@ def test_client_error_codes_have_fixed_safe_fallbacks() -> None:
         "authentication_required": "Authentication is required to send this message.",
         "task_access_denied": "You do not have access to this task.",
         "invalid_message": "The message format is invalid.",
+        "message_outcome_unknown": (
+            "The message may or may not have been applied. Check the "
+            "conversation before sending it again."
+        ),
     }
 
 

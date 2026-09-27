@@ -1,16 +1,21 @@
 """Tests for LanceDB-backed storage implementations."""
 
 import asyncio
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
-from xagent.core.tools.core.RAG_tools.core.config import DEFAULT_INDEX_POLICY
+from xagent.core.tools.core.RAG_tools.core.config import (
+    DEFAULT_FTS_PARAMS,
+    DEFAULT_INDEX_POLICY,
+)
 from xagent.core.tools.core.RAG_tools.core.exceptions import DatabaseOperationError
 from xagent.core.tools.core.RAG_tools.storage.factory import StorageFactory
 from xagent.core.tools.core.RAG_tools.storage.lancedb_stores import (
+    FtsRebuildOutcome,
     LanceDBIngestionStatusStore,
     LanceDBMainPointerStore,
     LanceDBMetadataStore,
@@ -1035,6 +1040,12 @@ def test_trigger_reindex_failure(mock_get_connection: Mock) -> None:
     assert result is False
 
 
+def test_default_fts_params_use_jieba() -> None:
+    """The FTS tokenizer must segment words; ngram prefix_only matched nothing."""
+    assert DEFAULT_FTS_PARAMS["base_tokenizer"] == "jieba/default"
+    assert "prefix_only" not in DEFAULT_FTS_PARAMS
+
+
 @pytest.mark.asyncio
 @patch(
     "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
@@ -1505,7 +1516,7 @@ async def test_search_fts_async_basic(
 
     mock_search.to_arrow = mock_to_arrow
 
-    mock_table.search = Mock(return_value=mock_search)
+    mock_table.search = AsyncMock(return_value=mock_search)
 
     store = LanceDBVectorIndexStore()
 
@@ -1517,6 +1528,37 @@ async def test_search_fts_async_basic(
 
     assert len(results) == 2
     assert results[0]["doc_id"] == "doc1"
+    built = mock_table.search.call_args.args[0]
+    assert [match.query for _, match in built.queries] == ["hello"]
+
+
+@pytest.mark.asyncio
+@patch("lancedb.connect_async", new_callable=AsyncMock)
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+async def test_search_fts_async_skips_query_without_terms(
+    mock_get_connection: Mock, mock_connect_async: AsyncMock
+) -> None:
+    """A whitespace-only query would match every chunk that contains whitespace."""
+    mock_conn = Mock()
+    mock_conn.uri = "test_uri"
+    mock_get_connection.return_value = mock_conn
+
+    mock_async_conn = Mock()
+    mock_connect_async.return_value = mock_async_conn
+    mock_table = Mock()
+    mock_table.search = AsyncMock()
+    mock_async_conn.open_table = AsyncMock(return_value=mock_table)
+
+    results = await LanceDBVectorIndexStore().search_fts_async(
+        table_name="chunks",
+        query_text="  ,. ",
+        top_k=5,
+    )
+
+    assert results == []
+    mock_table.search.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -4140,3 +4182,109 @@ def test_should_compact_fires_at_exactly_the_stale_version_threshold() -> None:
             store.should_compact("t", IndexPolicy(compact_stale_version_threshold=101))
             is False
         )
+
+
+def _index(index_type: str, columns: List[str]) -> Mock:
+    idx = Mock()
+    idx.index_type = index_type
+    idx.columns = columns
+    idx.name = f"{columns[0]}_idx"
+    return idx
+
+
+@contextmanager
+def _lock_recorder(acquired: bool, seen: List[str]):
+    @contextmanager
+    def fake_lock(conn: Any, table_name: str):
+        seen.append(table_name)
+        yield acquired
+
+    with patch(
+        "xagent.core.tools.core.RAG_tools.storage.lancedb_stores._compaction_lock",
+        fake_lock,
+    ):
+        yield
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_rebuild_text_fts_index_rebuilds_without_compacting(
+    mock_get_connection: Mock,
+) -> None:
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+    mock_table = Mock()
+    mock_table.list_indices.return_value = [_index("FTS", ["text"])]
+    mock_conn.open_table.return_value = mock_table
+    seen: List[str] = []
+
+    with _lock_recorder(True, seen):
+        outcome = LanceDBVectorIndexStore().rebuild_text_fts_index("embeddings_test")
+
+    assert outcome is FtsRebuildOutcome.REBUILT
+    assert seen == ["embeddings_test"]
+    mock_table.create_fts_index.assert_called_once()
+    kwargs = mock_table.create_fts_index.call_args.kwargs
+    assert kwargs["replace"] is True
+    # The literal, not DEFAULT_INDEX_POLICY: the whole migration exists to put
+    # this tokenizer into the index, so dropping the policy must fail here.
+    assert kwargs["base_tokenizer"] == "jieba/default"
+    assert kwargs["with_position"] is True
+    mock_table.optimize.assert_not_called()
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_rebuild_text_fts_index_skips_fts_on_another_column(
+    mock_get_connection: Mock,
+) -> None:
+    """An FTS index on metadata is not one this rebuild can replace."""
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+    mock_table = Mock()
+    mock_table.list_indices.return_value = [_index("FTS", ["metadata"])]
+    mock_conn.open_table.return_value = mock_table
+    seen: List[str] = []
+
+    with _lock_recorder(True, seen):
+        outcome = LanceDBVectorIndexStore().rebuild_text_fts_index("embeddings_test")
+
+    assert outcome is FtsRebuildOutcome.SKIPPED_NO_INDEX
+    mock_table.create_fts_index.assert_not_called()
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_rebuild_text_fts_index_yields_to_a_held_lock(
+    mock_get_connection: Mock,
+) -> None:
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+    seen: List[str] = []
+
+    with _lock_recorder(False, seen):
+        outcome = LanceDBVectorIndexStore().rebuild_text_fts_index("embeddings_test")
+
+    assert outcome is FtsRebuildOutcome.SKIPPED_LOCKED
+    assert seen == ["embeddings_test"]
+    mock_conn.open_table.assert_not_called()
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_rebuild_text_fts_index_propagates_failure(mock_get_connection: Mock) -> None:
+    """trigger_reindex swallows this; the migration entry point must not."""
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+    mock_table = Mock()
+    mock_table.list_indices.return_value = [_index("FTS", ["text"])]
+    mock_table.create_fts_index.side_effect = RuntimeError("index build failed")
+    mock_conn.open_table.return_value = mock_table
+
+    with _lock_recorder(True, []):
+        with pytest.raises(RuntimeError, match="index build failed"):
+            LanceDBVectorIndexStore().rebuild_text_fts_index("embeddings_test")

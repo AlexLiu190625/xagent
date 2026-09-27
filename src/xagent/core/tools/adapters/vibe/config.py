@@ -19,6 +19,11 @@ ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON = (
     "actor_stdio_session_runtime_unavailable"
 )
 ACTOR_STDIO_SHADOWED_REASON = "actor_stdio_shadowed_by_visible_connection"
+# A delegated sub-agent run cannot pause for approval (a paused child is
+# classified as an unsupported nested interaction), so when the delegating
+# run's task source has an approval gate registered, its children get the
+# selected MCP servers reported as unavailable instead of live and ungated.
+NESTED_DELEGATION_NOT_APPROVABLE_REASON = "nested_delegation_not_approvable"
 
 
 class MCPFailurePolicy(str, Enum):
@@ -72,6 +77,7 @@ _PUBLIC_MCP_UNAVAILABLE_REASONS = frozenset(
     {
         ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON,
         ACTOR_STDIO_SHADOWED_REASON,
+        NESTED_DELEGATION_NOT_APPROVABLE_REASON,
         "adapter_construction",
         "authorization_required",
         "catalog_app_not_found",
@@ -472,6 +478,18 @@ class BaseToolConfig(ABC):
         tool set it builds for a grandchild delegation, so a task's chosen
         voice reaches every agent this user talks to - not just the
         top-level one - without core importing a web route module."""
+        return None
+
+    def get_mcp_unavailable_reason(self) -> Optional[str]:
+        """The reason this config's MCP servers were refused, or None.
+
+        Set when a delegated run's connectors were refused rather than
+        loaded (see ``_nested_mcp_refusal_reason`` in ``agent_tool.py``).
+        Threaded the same way as ``get_voice`` into any further AgentTool
+        this config builds, so the refusal survives past the one hop the
+        ReAct-bound execution context covers: a grandchild delegation binds
+        no ``task_source`` of its own and would otherwise read as
+        unregistered and dispatch ungated."""
         return None
 
     def get_excluded_agent_id(self) -> Optional[int]:

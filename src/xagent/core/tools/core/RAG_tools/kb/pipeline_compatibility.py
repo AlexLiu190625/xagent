@@ -19,7 +19,6 @@ from .models import KBStorageBackend
 from .operation_compatibility import (
     KBOperation,
     KBOperationCompatibilityFacade,
-    KBOperationOutcome,
     PersistencePolicy,
     SideEffectPlane,
     finish_ingestion_outcome,
@@ -451,40 +450,15 @@ class KBPipelineCompatibilityFacade:
         )
 
     @staticmethod
-    def compensate_web_page_file_side_effect(
-        operation: KBOperation | None,
-    ) -> tuple[BaseException, ...]:
-        """Execute registered web-file compensation callbacks for a page."""
-        if operation is None or operation.outcome is not None:
-            return ()
-        return operation.execute_compensations(
-            step_names={"cleanup_web_page_persistence"},
-            planes={SideEffectPlane.FILE},
-        )
-
-    @staticmethod
     def finish_web_page_operation(
         operation: KBOperation | None,
         *,
         status: str,
         message: str,
-        side_effects_may_remain: Optional[bool] = None,
     ) -> None:
         if operation is None or operation.outcome is not None:
             return
-        if side_effects_may_remain is None:
-            side_effects_may_remain = (
-                status != "success" and operation.has_side_effects()
-            )
-        operation.finish(
-            status=status,
-            rollback_status=operation.infer_rollback_status(
-                status,
-                side_effects_may_remain=side_effects_may_remain,
-            ),
-            side_effects_may_remain=side_effects_may_remain,
-            details={"message": message},
-        )
+        operation.finish(status=status, details={"message": message})
 
     def _record_document_ingestion_side_effects(
         self,
@@ -518,29 +492,3 @@ class KBPipelineCompatibilityFacade:
         name: str,
     ) -> dict[str, Any] | None:
         return step_metadata(completed_steps, name)
-
-    @staticmethod
-    def _finish_document_ingestion_outcome(
-        operation: KBOperation | None,
-        result: IngestionResult,
-    ) -> None:
-        # Thin delegator kept for an existing test's monkeypatch target (#515).
-        finish_ingestion_outcome(
-            operation, status=result.status, message=result.message
-        )
-
-    @staticmethod
-    def _record_web_ingestion_outcome(
-        operation: KBOperation | None,
-        result: WebIngestionResult,
-    ) -> KBOperationOutcome | None:
-        # Thin delegator kept for an existing test's direct call (#515).
-        return finish_web_ingestion_outcome(
-            operation,
-            status=result.status,
-            documents_created=result.documents_created,
-            pages_crawled=result.pages_crawled,
-            pages_failed=result.pages_failed,
-            failed_urls=result.failed_urls,
-            message=result.message,
-        )

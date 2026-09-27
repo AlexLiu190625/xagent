@@ -1,7 +1,15 @@
 from __future__ import annotations
 
+import pytest
+
 import xagent.core.agent.grounding as grounding
-from xagent.core.agent.grounding import VALUE_KINDS, grounding_rule
+from xagent.core.agent.grounding import (
+    EVIDENCE_REMOVED_FACTS,
+    EVIDENCE_UNKNOWN_FACTS,
+    VALUE_KINDS,
+    evidence_facts,
+    grounding_rule,
+)
 
 # The sole sentence that may appear inside the answer without a source: it
 # names the exception explicitly and is unique to this rule's wording.
@@ -43,6 +51,30 @@ def test_grounding_rule_without_tools_omits_tool_verification() -> None:
     assert "quantitative data" in rule
     assert TEMPLATE_EXCEPTION_MARKER in rule
     assert "invented values. Never fill a gap" in rule
+
+
+@pytest.mark.parametrize("can_call_tools", [True, False])
+def test_grounding_rule_requires_source_content_for_inspection_claims(
+    can_call_tools: bool,
+) -> None:
+    rule = grounding_rule(can_call_tools=can_call_tools)
+
+    assert "A citation or search snippet is not evidence" in rule
+    assert "attribute only claims supported by text actually available" in rule
+    assert (
+        "text actually available in the conversation, retrieved context, or "
+        "tool results" in rule
+    )
+    if can_call_tools:
+        assert "omitted. A citation" in rule
+        assert "results. When the user asks" in rule
+        assert "retrieve its relevant content" in rule
+        assert "if retrieval fails" in rule
+    else:
+        assert "instead. A citation" in rule
+        assert "results. If requested source content" in rule
+        assert "retrieve its relevant content" not in rule
+        assert "If requested source content was not inspected, disclose" in rule
 
 
 def test_grounding_rule_covers_fact_carrying_tool_arguments() -> None:
@@ -311,8 +343,122 @@ def test_grounding_module_docstring_states_the_default_as_a_prohibition() -> Non
     # A denial of one phrasing is evaded by any synonym, so pin the claim
     # the docstring must positively make.
     assert "makes reporting the gap the instructed response" in normalized_doc
+    # Proposal B is no longer open in full: the forced answer turn now keeps
+    # its evidence. The docstring states that behaviour rather than claiming
+    # the proposal landed, and still says what remains open.
+    assert "ReAct's forced answer turn no longer compacts" in normalized_doc
+    assert "no other turn's compaction behavior is changed" in normalized_doc
     assert (
-        "Proposals B (evidence-preserving compaction) and C (provenance "
-        "tracking and a data-source gate) remain open." in normalized_doc
+        "Proposal C (provenance tracking and a data-source gate) remains open."
+        in normalized_doc
     )
+    assert "Proposals B (evidence-preserving compaction)" not in normalized_doc
     assert "illustrative" not in (grounding_rule.__doc__ or "")
+
+
+def test_evidence_removed_facts_states_the_loss_and_forbids_reconstruction() -> None:
+    """The sentence every tool-less answer prompt carries, pinned once.
+
+    The suites that check a prompt carries this text derive their expectation
+    from the constant, which by construction cannot notice the constant itself
+    being emptied or weakened. This cell is where that is noticed: the wording
+    lives here, so rewording it is one deliberate edit rather than a sweep
+    across every suite that quotes it.
+    """
+    assert EVIDENCE_REMOVED_FACTS == (
+        "Compaction removed tool observations from this run's context and "
+        "their values can no longer be read. If a compaction summary stands "
+        "above, treat any value not literally present in that summary -- "
+        f"{VALUE_KINDS} -- as unavailable rather than recalled. Do not "
+        "reconstruct, estimate, or illustrate a removed value, and do not "
+        "present one as an example. "
+    )
+
+
+def test_evidence_unknown_facts_states_the_uncertainty_and_forbids_reconstruction() -> (
+    None
+):
+    """The sentence a payload with no marker key carries, pinned once.
+
+    Mirrors the pin on ``EVIDENCE_REMOVED_FACTS`` above: the wording lives
+    here, so rewording it is one deliberate edit rather than a sweep across
+    every suite that quotes it. It states uncertainty rather than an
+    engine-version self-reference: nothing here tells the model which build
+    wrote the payload, only that this context does not record the answer.
+    """
+    assert EVIDENCE_UNKNOWN_FACTS == (
+        "This context carries no record of whether compaction removed tool "
+        "observations from it, so that cannot be determined. Treat any "
+        "value not literally present in the context -- "
+        f"{VALUE_KINDS} -- as unavailable rather than recalled. Do not "
+        "reconstruct, estimate, or illustrate such a value, and do not "
+        "present one as an example. "
+    )
+
+
+@pytest.mark.parametrize(
+    "state, expected",
+    [
+        ("intact", ""),
+        ("removed", EVIDENCE_REMOVED_FACTS),
+        ("unknown", EVIDENCE_UNKNOWN_FACTS),
+        ("corrupted-or-unrecognized", EVIDENCE_REMOVED_FACTS),
+    ],
+    ids=["intact", "removed", "unknown", "unrecognized_falls_to_removed"],
+)
+def test_evidence_facts_selects_by_state(state: str, expected: str) -> None:
+    """An unrecognized state falls to the removed wording, not to silence.
+
+    Silence is the branch that puts the fabricated answer back, so a state
+    string this function does not recognize must not be treated as intact.
+    """
+    assert evidence_facts(state) == expected
+
+
+def test_grounding_rule_forbids_reporting_a_sourced_fact_under_the_wrong_entity() -> (
+    None
+):
+    """A genuinely sourced fact must still be attributed to the right entity.
+
+    Production incident: asked for one company's open deals, the model found
+    a same-named contact belonging to a different company (via an unscoped
+    name search) and reported that company's real deal as if it belonged to
+    the company actually asked about. The deal's amount and stage were real;
+    only the reported owner was fabricated -- a failure mode the rest of this
+    rule, which is about inventing values outright, does not name.
+    """
+    for rule in (grounding_rule(), grounding_rule(can_call_tools=False)):
+        assert (
+            "reported under the wrong entity: attributing it to a company, "
+            "team, project, or account other than the one the tool call was "
+            "actually scoped to is fabrication" in rule
+        )
+        assert "scoped to that entity's own id or name" in rule
+        assert "a same-named or related record found while looking for" in rule
+        assert "report the fact under the record it actually came from" in rule
+
+
+def test_grounding_rule_entity_attribution_is_unconditional() -> None:
+    """Unlike the tool-argument clause, this does not depend on can_call_tools.
+
+    The misattribution happens in how the answer is composed, which every
+    call site -- including the three forced-answer, no-tool sites -- must
+    still guard against.
+    """
+    with_tools = grounding_rule()
+    without_tools = grounding_rule(can_call_tools=False)
+    marker = "reported under the wrong entity"
+    assert marker in with_tools
+    assert marker in without_tools
+    # Identical wording in both variants, not just present in both.
+    start = with_tools.index("A fact can be genuinely present")
+    end = with_tools.index("something else; when it did not,") + len(
+        "something else; when it did not,"
+    )
+    assert with_tools[start:end] == without_tools[start:end]
+
+
+def test_grounding_rule_entity_attribution_precedes_the_pinned_gap_sentence() -> None:
+    """The addition must not disturb the existing insufficient-context pins."""
+    assert "verify. Never fill a gap" in grounding_rule()
+    assert "invented values. Never fill a gap" in grounding_rule(can_call_tools=False)

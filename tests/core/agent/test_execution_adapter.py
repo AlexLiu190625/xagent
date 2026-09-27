@@ -1040,6 +1040,57 @@ async def test_execution_adapter_routes_dag_to_dag() -> None:
     assert result["agent_result"]["pattern"] == "DAGPattern"
 
 
+@pytest.mark.asyncio
+async def test_execution_adapter_preserves_dag_failure_delivery_reason() -> None:
+    class FailingStepLLM(FakeLLM):
+        async def chat(self, **kwargs: Any) -> Any:
+            if len(self.calls) == 2:
+                self.calls.append(kwargs)
+                raise RuntimeError("Step provider failed after the tool result")
+            return await super().chat(**kwargs)
+
+    llm = FailingStepLLM(
+        [
+            dag_plan([{"id": "work", "task": "Run a tool and verify it"}]),
+            {"tool_calls": [{"id": "work", "name": "noop", "args": {}}]},
+            {
+                "tool_calls": [
+                    {
+                        "id": "delivery",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": {
+                                "answer": "Tool ran; verification unfinished.",
+                                "outcome": "partial",
+                            },
+                        },
+                    }
+                ]
+            },
+        ]
+    )
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="dag-partial",
+            pattern="dag_plan_execute",
+            llm=llm,
+            tools=[FakeTool()],
+            workspace_enabled=False,
+            skills_enabled=False,
+        )
+    )
+
+    result = await adapter.execute(
+        task="Run a tool and verify it", task_id="dag-partial"
+    )
+
+    assert result["completion_outcome"] == "partial"
+    assert result["termination_reason"] == "step_failed"
+    assert result["metadata"]["termination_reason"] == "step_failed"
+    assert "not a completed task" in result["output"]
+    assert len(llm.calls) == 4
+
+
 def test_execution_adapter_passes_dag_max_concurrency_to_pattern() -> None:
     adapter = AgentExecutionAdapter(
         AgentExecutionConfig(
@@ -1622,7 +1673,8 @@ def test_execution_adapter_hides_internal_error_for_interrupted_result() -> None
     assert result["error"] == "ReActPattern interrupted."
 
 
-def test_execution_adapter_preserves_completion_outcome() -> None:
+@pytest.mark.parametrize("reason", ["max_iterations", "step_failed"])
+def test_execution_adapter_preserves_completion_outcome(reason: str) -> None:
     adapter = AgentExecutionAdapter(
         AgentExecutionConfig(
             name="partial",
@@ -1638,6 +1690,7 @@ def test_execution_adapter_preserves_completion_outcome() -> None:
             "success": True,
             "output": "One item remains.",
             "completion_outcome": "partial",
+            "termination_reason": reason,
         },
         execution_type="agent_react",
         execution_id="partial-exec",
@@ -1645,6 +1698,91 @@ def test_execution_adapter_preserves_completion_outcome() -> None:
 
     assert result["completion_outcome"] == "partial"
     assert result["metadata"]["completion_outcome"] == "partial"
+    assert result["termination_reason"] == reason
+    assert result["metadata"]["termination_reason"] == reason
+
+
+@pytest.mark.parametrize("reason", [None, "provider token=secret", [], {}])
+def test_execution_adapter_does_not_promote_unknown_termination_reason(
+    reason: Any,
+) -> None:
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(name="test", pattern="dag", llm=FakeLLM([]))
+    )
+    result = adapter._normalize_result(
+        result={
+            "success": True,
+            "output": "Partial result",
+            "termination_reason": reason,
+        },
+        execution_type="agent_dag",
+        execution_id="test",
+    )
+    assert "termination_reason" not in result
+    assert "termination_reason" not in result["metadata"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remove_tool", [False, True])
+async def test_execution_adapter_resume_refreshes_cached_runner_tools(
+    remove_tool: bool,
+) -> None:
+    old_tool = FakeTool()
+    new_tool = FakeTool()
+    llm = FakeLLM(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "call-ask",
+                        "name": "ask_user_question",
+                        "args": {
+                            "message": "Reconnect the data source, then continue."
+                        },
+                    }
+                ]
+            }
+        ]
+    )
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="refresh-tools",
+            pattern="react",
+            llm=llm,
+            tools=[old_tool],
+            tracer=TracerCheckpointStore(),
+            skill_manager=NoSkillManager(),
+        )
+    )
+    waiting = await adapter.execute(task="Read data", task_id="refresh-tools-exec")
+    assert waiting["status"] == "waiting_for_user"
+    handle = adapter.registry.get("refresh-tools-exec")
+    assert handle is not None
+    assert handle.runner.agent.tools == [old_tool]
+
+    await adapter.post_user_message(
+        "refresh-tools-exec", "Connection settings updated.", request_interrupt=False
+    )
+    # AgentService rebuilds its tools before resuming an existing runner.
+    # The refreshed objects (including removals) must reach that runner too.
+    adapter.config.tools = [] if remove_tool else [new_tool]
+    # Even if the model repeats the old tool name, a removed tool must not run.
+    llm.responses.append(
+        {"tool_calls": [{"id": "call-noop", "name": "noop", "args": {}}]}
+    )
+    llm.responses.append("done")
+
+    resumed = await adapter.resume("refresh-tools-exec")
+
+    assert resumed is not None
+    assert resumed["status"] == "completed"
+    assert old_tool.calls == []
+    assert old_tool.setup_calls == ["refresh-tools-exec"]
+    assert old_tool.teardown_calls == ["refresh-tools-exec"]
+    assert new_tool.calls == ([] if remove_tool else [{}])
+    assert handle.runner.agent.tools == adapter.config.tools
+    resumed_names = {schema["function"]["name"] for schema in llm.calls[1]["tools"]}
+    assert ("noop" in resumed_names) is not remove_tool
 
 
 @pytest.mark.asyncio
@@ -1781,6 +1919,111 @@ async def test_execution_adapter_posts_user_message_after_restart() -> None:
         and message.content == "New message after process restart."
         for message in context_messages
     )
+
+
+@pytest.mark.asyncio
+async def test_execution_adapter_resume_uses_handler_installed_after_post_user_message() -> (
+    None
+):
+    """A resumed run must use the outbound handler installed on the host's
+    config, even when the runner handle already existed before that
+    installation happened.
+
+    post_user_message builds and registers a runner via _build_runner()
+    when no handle exists yet, copying config.outbound_message_handler at
+    construction time. Every non-WebSocket resume caller (task_resume.py,
+    the SaaS dispatcher) calls post_user_message before it installs its
+    outbound handler, so the runner would otherwise be frozen with a None
+    handler and resume() would silently drop the resumed agent's next
+    message (#1328).
+    """
+    tracer = TracerCheckpointStore()
+    first_llm = BlockingLLM(
+        {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-noop",
+                    "name": "noop",
+                    "args": {},
+                }
+            ],
+        }
+    )
+    first_adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="resume-handler-ordering",
+            pattern="react",
+            llm=first_llm,
+            tools=[FakeTool()],
+            tracer=tracer,
+            skill_manager=NoSkillManager(),
+        )
+    )
+
+    first_adapter.start(task="Wait for message", task_id="resume-handler-ordering-exec")
+    first_handle = first_adapter.registry.get("resume-handler-ordering-exec")
+    assert first_handle is not None
+    assert first_handle.task is not None
+    await first_llm.started.wait()
+    assert first_adapter.pause(
+        "resume-handler-ordering-exec", reason="pause before restart"
+    )
+    first_llm.release.set()
+    interrupted = await first_handle.task
+    assert interrupted["status"] == "interrupted"
+
+    sent_messages: list[dict[str, Any]] = []
+    restarted_llm = FakeLLM(
+        [
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-message",
+                        "name": "send_message",
+                        "args": {
+                            "message": "Still working",
+                            "message_type": "progress",
+                            "expect_response": False,
+                        },
+                    }
+                ],
+            },
+            "resumed done",
+        ]
+    )
+    restarted_adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="resume-handler-ordering",
+            pattern="react",
+            llm=restarted_llm,
+            tools=[FakeTool()],
+            tracer=tracer,
+            outbound_message_handler=None,
+            skill_manager=NoSkillManager(),
+        )
+    )
+
+    # post_user_message runs first, while config.outbound_message_handler
+    # is still None, so it would build and register the runner handler-less.
+    assert await restarted_adapter.post_user_message(
+        "resume-handler-ordering-exec",
+        "New message after process restart.",
+        request_interrupt=False,
+    )
+
+    # The host installs its outbound handler only now, after the runner
+    # handle already exists (mirrors execute_resume_background's ordering).
+    restarted_adapter.config.outbound_message_handler = sent_messages.append
+
+    resumed = await restarted_adapter.resume("resume-handler-ordering-exec")
+
+    assert resumed is not None
+    assert resumed["success"] is True
+    assert len(sent_messages) == 1
+    assert sent_messages[0]["type"] == "agent_message"
+    assert sent_messages[0]["message"] == "Still working"
 
 
 @pytest.mark.asyncio

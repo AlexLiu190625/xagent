@@ -96,6 +96,7 @@ async def test_a2a_create_commits_start_without_local_execution(ingress):
         agent_execution_mode="balanced",
         text="hello",
         message_id="message-1",
+        key_prefix="key-one",
         context_id=None,
         task_id=None,
     )
@@ -115,14 +116,14 @@ async def test_a2a_create_commits_start_without_local_execution(ingress):
 
 
 @pytest.mark.asyncio
-async def test_legacy_existing_execution_waits_for_exact_durable_run(ingress):
+async def test_legacy_existing_execution_returns_after_durable_acceptance(ingress):
     owner, _ = ingress
     with get_session_local()() as db:
         task = Task(user_id=owner, title="legacy", status=TaskStatus.PENDING)
         db.add(task)
         db.commit()
         task_id = task.id
-    pending = asyncio.create_task(
+    await asyncio.wait_for(
         task_start.execute_existing_task(
             task_id=task_id,
             task_owner_user_id=owner,
@@ -130,39 +131,17 @@ async def test_legacy_existing_execution_waits_for_exact_durable_run(ingress):
             task_description="saved",
             context={},
             actor_user_id=owner,
-        )
+        ),
+        5,
     )
-    try:
-
-        async def accepted():
-            while True:
-                if pending.done():
-                    pending.result()
-                with get_session_local()() as db:
-                    command = (
-                        db.query(TaskExecutionCommand)
-                        .filter_by(task_id=task_id)
-                        .first()
-                    )
-                    if command is not None:
-                        return command.target_run_id
-                await asyncio.sleep(0.01)
-
-        run_id = await asyncio.wait_for(accepted(), 5)
-        assert not pending.done()
-        with get_session_local()() as db:
-            task = db.get(Task, task_id)
-            assert task.run_id is None
-            assert task.runner_id is None
-            assert db.query(TaskChatMessage).count() == 0
-            task.run_id = run_id
-            task.status = TaskStatus.COMPLETED
-            task.control_state = "completed"
-            db.commit()
-        await asyncio.wait_for(pending, 5)
-    finally:
-        pending.cancel()
-        await asyncio.gather(pending, return_exceptions=True)
+    with get_session_local()() as db:
+        command = db.query(TaskExecutionCommand).filter_by(task_id=task_id).one()
+        assert command.target_run_id is not None
+        assert command.status == "pending"
+        task = db.get(Task, task_id)
+        assert task.run_id is None
+        assert task.runner_id is None
+        assert db.query(TaskChatMessage).count() == 0
 
 
 @pytest.mark.parametrize(
@@ -250,8 +229,8 @@ def test_recovery_releases_expired_owner_without_mutating_business_status(
 async def test_sdk_append_records_current_actor_after_owner_transfer(
     ingress, monkeypatch
 ):
+    from tests.web.services.coordinator_command_shared import claim_for_owner
     from xagent.web.services import task_start_consumer
-    from xagent.web.services.task_command_transport import claim_task_command
 
     owner, agent_id = ingress
     first = await task_start.create_sdk_task(
@@ -291,7 +270,7 @@ async def test_sdk_append_records_current_actor_after_owner_transfer(
         assert row.actor_user_id == actor_id
         assert row.actor_subject == actor_subject
         assert row.task_owner_user_id == owner
-        command = claim_task_command(db, runner_id="worker", command_db_id=row.id)
+        command_id = row.id
     from xagent.web.services.task_coordinator_service import (
         acquire_task_lease_no_commit,
     )
@@ -300,6 +279,8 @@ async def test_sdk_append_records_current_actor_after_owner_transfer(
         owner_lease = acquire_task_lease_no_commit(
             db, first.task_id, runner_id="worker"
         )
+    with get_session_local()() as db:
+        command = claim_for_owner(db, owner_lease, command_id)
     handoff = task_start_consumer._commit_handoff(command, owner_lease)
     assert handoff.task_owner_user_id == owner
     assert handoff.claimed.task_lease.run_id == second.run_id

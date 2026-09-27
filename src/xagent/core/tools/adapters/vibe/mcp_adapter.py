@@ -46,11 +46,13 @@ from .connector_runtime import (
     RUNTIME_INPUT_CONTEXT,
     TARGET_MCP_META,
     TARGET_TOOL_ARGUMENTS,
+    ConnectorRef,
     binding_source_value,
     binding_target,
     connector_runtime_from_config,
     runtime_bindings_from_config,
 )
+from .mcp_approval_gate import gate_mcp_tools
 from .sandboxed_tool.chrome_session import (
     ChromeDaemonLaunchSpec,
     ChromeExecutionScope,
@@ -238,6 +240,7 @@ class EmptyArgsModel(BaseModel):
 logger = logging.getLogger(__name__)
 _RUNTIME_CONNECTION_REFRESH_KEY = "_connector_runtime_refresh"
 _OAUTH_TOKEN_RESOLVER_REFRESH_KEY = "_oauth_token_resolver_refresh"
+_SLACK_ACTOR_RUNTIME_REFRESH_KEY = "_slack_actor_runtime_refresh"
 # Hard ceiling on how many exception nodes either walk over a failed call
 # visits, so a wide or cyclic __cause__/__context__ graph cannot spin.
 # Two consumers read it: _bounded_exception_nodes (the 401 resolver's
@@ -1638,6 +1641,97 @@ class MCPToolAdapter(AbstractBaseTool):
 
         return normalized_args
 
+    def _validate_strict_integer_args(self, args: Mapping[str, Any]) -> None:
+        """Validate declared integer inputs before Pydantic can coerce them.
+
+        MCP arguments arrive as JSON values.  Pydantic's default ``int``
+        parsing accepts booleans, numeric strings, and integral floats, which
+        changes the caller's value before a strict downstream tool can inspect
+        it.  Preserve the schema's integer contract at this shared boundary and
+        enforce its numeric bounds without changing the emitted args model.
+        """
+        schema = self.mcp_tool.inputSchema
+        if not isinstance(schema, dict):
+            return
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            return
+
+        for field_name, field_schema in properties.items():
+            if field_name not in args or args[field_name] is None:
+                continue
+            if not self._schema_is_integer_only(field_schema):
+                continue
+
+            value = args[field_name]
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"{field_name} must be an integer")
+
+            for constraint, bound in self._integer_schema_bounds(field_schema):
+                if constraint == "minimum" and value < bound:
+                    raise ValueError(f"{field_name} must be at least {bound}")
+                if constraint == "maximum" and value > bound:
+                    raise ValueError(f"{field_name} must be at most {bound}")
+                if constraint == "exclusiveMinimum" and value <= bound:
+                    raise ValueError(f"{field_name} must be greater than {bound}")
+                if constraint == "exclusiveMaximum" and value >= bound:
+                    raise ValueError(f"{field_name} must be less than {bound}")
+
+    def _schema_is_integer_only(self, schema: Any) -> bool:
+        """Return True when integer is the only accepted non-null JSON type."""
+        if not isinstance(schema, dict):
+            return False
+
+        schema_type = schema.get("type")
+        if schema_type == "integer":
+            return True
+        if isinstance(schema_type, list):
+            concrete_types = [item for item in schema_type if item != "null"]
+            return bool(concrete_types) and all(
+                concrete_type == "integer" for concrete_type in concrete_types
+            )
+
+        for union_key in ("anyOf", "oneOf"):
+            options = schema.get(union_key)
+            if isinstance(options, list) and options:
+                non_null_options = [
+                    option for option in options if not self._is_null_schema(option)
+                ]
+                return bool(non_null_options) and all(
+                    self._schema_is_integer_only(option) for option in non_null_options
+                )
+
+        all_of = schema.get("allOf")
+        if isinstance(all_of, list) and all_of:
+            return any(self._schema_is_integer_only(option) for option in all_of)
+        return False
+
+    def _integer_schema_bounds(self, schema: Any) -> list[tuple[str, int | float]]:
+        """Collect valid numeric bounds from an integer schema and wrappers."""
+        if not isinstance(schema, dict):
+            return []
+
+        bounds: list[tuple[str, int | float]] = []
+        for constraint in (
+            "minimum",
+            "maximum",
+            "exclusiveMinimum",
+            "exclusiveMaximum",
+        ):
+            bound = schema.get(constraint)
+            if isinstance(bound, (int, float)) and not isinstance(bound, bool):
+                bounds.append((constraint, bound))
+
+        for composite_key in ("anyOf", "oneOf", "allOf"):
+            options = schema.get(composite_key)
+            if not isinstance(options, list):
+                continue
+            for option in options:
+                if self._is_null_schema(option):
+                    continue
+                bounds.extend(self._integer_schema_bounds(option))
+        return bounds
+
     def _schema_accepts_array(self, schema: Any) -> bool:
         """Return True when a JSON schema allows array input."""
         if not isinstance(schema, dict):
@@ -1708,6 +1802,7 @@ class MCPToolAdapter(AbstractBaseTool):
                         self.mcp_tool.name,
                     )
                     normalized_args.pop(field_name, None)
+            self._validate_strict_integer_args(normalized_args)
             parsed_args = self._args_type(**normalized_args)
             tool_args = parsed_args.model_dump(exclude_none=True)
             tool_args.update(self._runtime_tool_arguments())
@@ -1727,11 +1822,22 @@ class MCPToolAdapter(AbstractBaseTool):
             user_context = UserContext(current_user_id)
 
             with user_context.set_context():
+                (
+                    invocation_connection,
+                    was_refreshed,
+                ) = await self._invocation_connection()
+                if invocation_connection is None:
+                    return _delegated_authorization_failed_result()
                 try:
                     return await self._execute_mcp_call(
-                        self.connection, tool_args, tool_meta
+                        invocation_connection, tool_args, tool_meta
                     )
                 except (BaseExceptionGroup, Exception) as exc:
+                    # A trusted Slack grant is freshly revalidated before every
+                    # invocation. Never retry its call with the stale connection
+                    # retained only for tool metadata/listing.
+                    if was_refreshed:
+                        raise
                     retry_result = await self._retry_after_authorization_failure(
                         exc, tool_args, tool_meta
                     )
@@ -1783,6 +1889,34 @@ class MCPToolAdapter(AbstractBaseTool):
                 "content": [{"text": "Error executing MCP tool."}],
                 "is_error": True,
             }
+
+    async def _invocation_connection(self) -> tuple[Connection | None, bool]:
+        """Resolve a one-call trusted connection without stale fallback."""
+
+        if not isinstance(self.connection, Mapping):
+            return self.connection, False
+        refresh = self.connection.get(_SLACK_ACTOR_RUNTIME_REFRESH_KEY)
+        if refresh is None:
+            return self.connection, False
+        if not callable(refresh):
+            logger.warning("Slack actor runtime refresh is malformed")
+            return None, True
+        try:
+            refreshed = refresh()
+            if inspect.isawaitable(refreshed):
+                refreshed = await refreshed
+        except Exception as exc:
+            logger.warning(
+                "Slack actor runtime refresh failed (%s)", type(exc).__name__
+            )
+            return None, True
+        if (
+            not isinstance(refreshed, dict)
+            or _SLACK_ACTOR_RUNTIME_REFRESH_KEY in refreshed
+        ):
+            logger.warning("Slack actor runtime refresh returned no valid connection")
+            return None, True
+        return cast(Connection, refreshed), True
 
     async def _execute_mcp_call(
         self,
@@ -2076,6 +2210,9 @@ class _UnavailableMCPToolResult(BaseModel):
     reason: str | None = Field(
         default=None, description="Public-safe MCP unavailability reason"
     )
+    unavailable_server: str | None = Field(
+        default=None, description="Name of the unavailable MCP server"
+    )
     content: List[Dict[str, Any]] = Field(
         default_factory=list, description="Tool execution result content"
     )
@@ -2090,13 +2227,13 @@ class UnavailableMCPTool(AbstractBaseTool):
 
     The tool exists to explain an outage, so it always reports that outage to
     whoever invokes it: it carries no allow-list and performs no caller check.
-    Its result holds only a constant message plus a ``reason`` and a
-    ``failure_code``. ``failure_code`` is normalized against the public failure
-    allowlist here and dropped when it is not on it; ``reason`` is stored as
-    given, so an allowlisted value is a guarantee callers make, enforced where
-    the unavailable config is built. The server name it is built from is
-    already exposed in the tool listing, so there is nothing here to withhold
-    from a caller.
+    Its result holds only a constant message, the ``unavailable_server`` name,
+    a ``reason`` and a ``failure_code``. ``failure_code`` is normalized against
+    the public failure allowlist here and dropped when it is not on it;
+    ``reason`` is stored as given, so an allowlisted value is a guarantee
+    callers make, enforced where the unavailable config is built.
+    ``unavailable_server`` is the raw configured name, shown to anyone who can
+    see the trace, including anonymous share viewers (#1041).
     """
 
     read_only = True
@@ -2173,6 +2310,8 @@ class UnavailableMCPTool(AbstractBaseTool):
             result["reason"] = self._reason
         if self._failure_code is not None:
             result["failure_code"] = self._failure_code
+        # Output filtering truncates keys in insertion order; keep this after reason.
+        result["unavailable_server"] = self._server_name
         return result
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
@@ -2517,6 +2656,7 @@ async def _load_server_tools_bounded(
 async def load_mcp_tools_as_agent_tools(
     connection_map: Dict[str, Connection],
     *,
+    connector_refs: Mapping[str, ConnectorRef] | None = None,
     name_prefix: str = "mcp_",
     visibility: Optional[ToolVisibility] = None,
     allow_users: Optional[List[str]] = None,
@@ -2526,6 +2666,9 @@ async def load_mcp_tools_as_agent_tools(
 
     Args:
         connection_map: Map of server names to connection configurations
+        connector_refs: Trusted persisted connector identities keyed by server
+            name. These stay outside transport mappings so sandbox guests never
+            receive host authorization identity.
         name_prefix: Prefix for tool names (default: "mcp_")
         visibility: Tool visibility setting
         allow_users: List of allowed user IDs
@@ -2653,7 +2796,15 @@ async def load_mcp_tools_as_agent_tools(
                 server_tools = direct_result.tools
                 failures.extend(direct_result.failures)
 
-            agent_tools.extend(server_tools)
+            # Both direct adapters and sandbox wrappers reach this host-side
+            # boundary before any connector dispatch.
+            agent_tools.extend(
+                gate_mcp_tools(
+                    server_tools,
+                    connection=connection,
+                    connector_ref=(connector_refs or {}).get(server_name),
+                )
+            )
             if server_tools:
                 loaded_servers.append(server_name)
             logger.info(f"Found {len(server_tools)} tools from server {server_name}")

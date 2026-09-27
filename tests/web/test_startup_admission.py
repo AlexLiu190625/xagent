@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock
+from unittest.mock import ANY, AsyncMock, Mock
 
 import pytest
 from fastapi import FastAPI
@@ -210,14 +210,42 @@ async def test_failed_admission_with_due_trigger_launches_no_background_work(
 
 
 @pytest.mark.asyncio
-async def test_unwired_shared_execution_refuses_startup_before_database(monkeypatch):
+async def test_unconfigured_shared_execution_refuses_startup_before_database(
+    monkeypatch,
+):
     monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.delenv("XAGENT_REDIS_URL", raising=False)
     initialize = AsyncMock()
     monkeypatch.setattr(
         app_module, "_initialize_database_and_admit_runtime", initialize
     )
-    with pytest.raises(
-        RuntimeError, match="XAGENT_SHARED_TASK_EXECUTION_ENABLED must remain false"
-    ):
+    with pytest.raises(ValueError, match="requires XAGENT_REDIS_URL"):
         await app_module.startup_event()
     initialize.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_trace_configuration_failure_stops_ingress_and_names_phase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.services import trace_database
+
+    events: list[str] = []
+    test_app = FastAPI()
+    monkeypatch.setattr(app_module, "init_db", lambda: events.append("database"))
+    _patch_runtime_starts(monkeypatch, events)
+    rejection = RuntimeError("invalid trace configuration")
+
+    def reject():
+        raise rejection
+
+    monkeypatch.setattr(trace_database, "get_trace_database_runtime", reject)
+    log = Mock()
+    monkeypatch.setattr(app_module, "logger", log)
+    with pytest.raises(RuntimeError) as raised:
+        await app_module._initialize_database_and_admit_runtime(test_app)
+    assert raised.value is rejection
+    assert events == ["database"]
+    log.error.assert_called_once_with(
+        "startup phase failed: %s (after %.2fs)", "trace database init", ANY
+    )

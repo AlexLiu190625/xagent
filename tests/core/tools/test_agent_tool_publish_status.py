@@ -202,6 +202,59 @@ def test_non_owner_cannot_see_other_users_published_agent_tools() -> None:
             pass
 
 
+def test_inherited_mcp_unavailable_reason_reaches_every_built_agent_tool() -> None:
+    """The refusal a delegated child was itself built under must reach the
+    grandchild ``AgentTool`` instances this call constructs.
+
+    ``AgentTool`` refuses to materialize governed MCP connectors for its own
+    child (see ``_nested_mcp_refusal_reason``), but that refusal is only
+    visible through the ReAct-bound execution context one hop up. A
+    grandchild delegated from the child sees no such context and would
+    otherwise read as unregistered and dispatch ungated. Threading the
+    reason through ``inherited_mcp_unavailable_reason`` -- the same
+    plumbing ``voice`` already uses -- keeps a refusal sticky for the rest
+    of the delegation chain regardless of depth.
+    """
+    from xagent.core.tools.adapters.vibe.config import (
+        NESTED_DELEGATION_NOT_APPROVABLE_REASON,
+    )
+
+    db, db_path, SessionLocal = _create_session()
+    try:
+        owner = User(username="inherited-reason-owner", password_hash="x")
+        db.add(owner)
+        db.commit()
+        db.refresh(owner)
+
+        published_agent = Agent(
+            user_id=owner.id,
+            name="Grandchild Agent",
+            status=AgentStatus.PUBLISHED,
+        )
+        db.add(published_agent)
+        db.commit()
+
+        tools = get_published_agents_tools(
+            session_factory=SessionLocal,
+            user_id=owner.id,
+            inherited_mcp_unavailable_reason=NESTED_DELEGATION_NOT_APPROVABLE_REASON,
+        )
+        assert tools, "expected the published agent to yield a tool"
+        for tool in tools:
+            assert (
+                tool._inherited_mcp_unavailable_reason  # noqa: SLF001
+                == NESTED_DELEGATION_NOT_APPROVABLE_REASON
+            )
+    finally:
+        db.close()
+        try:
+            import os
+
+            os.remove(db_path)
+        except OSError:
+            pass
+
+
 def test_owner_sees_only_own_published_agents_not_drafts() -> None:
     db, db_path, SessionLocal = _create_session()
     try:

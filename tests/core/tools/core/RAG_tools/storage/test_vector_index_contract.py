@@ -293,3 +293,52 @@ def test_a_panicking_fts_rebuild_still_lets_optimize_run(tmp_path, monkeypatch):
     assert store.trigger_reindex("embeddings_probe") is True
 
     assert calls == ["create_fts_index", "optimize"]
+
+
+@pytest.fixture
+def jieba_dictionary(monkeypatch, tmp_path):
+    """Point lance at a dictionary this test installs, not at the machine's."""
+    from xagent.core.tools.core.RAG_tools.LanceDB.jieba_dictionary import (
+        ensure_jieba_dictionary,
+    )
+
+    monkeypatch.setenv("LANCE_LANGUAGE_MODEL_HOME", str(tmp_path / "lm"))
+    assert ensure_jieba_dictionary() is True
+
+
+def test_rebuild_text_fts_index_rebuilds_a_real_jieba_index(tmp_path, jieba_dictionary):
+    """The migration entry point against a real table, not a mocked one."""
+    from xagent.core.tools.core.RAG_tools.storage.lancedb_stores import (
+        FtsRebuildOutcome,
+    )
+
+    db = lancedb.connect(str(tmp_path / "rebuild-fts"))
+    table = db.create_table("embeddings_probe", data=_rows(300))
+    table.create_fts_index(
+        "text", with_position=True, replace=True, base_tokenizer="jieba/default"
+    )
+    version_before = table.version
+
+    outcome = _store_on(db).rebuild_text_fts_index("embeddings_probe")
+
+    assert outcome is FtsRebuildOutcome.REBUILT
+    table = db.open_table("embeddings_probe")
+    assert table.version > version_before
+    index = _fts_index(table)
+    assert index is not None
+    assert table.index_stats(index.name).num_unindexed_rows == 0
+
+
+def test_rebuild_text_fts_index_skips_a_real_table_without_fts(tmp_path):
+    """Most tables in the database carry no FTS index at all."""
+    from xagent.core.tools.core.RAG_tools.storage.lancedb_stores import (
+        FtsRebuildOutcome,
+    )
+
+    db = lancedb.connect(str(tmp_path / "rebuild-no-fts"))
+    db.create_table("parses", data=_rows(100))
+
+    outcome = _store_on(db).rebuild_text_fts_index("parses")
+
+    assert outcome is FtsRebuildOutcome.SKIPPED_NO_INDEX
+    assert _fts_index(db.open_table("parses")) is None

@@ -12,6 +12,7 @@ import base64
 import hashlib
 from datetime import timedelta
 from types import SimpleNamespace
+from unittest.mock import Mock
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -23,6 +24,7 @@ from xagent.web.api.auth import (
     _is_salesforce_provider,
     _resolve_oauth_secret,
     create_access_token,
+    generic_oauth_callback,
     generic_oauth_login,
     verify_token,
 )
@@ -31,9 +33,11 @@ from xagent.web.builtin_mcp_registry import (
     get_builtin_public_mcp_app,
 )
 from xagent.web.models.database import Base
+from xagent.web.models.mcp import MCPServer
 from xagent.web.models.oauth_provider import OAuthProvider
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
+from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.oauth_provider_quirks import requires_pkce
 
 XERO_APP_SCOPES = [
@@ -98,6 +102,16 @@ def _provider(
 def _location(response) -> str:
     # RedirectResponse stores the target in the Location header.
     return response.headers["location"]
+
+
+class _MockOAuthResponse:
+    def __init__(self, payload: dict):
+        self._payload = payload
+        self.status_code = 200
+        self.text = ""
+
+    def json(self):
+        return self._payload
 
 
 # ---------- the actual regression checks ------------------------------------
@@ -186,6 +200,80 @@ def test_xero_catalog_login_scopes(db_session, monkeypatch):
     assert set(scopes) == set(XERO_APP_SCOPES)
     assert len(scopes) == len(set(scopes))
     assert verify_token(params["state"][0])["app_id"] == "xero"
+
+
+def test_google_drive_login_does_not_reuse_previous_granted_scopes(db_session):
+    db, user = db_session
+    db.add(
+        PublicMCPApp(
+            app_id="google-drive",
+            name="Google Drive",
+            description="Drive",
+            transport="oauth",
+            provider_name="google",
+            category="Support",
+            oauth_scopes=["https://www.googleapis.com/auth/drive.file"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+    provider = _provider(
+        auth_url="https://accounts.google.com/o/oauth2/v2/auth",
+        default_scopes=["openid"],
+        redirect_uri="https://app.example.com/api/auth/google/callback",
+    )
+
+    response = generic_oauth_login(
+        provider="google",
+        token=_token_for(user),
+        app_id="google-drive",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    params = parse_qs(urlparse(_location(response)).query)
+    assert params["include_granted_scopes"] == ["false"]
+    assert set(params["scope"][0].split()) == {
+        "openid",
+        "https://www.googleapis.com/auth/drive.file",
+    }
+
+
+def test_other_google_connector_keeps_incremental_authorization(db_session):
+    db, user = db_session
+    db.add(
+        PublicMCPApp(
+            app_id="google-calendar",
+            name="Google Calendar",
+            description="Calendar",
+            transport="oauth",
+            provider_name="google",
+            category="Scheduling",
+            oauth_scopes=["https://www.googleapis.com/auth/calendar.events"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+    provider = _provider(
+        auth_url="https://accounts.google.com/o/oauth2/v2/auth",
+        default_scopes=["openid"],
+        redirect_uri="https://app.example.com/api/auth/google/callback",
+    )
+
+    response = generic_oauth_login(
+        provider="google",
+        token=_token_for(user),
+        app_id="google-calendar",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    params = parse_qs(urlparse(_location(response)).query)
+    assert params["include_granted_scopes"] == ["true"]
 
 
 def test_auth_url_with_query_uses_ampersand_separator(db_session):
@@ -573,6 +661,48 @@ def test_meta_login_uses_comma_separated_canonical_scopes_for_builtin_app(
     ]
 
 
+def test_meta_ads_login_requests_ads_read_scope_without_config_id(
+    db_session, monkeypatch
+):
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.delenv("META_CONFIG_ID", raising=False)
+    monkeypatch.delenv("META_ADS_CONFIG_ID", raising=False)
+    db.add(
+        PublicMCPApp(
+            app_id="meta-ads",
+            name="Meta Ads",
+            description="Meta Ads connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["ads_read"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="meta-ads",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["scope"] == ["public_profile,ads_read"]
+    assert "config_id" not in qs
+
+
 def test_github_login_requests_exact_canonical_scope(db_session):
     """The requested scope must be exactly the provider's default_scopes
     ("read:user") merged with the github app row's canonical oauth_scopes
@@ -779,6 +909,144 @@ def test_bare_login_for_unrestricted_provider_still_proceeds(db_session):
     )
 
     assert resp.status_code == 307
+
+
+def test_planner_catalog_login_requests_tasks_scope(db_session):
+    db, user = db_session
+    token = _token_for(user)
+    planner = get_builtin_public_mcp_app("planner")
+    assert planner is not None
+    db.add(PublicMCPApp(**planner))
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+        default_scopes=["User.Read"],
+        redirect_uri="https://app.example.com/cb",
+    )
+    response = generic_oauth_login(
+        provider="microsoft",
+        token=token,
+        app_id="planner",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    query = parse_qs(urlparse(_location(response)).query)
+    assert set(query["scope"][0].split()) == {"Tasks.ReadWrite", "User.Read"}
+
+
+def test_excel_login_requests_refresh_permission(db_session):
+    db, user = db_session
+    token = _token_for(user)
+    excel_row = get_builtin_public_mcp_app("excel")
+    assert excel_row is not None
+    db.add(PublicMCPApp(**excel_row))
+    db.commit()
+    provider = _provider(
+        auth_url="https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+        default_scopes=["User.Read"],
+        redirect_uri="https://app.example.com/api/auth/microsoft/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="microsoft",
+        token=token,
+        app_id="excel",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    assert resp.status_code == 307
+    scopes = parse_qs(urlparse(_location(resp)).query)["scope"][0].split()
+    assert set(scopes) == {"User.Read", "Files.ReadWrite", "offline_access"}
+
+
+def test_bare_microsoft_callback_skips_excel_but_connects_eligible_sibling(
+    db_session, monkeypatch
+):
+    """A User.Read-only provider grant must not provision the Excel app."""
+    from xagent.web.api import auth as auth_api
+
+    db, user = db_session
+    db.add_all(
+        [
+            PublicMCPApp(
+                app_id="excel",
+                name="Excel",
+                transport="oauth",
+                provider_name="microsoft",
+                oauth_scopes=["Files.ReadWrite"],
+                is_visible_in_connector=True,
+                launch_config={"command": "python", "args": ["-m", "excel"]},
+            ),
+            PublicMCPApp(
+                app_id="microsoft-profile",
+                name="Microsoft Profile",
+                transport="oauth",
+                provider_name="microsoft",
+                oauth_scopes=["User.Read"],
+                is_visible_in_connector=True,
+                launch_config={"command": "python", "args": ["-m", "profile"]},
+            ),
+        ]
+    )
+    db.commit()
+    state = create_access_token(
+        data={"type": "oauth_state", "user_id": user.id, "provider": "microsoft"},
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "code", "state": state})
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=_MockOAuthResponse(
+                {
+                    "access_token": "user-read-token",
+                    "token_type": "Bearer",
+                    "scope": "User.Read",
+                    "expires_in": 3600,
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(
+            return_value=_MockOAuthResponse(
+                {"id": "microsoft-user-1", "mail": "alice@example.com"}
+            )
+        ),
+    )
+    provider = SimpleNamespace(
+        provider_name="microsoft",
+        client_id=encrypt_value("microsoft-client-id"),
+        client_secret=encrypt_value("microsoft-client-secret"),
+        token_url="https://login.microsoftonline.com/common/oauth2/v2.0/token",
+        redirect_uri="https://app.example.com/api/auth/microsoft/callback",
+        userinfo_url="https://graph.microsoft.com/v1.0/me",
+        user_id_path="id",
+        email_path="mail",
+        default_scopes=["User.Read"],
+    )
+
+    response = generic_oauth_callback("microsoft", request, db, provider)
+
+    assert response.status_code == 200
+    assert (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "microsoft")
+        .one()
+        .access_token
+        == "user-read-token"
+    )
+    server_names = {server.name for server in db.query(MCPServer).all()}
+    assert "Microsoft Profile" in server_names
+    assert "Excel" not in server_names
 
 
 def test_hubspot_login_sends_tier_gated_scopes_as_optional(db_session):
@@ -1023,6 +1291,362 @@ def test_meta_login_uses_config_id_without_scope_for_facebook(db_session, monkey
     assert qs["config_id"] == ["1234567890"]
     assert "scope" not in qs
     assert "optional_scope" not in qs
+
+
+def test_facebook_login_uses_its_own_config_id_override(db_session, monkeypatch):
+    """Mirrors the meta-ads override test below for META_FACEBOOK_CONFIG_ID,
+    which had no dedicated coverage of its own."""
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.setenv("META_CONFIG_ID", "shared-config-id")
+    monkeypatch.setenv("META_FACEBOOK_CONFIG_ID", "facebook-only-config-id")
+    db.add(
+        PublicMCPApp(
+            app_id="facebook",
+            name="Facebook Pages",
+            description="Facebook connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["pages_show_list"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="facebook",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["config_id"] == ["facebook-only-config-id"]
+
+
+def test_instagram_login_uses_its_own_config_id_override(db_session, monkeypatch):
+    """Mirrors the meta-ads override test below for META_INSTAGRAM_CONFIG_ID,
+    which had no dedicated coverage of its own."""
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.setenv("META_CONFIG_ID", "shared-config-id")
+    monkeypatch.setenv("META_INSTAGRAM_CONFIG_ID", "instagram-only-config-id")
+    db.add(
+        PublicMCPApp(
+            app_id="instagram",
+            name="Instagram",
+            description="Instagram connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["instagram_basic"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="instagram",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["config_id"] == ["instagram-only-config-id"]
+
+
+def test_meta_ads_login_uses_its_own_config_id_override(db_session, monkeypatch):
+    """A dedicated META_ADS_CONFIG_ID must take precedence over the shared
+    META_CONFIG_ID for the meta-ads app -- otherwise widening the one shared
+    Login Configuration to include ads_read would also hand that permission
+    to Facebook/Instagram tokens issued from the same configuration."""
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.setenv("META_CONFIG_ID", "shared-config-id")
+    monkeypatch.setenv("META_ADS_CONFIG_ID", "ads-only-config-id")
+    db.add(
+        PublicMCPApp(
+            app_id="meta-ads",
+            name="Meta Ads",
+            description="Meta Ads connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["ads_read"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="meta-ads",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["config_id"] == ["ads-only-config-id"]
+    assert "scope" not in qs
+
+
+def test_meta_ads_login_falls_back_to_shared_config_id_when_unset(
+    db_session, monkeypatch
+):
+    """Without a dedicated META_ADS_CONFIG_ID, Meta Ads still falls back to
+    the shared META_CONFIG_ID -- preserving existing deployments that
+    haven't split their Login Configurations out per app."""
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.setenv("META_CONFIG_ID", "shared-config-id")
+    monkeypatch.delenv("META_ADS_CONFIG_ID", raising=False)
+    db.add(
+        PublicMCPApp(
+            app_id="meta-ads",
+            name="Meta Ads",
+            description="Meta Ads connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["ads_read"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="meta-ads",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["config_id"] == ["shared-config-id"]
+
+
+def test_meta_ads_login_config_id_override_survives_admin_app_id_casing(
+    db_session, monkeypatch
+):
+    """An admin-created app row's app_id is free-form (e.g. "Meta Ads" with
+    a space/capitals, still normalizing to "meta-ads" for the app-scoped
+    OAuth grant policy in mcp_apps.py). The config_id override lookup must
+    normalize the same way, or a differently-cased app_id would silently
+    miss META_ADS_CONFIG_ID and fall back to the shared META_CONFIG_ID --
+    reintroducing exactly the cross-app capability sharing the per-app
+    override exists to prevent."""
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.setenv("META_CONFIG_ID", "shared-config-id")
+    monkeypatch.setenv("META_ADS_CONFIG_ID", "ads-only-config-id")
+    db.add(
+        PublicMCPApp(
+            app_id="Meta Ads",
+            name="Meta Ads",
+            description="Meta Ads connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["ads_read"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="Meta Ads",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["config_id"] == ["ads-only-config-id"]
+
+
+def test_whatsapp_login_uses_its_own_config_id_override(db_session, monkeypatch):
+    """A dedicated META_WHATSAPP_CONFIG_ID must take precedence over the
+    shared META_CONFIG_ID for the whatsapp app -- otherwise widening the one
+    shared Login Configuration to include WhatsApp's business_management /
+    whatsapp_business_management / whatsapp_business_messaging scopes would
+    also hand those permissions to Facebook/Instagram/Meta Ads tokens issued
+    from the same configuration."""
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.setenv("META_CONFIG_ID", "shared-config-id")
+    monkeypatch.setenv("META_WHATSAPP_CONFIG_ID", "whatsapp-only-config-id")
+    db.add(
+        PublicMCPApp(
+            app_id="whatsapp",
+            name="WhatsApp Business",
+            description="WhatsApp connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["whatsapp_business_messaging"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="whatsapp",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["config_id"] == ["whatsapp-only-config-id"]
+    assert "scope" not in qs
+
+
+def test_whatsapp_login_falls_back_to_shared_config_id_when_unset(
+    db_session, monkeypatch
+):
+    """Mirrors the meta-ads equivalent above: without a dedicated
+    META_WHATSAPP_CONFIG_ID, whatsapp still falls back to the shared
+    META_CONFIG_ID -- preserving existing deployments that haven't split
+    their Login Configurations out per app."""
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.setenv("META_CONFIG_ID", "shared-config-id")
+    monkeypatch.delenv("META_WHATSAPP_CONFIG_ID", raising=False)
+    db.add(
+        PublicMCPApp(
+            app_id="whatsapp",
+            name="WhatsApp Business",
+            description="WhatsApp connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["whatsapp_business_messaging"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="whatsapp",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["config_id"] == ["shared-config-id"]
+
+
+def test_whatsapp_login_config_id_override_survives_admin_app_id_casing(
+    db_session, monkeypatch
+):
+    """Mirrors the meta-ads equivalent above: an admin-created app row's
+    app_id is free-form (e.g. "WhatsApp" with different casing/spacing,
+    still normalizing to "whatsapp" for the app-scoped OAuth grant policy in
+    mcp_apps.py). The config_id override lookup must normalize the same
+    way, or a differently-cased app_id would silently miss
+    META_WHATSAPP_CONFIG_ID and fall back to the shared META_CONFIG_ID."""
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.setenv("META_CONFIG_ID", "shared-config-id")
+    monkeypatch.setenv("META_WHATSAPP_CONFIG_ID", "whatsapp-only-config-id")
+    db.add(
+        PublicMCPApp(
+            app_id="WhatsApp",
+            name="WhatsApp Business",
+            description="WhatsApp connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["whatsapp_business_messaging"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="WhatsApp",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["config_id"] == ["whatsapp-only-config-id"]
 
 
 def test_meta_login_ignores_undocumented_legacy_config_id_alias(

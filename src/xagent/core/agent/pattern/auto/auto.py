@@ -10,6 +10,7 @@ from json_repair import loads as repair_json_loads
 
 from ....file_ref import final_deliverable_file_reference_instructions
 from ....model.chat.exceptions import LLMToolProtocolError
+from ....tools.tool_result_spill import SPILL_READ_TOOL_NAME
 from ...context.enrichment import (
     IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
     MEMORY_CONTEXT_METADATA_KEY,
@@ -17,6 +18,11 @@ from ...context.enrichment import (
     SELECTED_SKILL_METADATA_KEY,
     SKILL_CONTEXT_METADATA_KEY,
     enrich_context_with_memory,
+)
+from ...context.execution import (
+    EvidenceState,
+    note_compaction_evidence_loss,
+    tool_evidence_state,
 )
 from ...context.skill_tool import (
     LOAD_SKILL_TOOL_NAME,
@@ -26,7 +32,7 @@ from ...context.skill_tool import (
     build_load_skill_tool,
 )
 from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
-from ...grounding import VALUE_KINDS, grounding_rule
+from ...grounding import VALUE_KINDS, evidence_facts, grounding_rule
 from ...language import (
     final_answer_language_rule,
     reset_metadata_output_language,
@@ -281,6 +287,14 @@ class _AutoChildRuntime:
             pattern=self.auto_pattern,
             status=status,
             metadata=child_metadata,
+        )
+
+    async def checkpoint_context_tail(
+        self, label: str, *, context: Any
+    ) -> dict[str, Any] | None:
+        # Checkpoints are always written for the root context.
+        return await self.parent.checkpoint_context_tail(
+            label, context=self.root_context
         )
 
     async def on_tool_start(self, *, tool_call: dict[str, Any]) -> None:
@@ -794,12 +808,13 @@ class AutoPattern(AgentPattern):
             messages=context.get_messages_for_llm(),
             context=context,
         )
-        await runtime.compact_context_if_needed(
+        compact_result = await runtime.compact_context_if_needed(
             context=context,
             # See ReActPattern for why the fallback lives at the call site.
             llm=compact_llm if compact_llm is not None else route_llm,
             metadata={"phase": "auto_decision"},
         )
+        note_compaction_evidence_loss(context, compact_result)
 
         retry_feedback: str | None = None
         attempt = 0
@@ -814,6 +829,10 @@ class AutoPattern(AgentPattern):
                 tools,
                 memory_tools_available=memory_tools_available,
                 skill_loading_available=skill_loading_available,
+                # Recomputed on every parse retry on purpose: the state only
+                # ever moves toward removed, so a compaction between two
+                # attempts must not be missed.
+                evidence_state=tool_evidence_state(context),
             )
             routing_tools = [self._decision_tool_schema()]
             if skill_loading_available and load_skill_tool is not None:
@@ -1245,6 +1264,7 @@ class AutoPattern(AgentPattern):
         *,
         memory_tools_available: bool = False,
         skill_loading_available: bool = False,
+        evidence_state: EvidenceState,
     ) -> str:
         memory_rule = (
             "If the latest user message asks to remember, store, forget, or "
@@ -1259,7 +1279,13 @@ class AutoPattern(AgentPattern):
             if memory_tools_available
             else ""
         )
-        tool_count = len(tools)
+        # Both the count and the name list leave out the stored-result reader
+        # (see _execution_tool_names), so its exclusion changes neither.
+        tool_count = sum(
+            1
+            for tool in tools
+            if self._execution_tool_name(tool) != SPILL_READ_TOOL_NAME
+        )
         tool_names = self._execution_tool_names(tools)
         tool_capability_summary = (
             f"{tool_count} execution tools are available to the downstream "
@@ -1301,6 +1327,7 @@ class AutoPattern(AgentPattern):
             "when action is final_answer, you must include a complete non-empty "
             "answer field in the same tool call. Put action before answer in the "
             "tool arguments. "
+            f"{evidence_facts(evidence_state)}"
             f"When writing that answer field: {grounding_rule(can_call_tools=False)} "
             "If the answer would need any value the rule above forbids you to "
             f"supply -- {VALUE_KINDS} -- that no source here supports, set "
@@ -1365,27 +1392,35 @@ class AutoPattern(AgentPattern):
         )
 
     @staticmethod
+    def _execution_tool_name(tool: Any) -> str:
+        name: Any = None
+        if isinstance(tool, dict):
+            function = tool.get("function")
+            if isinstance(function, dict):
+                name = function.get("name")
+            if not name:
+                name = tool.get("name")
+        else:
+            metadata = getattr(tool, "metadata", None)
+            if metadata is not None:
+                name = getattr(metadata, "name", None)
+            if not name:
+                name = getattr(tool, "name", None)
+            if not name:
+                name = getattr(tool, "__name__", None)
+        return str(name or "").strip()
+
+    @staticmethod
     def _execution_tool_names(tools: list[Any]) -> list[str]:
         names: list[str] = []
         seen: set[str] = set()
         for tool in tools:
-            name: Any = None
-            if isinstance(tool, dict):
-                function = tool.get("function")
-                if isinstance(function, dict):
-                    name = function.get("name")
-                if not name:
-                    name = tool.get("name")
-            else:
-                metadata = getattr(tool, "metadata", None)
-                if metadata is not None:
-                    name = getattr(metadata, "name", None)
-                if not name:
-                    name = getattr(tool, "name", None)
-                if not name:
-                    name = getattr(tool, "__name__", None)
-
-            normalized = str(name or "").strip()
+            normalized = AutoPattern._execution_tool_name(tool)
+            # ReAct offers the stored-result reader per turn, once the run's
+            # registry holds a record; this list is not gated on the
+            # registry, so it leaves the reader out entirely.
+            if normalized == SPILL_READ_TOOL_NAME:
+                continue
             if normalized and normalized not in seen:
                 names.append(normalized)
                 seen.add(normalized)

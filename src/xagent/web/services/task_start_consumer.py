@@ -34,6 +34,7 @@ from .task_command_transport import (
     SettledTaskCommand,
     TaskCommandRejected,
     command_identity_matches_task,
+    command_processing_predicates,
     finish_task_command_no_commit,
 )
 from .task_coordinator_service import TaskLease as TaskOwnerLease
@@ -145,9 +146,7 @@ def _reject_start(
     owned = db.query(TaskExecutionCommand).filter(
         TaskExecutionCommand.id == row.id,
         TaskExecutionCommand.status == COMMAND_PROCESSING,
-        TaskExecutionCommand.claimed_by == row.claimed_by,
         TaskExecutionCommand.attempt_count == row.attempt_count,
-        TaskExecutionCommand.claim_expires_at > datetime.now(timezone.utc),
     )
     result = {"rejection_reason": reason}
     if (
@@ -189,6 +188,15 @@ def settle_failed_start_no_commit(db: Session, row: TaskExecutionCommand) -> Non
     )
     # A never-started new Task needs a terminal result. An append's failure
     # belongs to its command and must not overwrite the previous run's result.
+    stopped_before_start = (
+        isinstance(row.result, dict)
+        and row.result.get("rejection_reason") == "cancelled_before_admission"
+    )
+    error_message = (
+        "Task stopped before execution started."
+        if stopped_before_start
+        else "Task could not start."
+    )
     changed = (
         db.query(Task)
         .filter(
@@ -208,7 +216,7 @@ def settle_failed_start_no_commit(db: Session, row: TaskExecutionCommand) -> Non
                 Task.status: TaskStatus.FAILED,
                 Task.control_state: "failed",
                 Task.state_version: func.coalesce(Task.state_version, 0) + 1,
-                Task.error_message: "Task could not start.",
+                Task.error_message: error_message,
             },
             synchronize_session=False,
         )
@@ -247,9 +255,13 @@ def _commit_handoff(
             .where(
                 TaskExecutionCommand.id == command.id,
                 TaskExecutionCommand.status == COMMAND_PROCESSING,
-                TaskExecutionCommand.claimed_by == runner,
-                TaskExecutionCommand.attempt_count == command.attempt_count,
-                TaskExecutionCommand.claim_expires_at > datetime.now(timezone.utc),
+                *command_processing_predicates(
+                    db,
+                    command.id,
+                    runner,
+                    expected_attempt_count=command.attempt_count,
+                    owner_lease=owner_lease,
+                ),
             )
             .with_for_update()
         ).scalar_one_or_none()
@@ -272,6 +284,26 @@ def _commit_handoff(
             or (start.kind == "create" and task.status != TaskStatus.PENDING)
         ):
             return _reject_start(db, row, "start_state_changed")
+        if start.channel is not None:
+            from .channel_runtime import (
+                ChannelAuthorizationError,
+                ChannelConfigurationError,
+                _load_channel_owner_sync,
+            )
+
+            try:
+                channel_owner = _load_channel_owner_sync(
+                    db,
+                    channel_id=start.channel.channel_id,
+                    external_user_id=start.channel.external_user_id,
+                )
+            except (ChannelAuthorizationError, ChannelConfigurationError):
+                return _reject_start(db, row, "channel_unavailable")
+            if (
+                task.channel_id != start.channel.channel_id
+                or channel_owner.user_id != task.user_id
+            ):
+                return _reject_start(db, row, "channel_identity_changed")
         try:
             actor_policy = load_shared_actor_policy(
                 task, is_create=start.kind == "create"
@@ -318,6 +350,7 @@ def _commit_handoff(
             runner,
             result=result,
             expected_attempt_count=command.attempt_count,
+            owner_lease=owner_lease,
             require_live_claim=True,
         ):
             db.rollback()
@@ -399,6 +432,36 @@ async def _execute_task_start(command: ClaimedTaskCommand) -> SettledTaskCommand
         for key in ("trigger_id", "trigger_run_id", "trigger_type", "trigger_test"):
             if key in config:
                 context[key] = config[key]
+        if start.kind == "channel":
+            from .task_orchestrator import _schedule_bg, settle_task_lease_isolated
+
+            try:
+                _schedule_bg(
+                    task_id=command.task_id,
+                    task_owner_user_id=handoff.task_owner_user_id,
+                    task_source=handoff.claimed.task_source,
+                    run_id=start.run_id,
+                    task_lease=handoff.claimed.task_lease,
+                    payload=TaskTurnPayload(
+                        transcript_message=start.message,
+                        execution_message=start.execution_message,
+                        file_ids=tuple(start.file_ids),
+                        turn_id=start.turn_id,
+                    ),
+                    force_fresh=False,
+                    context=None,
+                    before_message_id=start.before_message_id,
+                    channel_command=command,
+                )
+            except BaseException:
+                await run_db_io_cancellation_safe(
+                    lambda: settle_task_lease_isolated(
+                        handoff.claimed.task_lease,
+                        error_message="Channel execution scheduling failed",
+                    )
+                )
+                raise
+            return SettledTaskCommand({"run_id": start.run_id})
         if start.kind == "existing":
             from .task_orchestrator import _schedule_bg, settle_task_lease_isolated
 

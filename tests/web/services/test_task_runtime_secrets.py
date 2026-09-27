@@ -175,10 +175,7 @@ def test_cleanup_cannot_observe_inputs_before_transaction_binds_run(task_id):
         )
 
 
-@pytest.mark.parametrize(
-    "key",
-    [None, "", "RQMpe38gK3m0szjpSmTNw_sP3Y54r6hDc6JewBoPKXc=", "invalid-key", "非密钥"],
-)
+@pytest.mark.parametrize("key", [None, "", "invalid-key", "非密钥"])
 def test_invalid_key_refuses_staging_without_writing(task_id, monkeypatch, key):
     monkeypatch.delenv("ENCRYPTION_KEY", raising=False)
     if key is not None:
@@ -192,6 +189,17 @@ def test_invalid_key_refuses_staging_without_writing(task_id, monkeypatch, key):
         db.commit()
     with get_session_local()() as observer:
         assert observer.query(TaskRuntimeSecret).count() == 0
+
+
+def test_explicit_fallback_key_round_trip(task_id, monkeypatch):
+    from xagent.config import DEV_FALLBACK_ENCRYPTION_KEY
+
+    monkeypatch.setenv("ENCRYPTION_KEY", DEV_FALLBACK_ENCRYPTION_KEY)
+    with get_session_local()() as db:
+        stage(db, task_id)
+        assert load_runtime_values(
+            db, task=db.get(Task, task_id), turn_id="turn-1", required=True
+        )
 
 
 def test_store_does_not_reuse_cached_development_cipher(
@@ -316,7 +324,7 @@ def test_read_distinguishes_key_configuration_from_decryption_failure(
             )
         assert error.value.code == (
             ERROR_RUNTIME_SECRET_UNAVAILABLE
-            if key_state == "rotated"
+            if key_state in {"default", "rotated"}
             else ERROR_CONNECTOR_RUNTIME_UNAVAILABLE
         )
         assert error.value.status_code == 503
@@ -380,3 +388,26 @@ def test_cleanup_pages_past_retained_inputs(task_id):
     assert clean_finished_runtime_values(batch_size=2, after_id=cursor) is None
     with get_session_local()() as db:
         assert db.query(TaskRuntimeSecret).count() == 4
+
+
+@pytest.mark.parametrize(
+    "status", [TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER, TaskStatus.RUNNING]
+)
+def test_expired_values_fail_before_sweep_and_are_removed(task_id, monkeypatch, status):
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setenv("XAGENT_TASK_RUNTIME_SECRETS_TTL_SECONDS", "60")
+    with get_session_local()() as db:
+        stage(db, task_id)
+        db.get(Task, task_id).status = status
+        db.query(TaskRuntimeSecret).one().created_at = datetime.now(
+            timezone.utc
+        ) - timedelta(seconds=61)
+        db.commit()
+    with get_session_local()() as db:
+        with pytest.raises(ConnectorRuntimeError) as error:
+            load_runtime_values(db, task=db.get(Task, task_id), required=True)
+        assert error.value.code == ERROR_RUNTIME_SECRET_UNAVAILABLE
+    clean_finished_runtime_values()
+    with get_session_local()() as db:
+        assert db.query(TaskRuntimeSecret).count() == 0

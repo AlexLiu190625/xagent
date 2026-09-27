@@ -12,6 +12,8 @@ from ....task_runtime import (
     PREFERRED_INPUT_MODALITIES_METADATA_KEY,
     normalize_input_modalities,
 )
+from ....tools.tool_result_spill import SPILL_READ_TOOL_NAME
+from ...checkpoint import CheckpointPersistenceError
 from ...context.enrichment import (
     enrich_context_with_memory,
     hydrate_top_level_user_request,
@@ -19,8 +21,9 @@ from ...context.enrichment import (
     pending_user_response_marker,
     top_level_user_request,
 )
+from ...context.execution import tool_evidence_state
 from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
-from ...grounding import grounding_rule
+from ...grounding import evidence_facts, grounding_rule, step_intent_not_fact_rule
 from ...language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     effective_output_language,
@@ -38,6 +41,7 @@ from ...runtime import (
 )
 from ..base import AgentPattern, PatternResult, RequiredToolCallError
 from ..final_answer_stream import FinalAnswerStreamSession, ToolCallStringFieldStreamer
+from ..partial_delivery import request_partial_delivery
 from ..react import ReActPattern, ReActReasoningMode
 from .plan_generator import (
     CallablePlanGenerator,
@@ -51,6 +55,7 @@ from .plan_generator import (
 logger = logging.getLogger(__name__)
 
 DAG_COMPLETION_TOOL_NAME = "assess_dag_completion"
+DAG_FAILURE_DELIVERY_TIMEOUT_SECONDS = 30.0
 
 # Precedence for _select_winner()'s ranking of a same-wakeup completed
 # batch: lower rank wins. A status not listed here (only "interrupted"
@@ -177,26 +182,126 @@ class _DAGStepRuntime:
         status: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        self.dag_pattern._set_active_step_context(self.step_id, context.to_dict())
-        get_state = getattr(pattern, "get_state", None)
-        if callable(get_state):
-            self.dag_pattern._set_active_step_pattern_state(
-                self.step_id,
-                get_state(),
-            )
+        # Snapshot only this step's own entries. Steps run concurrently
+        # (``max_concurrency`` defaults to 4) and the ``await`` below is a
+        # suspension point, so restoring the whole mapping would discard a
+        # sibling step's in-flight progress on failure.
+        #
+        # No deep copy is needed here, which keeps the hot path (~23
+        # checkpoint call sites per step) free of copying cost. That rests on
+        # two properties, both of which are pinned by tests:
+        #
+        # 1. ``_set_active_step_context`` / ``_set_active_step_pattern_state``
+        #    *replace* the dict entry rather than mutating it in place, so the
+        #    previous object survives the write untouched.
+        # 2. ``context.to_dict()`` and ``pattern.get_state()`` snapshot every
+        #    container that some code path mutates in place, so nothing that
+        #    happens after the entry was stored can reach into it. What they
+        #    still hand out by reference is write-once (replaced wholesale,
+        #    never written through) -- both methods document each exemption,
+        #    and the tests in ``test_context.py`` / ``test_react.py`` fail if
+        #    a new shared container appears.
+        #
+        # Together they make holding the previous reference and reassigning it
+        # a complete rollback. If a future change starts mutating one of those
+        # values in place, snapshot it there -- deep-copying the whole entry
+        # here would hide the problem and put the cost on every checkpoint.
+        was_active = self.step_id in self.dag_pattern.active_step_ids
+        had_context = self.step_id in self.dag_pattern.active_step_contexts
+        context_before = self.dag_pattern.active_step_contexts.get(self.step_id)
+        had_state = self.step_id in self.dag_pattern.active_step_pattern_states
+        state_before = self.dag_pattern.active_step_pattern_states.get(self.step_id)
         step_metadata = {
             "active_step_id": self.step_id,
             "child_label": label,
         }
         if metadata:
             step_metadata.update(metadata)
-        return await self.parent.checkpoint(
-            label=f"dag_{label}",
-            context=self.root_context,
-            pattern=self.dag_pattern,
-            status=status,
-            metadata=step_metadata,
-        )
+        try:
+            self.dag_pattern._set_active_step_context(self.step_id, context.to_dict())
+            get_state = getattr(pattern, "get_state", None)
+            if callable(get_state):
+                self.dag_pattern._set_active_step_pattern_state(
+                    self.step_id,
+                    get_state(),
+                )
+            return await self.parent.checkpoint(
+                label=f"dag_{label}",
+                context=self.root_context,
+                pattern=self.dag_pattern,
+                status=status,
+                metadata=step_metadata,
+            )
+        except BaseException as exc:
+            unrestorable = self._restore_step_snapshot(
+                was_active=was_active,
+                had_context=had_context,
+                context_before=context_before,
+                had_state=had_state,
+                state_before=state_before,
+            )
+            if unrestorable and isinstance(exc, Exception):
+                # The rollback could not fully reinstate the previous entry,
+                # so report a durability failure rather than let the caller
+                # believe the pre-checkpoint state survived. Only ordinary
+                # exceptions are replaced: cancellation, ``SystemExit`` and
+                # ``KeyboardInterrupt`` carry control-flow meaning and must
+                # reach the caller unchanged.
+                raise CheckpointPersistenceError(
+                    "Cannot roll back the DAG step checkpoint for step "
+                    f"{self.step_id!r}: {unrestorable}."
+                ) from exc
+            raise
+
+    def _restore_step_snapshot(
+        self,
+        *,
+        was_active: bool,
+        had_context: bool,
+        context_before: dict[str, Any] | None,
+        had_state: bool,
+        state_before: dict[str, Any] | None,
+    ) -> str | None:
+        """Undo this step's own active-step writes after a failed checkpoint.
+
+        Only entries keyed by ``self.step_id`` are touched, so a concurrently
+        running step keeps whatever it wrote while this coroutine was
+        suspended on the checkpoint ``await``.
+
+        This never raises, so a problem with one entry cannot leave the others
+        half-restored. It returns ``None`` when the rollback was complete, and
+        otherwise a description of what could not be reinstated, which the
+        caller turns into a durability failure.
+        """
+        unrestorable: list[str] = []
+        if not was_active:
+            # Nothing in the ``try`` removes a step id, so the id can only
+            # have been *added* by the setters. Drop it again.
+            self.dag_pattern.active_step_ids = [
+                step_id
+                for step_id in self.dag_pattern.active_step_ids
+                if step_id != self.step_id
+            ]
+        # A recorded-but-``None`` entry can only come from restored or legacy
+        # persisted state. It must not surface as an ``AssertionError``:
+        # DAGPattern's generic ``except Exception`` would swallow that into a
+        # permanent ``step.status="failed"`` instead of a retryable durability
+        # failure. Drop the key rather than write ``None`` back, so the
+        # mapping keeps its declared ``dict[str, dict[str, Any]]`` shape.
+        if had_context and context_before is not None:
+            self.dag_pattern.active_step_contexts[self.step_id] = context_before
+        else:
+            self.dag_pattern.active_step_contexts.pop(self.step_id, None)
+            if had_context:
+                unrestorable.append("the previous context is missing")
+        if had_state and state_before is not None:
+            self.dag_pattern.active_step_pattern_states[self.step_id] = state_before
+        else:
+            self.dag_pattern.active_step_pattern_states.pop(self.step_id, None)
+            if had_state:
+                unrestorable.append("the previous pattern state is missing")
+        self.dag_pattern._sync_legacy_active_step()
+        return " and ".join(unrestorable) if unrestorable else None
 
     async def on_tool_start(self, *, tool_call: dict[str, Any]) -> None:
         await self.parent.on_tool_start(tool_call=self._with_step(tool_call))
@@ -390,7 +495,11 @@ class DAGPattern(AgentPattern):
         self.active_step_pattern_states: dict[str, dict[str, Any]] = {}
         self.active_step_contexts: dict[str, dict[str, Any]] = {}
         self.step_results: dict[str, Any] = {}
+        # Failed-step observations are evidence only, never dependency results.
+        self.failed_step_evidence: dict[str, Any] = {}
+        self.failure_delivery_attempted = False
         self.planned_user_message_count = 0
+        self.replan_owed_step_ids: list[str] = []
         self.memory_input_text: str | None = None
         self.completion_feedback: str | None = None
         self.completion_replan_count = 0
@@ -437,6 +546,10 @@ class DAGPattern(AgentPattern):
                 skill_manager=kwargs.get("skill_manager"),
                 allowed_skills=kwargs.get("allowed_skills"),
             )
+            if result.get("failure_reason") == "step_failed":
+                result = await self._deliver_after_step_failure(
+                    context=context, llm=llm, runtime=runtime, failure=result
+                )
         except RequiredToolCallError as exc:
             result = await self._fail(
                 context=context,
@@ -501,15 +614,6 @@ class DAGPattern(AgentPattern):
                 )
                 if interrupted is not None:
                     return interrupted
-            elif self._needs_replan(context):
-                if not self._forward_user_response_to_waiting_step(context):
-                    await self._generate_plan(
-                        context=context,
-                        tools=tools,
-                        llm=llm,
-                        runtime=runtime,
-                        replan=True,
-                    )
         except PlanValidationError as exc:
             return await self._fail(
                 context=context,
@@ -527,22 +631,39 @@ class DAGPattern(AgentPattern):
             if interrupted is not None:
                 return interrupted
             raise
-        except RequiredToolCallError:
+        except (RequiredToolCallError, CheckpointPersistenceError):
+            # RequiredToolCallError already carries its own user-facing
+            # failure; re-raising lets the caller apply it directly.
+            # CheckpointPersistenceError is a durability failure, not a
+            # plan-generation failure: converting it to _fail() here would
+            # let its own checkpoint write (if it happens to succeed, e.g.
+            # after a transient failure) mask the durability error behind an
+            # ordinary unsuccessful PatternResult. That result reaches the
+            # runner's pattern loop as a recoverable failure, so a fallback
+            # pattern could run and repeat a non-idempotent side effect this
+            # pattern already performed. Let the runner's durability guard
+            # see it instead, same as the step-execution catch above.
             raise
         except Exception as exc:  # noqa: BLE001
             return await self._fail(
                 context=context,
                 runtime=runtime,
                 error=str(exc),
-                failure_reason=(
-                    "replan_generation_error"
-                    if self.status == "replanning"
-                    else "plan_generation_error"
-                ),
+                failure_reason="plan_generation_error",
                 checkpoint_label="dag_plan_generation_failed",
             )
 
         while True:
+            if self._reply_replan_owed():
+                # The branch below may reach _generate_plan, which clears
+                # the interrupt; a real Stop must be reported first.
+                interrupted = await self._interrupt_if_requested(
+                    runtime=runtime,
+                    context=context,
+                    label="dag_before_owed_replan",
+                )
+                if interrupted is not None:
+                    return interrupted
             if self._needs_replan(context):
                 if not self._forward_user_response_to_waiting_step(context):
                     try:
@@ -570,7 +691,9 @@ class DAGPattern(AgentPattern):
                         if interrupted is not None:
                             return interrupted
                         raise
-                    except RequiredToolCallError:
+                    except (RequiredToolCallError, CheckpointPersistenceError):
+                        # See the matching comment on the first
+                        # plan-generation catch above.
                         raise
                     except Exception as exc:  # noqa: BLE001
                         return await self._fail(
@@ -773,6 +896,7 @@ class DAGPattern(AgentPattern):
                 if available_slots <= 0:
                     break
 
+        hold_scheduling = False
         try:
             while pending:
                 done, pending = await asyncio.wait(
@@ -905,13 +1029,15 @@ class DAGPattern(AgentPattern):
                         )
                     return winner_result
 
-                if self._needs_replan(root_context):
-                    await cancel_all()
-                    return None
+                if self._reply_awaiting_replan():
+                    # An owed replan reuses whatever this batch finishes, so
+                    # let it drain and only stop scheduling new steps.
+                    hold_scheduling = True
                 if self.status in {"interrupted", "waiting_for_user"}:
                     await cancel_all()
                     return None
-                schedule_ready_steps()
+                if not hold_scheduling:
+                    schedule_ready_steps()
         except BaseException:
             # A sibling that already completed by this point is not in
             # `pending`, so cancel_all() below never clears its active-step
@@ -1047,11 +1173,16 @@ class DAGPattern(AgentPattern):
                 skill_manager=skill_manager,
                 allowed_skills=allowed_skills,
             )
-        except ExecutionInterrupted:
+        except (ExecutionInterrupted, CheckpointPersistenceError):
+            # A checkpoint that did not persist is a durability failure, not a
+            # step failure: converting it here would clear the active step and
+            # let a later ``_fail()`` checkpoint durably overwrite the last
+            # good checkpoint with the post-failure state.
             raise
         except Exception as exc:
             step.status = "failed"
             step.error = str(exc)
+            self._retain_failed_step_evidence(step.id, child_context, react_pattern)
             self._clear_active_step(step.id)
             await runtime.on_dag_step_end(
                 context=root_context,
@@ -1117,6 +1248,7 @@ class DAGPattern(AgentPattern):
         if not result.get("success"):
             step.status = "failed"
             step.error = result.get("error", f"Step {step.id} failed.")
+            self._retain_failed_step_evidence(step.id, child_context, react_pattern)
             await runtime.on_dag_step_end(
                 context=root_context,
                 step_id=step.id,
@@ -1169,7 +1301,10 @@ class DAGPattern(AgentPattern):
             "active_step_pattern_states": dict(self.active_step_pattern_states),
             "active_step_contexts": dict(self.active_step_contexts),
             "step_results": dict(self.step_results),
+            "failed_step_evidence": dict(self.failed_step_evidence),
+            "failure_delivery_attempted": self.failure_delivery_attempted,
             "planned_user_message_count": self.planned_user_message_count,
+            "replan_owed_step_ids": list(self.replan_owed_step_ids),
             "memory_input_text": self.memory_input_text,
             "max_concurrency": self.max_concurrency,
             "completion_feedback": self.completion_feedback,
@@ -1225,6 +1360,7 @@ class DAGPattern(AgentPattern):
             active_frame_ids=active_frame_ids,
             control_state={
                 "planned_user_message_count": self.planned_user_message_count,
+                "replan_owed_step_ids": list(self.replan_owed_step_ids),
                 "max_concurrency": self.max_concurrency,
             },
         ).to_dict()
@@ -1259,9 +1395,18 @@ class DAGPattern(AgentPattern):
             )
         self._sync_legacy_active_step()
         self.step_results = dict(state.get("step_results", {}))
+        self.failed_step_evidence = dict(state.get("failed_step_evidence", {}))
+        self.failure_delivery_attempted = bool(
+            state.get("failure_delivery_attempted", False)
+        )
         self.planned_user_message_count = int(
             state.get("planned_user_message_count", 0)
         )
+        owed_step_ids: list[str] = []
+        for owed_step_id in state.get("replan_owed_step_ids") or []:
+            if owed_step_id and str(owed_step_id) not in owed_step_ids:
+                owed_step_ids.append(str(owed_step_id))
+        self.replan_owed_step_ids = owed_step_ids
         stored_memory_input = state.get("memory_input_text")
         if stored_memory_input:
             self.memory_input_text = str(stored_memory_input)
@@ -1322,6 +1467,161 @@ class DAGPattern(AgentPattern):
             error=error,
             metadata=metadata,
         ).to_dict()
+
+    def _retain_failed_step_evidence(
+        self, step_id: str, context: Any, pattern: ReActPattern
+    ) -> None:
+        # Child contexts inherit root messages, but their durable tool ledger
+        # belongs to this step. Keep only its observations, using the latest
+        # visible result when a provider reuses an inherited tool-call id.
+        tool_call_ids = {
+            record.tool_call_id
+            for record in pattern.tool_ledger.values()
+            if record.status == "completed"
+        }
+        observations = {
+            message["tool_call_id"]: message["content"]
+            for message in context.get_messages_for_llm()
+            if message.get("role") == "tool"
+            and message.get("tool_call_id") in tool_call_ids
+        }
+        self.failed_step_evidence[step_id] = {
+            "evidence_state": evidence_facts(tool_evidence_state(context)),
+            "observations": list(observations.values()),
+        }
+
+    async def _deliver_after_step_failure(
+        self,
+        *,
+        context: Any,
+        llm: Any,
+        runtime: PatternRuntime,
+        failure: dict[str, Any],
+    ) -> dict[str, Any]:
+        # _run has already stopped scheduling and drained concurrent siblings.
+        # Preserve failure dominance over a simultaneous sibling interruption;
+        # a user stop must not start a new LLM call either.
+        if self.failure_delivery_attempted or await runtime.should_interrupt():
+            return failure
+        if not self.step_results and not any(
+            evidence.get("observations")
+            for evidence in self.failed_step_evidence.values()
+        ):
+            return failure
+        self.failure_delivery_attempted = True
+        await runtime.checkpoint(
+            "dag_before_failure_delivery",
+            context=context,
+            pattern=self,
+            metadata={"failure_reason": "step_failed"},
+        )
+        # Reuse the final-answer scope/language/evidence payload, but never send
+        # raw exceptions or planner prose as facts for the handoff.
+        payload = self._delivery_evidence_payload(context)
+        payload.update(
+            failed_step_id=failure.get("failed_step_id"),
+            failed_step_evidence=self.failed_step_evidence,
+        )
+        system_prompt = (
+            "DAG execution stopped because a step failed. No further work or "
+            "verification is possible in this run. Call final_answer exactly "
+            "once to hand over useful existing results and trusted deliverable "
+            "links. Clearly distinguish completed work from incomplete steps "
+            "and list missing or unverified parts of the user's request. Do not "
+            "claim full completion or promise to keep working. Set outcome to "
+            "partial if useful results exist, otherwise blocked. Failed-step "
+            "observations may show individual operations succeeded, not that "
+            "the step completed. Only authoritative_user_requests determine "
+            "required scope. Plan structure is execution status, not facts. "
+            "Do not reproduce raw exceptions or tool payloads. "
+            f"{grounding_rule(can_call_tools=False)}\n\n"
+            f"{final_deliverable_file_reference_instructions(can_lookup=False)}\n\n"
+            f"{final_answer_language_rule(subject='output_language_policy field')}"
+        )
+        user_prompt = json.dumps(payload, ensure_ascii=False) + (
+            "\n\nRuntime notice: work has stopped. Call only final_answer to "
+            "hand over existing results and explain what was not done. "
+            "No other tools are available."
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        schema = {
+            "type": "function",
+            "function": {
+                "name": "final_answer",
+                "description": "Deliver existing results after execution stopped.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "answer": {"type": "string"},
+                        "outcome": {"type": "string", "enum": ["partial", "blocked"]},
+                    },
+                    "required": ["answer", "outcome"],
+                },
+            },
+        }
+
+        def parse_response(response: Any) -> dict[str, Any] | None:
+            if len(self._response_tool_calls(response)) != 1:
+                return None
+            args = self._extract_tool_arguments(response, "final_answer")
+            answer = args.get("answer")
+            return args if isinstance(answer, str) and answer.strip() else None
+
+        try:
+            args = await request_partial_delivery(
+                context=context,
+                llm=llm,
+                runtime=runtime,
+                messages=messages,
+                schema=schema,
+                parse_response=parse_response,
+                metadata={"phase": "dag_failure_delivery"},
+                timeout=DAG_FAILURE_DELIVERY_TIMEOUT_SECONDS,
+            )
+        except ExecutionInterrupted:
+            return failure
+        if args is None or await runtime.should_interrupt():
+            await runtime.checkpoint(
+                "dag_failed",
+                context=context,
+                pattern=self,
+                metadata={
+                    "failure_reason": "step_failed",
+                    "failed_step_id": failure.get("failed_step_id"),
+                },
+            )
+            return failure
+        outcome = args["outcome"]
+        answer = (
+            "DAG execution stopped after a step failed; this is not a completed task."
+            f"\n\n{args['answer']}"
+        )
+        context.add_assistant_message(answer)
+        self.status = "completed"
+        result = PatternResult(
+            success=True,
+            output=answer,
+            metadata={
+                "status": self.status,
+                "completion_outcome": outcome,
+                "termination_reason": "step_failed",
+                "failed_step_id": failure.get("failed_step_id"),
+                "step_results": dict(self.step_results),
+            },
+        ).to_dict()
+        await runtime.checkpoint(
+            "dag_partial_delivery",
+            context=context,
+            pattern=self,
+            metadata={
+                "completion_outcome": outcome,
+                "termination_reason": "step_failed",
+            },
+        )
+        return result
 
     def _ready_steps(self) -> list[PlanStep]:
         if self.plan is None:
@@ -1389,6 +1689,7 @@ class DAGPattern(AgentPattern):
         if assessment.complete:
             self.status = "completed"
             self.completion_feedback = None
+            self.replan_owed_step_ids = []
             output = assessment.answer or self._final_output()
             await runtime.checkpoint("dag_completed", context=context, pattern=self)
             return PatternResult(
@@ -1453,7 +1754,9 @@ class DAGPattern(AgentPattern):
             if interrupted is not None:
                 return interrupted
             raise
-        except RequiredToolCallError:
+        except (RequiredToolCallError, CheckpointPersistenceError):
+            # See the matching comment on the first plan-generation catch
+            # above.
             raise
         except Exception as exc:  # noqa: BLE001
             return await self._fail(
@@ -1529,7 +1832,8 @@ class DAGPattern(AgentPattern):
             await final_answer_stream.finish(assessment.answer)
         return assessment
 
-    def _completion_assessment_messages(self, context: Any) -> list[dict[str, Any]]:
+    def _delivery_evidence_payload(self, context: Any) -> dict[str, Any]:
+        """Shared scope, language, and evidence for completed or stopped DAGs."""
         request = top_level_user_request(context)
         pending_response = latest_pending_user_response(context)
         latest_messages = [
@@ -1542,7 +1846,7 @@ class DAGPattern(AgentPattern):
             for message in getattr(context, "messages", [])
             if getattr(message, "role", None) == "user"
         ]
-        payload = {
+        return {
             "independent_user_request": request.language_text,
             "pending_response": (
                 serialize_pending_user_response(pending_response)
@@ -1556,19 +1860,43 @@ class DAGPattern(AgentPattern):
             ),
             "authoritative_user_requests": authoritative_user_requests,
             "messages": latest_messages,
-            "plan": self.plan.to_dict() if self.plan is not None else None,
+            # Delivery gets plan structure and actual execution status only:
+            # planner prose must never become a fact source in the answer.
+            "plan": (
+                {
+                    "steps": [
+                        {
+                            "id": step.id,
+                            "dependencies": list(step.dependencies),
+                            "status": step.status,
+                        }
+                        for step in self.plan.steps
+                    ]
+                }
+                if self.plan is not None
+                else None
+            ),
             "step_results": self.step_results,
             "candidate_output": self._final_output(),
             "previous_completion_feedback": self.completion_feedback,
         }
+
+    def _completion_assessment_messages(self, context: Any) -> list[dict[str, Any]]:
+        payload = self._delivery_evidence_payload(context)
+        # This call writes the answer the user receives, with no tool to fetch
+        # anything back, and its payload filters out system messages -- so the
+        # compaction summary never reaches it and this is the only place the
+        # loss can be stated.
+        evidence_rule = evidence_facts(tool_evidence_state(context))
         return [
             {
                 "role": "system",
                 "content": (
                     "Assess whether the completed DAG steps satisfy the user's "
                     "overall request. The authoritative_user_requests field is "
-                    "the only source of required scope. The plan, step results, "
-                    "briefs, inferred formats, and candidate output are evidence "
+                    "the only source of required scope. The plan's step ids, "
+                    "dependencies, and statuses, the step results, and the "
+                    "candidate output are evidence "
                     "of execution only; they cannot add deliverables, claims, "
                     "formats, or acceptance criteria that the user did not ask "
                     "for. Do not mark the goal incomplete solely because an "
@@ -1579,6 +1907,7 @@ class DAGPattern(AgentPattern):
                     "missing, choose status=incomplete, leave answer empty, and "
                     "state the missing work plus concise replan instructions. Put "
                     "status before answer in the tool arguments. "
+                    f"{evidence_rule}"
                     "When writing the answer field, including any content carried "
                     "over from candidate_output or step_results: "
                     f"{grounding_rule(can_call_tools=False)}\n\n"
@@ -1768,15 +2097,17 @@ class DAGPattern(AgentPattern):
             "TERMINATION CONDITION - AUTHORITATIVE STOP RULE\n"
             f"{termination_condition}\n"
             f"Completion evidence: {completion_evidence}\n"
-            "Treat this termination condition as authoritative for this step. "
+            "Treat this termination condition as authoritative for when this step "
+            "stops. "
             "Once it is satisfied, your next action must be final_answer for this "
             "step. Do not inspect, verify, revise, optimize, regenerate, or perform "
             "downstream work unless the termination condition explicitly requires "
             "that work.\n\n"
+            f"{step_intent_not_fact_rule()}\n\n"
             f"{dependency_note}\n\n"
             "Execute only the current DAG step. The current step title and "
             "description plus the termination condition define the entire "
-            "actionable goal for this ReAct run. "
+            "actionable work for this ReAct run. "
             "Do not infer extra work from the overall user goal. Do not complete "
             "downstream, sibling, final synthesis, rendering, screenshots, visual "
             "inspection, export, or delivery work unless that work is explicitly "
@@ -1810,6 +2141,7 @@ class DAGPattern(AgentPattern):
         runtime: PatternRuntime,
         replan: bool,
     ) -> None:
+        reply_driven = self._reply_awaiting_replan()
         self.status = "replanning" if replan else "planning"
         if replan:
             self._clear_all_active_steps()
@@ -1827,8 +2159,16 @@ class DAGPattern(AgentPattern):
             replan=replan,
             completed_step_results=dict(self.step_results),
             previous_plan=self.plan,
-            available_tool_names=[self._tool_name(tool) for tool in tools],
+            # ReAct offers the stored-result reader per turn, once the run's
+            # registry holds a record; this list is not gated on the
+            # registry, so it leaves the reader out entirely.
+            available_tool_names=[
+                name
+                for tool in tools
+                if (name := self._tool_name(tool)) != SPILL_READ_TOOL_NAME
+            ],
             completion_feedback=self.completion_feedback,
+            reply_driven=reply_driven,
         )
         self.plan = await self.plan_generator.generate_plan(
             request=request,
@@ -1837,6 +2177,7 @@ class DAGPattern(AgentPattern):
         self.plan.validate()
         self._apply_completed_results_to_plan()
         self.planned_user_message_count = self._user_message_count(context)
+        self.replan_owed_step_ids = []
         if replan:
             runtime.clear_interrupt()
         await runtime.checkpoint(
@@ -1891,7 +2232,23 @@ class DAGPattern(AgentPattern):
                 step.status = "completed"
                 step.result = self.step_results[step.id]
 
+    def _reply_awaiting_replan(self) -> bool:
+        """A consumed reply no plan has answered yet; unlike the owed check it
+        ignores plan completion, so a completion replan still sees it."""
+        return any(
+            step_id in self.step_results for step_id in self.replan_owed_step_ids
+        )
+
+    def _reply_replan_owed(self) -> bool:
+        return (
+            self._reply_awaiting_replan()
+            and not self._all_steps_completed()
+            and not self.active_step_ids
+        )
+
     def _needs_replan(self, context: Any) -> bool:
+        if self._reply_replan_owed():
+            return True
         if self.status not in {"interrupted", "waiting_for_user", "replanning"}:
             return False
         return self._user_message_count(context) > self.planned_user_message_count
@@ -1925,6 +2282,9 @@ class DAGPattern(AgentPattern):
             else None
         )
         marker = pending_user_response_marker(waiting_request)
+        if marker is not None:
+            # The answer belongs to this step; the planner reads the pairing.
+            marker = {**marker, "step_id": step_id}
         raw_response_metadata = getattr(response_message, "metadata", None)
         response_metadata = (
             dict(raw_response_metadata)
@@ -1956,6 +2316,9 @@ class DAGPattern(AgentPattern):
 
         self._set_active_step_context(step_id, child_context.to_dict())
         self.planned_user_message_count = len(root_user_messages)
+        # Every consumed reply stays listed until a plan absorbs them all.
+        if step_id not in self.replan_owed_step_ids:
+            self.replan_owed_step_ids.append(step_id)
         self.status = "running"
         return True
 

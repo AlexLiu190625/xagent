@@ -937,6 +937,11 @@ def acquire_task_lease_no_commit(
     stored_run_id = result.scalar_one_or_none()
     if stored_run_id is None:
         return None
+    from .task_admission_execution import require_execution_admission
+
+    require_execution_admission(
+        db, task_id, continuing_run_id=None if new_run else str(stored_run_id)
+    )
     return TaskLease(
         task_id=task_id,
         runner_id=runner,
@@ -1187,12 +1192,19 @@ def release_task_lease(
     *,
     status: TaskStatus,
 ) -> bool:
-    """Release a task lease and set its final visible status."""
+    """Release a task lease and set its final visible status.
+
+    A failed release means the row is no longer this lease's, so work staged
+    in the same transaction is rolled back instead of committed with it.
+    """
     released = release_task_lease_no_commit(db, lease, status=status)
     if lease is None:
         return False
+    if not released:
+        db.rollback()
+        return False
     db.commit()
-    return released
+    return True
 
 
 def task_settlement_ownership_values(

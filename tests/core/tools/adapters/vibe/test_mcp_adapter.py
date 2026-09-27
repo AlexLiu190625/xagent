@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import re
@@ -1104,6 +1105,265 @@ def test_normalize_args_by_schema_keeps_scalar_for_union_scalar_or_array_field()
     normalized = adapter._normalize_args_by_schema({"value": "abc"})
 
     assert normalized["value"] == "abc"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "field_name", "field_schema", "value"),
+    [
+        (
+            "excel_add_table_rows",
+            "index",
+            {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
+            True,
+        ),
+        (
+            "excel_delete_table_row",
+            "row_index",
+            {"type": "integer", "minimum": 0},
+            "3",
+        ),
+        (
+            "excel_list_table_rows",
+            "skip",
+            {"type": "integer", "minimum": 0, "default": 0},
+            1.0,
+        ),
+        (
+            "excel_list_table_rows",
+            "page_size",
+            {"type": "integer", "minimum": 1, "maximum": 100},
+            0,
+        ),
+    ],
+)
+async def test_adapter_rejects_coerced_or_out_of_range_excel_integer_args(
+    monkeypatch, tool_name, field_name, field_schema, value
+):
+    mcp_tool = SimpleNamespace(
+        name=tool_name,
+        description="Excel tool",
+        inputSchema={
+            "type": "object",
+            "properties": {field_name: field_schema},
+            "required": [field_name],
+        },
+    )
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={"transport": "stdio", "command": "python", "args": []},
+    )
+    execute = AsyncMock()
+    monkeypatch.setattr(adapter, "_execute_mcp_call", execute)
+
+    result = await adapter.run_json_async({field_name: value})
+
+    assert result["is_error"] is True
+    execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_adapter_forwards_valid_excel_integer_args_without_coercion(monkeypatch):
+    mcp_tool = SimpleNamespace(
+        name="excel_list_table_rows",
+        description="List Excel table rows",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "skip": {"type": "integer", "minimum": 0, "default": 0},
+                "page_size": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "default": 20,
+                },
+            },
+            "required": [],
+        },
+    )
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={"transport": "stdio", "command": "python", "args": []},
+    )
+    execute = AsyncMock(return_value={"content": [], "is_error": False})
+    monkeypatch.setattr(adapter, "_execute_mcp_call", execute)
+
+    result = await adapter.run_json_async({"skip": 3, "page_size": 10})
+
+    assert result["is_error"] is False
+    assert execute.await_args.args[1] == {"skip": 3, "page_size": 10}
+
+
+@pytest.mark.asyncio
+async def test_slack_actor_runtime_refreshes_each_call_across_old_expiry(monkeypatch):
+    refresh_count = 0
+    executed_connections = []
+
+    async def refresh():
+        nonlocal refresh_count
+        refresh_count += 1
+        return {
+            "transport": "stdio",
+            "command": "python",
+            "args": ["-m", "xagent.web.tools.mcp.slack"],
+            "env": {
+                "SLACK_ACCESS_TOKEN": f"fresh-{refresh_count}",
+                "XAGENT_SLACK_CHANNEL_ACCESS_POLICY": f"fresh-policy-{refresh_count}",
+            },
+        }
+
+    adapter = MCPToolAdapter(
+        mcp_tool=_mcp_tool("slack_get_channel_history"),
+        connection={
+            "transport": "stdio",
+            "command": "python",
+            "args": ["-m", "xagent.web.tools.mcp.slack"],
+            "env": {
+                "SLACK_ACCESS_TOKEN": "expired-token",
+                "XAGENT_SLACK_CHANNEL_ACCESS_POLICY": "expired-policy",
+            },
+            "_slack_actor_runtime_refresh": refresh,
+        },
+    )
+
+    async def execute(connection, tool_args, tool_meta):
+        executed_connections.append(connection)
+        return {"content": [], "is_error": False}
+
+    monkeypatch.setattr(adapter, "_execute_mcp_call", execute)
+
+    first = await adapter.run_json_async({})
+    second = await adapter.run_json_async({})
+
+    assert first["is_error"] is False
+    assert second["is_error"] is False
+    assert refresh_count == 2
+    assert [
+        connection["env"]["SLACK_ACCESS_TOKEN"] for connection in executed_connections
+    ] == ["fresh-1", "fresh-2"]
+    assert all(
+        "_slack_actor_runtime_refresh" not in connection
+        for connection in executed_connections
+    )
+
+
+@pytest.mark.asyncio
+async def test_slack_actor_runtime_revocation_never_uses_stale_connection(monkeypatch):
+    refresh_count = 0
+    execute = AsyncMock(return_value={"content": [], "is_error": False})
+
+    def refresh():
+        nonlocal refresh_count
+        refresh_count += 1
+        if refresh_count == 2:
+            return None
+        return {
+            "transport": "stdio",
+            "command": "python",
+            "args": ["-m", "xagent.web.tools.mcp.slack"],
+            "env": {"SLACK_ACCESS_TOKEN": "fresh-token"},
+        }
+
+    adapter = MCPToolAdapter(
+        mcp_tool=_mcp_tool("slack_get_channel_history"),
+        connection={
+            "transport": "stdio",
+            "command": "python",
+            "env": {"SLACK_ACCESS_TOKEN": "stale-token"},
+            "_slack_actor_runtime_refresh": refresh,
+        },
+    )
+    monkeypatch.setattr(adapter, "_execute_mcp_call", execute)
+
+    first = await adapter.run_json_async({})
+    revoked = await adapter.run_json_async({})
+
+    assert first["is_error"] is False
+    assert "delegated_authorization_failed" in revoked["content"][0]["text"]
+    assert execute.await_count == 1
+    assert execute.await_args.args[0]["env"]["SLACK_ACCESS_TOKEN"] == "fresh-token"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("behavior", ["raise", "malformed", "nested-refresh"])
+async def test_slack_actor_runtime_malformed_refresh_fails_closed(
+    monkeypatch, behavior
+):
+    def refresh():
+        if behavior == "raise":
+            raise RuntimeError("refresh failed")
+        if behavior == "nested-refresh":
+            return {"_slack_actor_runtime_refresh": refresh}
+        return "not-a-connection"
+
+    adapter = MCPToolAdapter(
+        mcp_tool=_mcp_tool("slack_get_channel_history"),
+        connection={
+            "transport": "stdio",
+            "command": "python",
+            "env": {"SLACK_ACCESS_TOKEN": "stale-token"},
+            "_slack_actor_runtime_refresh": refresh,
+        },
+    )
+    execute = AsyncMock()
+    monkeypatch.setattr(adapter, "_execute_mcp_call", execute)
+
+    result = await adapter.run_json_async({})
+
+    assert "delegated_authorization_failed" in result["content"][0]["text"]
+    execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_slack_actor_runtime_fresh_call_is_never_retried(monkeypatch):
+    connector_refresh = AsyncMock()
+
+    async def refresh():
+        return {
+            "transport": "stdio",
+            "command": "python",
+            "env": {"SLACK_ACCESS_TOKEN": "fresh-token"},
+        }
+
+    adapter = MCPToolAdapter(
+        mcp_tool=_mcp_tool("slack_get_channel_history"),
+        connection={
+            "transport": "stdio",
+            "command": "python",
+            "_slack_actor_runtime_refresh": refresh,
+            "_connector_runtime_refresh": connector_refresh,
+        },
+    )
+    execute = AsyncMock(side_effect=RuntimeError("HTTP 401 Unauthorized"))
+    monkeypatch.setattr(adapter, "_execute_mcp_call", execute)
+
+    result = await adapter.run_json_async({})
+
+    assert result["is_error"] is True
+    assert execute.await_count == 1
+    connector_refresh.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_slack_actor_runtime_refresh_cancellation_starts_no_child(monkeypatch):
+    async def refresh():
+        raise asyncio.CancelledError
+
+    adapter = MCPToolAdapter(
+        mcp_tool=_mcp_tool("slack_get_channel_history"),
+        connection={
+            "transport": "stdio",
+            "command": "python",
+            "_slack_actor_runtime_refresh": refresh,
+        },
+    )
+    execute = AsyncMock()
+    monkeypatch.setattr(adapter, "_execute_mcp_call", execute)
+
+    with pytest.raises(asyncio.CancelledError):
+        await adapter.run_json_async({})
+
+    execute.assert_not_awaited()
 
 
 def test_build_args_model_handles_anyof_multi_type_schema():

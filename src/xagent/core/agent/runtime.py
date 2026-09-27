@@ -4,11 +4,12 @@ import asyncio
 import inspect
 import logging
 from collections.abc import Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Callable
 from uuid import uuid4
 
-from ...config import get_compact_threshold_ratio
+from ...config import COMPACT_THRESHOLD_DEFAULT
 from ..agent.trace import (
     TraceAction,
     TraceCategory,
@@ -35,11 +36,96 @@ from ..tools.user_interaction import (
     WAITING_FOR_USER_STATUS,
     tool_result_waits_for_user,
 )
-from .context.execution import COMPACT_SUMMARY_FALLBACK_BUDGETS, CompactResult
+from .checkpoint import CheckpointPersistenceError, TraceCheckpointStore
+from .context.execution import (
+    COMPACT_SUMMARY_FALLBACK_BUDGETS,
+    COMPACT_THRESHOLD_SOURCE_DEFAULT,
+    COMPACT_THRESHOLD_SOURCE_UNKNOWN,
+    LLM_COMPACT_CONTEXT_WINDOW_UNKNOWN_KEY,
+    LLM_COMPACT_TOKENIZER_UNAVAILABLE_KEY,
+    CompactResult,
+    ExecutionContext,
+    context_checkpoint_gate,
+    derive_compact_threshold,
+)
 from .result import normalize_tool_failure_code, tool_result_succeeded
 from .streaming import merge_streamed_tool_call_arguments
 
 logger = logging.getLogger(__name__)
+
+# Keys already warned about running compaction without a usable context
+# window (see ``warn_once_per_model``). One line per model per process is
+# enough to point at the missing column; one per task or per iteration would
+# bury it.
+_COMPACT_WINDOW_WARNED_MODELS: set[str] = set()
+
+# Roles a model can be warned about; the same model can hold both.
+THRESHOLD_WARNING_KEY_PREFIX = "threshold:"
+COMPACT_MODEL_WARNING_KEY_PREFIX = "compact:"
+
+
+def compact_model_key(llm: Any) -> str:
+    """Name a model for the once-per-model compaction warnings.
+
+    Prefers the stable ``model_id`` so identically-named rows under two
+    providers each get their own warning; falls back to the model name, then
+    the class name for test doubles and wrappers that carry neither.
+    """
+    for attribute in ("model_id", "model_name"):
+        value = getattr(llm, attribute, None)
+        if isinstance(value, str) and value:
+            return value
+    return type(llm).__name__
+
+
+def warn_once_per_model(key: str, message: str, *args: Any) -> None:
+    """Log ``message`` at WARNING the first time ``key`` is seen in this process.
+
+    ``key`` should combine the warning's role with ``compact_model_key`` so the
+    same model can be reported once as the agent model and once as the compact
+    model; the two messages describe different failures.
+    """
+    if key in _COMPACT_WINDOW_WARNED_MODELS:
+        return
+    _COMPACT_WINDOW_WARNED_MODELS.add(key)
+    logger.warning(message, *args)
+
+
+def warn_restored_compact_threshold(context: Any, llm: Any) -> None:
+    """Re-issue the fallback warning for a context restored from a checkpoint.
+
+    ``AgentRunner`` only resolves the threshold at task start, so a task
+    resumed in a fresh process would otherwise run on the default threshold
+    with no line in this process's log saying so. Checkpoints written before
+    ``threshold_source`` existed restore as ``unknown`` and are warned about
+    too, on the same terms, when the live model still has no window.
+    """
+    compact_config = getattr(context, "compact_config", None)
+    if llm is None or compact_config is None:
+        return
+    # The live model row may have been populated since the checkpoint was
+    # written, and a virtual model resolves its window per call; neither is
+    # running on the fallback for lack of a window.
+    if derive_compact_threshold(getattr(llm, "context_window", None)) is not None:
+        return
+    if callable(getattr(llm, "prepare_for_call", None)):
+        return
+    if getattr(compact_config, "threshold_source", None) not in (
+        COMPACT_THRESHOLD_SOURCE_DEFAULT,
+        COMPACT_THRESHOLD_SOURCE_UNKNOWN,
+    ):
+        return
+    model_key = compact_model_key(llm)
+    warn_once_per_model(
+        THRESHOLD_WARNING_KEY_PREFIX + model_key,
+        "Model %s has no context_window; the resumed task keeps its context "
+        "compaction threshold of %s tokens (%s). Set context_window on the "
+        "model so new tasks compact at a fraction of its real window instead.",
+        model_key,
+        getattr(compact_config, "threshold", None),
+        COMPACT_THRESHOLD_DEFAULT,
+    )
+
 
 # Fixed final_answer stream close reasons. ReAct's fail() call sites import
 # these names directly (react.py already imports this module at module
@@ -165,17 +251,30 @@ async def prepare_llm_for_context(
 
     context_window = getattr(prepared, "context_window", None)
     compact_config = getattr(context, "compact_config", None)
+    derived = derive_compact_threshold(context_window)
     # Fixed-model thresholds are initialized once by AgentRunner and restored
     # verbatim from checkpoints. Recompute only when a virtual model resolves to
     # a concrete per-call wrapper whose window was unavailable at task start.
-    if (
-        prepared is not llm
-        and isinstance(context_window, int)
-        and context_window > 0
-        and compact_config is not None
-    ):
-        compact_config.threshold = max(
-            1, int(context_window * get_compact_threshold_ratio())
+    if prepared is not llm and compact_config is not None and derived is not None:
+        compact_config.threshold, compact_config.threshold_source = derived
+    elif prepared is not llm and compact_config is not None:
+        # The standing threshold may have been derived from an earlier selection;
+        # it no longer describes the active model, so stop claiming that source.
+        compact_config.threshold_source = COMPACT_THRESHOLD_SOURCE_UNKNOWN
+        # The virtual model was exempt from AgentRunner's warning because its
+        # window is only known here, and the concrete model it picked has
+        # none. The threshold is left as it was -- the fallback, or one
+        # derived from an earlier selection -- and the message says which.
+        model_key = compact_model_key(prepared)
+        warn_once_per_model(
+            THRESHOLD_WARNING_KEY_PREFIX + model_key,
+            "Model %s (selected by a virtual model) has no context_window; "
+            "the context compaction threshold stays at %s tokens "
+            "(threshold_source=%s). Set context_window on the model so "
+            "compaction triggers at a fraction of its real window instead.",
+            model_key,
+            getattr(compact_config, "threshold", None),
+            getattr(compact_config, "threshold_source", None),
         )
 
     return prepared
@@ -222,6 +321,12 @@ class PatternRuntime:
     # on_tool_error so tool trace events can be joined to their turn without
     # relying on step_id or timestamp-adjacency heuristics.
     active_turn_id: str | None = None
+    # Set by on_pattern_error() before it does anything else, so the
+    # runner's CheckpointPersistenceError guard can tell whether the
+    # failing pattern already reported its own terminal trace (as
+    # DAGPattern and ReActPattern do) or whether it needs a fallback
+    # report for a custom pattern that only raises.
+    pattern_error_reported: bool = False
     last_final_answer_stream_message_id: str | None = None
     inline_file_delivery: InlineFileDelivery | None = None
     _inline_stream_guards: dict[str, InlineFileStreamGuard] = field(
@@ -281,6 +386,12 @@ class PatternRuntime:
             kwargs=kwargs,
             resolver=self.context_ref_resolver,
         )
+        # Setup may yield before a provider task exists for cancellation.
+        await self.should_interrupt()
+        if self._interrupt_requested:
+            raise LLMCallInterrupted(
+                self.interrupt_reason or "interrupted before LLM call"
+            )
         call = llm.chat(**kwargs)
         if not inspect.isawaitable(call):
             return call
@@ -794,17 +905,63 @@ class PatternRuntime:
         status: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        payload = self._build_checkpoint_payload(
-            label=label,
-            context=context,
-            pattern=pattern,
-            status=status,
-            metadata=metadata,
+        # Keep ordinary checkpoint writes concurrent. A future exclusive
+        # injection must cover snapshot construction as well as persistence.
+        gate = (
+            context_checkpoint_gate(context).shared()
+            if isinstance(context, ExecutionContext)
+            else nullcontext()
         )
-        self.last_checkpoint = payload
-        self.checkpoints.append(payload)
-        await self._emit_checkpoint(payload)
-        return payload
+        async with gate:
+            if (
+                isinstance(context, ExecutionContext)
+                and context_checkpoint_gate(context).injection_uncertain
+            ):
+                # Tool steps after the fence may re-run on explicit resume; see
+                # docs/architecture/task-runner-execution-boundary.md.
+                raise ExecutionInterrupted(
+                    "Injection outcome unknown; explicit resume must reload the checkpoint."
+                )
+            payload = self._build_checkpoint_payload(
+                label=label,
+                context=context,
+                pattern=pattern,
+                status=status,
+                metadata=metadata,
+            )
+            self.last_checkpoint = payload
+            self.checkpoints.append(payload)
+            await self._emit_checkpoint(payload)
+            return payload
+
+    async def checkpoint_context_tail(
+        self, label: str, *, context: ExecutionContext
+    ) -> dict[str, Any] | None:
+        """Re-persist the last checkpoint with context changes made after it.
+
+        The runner still edits the context once the pattern's final checkpoint
+        is written (it appends or rewrites the delivered answer). The pattern
+        state is reused from that checkpoint, never rebuilt, because the
+        pattern has already returned. Returns ``None`` when nothing was
+        written: no checkpoint in this run, a fenced context, or no change.
+        """
+        gate = context_checkpoint_gate(context)
+        async with gate.shared():
+            baseline = self.last_checkpoint
+            if baseline is None or gate.injection_uncertain:
+                return None
+            # ``to_dict`` snapshots every container a writer mutates in place,
+            # so the stored payload is an exact record of what was persisted
+            # and equality is precise. It is also the serialization the write
+            # itself needs, so the comparison adds no extra snapshot.
+            context_payload = context.to_dict()
+            if baseline.get("context") == context_payload:
+                return None
+            payload = {**baseline, "label": label, "context": context_payload}
+            await self._emit_checkpoint(payload)
+            self.last_checkpoint = payload
+            self.checkpoints.append(payload)
+            return payload
 
     async def send_message(
         self,
@@ -843,6 +1000,24 @@ class PatternRuntime:
 
         if self.outbound_message_handler is not None:
             await self._maybe_await(self.outbound_message_handler(payload))
+        elif expect_response or message_type == "question":
+            # A dropped question parks the run waiting for a reply that can
+            # never arrive, so this is worth a warning.
+            logger.warning(
+                "Dropping agent outbound message for execution %s: no outbound "
+                "message handler is installed (type=%r, expect_response=%s)",
+                self.execution_id,
+                message_type,
+                expect_response,
+            )
+        else:
+            logger.debug(
+                "Dropping agent outbound message for execution %s: no outbound "
+                "message handler is installed (type=%r, expect_response=%s)",
+                self.execution_id,
+                message_type,
+                expect_response,
+            )
 
         return payload
 
@@ -912,6 +1087,12 @@ class PatternRuntime:
         pattern: Any,
         error: Exception,
     ) -> None:
+        # Set before any I/O below, so a pattern is marked as having
+        # reported its own failure even if a later step here raises --
+        # the runner's fallback terminal-trace reporting (see its
+        # ``CheckpointPersistenceError`` guard) checks this to decide
+        # whether it still needs to report the abort itself.
+        self.pattern_error_reported = True
         await self._emit_trace_event(
             TraceEventType(TraceScope.TASK, TraceAction.ERROR, TraceCategory.GENERAL),
             task_id=self._task_id(context),
@@ -929,19 +1110,29 @@ class PatternRuntime:
             return
         finish_trace = getattr(self.tracer, "finish_trace", None)
         if callable(finish_trace):
-            await self._maybe_await(
-                finish_trace(
-                    name=self._pattern_trace_name(pattern),
-                    status="error",
-                    output={"error": str(error)},
-                    metadata={
-                        "execution_id": getattr(
-                            context, "execution_id", self.execution_id
-                        ),
-                        "pattern": pattern.__class__.__name__,
-                    },
+            try:
+                await self._maybe_await(
+                    finish_trace(
+                        name=self._pattern_trace_name(pattern),
+                        status="error",
+                        output={"error": str(error)},
+                        metadata={
+                            "execution_id": getattr(
+                                context, "execution_id", self.execution_id
+                            ),
+                            "pattern": pattern.__class__.__name__,
+                        },
+                    )
                 )
-            )
+            except Exception:
+                # Trace finalization is best-effort here: this method's job
+                # is to report ``error`` (often a CheckpointPersistenceError
+                # durability abort) to the caller. Letting a ``finish_trace``
+                # failure propagate would replace ``error`` with this
+                # unrelated exception, and the runner's typed guard would
+                # then treat the replacement as an ordinary recoverable
+                # pattern exception instead of aborting the run.
+                logger.exception("finish_trace failed while reporting a pattern error")
 
     async def on_tool_start(self, *, tool_call: dict[str, Any]) -> None:
         # Count one billable action per tool invocation, at invocation time.
@@ -1453,13 +1644,37 @@ class PatternRuntime:
                             "fallback_suppressed": True,
                         },
                     )
-                    logger.warning(
-                        "Context compaction request cannot fit the compact "
-                        "model window without discarding unrecoverable "
-                        "messages; preserving the original context. "
-                        "execution_id=%s",
-                        getattr(context, "execution_id", None),
-                    )
+                    if request_metadata.get(LLM_COMPACT_CONTEXT_WINDOW_UNKNOWN_KEY):
+                        # Not a fit problem: the compact model row has no
+                        # context_window, so no summary request can be sized
+                        # and compaction stays off until the column is set.
+                        # Once per model: the context stays over threshold, so
+                        # this branch recurs on every iteration otherwise.
+                        model_key = compact_model_key(llm)
+                        warn_once_per_model(
+                            COMPACT_MODEL_WARNING_KEY_PREFIX + model_key,
+                            "Compact model %s has no context_window; context "
+                            "compaction is disabled until it is set on the "
+                            "model. First seen on execution_id=%s",
+                            model_key,
+                            getattr(context, "execution_id", None),
+                        )
+                    elif request_metadata.get(LLM_COMPACT_TOKENIZER_UNAVAILABLE_KEY):
+                        logger.warning(
+                            "Context compaction could not count the compact "
+                            "request's tokens (%s); preserving the original "
+                            "context. execution_id=%s",
+                            request_metadata.get("compact_tokenizer_error_type"),
+                            getattr(context, "execution_id", None),
+                        )
+                    else:
+                        logger.warning(
+                            "Context compaction request cannot fit the compact "
+                            "model window without discarding unrecoverable "
+                            "messages; preserving the original context. "
+                            "execution_id=%s",
+                            getattr(context, "execution_id", None),
+                        )
                 else:
                     llm_metadata = {
                         **request_metadata,
@@ -1685,6 +1900,28 @@ class PatternRuntime:
         if self.tracer is None:
             return
 
+        # Normalize here rather than only in ``TraceCheckpointStore``: that
+        # wrapper is applied in exactly one place (``xagent/service.py``), so
+        # the fallback ``PatternRuntime`` constructions in ``auto.py``,
+        # ``react.py`` and ``dag.py`` talk to a bare tracer and would otherwise
+        # surface a raw writer exception. DAG only treats
+        # ``CheckpointPersistenceError`` as a durability failure; anything else
+        # is swallowed by its generic handler into a permanent step failure.
+        #
+        # ``CheckpointPersistenceError`` is re-raised untouched so an error the
+        # store already normalized is not wrapped twice, and ``BaseException``
+        # is not caught at all so cancellation / ``SystemExit`` /
+        # ``KeyboardInterrupt`` keep their control-flow semantics.
+        try:
+            await self._write_checkpoint_to_tracer(payload)
+        except CheckpointPersistenceError:
+            raise
+        except Exception as exc:
+            raise CheckpointPersistenceError(
+                "Checkpoint writer failed before persistence was confirmed."
+            ) from exc
+
+    async def _write_checkpoint_to_tracer(self, payload: dict[str, Any]) -> None:
         checkpoint = getattr(self.tracer, "checkpoint", None)
         if callable(checkpoint):
             await self._maybe_await(checkpoint(**payload))
@@ -1697,13 +1934,46 @@ class PatternRuntime:
 
         trace_event = getattr(self.tracer, "trace_event", None)
         if callable(trace_event):
-            await self._maybe_await(
-                trace_event(
-                    self._checkpoint_trace_event_type(trace_event),
-                    task_id=str(payload.get("execution_id") or self.execution_id),
-                    data=payload,
-                )
+            # Write through ``TraceCheckpointStore`` rather than emitting the
+            # event here. Asking a plain event tracer for persisted delivery
+            # only proves its handlers ran; it does not make a task-scoped
+            # event carrying the raw payload a *readable* checkpoint. The
+            # checkpoint readers select on the canonical envelope -- system
+            # scope, ``checkpoint_type`` in ``READABLE_CHECKPOINT_TYPES``, and
+            # a ``snapshot`` dict -- so a raw event is dropped by
+            # ``EphemeralCheckpointTraceHandler`` and filtered out of the
+            # database checkpoint lookup. A cold resume would then find no
+            # checkpoint and could replay non-idempotent work, even though
+            # this call reported success.
+            #
+            # The store also keeps the capability check: it raises
+            # ``CheckpointPersistenceError`` when ``trace_event`` cannot
+            # accept ``require_persisted``, when a genuine ``Tracer`` has no
+            # handler that can answer a checkpoint read (a ``Tracer`` wired
+            # with only observational handlers such as
+            # ``ConsoleTraceHandler`` would otherwise dispatch cleanly and
+            # return an event id without ever being able to survive a cold
+            # resume), and when the write returns no event id. Nothing is
+            # double-wrapped, because a tracer that is already a
+            # ``TraceCheckpointStore`` exposes ``checkpoint`` and returns at
+            # the first branch above.
+            await TraceCheckpointStore(self.tracer, require_persisted=True).save(
+                payload
             )
+            return
+
+        # No writer capability at all: the tracer does spans only, which is
+        # the same "checkpointing is not configured" mode as ``tracer=None``
+        # above, and is treated the same way rather than failing the run.
+        # Raising here would break every execution that passes an
+        # observability-only tracer (see the span-only tracer in
+        # ``test_react.py``), which is a supported shape.
+        #
+        # The case just above is different and does raise: a tracer that
+        # exposes an event writer but cannot be asked for persisted delivery
+        # is claiming to record the checkpoint without being able to promise
+        # it survives, and that claim must not be reported as durable.
+        return
 
     async def _maybe_await(self, result: Any) -> None:
         if inspect.isawaitable(result):
@@ -1782,11 +2052,11 @@ class PatternRuntime:
         # user Message's own metadata (AgentRunner.inject_user_message's
         # _ensure_user_message_turn_id), which is guaranteed fresh per turn.
         # Deliberately NOT stashed in context.metadata instead: that dict is
-        # scoped to the whole execution/task, not one turn - it's the SAME
-        # object reused across every follow-up message in the task
-        # (inject_user_message calls context_manager.get_context, never
-        # rebuilding it), so a value stored there would persist unchanged
-        # into turn 2, 3, etc., never actually distinguishing runs.
+        # scoped to the whole execution/task, not one turn - it's carried
+        # across every follow-up message in the task (reused from the context
+        # cache while a run or injection holds it, otherwise restored from the
+        # checkpoint), so a value stored there would persist unchanged into
+        # turn 2, 3, etc., never actually distinguishing runs.
         messages = getattr(context, "messages", None) or []
         for message in reversed(messages):
             if getattr(message, "role", None) != "user":
@@ -1842,16 +2112,6 @@ class PatternRuntime:
     def _pattern_trace_name(self, pattern: Any) -> str:
         del pattern
         return "agent.task"
-
-    def _checkpoint_trace_event_type(self, trace_event: Any) -> Any:
-        del trace_event
-        # Runtime checkpoints are task-scoped progress events. Durable checkpoint
-        # persistence uses TraceCheckpointStore, which emits system-scoped events.
-        return TraceEventType(
-            TraceScope.TASK,
-            TraceAction.UPDATE,
-            TraceCategory.GENERAL,
-        )
 
 
 def load_pattern_checkpoint(pattern: Any, checkpoint: dict[str, Any] | None) -> None:

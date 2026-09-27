@@ -5,6 +5,7 @@ import os
 # In Python 3.11, pathlib.Path doesn't have _flavour but PosixPath does
 # This is needed for pytest internal usage
 import pathlib
+import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Iterator
@@ -60,6 +61,17 @@ elif example_env_file.exists():
     load_dotenv(example_env_file, override=False)
 else:
     print("Warning: Neither .env nor example.env file found")
+
+
+@pytest.fixture(autouse=True)
+def local_execution_unless_selected(monkeypatch):
+    """Existing suites select local execution; shared suites opt in explicitly."""
+    # A reachable CI Redis must not silently enable shared caches or rate limits.
+    # Tests that exercise Redis opt in explicitly after this fixture.
+    monkeypatch.delenv("XAGENT_REDIS_URL", raising=False)
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "false")
+    monkeypatch.setenv("XAGENT_TASK_EXECUTION_ROLE", "combined")
+    monkeypatch.delenv("XAGENT_CHANNEL_INGRESS_ENABLED", raising=False)
 
 
 def pytest_addoption(parser):
@@ -282,6 +294,47 @@ def isolate_execution_scope_hooks() -> Iterator[None]:
     set_execution_scope_snapshot_loader(None)
 
 
+def _reset_task_keyed_process_state() -> None:
+    # Only modules a test already imported can hold state; importing the web
+    # stack here would slow every core-only test.
+    manager_module = sys.modules.get("xagent.core.agent.context.manager")
+    if (
+        manager_module is not None
+        and manager_module.ContextManager._instance is not None
+    ):
+        manager = manager_module.ContextManager()
+        for context in manager.list_active_contexts():
+            manager.remove_context(context.execution_id)
+        with manager._lock:
+            manager._cold_starts.clear()
+    task_execution = sys.modules.get("xagent.web.services.task_execution")
+    if task_execution is not None:
+        task_execution._pause_accepted_task_ids.clear()
+    connector_runtime = sys.modules.get("xagent.web.services.connector_runtime")
+    if connector_runtime is not None:
+        # Keyed by turn id, which is the client message id when one is sent.
+        with connector_runtime._EPHEMERAL_RUNTIME_VALUES_LOCK:
+            connector_runtime._EPHEMERAL_RUNTIME_VALUES.clear()
+            connector_runtime._EPHEMERAL_RUNTIME_MANIFESTS.clear()
+
+
+@pytest.fixture(autouse=True, scope="function")
+def isolate_task_keyed_process_state() -> Iterator[None]:
+    """Clear process-wide state keyed by task, execution or turn id around every test.
+
+    Each test's database numbers tasks from 1 again, so an entry a test leaves
+    behind is picked up by the next test on the same worker as if it were its
+    own task: a fenced or finished ``ContextManager`` context becomes the
+    "cached" context of an unrelated injection, and a leaked pause-accepted id
+    routes an unrelated message into the pause-drain branch. Which test pairs
+    collide depends on how xdist distributes files, so these leaks surface as
+    order-dependent failures far from the test that caused them.
+    """
+    _reset_task_keyed_process_state()
+    yield
+    _reset_task_keyed_process_state()
+
+
 @pytest.fixture(autouse=True, scope="function")
 def isolate_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Clear ambient proxy env vars so tests are deterministic across hosts.
@@ -301,6 +354,28 @@ def isolate_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "HTTPS_PROXY",
         "https_proxy",
         "XAGENT_TRUSTED_EGRESS_PROXY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True, scope="function")
+def isolate_meta_config_id_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear ambient Meta Login Configuration env vars for the same reason as
+    isolate_proxy_env above: a developer's real .env can carry META_CONFIG_ID
+    or one of the per-app overrides (META_FACEBOOK_CONFIG_ID /
+    META_INSTAGRAM_CONFIG_ID / META_ADS_CONFIG_ID / META_WHATSAPP_CONFIG_ID --
+    exactly what example.env now documents setting), and without this an
+    otherwise unrelated test exercising the Meta OAuth authorize flow would
+    silently pick up that ambient value instead of the one it explicitly
+    sets/expects. Tests exercising config_id behavior already opt in with
+    ``monkeypatch.setenv(...)`` for the exact var(s) they need.
+    """
+    for name in (
+        "META_CONFIG_ID",
+        "META_FACEBOOK_CONFIG_ID",
+        "META_INSTAGRAM_CONFIG_ID",
+        "META_ADS_CONFIG_ID",
+        "META_WHATSAPP_CONFIG_ID",
     ):
         monkeypatch.delenv(name, raising=False)
 
