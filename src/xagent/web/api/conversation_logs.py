@@ -35,7 +35,7 @@ from ..services.public_trace_events import (
     normalize_public_trace_event,
     public_task_trace_filter,
 )
-from ..services.task_runtime import MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY
+from ..services.task_runtime import mcp_runtime_authorization_policy_required_clause
 from ..utils.db_timezone import format_datetime_for_api
 
 logger = logging.getLogger(__name__)
@@ -333,10 +333,11 @@ def _apply_external_task_scope(query: Any, user: User) -> Any:
         # tasks too (``channel_runtime`` selects them by this key). They are
         # channel plumbing, not conversations, so keep them off this page as
         # they were before ``external`` entered the scope. NULL IS NOT TRUE
-        # holds, so rows without the key are unaffected.
-        Task.agent_config[MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY]
-        .as_boolean()
-        .isnot(True),
+        # holds, so rows without the key are unaffected. Spelled through the
+        # shared helper so the expired-task tombstone's stored flag
+        # (``services.expired_tasks``) is this same predicate, not a second
+        # implementation of it.
+        mcp_runtime_authorization_policy_required_clause().isnot(True),
     )
     if not bool(user.is_admin):
         query = query.filter(Task.user_id == int(user.id))
