@@ -45,6 +45,7 @@ from xagent.core.agent.language import (
     output_language_policy,
     response_language_rules,
 )
+from xagent.core.agent.runtime import PatternRuntime
 from xagent.core.agent.utils.context_builder import ContextBuilder
 from xagent.core.context_ref import (
     CONTEXT_REFS_KEY,
@@ -4049,6 +4050,38 @@ def test_spill_compaction_notice_drops_bad_shape_records(tmp_path, mix):
         assert notice == _expected_spill_index(good)
 
 
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "tool-results/acme-stored-result.json",
+        7,
+        {**VALID_RECORD, "relative_path": "../x"},
+    ],
+    ids=["string", "number", "parent_path"],
+)
+def test_spill_compaction_notice_leaves_out_records_it_cannot_look_up(
+    tmp_path, caplog, bad
+):
+    """A registry entry that is not a dict, or whose path is not a
+    stored-result path, is left out before rendering -- counted in the log
+    line, not passed to the renderer -- even when a file sits at that path."""
+    ctx = _context_with_stored_results(tmp_path, names=("alpha-result", "beta-result"))
+    good = list(ctx.get_component("spilled_results").records)
+    (tmp_path / "output" / "x").write_text("[1]", encoding="utf-8")
+    ctx.set_component(
+        "spilled_results",
+        SpillRegistryComponent(records=[good[0], bad, good[1]]),
+    )
+
+    with caplog.at_level(logging.INFO):
+        notice = ctx._spilled_tool_results_notice()
+
+    assert notice == _expected_spill_index(good)
+    assert "../x" not in notice
+    assert "Compaction left 1 stored tool result(s) out of its list" in caplog.text
+    assert "Ignoring a spilled-result record" not in caplog.text
+
+
 def test_spill_compaction_notice_skips_records_whose_file_is_gone(tmp_path, caplog):
     """The workspace behind a registry can be gone by the time compaction
     runs -- an external-credential task removes it every turn, and a
@@ -4064,6 +4097,7 @@ def test_spill_compaction_notice_skips_records_whose_file_is_gone(tmp_path, capl
 
     assert notice == _expected_spill_index([beta])
     assert alpha["relative_path"] not in notice
+    assert "Compaction left 1 stored tool result(s) out of its list" in caplog.text
     assert "tool-results/" not in caplog.text
 
     (spill_dir / "beta-result.json").unlink()
@@ -4217,54 +4251,125 @@ def test_summary_compaction_counts_exclude_the_spill_index(tmp_path):
     assert result.final_count == baseline.final_count + 1
 
 
-@pytest.mark.parametrize("exit_kind", ["empty_summary", "blocked_request"])
-def test_summary_compaction_early_exit_adds_no_spill_index(tmp_path, exit_kind):
+def test_summary_compaction_with_an_empty_summary_adds_no_spill_index(tmp_path):
     ctx = _context_with_stored_results(tmp_path)
     before = list(ctx.messages)
 
-    if exit_kind == "empty_summary":
-        result = ctx.compact_with_llm_response({"summary": "   "})
-        assert not result.compacted
-        assert result.final_count == len(before)
-    else:
-        request = ctx.build_llm_compact_request_if_needed(context_window=None)
-        assert request is not None and request["blocked"]
+    result = ctx.compact_with_llm_response({"summary": "   "})
 
-    assert ctx.messages == before
+    assert not result.compacted
+    assert result.final_count == len(before)
     assert all(a is b for a, b in zip(ctx.messages, before, strict=True))
     assert _spill_index_messages(ctx) == []
 
 
+class _WindowlessCompactLLM:
+    """A compaction model with no context window, so no summary request can
+    be sized and the runtime blocks compaction."""
+
+    context_window = None
+
+    async def chat(self, **_):
+        raise AssertionError("a blocked summary request is never sent")
+
+
+async def test_blocked_compaction_adds_no_spill_index(tmp_path):
+    """A blocked summary request leaves the context as it is: the runtime
+    does not fall back to dropping messages, so no list is inserted."""
+    ctx = _context_with_stored_results(tmp_path)
+    before = list(ctx.messages)
+
+    result = await PatternRuntime().compact_context_if_needed(
+        context=ctx, llm=_WindowlessCompactLLM()
+    )
+
+    assert not result.compacted
+    assert result.metadata["fallback_suppressed"] is True
+    assert all(a is b for a, b in zip(ctx.messages, before, strict=True))
+    assert _spill_index_messages(ctx) == []
+
+
+# What each compaction path produced for _context_without_stored_results
+# (26 messages, 12 tool calls) before the stored-result list existed:
+# (message count, original_count, final_count, removed_count, dropped tool
+# results by name, result metadata keys). The drop-oldest window keeps 21
+# messages, not 20, because it walks back to the assistant message whose
+# tool result would otherwise start it.
+_SUMMARY_WITHOUT_SPILL = (
+    2,
+    26,
+    2,
+    24,
+    {"acme": 12},
+    {
+        "compact_model",
+        "dropped_context_ref_count",
+        "dropped_tool_result_count",
+        "dropped_tool_results_by_name",
+        "removed_count",
+        "retained_context_ref_count",
+        COMPACT_SUMMARY_METADATA_KEY,
+        "summary_chars",
+        "summary_context_refs",
+    },
+)
+_DROP_OLDEST_WITHOUT_SPILL = (
+    21,
+    26,
+    21,
+    5,
+    {"acme": 2},
+    {
+        "compacted_tokens",
+        "compression_ratio",
+        "dropped_tool_result_count",
+        "dropped_tool_results_by_name",
+        "original_tokens",
+        "removed_count",
+        "threshold",
+        "threshold_source",
+    },
+)
+
+
 @pytest.mark.parametrize(
-    "compact",
-    [_compact_by_summary, _compact_by_dropping],
+    "compact, expected",
+    [
+        (_compact_by_summary, _SUMMARY_WITHOUT_SPILL),
+        (_compact_by_dropping, _DROP_OLDEST_WITHOUT_SPILL),
+    ],
     ids=["summary", "drop_oldest"],
 )
-def test_compaction_unchanged_without_spill(tmp_path, monkeypatch, compact):
+def test_compaction_unchanged_without_spill(tmp_path, compact, expected):
     """With no stored results, compaction is what it was before the list
     existed: same messages, same counts, same result metadata."""
     ctx = _context_without_stored_results(tmp_path)
-    control = _context_without_stored_results(tmp_path)
-    monkeypatch.setattr(control, "_spilled_tool_results_notice", lambda: "")
+    before = list(ctx.messages)
+    message_count, original, final, removed, dropped_by_name, keys = expected
 
     result = compact(ctx)
-    control_result = compact(control)
 
-    def shape(context):
-        return [
-            (message.role, message.content, message.metadata)
-            for message in context.messages
-        ]
-
-    assert shape(ctx) == shape(control)
-    assert result.original_count == control_result.original_count
-    assert result.final_count == control_result.final_count
-    assert result.metadata == control_result.metadata
+    assert len(ctx.messages) == message_count
+    if compact is _compact_by_summary:
+        summary, latest_user = ctx.messages
+        assert summary.role == "system"
+        assert summary.metadata == {"compacted_context": True}
+        assert summary.content.startswith(
+            "Compacted conversation summary:\nSummary of the work so far."
+        )
+        assert result.metadata[COMPACT_SUMMARY_METADATA_KEY] == summary.content
+        assert latest_user is before[-1]
+    else:
+        assert all(
+            a is b for a, b in zip(ctx.messages, before[-message_count:], strict=True)
+        )
+    assert result.original_count == original
+    assert result.final_count == final
+    assert result.metadata["removed_count"] == removed
+    assert result.metadata["dropped_tool_results_by_name"] == dropped_by_name
+    assert result.metadata["dropped_tool_result_count"] == sum(dropped_by_name.values())
+    assert set(result.metadata) == keys
     assert _spill_index_messages(ctx) == []
-    # Every message is history again: the counts add up with nothing left
-    # over for an engine-written one.
-    assert result.final_count == len(ctx.messages)
-    assert result.metadata["removed_count"] == result.original_count - len(ctx.messages)
     assert "spilled_results" not in ctx.components
 
 
