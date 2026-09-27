@@ -1658,7 +1658,9 @@ def test_compact_truncate_counts_tool_result_excised_from_window_interior() -> N
 
 
 def test_compact_truncate_adds_no_in_prompt_notice() -> None:
-    """Truncate keeps an exact message count; a notice would break that."""
+    """Truncate adds no dropped-observations notice of its own. With no
+    stored tool results it keeps exactly the window; stored results add one
+    engine-written list in front of it (test_drop_oldest_carries_spill_index)."""
     ctx = ExecutionContext()
     ctx.compact_config.threshold = 1
     ctx.compact_config.max_messages = 2
@@ -4269,3 +4271,24 @@ def test_spill_index_keeps_superseded_records(tmp_path, compact):
 
     (notice,) = _spill_index_messages(ctx)
     assert record["relative_path"] in notice.content
+
+
+def test_summary_compaction_counts_ignore_a_previous_spill_index(tmp_path):
+    """A second summary compaction replaces the list the first one inserted,
+    but that list is not history: original_count and removed_count are the
+    ones the same history reports with no list in it."""
+    ctx = _context_with_stored_results(tmp_path)
+    baseline = _context_with_stored_results(tmp_path)
+    baseline.components.pop("spilled_results")
+    for context in (ctx, baseline):
+        _compact_by_summary(context)
+        context.add_user_message("next request")
+    assert len(ctx.messages) == len(baseline.messages) + 1
+
+    result = _compact_by_summary(ctx)
+    expected = _compact_by_summary(baseline)
+
+    assert result.original_count == expected.original_count
+    assert result.metadata["removed_count"] == expected.metadata["removed_count"]
+    assert result.final_count == len(ctx.messages) == len(baseline.messages) + 1
+    assert len(_spill_index_messages(ctx)) == 1

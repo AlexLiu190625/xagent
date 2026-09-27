@@ -2060,6 +2060,12 @@ class ExecutionContext:
         next_messages = [summary_message]
         if latest_user is not None:
             next_messages.append(latest_user)
+        # A list inserted by an earlier compaction is replaced along with the
+        # rest, but it is not history, so it is not counted as history this
+        # summary replaced -- the same rule the message-dropping path follows.
+        original_count = sum(
+            1 for message in self.messages if not self._is_spill_index_message(message)
+        )
         removed_count = max(0, original_count - len(next_messages))
         # The stored-result list is its own message rather than part of
         # summary_content: the summary is persisted below and replayed into a
