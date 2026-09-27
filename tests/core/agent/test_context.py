@@ -4097,6 +4097,35 @@ def test_summary_compaction_keeps_the_spill_index_out_of_the_persisted_summary(
     assert VALID_RECORD["relative_path"] not in persisted
 
 
+@pytest.mark.parametrize(
+    "compact", [_compact_by_summary, _compact_by_dropping], ids=["summary", "drop"]
+)
+def test_model_receives_the_spill_index_as_written(tmp_path, compact):
+    """The list is current engine state, not an earlier system context: the
+    model gets its text unchanged, as a user message because only the
+    leading message may be a system one."""
+    ctx = _context_with_stored_results(tmp_path, names=("alpha-result", "beta-result"))
+    records = list(ctx.get_component("spilled_results").records)
+    compact(ctx)
+
+    sent = ctx.get_messages_for_llm()
+
+    listed = [
+        message
+        for message in sent
+        if _compaction_notice_header() in str(message.get("content"))
+    ]
+    assert listed == [
+        {"role": "user", "content": render_spill_notice(records, style="compaction")}
+    ]
+    assert "Previous system-context message" not in listed[0]["content"]
+    assert [message["role"] for message in sent].count("system") == 1
+    if compact is _compact_by_summary:
+        # The summary is still framed as the earlier context it is.
+        assert sent[1]["content"].startswith("Previous system-context message")
+        assert sent[2] is listed[0]
+
+
 def test_compact_request_is_unchanged_by_the_spill_registry(tmp_path):
     """The summary model reads the same request with or without stored
     results, including on a later compaction: the list an earlier one

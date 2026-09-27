@@ -1148,7 +1148,14 @@ class ExecutionContext:
                 )
             if include_system and message_dict.get("role") == "system":
                 content = str(message_dict.get("content") or "").strip()
-                if content:
+                if content and self._is_spill_index_message(message):
+                    # Only the leading message may be a system one, so this
+                    # one is sent as a user message too. It is not an earlier
+                    # system context, though: compaction built it from the
+                    # spill registry, and its own header says what it lists,
+                    # so it goes to the model as written.
+                    messages.append({"role": "user", "content": content})
+                elif content:
                     continuity_message: dict[str, Any] = {
                         "role": "user",
                         "content": (
