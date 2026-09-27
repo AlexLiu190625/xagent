@@ -4,8 +4,8 @@
 // task (if any) the dialog is being asked to open a request for, the most
 // recently delivered turn on this tab that a dialog could offer to resend,
 // the turns handed to the transport but not yet acknowledged as delivered
-// (see ConnectorRuntimePendingDelivery below), and the task whose session
-// check the user closed (dismissedCheck). It never issues a request itself,
+// (see ConnectorRuntimePendingDelivery below), and the task whose dialog
+// the user closed (dismissedCheck). It never issues a request itself,
 // never reads the viewed-task/`sendMessage` context (it sits above that
 // provider in the tree and cannot reach it), and never looks at the route.
 //
@@ -73,7 +73,7 @@ export interface ConnectorRuntimeDialogState {
   request: ConnectorRuntimeDialogRequest | null
   payload: ConnectorRuntimeResendPayload | null
   pending: ConnectorRuntimePendingDelivery[]
-  // Whose session check the user closed this view (see transitionRequest).
+  // Whose dialog the user closed this view (see transitionRequest).
   dismissedCheck: number | null
 }
 
@@ -191,7 +191,7 @@ export function transitionRequest(prev: ConnectorRuntimeDialogState, input: Requ
         // a message on its way: a ticket (queued or unacknowledged), or on a
         // fresh view a stash (delivered, turn not ended). A reconnect ignores
         // the stash, since a failure frame lost while disconnected is never
-        // replayed, but stays quiet for a check the user closed this view.
+        // replayed, but stays quiet for a dialog the user closed this view.
         const { cause } = input
         const base = cause === "opened" && prev.dismissedCheck !== null ? { ...prev, dismissedCheck: null } : prev
         if (
@@ -258,14 +258,15 @@ export function transitionRequest(prev: ConnectorRuntimeDialogState, input: Requ
       if (prev.request === null || prev.request.taskId !== input.taskId) return prev
       // "dismissed": the user ended a dialog they saw (close, Esc, Got it,
       //   or a save that settled it without a resend) -- drop the stash too,
-      //   but only for a turn_failure request, the one the stash is about. A
-      //   dismissed session check is remembered instead (dismissedCheck).
+      //   but only for a turn_failure request, the one the stash is about.
+      //   Any dismissed dialog is remembered (dismissedCheck), so a reconnect
+      //   check does not bring back a dialog the user just closed.
       // "resent": the stash now holds the turn that was just resent; keep it.
       // "not-shown": the dialog never became visible; keep the stash.
       // "left-host": the user navigated off the host pages after seeing
       //   it; they did not choose to give up, so keep the stash.
       const dismissed = outcome === "dismissed" ? prev.request.trigger : null
-      const dismissedCheck = dismissed === "session_open" ? input.taskId : prev.dismissedCheck
+      const dismissedCheck = dismissed === null ? prev.dismissedCheck : input.taskId
       return { ...prev, request: null, payload: dismissed === "turn_failure" ? null : prev.payload, dismissedCheck }
     }
     case "retain": {

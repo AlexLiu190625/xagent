@@ -392,8 +392,8 @@ describe("transitionRequest keeps today's transitions", () => {
     ["open for another task replaces the request and drops its snapshot", state({ request: request(2, 4, stash2) }), open(1),
       state({ seq: 5, request: request(1, 5) })],
     ["close with no request", state({ payload: stash1 }), closeAs("dismissed"), "same"],
-    ["close dismissed drops the stash", state({ request: request(1, 4), payload: stash1 }), closeAs("dismissed"),
-      state({ payload: null })],
+    ["close dismissed drops the stash (and sets the dismissed-check mark, see below)", state({ request: request(1, 4), payload: stash1 }), closeAs("dismissed"),
+      state({ payload: null, dismissedCheck: 1 })],
     ["close resent keeps the stash", state({ request: request(1, 4), payload: stash1 }), closeAs("resent"),
       state({ payload: stash1 })],
     ["close not-shown keeps the stash", state({ request: request(1, 4), payload: stash1 }), closeAs("not-shown"),
@@ -481,8 +481,8 @@ describe("transitionRequest opens and closes requests by trigger", () => {
       state({ payload: stash1 })],
     ["B7 SO: left-host keeps the stash, no mark", state({ request: sessionCheck(1), payload: stash1 }), closeAs("left-host"),
       state({ payload: stash1 })],
-    ["B4 TF: dismissed drops the stash and marks nothing", state({ request: tf(1), payload: stash1 }), closeAs("dismissed"),
-      state()],
+    ["B4 TF: dismissed drops the stash and marks the task", state({ request: tf(1), payload: stash1 }), closeAs("dismissed"),
+      state({ dismissedCheck: 1 })],
     // B8-B10 for a session check.
     ["B8a SO: retain its own task", state({ request: sessionCheck(1) }), { type: "retain", taskId: 1 }, "same"],
     ["B8b SO: retain another task", state({ request: sessionCheck(1) }), { type: "retain", taskId: 2 }, state()],
@@ -518,6 +518,15 @@ describe("transitionRequest opens and closes requests by trigger", () => {
     expect(reopened.request).toEqual(request(1, 6, null, "session_open"))
     const closedUnseen = transitionRequest(reopened, closeAs("not-shown"))
     expect(transitionRequest(closedUnseen, check(1, "reconnected")).request).toEqual(request(1, 7, null, "session_open"))
+  })
+
+  it("stays quiet on a reconnect after the user closes a turn-failure dialog too", () => {
+    const closed = [open(1), closeAs("dismissed")].reduce(transitionRequest, state())
+    expect(transitionRequest(closed, check(1, "reconnected"))).toBe(closed)
+    const upgraded = [check(1, "opened"), open(1), closeAs("dismissed")].reduce(transitionRequest, state())
+    expect(transitionRequest(upgraded, check(1, "reconnected"))).toBe(upgraded)
+    const resent = [open(1), closeAs("resent")].reduce(transitionRequest, state())
+    expect(transitionRequest(resent, check(1, "reconnected")).request).toEqual(request(1, 6, null, "session_open"))
   })
 
   it("keeps a session check when another task's dialog closes in the same batch", () => {
