@@ -247,6 +247,7 @@ OIDC_EXCHANGE_TTL_SECONDS = "XAGENT_OIDC_EXCHANGE_TTL_SECONDS"
 SESSION_SECRET = "XAGENT_SESSION_SECRET"
 OPENROUTER_OFFICIAL_PROVIDERS_ONLY = "XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY"
 XROUTER_EXCLUDED_MODELS = "XAGENT_XROUTER_EXCLUDED_MODELS"
+FORM_ANSWER_CONTINUATION_MODELS = "XAGENT_FORM_ANSWER_CONTINUATION_MODELS"
 MCP_OAUTH_ALLOW_PRIVATE_HOSTS = "XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS"
 MCP_OAUTH_PROXY_URL = "XAGENT_MCP_OAUTH_PROXY_URL"
 TOBY_PERSONAL_STDIO_ENABLED = "XAGENT_TOBY_PERSONAL_STDIO_ENABLED"
@@ -720,6 +721,20 @@ def get_xrouter_excluded_models() -> tuple[str, ...]:
     value = os.getenv(XROUTER_EXCLUDED_MODELS, "")
     return tuple(
         dict.fromkeys(item.strip() for item in value.split(",") if item.strip())
+    )
+
+
+def get_form_answer_continuation_models() -> tuple[str, ...]:
+    """Return model names gated in for form-answer continuation text.
+
+    The environment value is a comma-separated list. Empty entries are ignored,
+    remaining entries are lowercased for case-insensitive matching, and
+    duplicates are removed while preserving the configured order. Read on
+    every call (not cached).
+    """
+    value = os.getenv(FORM_ANSWER_CONTINUATION_MODELS, "")
+    return tuple(
+        dict.fromkeys(item.strip().lower() for item in value.split(",") if item.strip())
     )
 
 

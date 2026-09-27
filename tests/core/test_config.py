@@ -47,6 +47,7 @@ from xagent.config import (
     FILE_STORAGE_STARTUP_SYNC_ENABLED,
     FILE_STORAGE_URI,
     FILE_STREAM_TICKET_TTL_SECONDS,
+    FORM_ANSWER_CONTINUATION_MODELS,
     FRONTEND_DIST_DIR,
     GMAIL_PUBSUB_PROJECT_ID,
     GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT,
@@ -157,6 +158,7 @@ from xagent.config import (
     get_file_storage_startup_sync_enabled,
     get_file_storage_uri,
     get_file_stream_ticket_ttl_seconds,
+    get_form_answer_continuation_models,
     get_frontend_dist_dir,
     get_gmail_pubsub_project_id,
     get_gmail_pubsub_push_service_account,
@@ -635,6 +637,29 @@ class TestOpenRouterConfig:
             "z-ai/glm-5.3-flash",
             "openai/gpt-5.6-luna",
         )
+
+
+class TestFormAnswerContinuationConfig:
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            pytest.param(None, (), id="unset"),
+            pytest.param("", (), id="empty"),
+            pytest.param("  ", (), id="whitespace-only"),
+            pytest.param(",", (), id="comma-only"),
+            pytest.param("a,b", ("a", "b"), id="multiple-entries"),
+            pytest.param(" A , ,B ", ("a", "b"), id="strips-drops-empty-lowercases"),
+            pytest.param("a,a", ("a",), id="deduplicates-preserving-order"),
+            pytest.param("none", ("none",), id="placeholder-none-is-literal"),
+            pytest.param("null", ("null",), id="placeholder-null-is-literal"),
+        ],
+    )
+    def test_env_table(self, monkeypatch, value, expected):
+        if value is None:
+            monkeypatch.delenv(FORM_ANSWER_CONTINUATION_MODELS, raising=False)
+        else:
+            monkeypatch.setenv(FORM_ANSWER_CONTINUATION_MODELS, value)
+        assert get_form_answer_continuation_models() == expected
 
 
 class TestMCPOAuthConfig:
