@@ -113,11 +113,11 @@ export interface SendFailureState {
 
 /**
  * Everything deriveGates needs, read fresh off the dialog's own state and
- * the request it is currently showing. Flat facts rather than the dialog's
- * storage shape itself: a caller holding twelve independent pieces of state
- * today can feed this the same way a caller holding one combined state
- * value will tomorrow, and neither has to restate the formulas below --
- * only how to read its own storage into this shape.
+ * the request it is currently showing. Flat facts rather than DialogState
+ * itself: gateFactsOf (below) is the one adapter from the dialog's state
+ * into this shape, so the formulas in deriveGates stay independent of how
+ * that state is stored, and a test can state any combination of facts
+ * directly.
  */
 export interface GateFacts {
   report: ConnectorRuntimeReport | null
@@ -126,15 +126,13 @@ export interface GateFacts {
   readNonce: number
   // Whether any submission-shaped action is in flight: an explicit save
   // (which may itself run a resend as part of "save and resend") or a
-  // standalone retry resend from the send-failed panel. The caller keeps
-  // this rather than deriveGates folding it from two flags of its own,
-  // because what those flags are and how many there are is the caller's
-  // storage question, not this module's.
+  // standalone retry resend from the send-failed panel. gateFactsOf reads
+  // it off the phase with isBusy.
   //
-  // The caller must keep `retrying` implying `busy`: a retry resend is one
-  // of the submission-shaped actions `busy` covers. A fact set with
-  // `retrying` true and `busy` false describes no state the dialog can be
-  // in, and nothing below is written to give it a meaning.
+  // Whoever builds these facts must keep `retrying` implying `busy`: a
+  // retry resend is one of the submission-shaped actions `busy` covers. A
+  // fact set with `retrying` true and `busy` false describes no state the
+  // dialog can be in, and nothing below is written to give it a meaning.
   busy: boolean
   // The send the "saved but not sent" panel is about, or null when no send
   // has failed. See `liveSendFailure` below for why this is joined against
