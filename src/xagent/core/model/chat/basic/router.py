@@ -680,6 +680,19 @@ class _ResolvedRouterLLM(BaseLLM):
         return self._selected_model
 
     @property
+    def concrete_model_name(self) -> str | None:
+        """The downstream client's own model name, not the routing profile id.
+
+        ``model_name`` returns the routing id xrouter selected (e.g. an xrouter
+        config name), which may differ from the spelling the downstream client
+        actually sends upstream. Callers that need to match on the real
+        provider model name (e.g. an exact-match feature gate) should read
+        this instead. None when the downstream does not expose a usable name.
+        """
+        name = getattr(self._downstream, "model_name", None)
+        return name if isinstance(name, str) and name else None
+
+    @property
     def supports_thinking_mode(self) -> bool:
         if not self._router.uses_configured_candidates:
             return self._router.supports_thinking_mode
