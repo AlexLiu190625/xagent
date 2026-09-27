@@ -8369,6 +8369,34 @@ describe("connector runtime dialog trigger", () => {
     )
   })
 
+  it("counts a socket open as a same-task reconnect only when the task was already connected", () => {
+    let reconnects: number | undefined
+    let setTask: ((taskId: number) => void) | undefined
+    function ReconnectProbe() {
+      const app = useApp()
+      reconnects = app.sameTaskReconnects
+      setTask = (taskId) => app.setTaskId(taskId, { navigate: false })
+      return null
+    }
+    render(<AppProvider token="token"><ReconnectProbe /></AppProvider>)
+    const open = () => act(() => { webSocketOptions.current?.onConnect?.() })
+
+    act(() => { setTask?.(5) })
+    open()
+    expect(reconnects).toBe(0)
+    open()
+    expect(reconnects).toBe(1)
+    act(() => { setTask?.(6) })
+    open()
+    expect(reconnects).toBe(1)
+    // Two opens that land before one render still count as two.
+    act(() => {
+      webSocketOptions.current?.onConnect?.()
+      webSocketOptions.current?.onConnect?.()
+    })
+    expect(reconnects).toBe(3)
+  })
+
   // A companion assertion -- this context runs with no
   // ConnectorRuntimeDialogProvider above it on widget/share pages, and that
   // must never trip the dev-only "called outside provider" warning -- lives

@@ -5,8 +5,8 @@ import { I18nProvider } from "@/contexts/i18n-context"
 import type { AppState } from "@/contexts/app-context-chat"
 
 // The task page's session-check trigger. Kept apart from page-client.test.tsx
-// because that file's app-context mock does not expose `isConnected`, which
-// every reconnect case here depends on.
+// because that file's app-context mock does not expose `sameTaskReconnects`,
+// which every reconnect case here depends on.
 
 const navigation = vi.hoisted(() => ({ params: { id: "1" } as { id: string } }))
 vi.mock("next/navigation", () => ({
@@ -22,7 +22,7 @@ vi.mock("@/contexts/auth-context", () => ({ useAuth: () => ({ user: { id: "u1" }
 
 const app = vi.hoisted(() => ({
   taskId: 1 as number | null,
-  isConnected: false,
+  sameTaskReconnects: 0,
   setTaskId: vi.fn(),
   closeFilePreview: vi.fn(),
 }))
@@ -32,7 +32,7 @@ vi.mock("@/contexts/app-context-chat", async (importOriginal) => {
     ...actual,
     useApp: () => ({
       state: { taskId: app.taskId, currentTask: null, dagExecution: null, steps: [] } as Partial<AppState>,
-      isConnected: app.isConnected,
+      sameTaskReconnects: app.sameTaskReconnects,
       setTaskId: app.setTaskId,
       closeFilePreview: app.closeFilePreview,
     }),
@@ -58,54 +58,58 @@ afterEach(() => {
   vi.restoreAllMocks()
   navigation.params = { id: "1" }
   app.taskId = 1
-  app.isConnected = false
+  app.sameTaskReconnects = 0
 })
 
-// One observation per effect run: [URL-and-state task (null when they
-// disagree), the state's task, isConnected] and the check it must ask for.
-type Step = [number | null, number | null, boolean, SessionCheckCause | null]
+// One observation per effect run: [the URL's task id, the state's task id,
+// the app's sameTaskReconnects] and the check it must ask for, if any.
+type Step = [number, number | null, number, [number, SessionCheckCause] | null]
+const N = Number.NaN
 
-function replay(steps: Step[]): Array<SessionCheckCause | null> {
+function replay(steps: Step[]): Array<[number, SessionCheckCause] | null> {
   let watch: SessionCheckWatch = INITIAL_SESSION_CHECK_WATCH
-  return steps.map(([viewed, stateTaskId, isConnected]) => {
-    const { next, check } = nextSessionCheck(watch, { viewed, stateTaskId, isConnected })
+  return steps.map(([urlTaskId, stateTaskId, reconnects]) => {
+    const { next, check } = nextSessionCheck(watch, { urlTaskId, stateTaskId, reconnects })
     watch = next
-    return check
+    return check === null ? null : [check.taskId, check.cause]
   })
 }
 
 describe("nextSessionCheck", () => {
   it.each<[string, Step[]]>([
-    ["E1 mount before connecting: the first connect is skipped, a later one checks", [
-      [5, 5, false, "opened"], [5, 5, true, null], [5, 5, false, null], [5, 5, true, "reconnected"],
+    ["E1 mount, then the first connect (not counted), then a reconnect", [
+      [5, 5, 0, [5, "opened"]], [5, 5, 0, null], [5, 5, 1, [5, "reconnected"]],
     ]],
-    ["E2 mount already connected, then a reconnect", [
-      [5, 5, true, "opened"], [5, 5, false, null], [5, 5, true, "reconnected"],
+    ["E2 mount after earlier reconnects of the same task: only later ones check", [
+      [5, 5, 3, [5, "opened"]], [5, 5, 3, null], [5, 5, 4, [5, "reconnected"]],
     ]],
-    ["E3 arrive from another task: its stale connected value is not this view's first connect", [
-      [null, 3, true, null], [5, 5, true, "opened"], [5, 5, false, null], [5, 5, true, null],
-      [5, 5, false, null], [5, 5, true, "reconnected"],
+    ["E3 arrive from another task: nothing while the URL and the state disagree", [
+      [5, 3, 2, null], [5, 5, 2, [5, "opened"]], [5, 5, 2, null], [5, 5, 3, [5, "reconnected"]],
     ]],
     ["E4 soft navigation from one task to another", [
-      [3, 3, true, "opened"], [3, 3, false, null], [3, 3, true, "reconnected"],
-      [null, 3, true, null], [5, 5, true, "opened"], [5, 5, false, null], [5, 5, true, null],
-      [5, 5, false, null], [5, 5, true, "reconnected"],
+      [3, 3, 0, [3, "opened"]], [3, 3, 1, [3, "reconnected"]],
+      [5, 3, 1, null], [5, 5, 1, [5, "opened"]], [5, 5, 2, [5, "reconnected"]],
     ]],
-    ["E5 back from the new-conversation page, which cleared the task", [
-      [null, null, false, null], [3, 3, false, "opened"], [3, 3, true, null],
+    ["E5 back from the new-conversation page: the app counts that socket open as a same-task reconnect", [
+      [3, null, 0, null], [3, 3, 0, [3, "opened"]], [3, 3, 1, [3, "reconnected"]],
     ]],
-    ["E6 a URL id that is not a number", [[null, 5, true, null], [null, 5, false, null], [null, 5, true, null]]],
-    ["E7 no task in the app state", [[null, null, true, null], [null, null, false, null]]],
-    ["E8 the same observation twice (strict mode)", [[5, 5, true, "opened"], [5, 5, true, null]]],
-    ["E9 several failed reconnects, then one that works", [
-      [5, 5, true, "opened"], [5, 5, false, null], [5, 5, false, null], [5, 5, false, null], [5, 5, true, "reconnected"],
+    ["E6 a URL id that is not a number", [[N, 5, 0, null], [N, 5, 1, null]]],
+    ["E7 no task in the app state", [[5, null, 0, null], [5, null, 1, null]]],
+    ["E8 the same observation twice (strict mode)", [[5, 5, 0, [5, "opened"]], [5, 5, 0, null]]],
+    ["E9 two reconnects between two observations check once", [
+      [5, 5, 0, [5, "opened"]], [5, 5, 2, [5, "reconnected"]], [5, 5, 2, null],
     ]],
-    ["E16 a switch whose disconnect and reconnect land in one render skips the next reconnect", [
-      [3, 3, true, "opened"], [null, 3, true, null], [5, 5, true, "opened"], [5, 5, true, null],
-      [5, 5, false, null], [5, 5, true, null], [5, 5, false, null], [5, 5, true, "reconnected"],
+    ["E16 the reconnect after a switch is checked however the switch's renders were merged", [
+      [3, 3, 0, [3, "opened"]], [5, 5, 0, [5, "opened"]], [5, 5, 1, [5, "reconnected"]],
     ]],
-    ["E19 the URL briefly disagrees, then shows the same task again: its connection is this view's own", [
-      [5, 5, true, "opened"], [null, 5, true, null], [5, 5, true, "opened"], [5, 5, false, null], [5, 5, true, "reconnected"],
+    ["E19 the URL briefly disagrees, then shows the same task again: still the same view", [
+      [5, 5, 0, [5, "opened"]], [7, 5, 0, null], [5, 5, 0, null], [5, 5, 1, [5, "reconnected"]],
+    ]],
+    ["E20 a reconnect while the URL disagrees is checked for the task the view is on", [
+      [5, 5, 0, [5, "opened"]], [7, 5, 1, [5, "reconnected"]], [5, 5, 1, null],
+    ]],
+    ["E21 the app state leaves the task and comes back: a new view", [
+      [5, 5, 0, [5, "opened"]], [5, 7, 0, null], [5, 5, 0, [5, "opened"]],
     ]],
   ])("%s", (_name, steps) => {
     expect(replay(steps)).toEqual(steps.map(step => step[3]))
@@ -169,19 +173,27 @@ describe("the task page asks for a session check", () => {
     const { spy, update } = mountPage()
     app.taskId = 3
     act(() => { update() })
-    app.isConnected = true
     act(() => { update() })
     expect(spy.mock.calls).toEqual([[3, "opened"]])
   })
 
-  it("checks again, as reconnected, when the same view's connection comes back", () => {
-    app.isConnected = true
+  it("checks again, as reconnected, when the app reports a same-task reconnect", () => {
     const { spy, update } = mountPage()
-    app.isConnected = false
-    act(() => { update() })
-    app.isConnected = true
+    app.sameTaskReconnects = 1
     act(() => { update() })
     expect(spy.mock.calls).toEqual([[1, "opened"], [1, "reconnected"]])
+  })
+
+  it("does not bring back a dismissed check when the URL briefly disagrees", () => {
+    const { spy, update } = mountPage()
+    act(() => { actions?.close("dismissed", 1) })
+    expect(value?.request).toBeNull()
+    navigation.params = { id: "2" }
+    act(() => { update() })
+    navigation.params = { id: "1" }
+    act(() => { update() })
+    expect(spy.mock.calls).toEqual([[1, "opened"]])
+    expect(value?.request).toBeNull()
   })
 
   it("checks once under StrictMode", () => {
