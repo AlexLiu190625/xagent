@@ -605,6 +605,30 @@ async def test_caller_cancellation_schedules_reclaim(monkeypatch, caller_context
             await caller
     else:
         holder: dict[str, Any] = {}
+        real_schedule_reclaim = mcp_adapter_module._schedule_reclaim
+
+        async def _never_runs() -> None:
+            pass  # pragma: no cover
+
+        def probing_schedule_reclaim(server_name, task, recorder):
+            # At the exact moment the caller's cancellation reaches
+            # _schedule_reclaim, the enclosing group must already be
+            # shutting down: trying to add a task to it here must be
+            # refused the same way it would be for any other caller. This
+            # checks that through the group's own public create_task, not
+            # by reaching into its private state.
+            group = holder["group"]
+            probe_coro = _never_runs()
+            try:
+                with pytest.raises(RuntimeError):
+                    group.create_task(probe_coro)
+            finally:
+                probe_coro.close()
+            return real_schedule_reclaim(server_name, task, recorder)
+
+        monkeypatch.setattr(
+            mcp_adapter_module, "_schedule_reclaim", probing_schedule_reclaim
+        )
 
         async def group_body():
             async with asyncio.TaskGroup() as tg:
@@ -627,9 +651,6 @@ async def test_caller_cancellation_schedules_reclaim(monkeypatch, caller_context
             await group_task
         except (asyncio.CancelledError, BaseExceptionGroup):
             pass
-        # Confirms the group really did abort -- not just that its child was
-        # cancelled -- so this cell exercises what it claims to.
-        assert holder["group"]._aborting is True
 
     # The reaper must already be running (scheduled via ensure_future, not
     # refused by an aborting TaskGroup) by the time the caller has unwound.
@@ -1080,7 +1101,9 @@ async def test_second_reclaim_warning_reports_live_load_count(monkeypatch, caplo
             if r.name == _LOGGER_NAME and "still alive" in r.getMessage()
         ]
         assert len(still_alive) == 1
-        assert still_alive[0].args[-1] == 2  # len(_active_load_tasks) at that time
+        # len(_active_load_tasks) at that time: before's snapshot (which
+        # already includes the dummy task) plus the one real load task.
+        assert still_alive[0].args[-1] == len(before) + 1
         assert "MCP load tasks alive in this process" in still_alive[0].getMessage()
     finally:
         release.set()
