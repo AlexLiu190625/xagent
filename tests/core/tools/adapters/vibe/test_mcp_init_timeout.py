@@ -9,9 +9,11 @@ on its own.
 """
 
 import asyncio
+import contextlib
 import inspect
 import logging
 from contextlib import asynccontextmanager
+from typing import Any
 
 import httpx
 import pytest
@@ -84,11 +86,20 @@ async def _swallow_cancels_for(seconds: float) -> None:
             remaining -= loop.time() - start
 
 
-async def _swallow_cancels_until(event: asyncio.Event) -> None:
-    """Swallow every cancellation received while waiting for ``event``."""
+async def _swallow_cancels_until(
+    event: asyncio.Event, give_up_after: float = 5.0
+) -> None:
+    """Swallow every cancellation received while waiting for ``event``, but
+    only for ``give_up_after`` seconds: if the code under test never sets the
+    event, the test must fail rather than leave a task no cancel can end."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + give_up_after
     while not event.is_set():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return
         try:
-            await asyncio.wait_for(event.wait(), 0.05)
+            await asyncio.wait_for(event.wait(), min(0.05, remaining))
         except asyncio.CancelledError:
             _uncancel_current_task()
         except TimeoutError:
@@ -293,7 +304,7 @@ async def test_create_mcp_tools_releases_db_before_network_init(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Bounded reclaim of abandoned MCP initializations (I-3 .. I-19).
+# Bounded reclaim of abandoned MCP initializations.
 # ---------------------------------------------------------------------------
 
 
@@ -403,20 +414,16 @@ async def test_abandoned_http_load_is_force_closed_after_grace_bare_coroutine(
                 await _swallow_cancels_until(client.closed)
         return []  # pragma: no cover
 
+    before = set(mcp_adapter_module._active_load_tasks)
     with pytest.raises(TimeoutError):
         await _load_server_tools_bounded("s", bare_load(), 0.05, recorder=recorder)
     abandoned_at = asyncio.get_event_loop().time()
 
-    task = next(iter(mcp_adapter_module._active_load_tasks), None)
-    assert task is not None
+    task = _new_active_load_task(before)
     # Whichever ending: "swallows_cancel" is ended by the reaper's second
     # cancel (task.cancelled() is True); "blocked_on_transport" ends
     # normally once its own client is force-closed.
-    try:
-        await asyncio.wait_for(task, timeout=5)
-    except asyncio.CancelledError:
-        pass
-    assert task.done()
+    await _assert_task_done_within(task, timeout=5)
     ended_after = asyncio.get_event_loop().time() - abandoned_at
 
     assert client.aclose_calls == 1
@@ -435,8 +442,8 @@ async def test_abandoned_http_load_is_force_closed_after_grace_real_retry_loop(
     """Variant b: the real retry loop and real bounded call. The load's first
     (and only) attempt gets stuck; after the grace period the reaper
     force-closes it. Because the retry loop checks the seal before every
-    attempt (m1), the load starts no second attempt at all -- it ends with
-    ``_TransportReclaimedError``, not with a refused retry."""
+    attempt, the load starts no second attempt at all -- it ends with
+    ``_TransportReclaimedError``."""
     monkeypatch.setattr(mcp_adapter_module, "_HANDSHAKE_RECLAIM_GRACE_SECONDS", 1.5)
     caplog.set_level(logging.WARNING, logger=_LOGGER_NAME)
 
@@ -447,6 +454,7 @@ async def test_abandoned_http_load_is_force_closed_after_grace_real_retry_loop(
     monkeypatch.setattr(mcp_adapter_module, "create_session", stand_in)
 
     recorder = _TransportRecorder("s")
+    before = set(mcp_adapter_module._active_load_tasks)
     with pytest.raises(TimeoutError):
         await _load_server_tools_bounded(
             "s",
@@ -464,10 +472,9 @@ async def test_abandoned_http_load_is_force_closed_after_grace_real_retry_loop(
     abandoned_at = asyncio.get_event_loop().time()
 
     built_at_abandon = counts["built"]
-    task = next(iter(mcp_adapter_module._active_load_tasks), None)
-    assert task is not None
-    with pytest.raises(_TransportReclaimedError):
-        await asyncio.wait_for(task, timeout=5)
+    task = _new_active_load_task(before)
+    await _assert_task_done_within(task, timeout=5)
+    assert isinstance(task.exception(), _TransportReclaimedError)
     ended_after = asyncio.get_event_loop().time() - abandoned_at
 
     assert counts["built"] == built_at_abandon  # zero new clients after abandonment
@@ -506,12 +513,12 @@ async def test_reclaim_is_silent_when_abandoned_load_unwinds(
             await _swallow_cancels_for(unwind_delay)
         return []  # pragma: no cover
 
+    before = set(mcp_adapter_module._active_load_tasks)
     with pytest.raises(TimeoutError):
         await _load_server_tools_bounded("s", bare_load(), 0.05, recorder=recorder)
 
-    task = next(iter(mcp_adapter_module._active_load_tasks), None)
-    assert task is not None
-    await asyncio.wait_for(task, timeout=5)
+    task = _new_active_load_task(before)
+    await _assert_task_done_within(task, timeout=5)
 
     assert client.aclose_calls == 0
     assert _reclaim_warnings(caplog.records) == []
@@ -525,6 +532,36 @@ async def test_reclaim_is_silent_when_abandoned_load_unwinds(
 async def _poll_until_empty(task_set) -> None:
     while task_set:
         await asyncio.sleep(0.02)
+
+
+def _new_active_load_task(before: set) -> "asyncio.Task[Any]":
+    """Return the one task added to ``_active_load_tasks`` since ``before``
+    was snapshotted.
+
+    That set is module-level and shared across every test in this file, so
+    picking any element of it (rather than the one this test's own call just
+    added) could silently grab a task a previous test left stranded.
+    """
+    new_tasks = mcp_adapter_module._active_load_tasks - before
+    assert len(new_tasks) == 1, (
+        f"expected exactly one new load task, got {len(new_tasks)}"
+    )
+    return next(iter(new_tasks))
+
+
+async def _assert_task_done_within(task: "asyncio.Task[Any]", timeout: float) -> None:
+    """Wait for ``task`` to finish within ``timeout``, and fail explicitly if
+    it doesn't.
+
+    ``asyncio.wait_for`` would cancel ``task`` at the deadline and then keep
+    awaiting it, so a task that swallows every cancellation it receives would
+    hang ``wait_for`` itself forever. ``asyncio.wait`` only watches; it
+    returns at the deadline whether or not the task has finished, and never
+    raises the task's own outcome (a return value, an exception, or having
+    been cancelled) into the caller.
+    """
+    done, _pending = await asyncio.wait({task}, timeout=timeout)
+    assert task in done, f"task did not finish within {timeout}s"
 
 
 @pytest.mark.asyncio
@@ -559,6 +596,7 @@ async def test_caller_cancellation_schedules_reclaim(monkeypatch, caller_context
     async def call_bounded():
         await _load_server_tools_bounded("s", bare_load(), 30, recorder=recorder)
 
+    before = set(mcp_adapter_module._active_load_tasks)
     if caller_context == "plain_task":
         caller = asyncio.create_task(call_bounded())
         await asyncio.wait_for(load_started.wait(), timeout=5)
@@ -566,26 +604,39 @@ async def test_caller_cancellation_schedules_reclaim(monkeypatch, caller_context
         with pytest.raises(asyncio.CancelledError):
             await caller
     else:
-        holder: dict[str, "asyncio.Task"] = {}
+        holder: dict[str, Any] = {}
 
         async def group_body():
             async with asyncio.TaskGroup() as tg:
+                holder["group"] = tg
                 holder["caller"] = tg.create_task(call_bounded())
                 await asyncio.wait_for(load_started.wait(), timeout=5)
-                holder["caller"].cancel()
+                # Cancel the task running this function (the group's own
+                # parent task), not just the child: a child that is merely
+                # cancelled makes the group return without aborting
+                # (asyncio/taskgroups.py's _on_task_done: `if
+                # task.cancelled(): return`, never calling `_abort()`).
+                # Only a cancellation received while still inside the
+                # `async with` block makes __aexit__ call `_abort()` --
+                # the actual "the group is shutting down" state
+                # `_schedule_reclaim` must survive.
+                asyncio.current_task().cancel()
 
+        group_task = asyncio.create_task(group_body())
         try:
-            await group_body()
+            await group_task
         except (asyncio.CancelledError, BaseExceptionGroup):
             pass
+        # Confirms the group really did abort -- not just that its child was
+        # cancelled -- so this cell exercises what it claims to.
+        assert holder["group"]._aborting is True
 
     # The reaper must already be running (scheduled via ensure_future, not
     # refused by an aborting TaskGroup) by the time the caller has unwound.
     assert recorder._sealed is True
-    load_task = next(iter(mcp_adapter_module._active_load_tasks), None)
-    assert load_task is not None
+    load_task = _new_active_load_task(before)
     assert not load_task.done() or load_task.cancelled()
-    await asyncio.wait_for(load_task, timeout=5)
+    await _assert_task_done_within(load_task, timeout=5)
     assert client.aclose_calls == 1
 
 
@@ -646,11 +697,11 @@ async def test_reclaim_failure_is_logged_and_contained(monkeypatch, caplog, rais
             _uncancel_current_task()
             await asyncio.Event().wait()  # stay stuck forever
 
+    before = set(mcp_adapter_module._active_load_tasks)
     with pytest.raises(TimeoutError):
         await _load_server_tools_bounded("s", bare_load(), 0.05, recorder=recorder)
 
-    task = next(iter(mcp_adapter_module._active_load_tasks), None)
-    assert task is not None
+    task = _new_active_load_task(before)
     await _poll_until_empty(mcp_adapter_module._RECLAIM_TASKS)
 
     assert broken.aclose_calls == 1
@@ -911,7 +962,7 @@ async def test_abandoned_load_starts_no_further_attempt(
     monkeypatch, caplog, transport, k, ending
 ):
     """After abandonment, no transport starts another attempt: the retry
-    loop checks the seal before every attempt, whatever the transport (m1).
+    loop checks the seal before every attempt, whatever the transport.
     A load whose k-th (of 3) attempt is the one abandoned ends with
     _TransportReclaimedError when k < 3 (the next attempt's check fails it);
     when k == 3 there is no next attempt, so it returns normally with a
@@ -934,6 +985,7 @@ async def test_abandoned_load_starts_no_further_attempt(
 
     recorder = _TransportRecorder("s")
     caller_timeout = (k - 1) + 0.5
+    before = set(mcp_adapter_module._active_load_tasks)
     with pytest.raises(TimeoutError):
         await _load_server_tools_bounded(
             "s",
@@ -950,13 +1002,12 @@ async def test_abandoned_load_starts_no_further_attempt(
         )
     abandoned_at = asyncio.get_event_loop().time()
 
-    task = next(iter(mcp_adapter_module._active_load_tasks), None)
-    assert task is not None
+    task = _new_active_load_task(before)
+    await _assert_task_done_within(task, timeout=10)
     if k < 3:
-        with pytest.raises(_TransportReclaimedError):
-            await asyncio.wait_for(task, timeout=10)
+        assert isinstance(task.exception(), _TransportReclaimedError)
     else:
-        result = await asyncio.wait_for(task, timeout=10)
+        result = task.result()
         assert len(result.failures) == 1
         failure = result.failures[0]
         assert failure.attempts == 3
@@ -983,8 +1034,9 @@ async def test_abandoned_load_starts_no_further_attempt(
 async def test_second_reclaim_warning_reports_live_load_count(monkeypatch, caplog):
     """When an abandoned load is still alive after its transports were
     force-closed, the second WARNING carries how many MCP load tasks are
-    still alive in this process; the reaper still removes itself from
-    _RECLAIM_TASKS once it has logged it."""
+    still alive in this process -- not some other count that merely happens
+    to match it -- and the reaper still removes itself from _RECLAIM_TASKS
+    once it has logged it."""
     grace = 0.1
     monkeypatch.setattr(mcp_adapter_module, "_HANDSHAKE_RECLAIM_GRACE_SECONDS", grace)
     caplog.set_level(logging.WARNING, logger=_LOGGER_NAME)
@@ -994,41 +1046,52 @@ async def test_second_reclaim_warning_reports_live_load_count(monkeypatch, caplo
     instrumented = recorder.instrument(connection)
     instrumented["httpx_client_factory"]()
 
-    # Swallows exactly the two cancels the reaper delivers (abandonment, then
-    # after force-close); a third cancel -- issued by this test at the end,
-    # to let the task finish -- is allowed to propagate.
-    remaining_swallows = {"n": 2}
+    # Stays alive through both cancels the reaper delivers (abandonment, then
+    # after force-close), whatever happens in the body below: it is released
+    # only from this test's own `finally`, and (see _swallow_cancels_until)
+    # gives up on its own after 5s regardless, so it can never hang the loop
+    # teardown even if an assertion above fails first.
+    release = asyncio.Event()
 
     async def bare_load():
-        while True:
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                if remaining_swallows["n"] <= 0:
-                    raise
-                remaining_swallows["n"] -= 1
-                _uncancel_current_task()
+        await _swallow_cancels_until(release)
         return []  # pragma: no cover
 
-    with pytest.raises(TimeoutError):
-        await _load_server_tools_bounded("s", bare_load(), 0.05, recorder=recorder)
+    # A second, unrelated pending task, added directly to the module-level
+    # set the WARNING's count is read from. This makes that count (2)
+    # diverge from _RECLAIM_TASKS's count (1), so a WARNING that reports the
+    # wrong set shows up as the wrong number, not as a coincidentally correct
+    # one (both sets hold exactly one task otherwise).
+    dummy_task = asyncio.ensure_future(asyncio.Event().wait())
+    mcp_adapter_module._active_load_tasks.add(dummy_task)
 
-    task = next(iter(mcp_adapter_module._active_load_tasks), None)
-    assert task is not None
-    await _poll_until_empty(mcp_adapter_module._RECLAIM_TASKS)
+    task = None
+    try:
+        before = set(mcp_adapter_module._active_load_tasks)
+        with pytest.raises(TimeoutError):
+            await _load_server_tools_bounded("s", bare_load(), 0.05, recorder=recorder)
 
-    still_alive = [
-        r
-        for r in caplog.records
-        if r.name == _LOGGER_NAME and "still alive" in r.getMessage()
-    ]
-    assert len(still_alive) == 1
-    assert still_alive[0].args[-1] >= 1  # len(_active_load_tasks) at that time
-    assert "MCP load tasks alive in this process" in still_alive[0].getMessage()
+        task = _new_active_load_task(before)
+        await _poll_until_empty(mcp_adapter_module._RECLAIM_TASKS)
 
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+        still_alive = [
+            r
+            for r in caplog.records
+            if r.name == _LOGGER_NAME and "still alive" in r.getMessage()
+        ]
+        assert len(still_alive) == 1
+        assert still_alive[0].args[-1] == 2  # len(_active_load_tasks) at that time
+        assert "MCP load tasks alive in this process" in still_alive[0].getMessage()
+    finally:
+        release.set()
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        dummy_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await dummy_task
+        mcp_adapter_module._active_load_tasks.discard(dummy_task)
 
 
 @pytest.mark.asyncio
