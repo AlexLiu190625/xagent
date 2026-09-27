@@ -65,10 +65,10 @@ whose bytes no longer match the digest in its name, is reported as
 unavailable.
 
 The reply goes through the same output filter as every other tool and is
-never stored again. Because the text of one reply is never longer than the
-output limit, the filter does not cut it, and advancing `offset` by the
-number in the tool description continues exactly where the previous reply
-ended.
+never stored again. For any positive limit the text of one reply is never
+longer than the output limit, so the filter does not cut it, and advancing
+`offset` by the number in the tool description continues exactly where the
+previous reply ended.
 
 ## Settings and limits
 

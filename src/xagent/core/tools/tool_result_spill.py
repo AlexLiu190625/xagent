@@ -564,8 +564,10 @@ def spill_read_page_chars(max_chars: int) -> int:
     enforce a lower bound, so a limit of 0 or below reaches here unchanged,
     and a page of 0 characters would return the same empty preview for
     every offset without ever moving forward. Under such a limit the output
-    filter already cuts every string to nothing, so the clamp does not make
-    the read tool usable; it only keeps its paging from standing still.
+    filter already mangles every string (a limit of 0 leaves only the
+    truncation marker, a negative limit drops that many characters from the
+    end), so the clamp does not make the read tool usable; it only keeps its
+    paging from standing still.
     """
     return max(1, min(SPILL_READ_MAX_CHARS, max_chars))
 

@@ -609,7 +609,9 @@ def test_read_spilled_result_whole_reply_threshold_follows_page_chars(tmp_path):
     }
 
 
-@pytest.mark.parametrize("page_chars", [0, SPILL_READ_MAX_CHARS + 1, True])
+@pytest.mark.parametrize(
+    "page_chars", [0, SPILL_READ_MAX_CHARS + 1, True, 8000.0, "8000"]
+)
 def test_read_spilled_result_rejects_a_page_size_outside_its_range(
     tmp_path, page_chars
 ):

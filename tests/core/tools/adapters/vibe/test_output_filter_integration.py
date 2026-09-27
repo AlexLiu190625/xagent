@@ -1134,6 +1134,35 @@ async def test_read_back_pages_at_a_lower_output_limit_join_to_the_stored_text(
 
 
 @pytest.mark.asyncio
+async def test_read_back_of_an_item_between_the_page_size_and_the_cap_is_paged(
+    tmp_path,
+):
+    """A 10,000-character line is shorter than SPILL_READ_MAX_CHARS but
+    longer than an 8,000-character output limit. Through the factory's
+    wrapped read_tool_result it comes back as a preview, not as one whole
+    reply the filter would then cut: two pages of 8,000 and 2,000 that join
+    to the stored text, neither carrying the truncation marker."""
+    reader, spill_dir = await _read_back_tool(tmp_path, "read-back-between", 8_000)
+    line = "".join(chr(ord("a") + index % 26) for index in range(10_000))
+    path = _store_for_reading(spill_dir, line, max_chars=100)
+
+    first = await reader.run_json_async({"path": path, "start": 1, "end": 1})
+    assert "output" not in first
+    assert first["content_truncated"] is True
+    assert DEFAULT_TRUNCATION_MESSAGE not in first["content_preview"]
+    second = await reader.run_json_async(
+        {"path": path, "start": 1, "end": 1, "offset": _stated_page_chars(reader)}
+    )
+    assert second["content_truncated"] is False
+    assert DEFAULT_TRUNCATION_MESSAGE not in second["content_preview"]
+    assert [len(first["content_preview"]), len(second["content_preview"])] == [
+        8_000,
+        2_000,
+    ]
+    assert first["content_preview"] + second["content_preview"] == line
+
+
+@pytest.mark.asyncio
 async def test_read_back_page_size_is_stated_in_the_description_not_an_argument(
     tmp_path,
 ):
