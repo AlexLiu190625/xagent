@@ -3348,6 +3348,190 @@ describe("keeps a message's delivery verdict from falling back once its panel is
   })
 })
 
+describe("words a settlement that takes the snapshot mid save-and-resend off the message's verdict", () => {
+  function fillableReport() {
+    return report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])
+  }
+
+  /** One save-and-resend of `orig-1` whose resend fails with `disposition`. */
+  async function firstResendOfOrig1EndsIn(disposition: "outcome_unknown" | "not_sent") {
+    fetchMock.mockResolvedValueOnce(ok(fillableReport()))
+    const view = renderHarness()
+    await recordThenOpen({ taskId: 1, clientMessageId: "orig-1", text: "hi" })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(deliveryFailure(disposition))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.resend")).toBeInTheDocument())
+    return view
+  }
+
+  /**
+   * That failed resend, then its panel taken down by a retry the re-read
+   * report turns down, leaving the rows and `orig-1` still in the snapshot.
+   */
+  async function panelDownAfter(disposition: "outcome_unknown" | "not_sent") {
+    const view = await firstResendOfOrig1EndsIn(disposition)
+    fetchMock.mockResolvedValueOnce(ok(fillableReport()))
+    await openForTask() // a same-task terminal frame; the snapshot stays
+    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.resend")).toBeEnabled())
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+    expect(screen.queryByText("connectorRuntime.actions.resend")).not.toBeInTheDocument()
+    toastMock.mockClear()
+    return view
+  }
+
+  /**
+   * A save-and-resend of whatever the snapshot holds now, whose save is
+   * still in flight when a settlement frame for this task takes the snapshot
+   * away. The save then lands, and there is nothing left to resend.
+   * `alsoMidSave` runs after the settlement frame, while the save is still
+   * in flight.
+   */
+  async function snapshotTakenMidSave(alsoMidSave?: () => Promise<void>) {
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "y" } })
+    let resolveSave: (value: unknown) => void = () => {}
+    submitMock.mockReturnValueOnce(new Promise((res) => { resolveSave = res }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await act(async () => { latestActions.forgetDelivery(1) })
+    await alsoMidSave?.()
+    await act(async () => { resolveSave(ok(report(true, []))) })
+  }
+
+  async function snapshotTakenMidSaveAfter(disposition: "outcome_unknown" | "not_sent") {
+    await panelDownAfter(disposition)
+    await snapshotTakenMidSave()
+  }
+
+  it("does not say \"not sent\" when an earlier attempt's outcome was unknown", async () => {
+    // Nothing went out this time, but the first attempt may still be
+    // running: the only toast this exit raises must keep saying so.
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    await snapshotTakenMidSaveAfter("outcome_unknown")
+
+    expect(sendMessageMock).toHaveBeenCalledTimes(1)
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.sendOutcomeUnknown"]])
+    expect(screen.queryByText("connectorRuntime.actions.resend")).not.toBeInTheDocument()
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+  })
+
+  it("still says \"not sent\" when every earlier attempt definitely did not go out", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    await snapshotTakenMidSaveAfter("not_sent")
+
+    expect(sendMessageMock).toHaveBeenCalledTimes(1)
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.sendFailed"]])
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+  })
+
+  // The two ways the view can go away under that same save. Either one ends
+  // the flow when the save lands, before the resend step runs, so the only
+  // toast says this press did not resend -- which leaves the earlier "may
+  // have been sent" standing -- rather than saying the message was not sent.
+  it("does not say \"not sent\" when the dialog unmounts mid save after an unknown outcome", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    const view = await panelDownAfter("outcome_unknown")
+    await snapshotTakenMidSave(async () => {
+      view.rerender(<ConnectorRuntimeDialogProvider><Probe mounted={false} /></ConnectorRuntimeDialogProvider>)
+    })
+
+    expect(sendMessageMock).toHaveBeenCalledTimes(1)
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.savedNotResentUnmounted"]])
+    expect(warn).not.toHaveBeenCalledWith("[connector-runtime] resend attempted with no snapshot to send")
+  })
+
+  it("does not say \"not sent\" when a same-task frame retargets the dialog mid save after an unknown outcome", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    await panelDownAfter("outcome_unknown")
+    await snapshotTakenMidSave(async () => {
+      fetchMock.mockResolvedValueOnce(ok(fillableReport()))
+      await openForTask() // a same-task terminal frame retargets this dialog
+    })
+
+    expect(sendMessageMock).toHaveBeenCalledTimes(1)
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.savedNotResentSuperseded"]])
+    expect(warn).not.toHaveBeenCalledWith("[connector-runtime] resend attempted with no snapshot to send")
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+  })
+
+  it("does not say \"not sent\" when the footer retry repeats a save-and-resend after the snapshot went", async () => {
+    // The save-and-resend press promised to resend `orig-1`, and its save
+    // was refused with a retryable error. A settlement then took the
+    // snapshot, so "Save and resend" is gone but the retry button that
+    // repeats that press is still there. Pressing it saves, finds nothing
+    // to send, and must still say the first attempt may have gone out.
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    await panelDownAfter("outcome_unknown")
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "y" } })
+    submitMock.mockResolvedValueOnce({ ok: false, kind: "transport" })
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.retry")).toBeInTheDocument())
+
+    await act(async () => { latestActions.forgetDelivery(1) })
+    expect(screen.queryByText("connectorRuntime.actions.saveAndResend")).not.toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.actions.retry")).toBeEnabled()
+
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.retry"))
+    await waitFor(() => expect(toastMock).toHaveBeenCalled())
+
+    expect(submitMock).toHaveBeenCalledTimes(3)
+    expect(sendMessageMock).toHaveBeenCalledTimes(1)
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.sendOutcomeUnknown"]])
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+  })
+
+  it("reads the verdict of the message the flow set out to resend, not another message's", async () => {
+    // `orig-1` may have gone out; `orig-2`, a newer turn that replaced it in
+    // the snapshot, was never attempted. A save-and-resend of `orig-2` that
+    // loses its snapshot mid-save sent nothing and nothing before it did
+    // either, so it must say "not sent" whatever `orig-1`'s verdict is.
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    await firstResendOfOrig1EndsIn("outcome_unknown")
+
+    await stageThenRecord({ taskId: 1, clientMessageId: "orig-2", text: "a later message" })
+    fetchMock.mockResolvedValueOnce(ok(fillableReport()))
+    await openForTask()
+    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.saveAndResend")).toBeEnabled())
+    expect(latestState.request).toMatchObject({ resendPayload: { clientMessageId: "orig-2" } })
+    expect(screen.queryByText("connectorRuntime.actions.resend")).not.toBeInTheDocument()
+    toastMock.mockClear()
+
+    await snapshotTakenMidSave()
+
+    expect(sendMessageMock).toHaveBeenCalledTimes(1)
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.sendFailed"]])
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+  })
+
+  it("does not resend when the footer retry repeats a save-only press", async () => {
+    // The recorded-message field is written by every save press, including
+    // a save-only one -- as null, because a save-only press never sets out
+    // to resend anything. If it wrote the snapshot's id instead, repeating
+    // that press through the footer Retry would resend a message the user
+    // only ever asked to save.
+    fetchMock.mockResolvedValueOnce(ok(fillableReport()))
+    renderHarness()
+    await recordThenOpen({ taskId: 1, clientMessageId: "orig-1", text: "hi" })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+
+    submitMock.mockResolvedValueOnce({ ok: false, kind: "transport" })
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.retry")).toBeInTheDocument())
+    expect(submitMock).toHaveBeenCalledTimes(1)
+
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.retry"))
+    await waitFor(() => expect(submitMock).toHaveBeenCalledTimes(2))
+
+    expect(sendMessageMock).not.toHaveBeenCalled()
+  })
+})
+
 describe("drops the send-failed panel once the snapshot it is about is replaced", () => {
   it("drops the send-failed panel once the snapshot it is about is replaced", async () => {
     // The panel names the message whose send failed, and its retry button

@@ -198,7 +198,7 @@ async def test_recovered_delivery_on_changed_run_settles_outcome_unknown(
             agent,
             background_manager,
         ),
-        patch.object(command_execution_service, "publish_task_event", publish),
+        patch.object(task_execution_service, "publish_task_event", publish),
     ):
         result = await execute_durable_task_command(_recovered_command(task, owner))
 
@@ -540,7 +540,7 @@ async def test_outcome_unknown_notice_is_published_when_the_reply_is_discarded(
             "command_reply",
             return_value=discard_command_reply,
         ),
-        patch.object(command_execution_service, "publish_task_event", publish),
+        patch.object(task_execution_service, "publish_task_event", publish),
     ):
         result = await execute_durable_task_command(_recovered_command(task, owner))
 

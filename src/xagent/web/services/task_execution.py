@@ -54,7 +54,7 @@ from typing import (
 )
 from urllib.parse import unquote
 
-from sqlalchemy import case, func, or_, update
+from sqlalchemy import case, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from ...config import (
@@ -82,7 +82,7 @@ from ..models.database import (
     get_db,
     get_session_local,
 )
-from ..models.task import Task, TaskStatus
+from ..models.task import Task, TaskStatus, task_status_predicate
 from ..models.uploaded_file import UploadedFile
 from .llm_utils import AutoModelUnavailableError
 from .task_events import DeliveryNotifier, publish_task_event
@@ -138,6 +138,7 @@ from .mcp_runtime import (
     MCPBuiltinOAuthActorPolicy,
 )
 from .task_execution_controller import (
+    NON_RESUMABLE_STATUSES,
     TaskControlSnapshot,
     TaskControlState,
     apply_task_control_transition,
@@ -2269,6 +2270,8 @@ def _acquire_resume_task_lease(
     expected_run_id: str | None,
     *,
     prior_status_out: list[TaskStatus] | None = None,
+    refuse_terminal_status: bool = False,
+    run_not_resumable_out: list[bool] | None = None,
 ) -> TaskLease | None:
     """Validate and claim a resume lease in one worker transaction.
 
@@ -2279,6 +2282,14 @@ def _acquire_resume_task_lease(
     is an out parameter rather than part of the return value because this
     function is called through ``acquire_task_lease_cancellation_safe``,
     whose acquire/cleanup pair is typed for a bare ``TaskLease``.
+
+    ``refuse_terminal_status`` adds ``status NOT IN (FAILED, COMPLETED)`` to
+    the claim UPDATE, so a run that ended after the caller's snapshot is
+    never flipped back to RUNNING. When the claim is refused and the row is
+    in one of those statuses or on another run -- the fenced run is not
+    resumable either way -- ``run_not_resumable_out`` receives ``True``; a
+    refusal by a live owner of the same run leaves it empty. The caller only
+    uses the distinction to say which one it was.
     """
     SessionLocal = get_session_local()
     with SessionLocal() as db:
@@ -2300,8 +2311,22 @@ def _acquire_resume_task_lease(
             db,
             task_id,
             expected_run_id=expected_run_id,
+            claim_predicates=(
+                (task_status_predicate.not_in(NON_RESUMABLE_STATUSES),)
+                if refuse_terminal_status
+                else ()
+            ),
         )
         if lease is None:
+            if refuse_terminal_status and run_not_resumable_out is not None:
+                current = db.execute(
+                    select(Task.status, Task.run_id).where(Task.id == task_id)
+                ).first()
+                if current is not None and (
+                    current.status in NON_RESUMABLE_STATUSES
+                    or current.run_id != expected_run_id
+                ):
+                    run_not_resumable_out.append(True)
             db.commit()
             return None
         if task is not None:
@@ -2556,6 +2581,36 @@ def _settle_resumed_task_lease(
     )
 
 
+async def publish_message_outcome_unknown_notice(task_id: int, turn_id: str) -> None:
+    """Tell every subscriber of the task a message's outcome is unknown.
+
+    For when the sender cannot be answered personally. It carries only ids,
+    the error code and the generic client-safe text, never the message body.
+    Best effort: a failure is logged, never raised.
+    """
+
+    notice = {
+        "type": "error",
+        "task_id": task_id,
+        "client_message_id": turn_id,
+        "turn_id": turn_id,
+        "error_code": ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
+        "message": client_error_message(ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN),
+    }
+    try:
+        await publish_task_event(
+            {**notice, "timestamp": datetime.now(timezone.utc).timestamp()},
+            task_id,
+        )
+    except Exception:
+        logger.warning(
+            "task %s outcome-unknown notice for message %s was not published",
+            task_id,
+            turn_id,
+            exc_info=True,
+        )
+
+
 async def execute_resume_background(
     task_id: int,
     agent_service: Any,
@@ -2590,6 +2645,12 @@ async def execute_resume_background(
     # value", never "this task has no source": the runner's overlay ignores a
     # None and keeps whatever the checkpoint carries.
     trusted_task_source: str | None = None,
+    # Appended for the same reason. True for a recovered delivery (a retried
+    # command whose pending row an earlier attempt claimed): its run must
+    # never be resumed once it ended (FAILED or COMPLETED), so the lease claim
+    # refuses those statuses atomically and the delivery settles as outcome
+    # unknown instead.
+    refuse_terminal_status: bool = False,
 ) -> None:
     """Resume an agent execution after an interrupt/user-message checkpoint.
 
@@ -2786,12 +2847,15 @@ async def execute_resume_background(
 
         if lease is None:
             prior_status_box: list[TaskStatus] = []
+            run_not_resumable_box: list[bool] = []
             lease = await acquire_task_lease_cancellation_safe(
                 lambda: _acquire_resume_task_lease(
                     task_id,
                     task_owner_user_id,
                     expected_run_id,
                     prior_status_out=prior_status_box,
+                    refuse_terminal_status=refuse_terminal_status,
+                    run_not_resumable_out=run_not_resumable_box,
                 ),
                 lambda acquired: _settle_resumed_task_lease(
                     acquired,
@@ -2800,6 +2864,77 @@ async def execute_resume_background(
             )
             if prior_status_box:
                 resume_prior_status = prior_status_box[0]
+            if lease is None and refuse_terminal_status:
+                # A recovered delivery: an earlier attempt claimed its row and
+                # may already have applied the turn, so a refused resume is
+                # never recorded as failed, which would invite a resend. The
+                # run is not resumed either way; the task keeps the state its
+                # last writer gave it.
+                refusal = (
+                    "its run ended or was replaced"
+                    if run_not_resumable_box
+                    else "another runner owns the lease"
+                )
+                if delivery_turn_id is None:
+                    logger.warning(
+                        "Task %s resume of run %s refused: %s",
+                        task_id,
+                        expected_run_id,
+                        refusal,
+                    )
+                elif delivery_was_dispatched:
+                    # The injection already landed in the run's checkpoint
+                    # and the sender was told it was accepted, but no resume
+                    # will answer it. Tell the task's audience its outcome is
+                    # unknown, as the durable answer does for a lost origin.
+                    # Known limitation: the notice is best effort, and the
+                    # command already completed as accepted, so a same-id
+                    # resend is still answered accepted.
+                    logger.warning(
+                        "Task %s resume of run %s refused: %s; delivery %s was "
+                        "already accepted, publishing an outcome-unknown notice",
+                        task_id,
+                        expected_run_id,
+                        refusal,
+                        delivery_turn_id,
+                    )
+                    await publish_message_outcome_unknown_notice(
+                        task_id, delivery_turn_id
+                    )
+                else:
+                    delivery_outcome_unknown = True
+                    try:
+                        await run_db_io_cancellation_safe(
+                            lambda: mark_user_message_delivery_sync(
+                                task_id,
+                                delivery_turn_id,
+                                DELIVERY_OUTCOME_UNKNOWN,
+                            )
+                        )
+                    except Exception:
+                        # Returning here keeps a possibly COMPLETED task out
+                        # of the generic failure handler below. The row stays
+                        # pending, so the retried command settles it again.
+                        logger.warning(
+                            "Task %s resume of run %s refused: %s; could not "
+                            "record delivery %s as outcome unknown",
+                            task_id,
+                            expected_run_id,
+                            refusal,
+                            delivery_turn_id,
+                            exc_info=True,
+                        )
+                    else:
+                        logger.warning(
+                            "Task %s resume of run %s refused: %s; recorded "
+                            "delivery %s as outcome unknown",
+                            task_id,
+                            expected_run_id,
+                            refusal,
+                            delivery_turn_id,
+                        )
+                    await notify_deferred_delivery(False)
+                return
             if lease is None:
                 logger.info(
                     "Task %s resume skipped; another runner owns the lease", task_id
