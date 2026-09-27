@@ -286,11 +286,15 @@ function sendFailureTextKey(disposition: MessageDeliveryDisposition | null): Tra
 // the same snapshot established (doResend does the merge), because what this
 // dialog then says about the message depends on it and every reader of this
 // outcome -- the panel it raises and the three toasts that stand in for that
-// panel where it cannot be rendered -- has to say the same thing.
+// panel where it cannot be rendered -- has to say the same thing. The
+// nothing-to-send case carries that same verdict for the message the flow
+// set out to resend: nothing was attempted, so it adds nothing, but a toast
+// that words it as "not sent" would still take back an earlier unknown
+// outcome.
 type ResendOutcome =
   | { kind: "sent" }
   | { kind: "failed"; disposition: MessageDeliveryDisposition | null }
-  | { kind: "nothing-to-send" }
+  | { kind: "nothing-to-send"; disposition: MessageDeliveryDisposition | null }
 
 /**
  * Why the message was not resent, for a report canResendReport turns down.
@@ -615,24 +619,35 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     dispatch({ type: "object-blurred", draftKey, reason })
   }
 
-  const doResend = async (): Promise<ResendOutcome> => {
+  // `resendFor` is the clientMessageId of the snapshot the caller set out to
+  // resend. It is read only when the snapshot has gone by the time this runs;
+  // otherwise the snapshot the request carries now is what goes out.
+  const doResend = async (resendFor: string | null): Promise<ResendOutcome> => {
     const snapshot = requestRef.current.resendPayload
     if (!snapshot) {
-      // Reachable, and covered by a regression test ("says the message did
-      // not go out when the settlement lands mid save-and-resend"). Both
-      // callers check a precondition that implies a snapshot exists, but a
-      // precondition only holds until the next await: a settlement frame for
+      // Reachable, and covered by regression tests ("says the message did
+      // not go out when the settlement lands mid save-and-resend", and the
+      // footer-retry case in "words a settlement that takes the snapshot mid
+      // save-and-resend off the message's verdict"). A settlement frame for
       // this task drops the snapshot in place (forgetDelivery), without
       // moving `seq`, so nothing re-runs the read effect and nothing else
       // notices. handleRetryResend cannot get here -- it compares the
       // panel's snapshot id against the one the request carries right now,
       // and awaits nothing between that comparison and the read above -- but
-      // handleSave can: its save POST is awaited in between, and the
-      // settlement can land during it. Kept distinct from "sent" and
-      // "failed" so neither this case nor a future fourth caller is
-      // misreported as a completed resend or as one the server refused.
+      // handleSave can, two ways: its save POST is awaited in between, and
+      // the settlement can land during it; and its footer retry repeats an
+      // earlier save-and-resend press, so it can start after the settlement
+      // already took the snapshot. Kept distinct from "sent" and "failed" so
+      // neither this case nor a future fourth caller is misreported as a
+      // completed resend or as one the server refused.
       console.warn("[connector-runtime] resend attempted with no snapshot to send")
-      return { kind: "nothing-to-send" }
+      // The snapshot that went is the one the caller named, so its verdict
+      // is looked up under that id; the verdicts themselves are read off the
+      // render this flow started from, for the reason given at the failed
+      // branch below. This attempt itself is a definite not-sent, merged the
+      // same way a refusal would be.
+      const recorded = resendFor !== null && state.stage === "shown" ? state.verdicts.get(resendFor) : undefined
+      return { kind: "nothing-to-send", disposition: mergeSendFailureDisposition(recorded ?? null, null) }
     }
     // Reuse the id the last unresolved attempt for this snapshot used,
     // unless that attempt's own outcome already proved it, or the snapshot
@@ -740,7 +755,14 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     if (!view || !canSubmitNow) return
     const seqAtStart = request.seq
     const items = buildSubmitItems(view.report, view.drafts)
-    dispatch({ type: "save-started", alsoResend })
+    // The message a save-and-resend sets out to resend: the snapshot the
+    // request carries at this press. The footer retry repeats an earlier
+    // save-and-resend, and a settlement frame (forgetDelivery) can have taken
+    // that snapshot before the retry is pressed; the retry then stands for
+    // the message the press it repeats named, so a resend that finds nothing
+    // to send still words its toast off that message's verdict.
+    const resendFor = alsoResend ? (request.resendPayload?.clientMessageId ?? view.lastResendFor) : null
+    dispatch({ type: "save-started", resendFor })
     const result = await submitTaskConnectorRuntimeValues(request.taskId, items)
 
     if (!result.ok) {
@@ -844,11 +866,11 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     if (saved === "stopped") return
 
     dispatch({ type: "save-landed-resending", ...landed })
-    const resendOutcome = await doResend()
-    // "nothing-to-send" handed nothing to the send path, so it takes the
-    // definite text; a failed outcome is worded off the verdict it carries.
+    const resendOutcome = await doResend(resendFor)
+    // Both ways of not sending are worded off the verdict they carry, so a
+    // snapshot taken mid-save cannot un-say an earlier unknown outcome.
     const notSent: Tell = {
-      notice: { kind: "resend-not-sent", disposition: resendOutcome.kind === "failed" ? resendOutcome.disposition : null },
+      notice: { kind: "resend-not-sent", disposition: resendOutcome.kind === "sent" ? null : resendOutcome.disposition },
     }
     // Read after the await: when settle finds the request still current,
     // the snapshot it carries is the one doResend read, which is what the
@@ -947,12 +969,12 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     }
     const seqAtStart = request.seq
     dispatch({ type: "retry-started" })
-    const resendOutcome = await doResend()
+    const resendOutcome = await doResend(sendFailure.snapshotId)
     // Every way this attempt can fail is worded off the verdict doResend
     // returns, which already folds in every earlier attempt for this message
     // (see DeliveryVerdicts in connector-runtime-dialog-state.ts), so a
     // refusal cannot un-say an earlier unknown outcome.
-    const merged = resendOutcome.kind === "failed" ? resendOutcome.disposition : null
+    const merged = resendOutcome.kind === "sent" ? null : resendOutcome.disposition
     const notSent: Tell = { notice: { kind: "resend-not-sent", disposition: merged } }
     settle(seqAtStart, {
       // A failed retry leaves no panel in an unmounted tree, so without this
@@ -1008,7 +1030,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   const dialogFieldError = activeFieldError?.location.scope === "dialog" ? activeFieldError.disposition : null
 
   if (state.stage !== "shown" || !outcome) return null
-  const { drafts, invalidDraftKeys, lastAlsoResend } = state.view
+  const { drafts, invalidDraftKeys, lastResendFor } = state.view
   const { connectors } = state.view.report
 
   return (
@@ -1257,7 +1279,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
                 was the one control still able to submit into a shape whose
                 whole point is that submitting is not on offer. */}
             {hasSaveEntryPoint && dialogFieldError?.retry && (
-              <Button variant="outline" disabled={!canSubmitNow} onClick={() => handleSave(lastAlsoResend)}>
+              <Button variant="outline" disabled={!canSubmitNow} onClick={() => handleSave(lastResendFor !== null)}>
                 {t("connectorRuntime.actions.retry")}
               </Button>
             )}

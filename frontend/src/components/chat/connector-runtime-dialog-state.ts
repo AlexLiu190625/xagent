@@ -358,9 +358,13 @@ export interface View {
   // re-derived on every render against whatever report is on screen then,
   // so a fresher report can never leave it pointing at a row that moved.
   fieldError: ConnectorRuntimeFailureDisposition | null
-  // Which of the two save buttons was pressed last, for the retry button a
-  // retryable rejection offers.
-  lastAlsoResend: boolean
+  // What the last save press promised, for the retry button a retryable
+  // rejection offers: the clientMessageId of the snapshot a save-and-resend
+  // set out to resend, or null for a save-only press. The id rather than a
+  // yes/no: a settlement frame can take the snapshot away before that retry
+  // is pressed, and the id is what the retry's resend then words its "not
+  // sent" off (see doResend).
+  lastResendFor: string | null
 }
 
 /**
@@ -444,7 +448,7 @@ export type LocalEvent =
   | { type: "read-again" }
   | { type: "draft-changed"; draftKey: string; value: string }
   | { type: "object-blurred"; draftKey: string; reason: InvalidObjectDraftReason | null }
-  | { type: "save-started"; alsoResend: boolean }
+  | { type: "save-started"; resendFor: string | null }
   | { type: "retry-started" }
   // The request no longer carries the snapshot the held failure names.
   // Dispatched from render, so it must make needsSnapshotRecycle false in
@@ -560,7 +564,7 @@ export function reduceDialog(state: DialogState, event: DialogEvent): DialogStat
             drafts: {},
             invalidDraftKeys: new Map(),
             fieldError: null,
-            lastAlsoResend: false,
+            lastResendFor: null,
           },
           phase: OPEN,
           verdicts: new Map(),
@@ -585,7 +589,7 @@ export function reduceDialog(state: DialogState, event: DialogEvent): DialogStat
     }
     case "save-started":
       if (phase.kind !== "open") return state
-      return { ...state, phase: { kind: "saving", step: "post" }, view: { ...view, lastAlsoResend: event.alsoResend } }
+      return { ...state, phase: { kind: "saving", step: "post" }, view: { ...view, lastResendFor: event.resendFor } }
     case "retry-started":
       if (phase.kind !== "send-failed") return state
       return { ...state, phase: { kind: "retrying", failure: phase.failure } }
