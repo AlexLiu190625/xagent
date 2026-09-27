@@ -14,6 +14,7 @@ from tests.web.api import test_kb_dir as kb_dir
 from tests.web.api import test_kb_local_rollback_contract as local
 from xagent.core.tools.core.RAG_tools.core.schemas import IngestionResult
 from xagent.core.tools.core.RAG_tools.file.register_document import register_document
+from xagent.core.tools.core.RAG_tools.kb import KBApiCompatibilityFacade
 from xagent.core.tools.core.RAG_tools.management.collection_manager import (
     update_collection_stats_sync,
 )
@@ -322,11 +323,15 @@ def test_ingest_raise_into_a_new_collection_compares_real_doc_ids(
             "xagent.web.api.kb.run_document_ingestion",
             side_effect=_register_then_raise(seen),
         ),
-        patch("xagent.web.api.kb._rollback_may_delete_collection", may_delete),
+        patch.object(
+            KBApiCompatibilityFacade, "failed_ingest_may_delete_collection", may_delete
+        ),
     )
 
     _assert_rolled_back(response)
-    assert may_delete.await_args.kwargs["other_document_present"] is False
+    decision = may_delete.await_args.kwargs
+    assert (decision["register_created"], decision["doc_id"]) == (True, seen["doc_id"])
+    assert [r.doc_id for r in decision["collection_records"]] == [seen["doc_id"]]
     assert _list_refs(seen["file_id"]) == []
 
 
@@ -405,11 +410,13 @@ def test_ingest_raise_before_registration_may_still_delete_a_new_collection(
             "xagent.web.api.kb.run_document_ingestion",
             side_effect=RuntimeError("before registration"),
         ),
-        patch("xagent.web.api.kb._rollback_may_delete_collection", may_delete),
+        patch.object(
+            KBApiCompatibilityFacade, "failed_ingest_may_delete_collection", may_delete
+        ),
     )
 
     _assert_rolled_back(response)
-    assert may_delete.await_args.kwargs["other_document_present"] is False
+    assert may_delete.await_args.kwargs["collection_records"] == []
 
 
 def test_ingest_cloud_raise_after_registration_removes_the_new_document(

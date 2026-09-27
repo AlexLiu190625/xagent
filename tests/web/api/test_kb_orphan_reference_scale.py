@@ -15,6 +15,7 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
     CollectionOperationResult,
     IngestionResult,
 )
+from xagent.core.tools.core.RAG_tools.kb import KBApiCompatibilityFacade
 from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import (
     ensure_documents_table,
 )
@@ -125,11 +126,15 @@ def _stub_rollback_leaves(monkeypatch: pytest.MonkeyPatch, *, may_delete: bool):
     for name, fake in {
         "delete_document": _fake_delete_document,
         "delete_collection": _fake_delete_collection,
-        "_rollback_may_delete_collection": AsyncMock(return_value=may_delete),
         "_cleanup_failed_new_collection_metadata": AsyncMock(),
         "_restore_ingest_file_backup": lambda **_kw: None,
     }.items():
         monkeypatch.setattr(kb_module, name, fake)
+    monkeypatch.setattr(
+        KBApiCompatibilityFacade,
+        "failed_ingest_may_delete_collection",
+        AsyncMock(return_value=may_delete),
+    )
 
 
 async def _rollback(

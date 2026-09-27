@@ -1168,152 +1168,11 @@ async def _cleanup_failed_new_collection_metadata(
     collection_name: str,
     user: User,
 ) -> None:
-    """Remove config rows left behind when a brand-new collection ingest fails.
-
-    Every caller reaches here from a stale `collection_existed_before`, so the
-    documents check is the last guard before a row a sibling ingest owns is
-    deleted by name.
-    """
-    # Read as the owner, and delete as the owner too: an admin-scoped delete
-    # bypasses owner scoping entirely and would wipe a metadata row another
-    # tenant owns under the same name, which the owner-scoped read never saw.
-    if _collection_holds_documents(
+    """API compatibility wrapper for failed-ingest collection metadata cleanup."""
+    await _get_api_compatibility_facade().cleanup_failed_new_collection_metadata(
         collection_name=collection_name,
         user_id=int(user.id),
-        context="failed-ingest metadata cleanup",
-        on_error=True,
-    ):
-        logger.info(
-            "Skipping failed-ingest collection metadata cleanup for %s/user_%s "
-            "because the collection holds documents",
-            collection_name,
-            int(user.id),
-        )
-        return
-
-    cleanup_result = await _get_api_compatibility_facade().delete_collection_metadata(
-        collection_name=collection_name,
-        user_id=int(user.id),
-        is_admin=False,
-        delete_orphaned_metadata=True,
     )
-    logger.info(
-        "Cleaned failed-ingest collection metadata for %s: %s",
-        collection_name,
-        cleanup_result,
-    )
-
-
-async def _collection_config_exists(
-    *,
-    collection_name: str,
-    user_id: int,
-    context: str,
-) -> bool:
-    """Whether a config row is already published for this collection."""
-    try:
-        config = await _get_api_compatibility_facade().get_collection_config(
-            collection=collection_name,
-            user_id=user_id,
-            is_admin=False,
-        )
-    except Exception as exc:  # noqa: BLE001
-        # Unreadable state must not authorize a destructive rollback.
-        logger.warning(
-            "Failed to read the collection config of %s/user_%s during %s: %s",
-            collection_name,
-            user_id,
-            context,
-            exc,
-        )
-        return True
-    return config is not None
-
-
-async def _rollback_may_delete_collection(
-    *,
-    collection_name: str,
-    user_id: int,
-    collection_existed_before: bool,
-    other_document_present: bool,
-    context: str,
-) -> bool:
-    """Whether a failed ingest may delete the whole collection.
-
-    `collection_existed_before` is stamped when the request or job is submitted,
-    so a sibling ingest into the same new collection may have landed a document
-    or published the config since. Either one makes the delete destructive, and
-    both are re-read here rather than inferred from the stamp.
-
-    The stamp itself cannot be re-read: `initialize_collection` creates the
-    collection metadata row at step 0 of the ingest (collection_manager.py:598),
-    so by rollback time the row exists for every run and says nothing about
-    whether the collection predated this one.
-
-    Caveat: these reads are not atomic with the delete that follows, so a
-    sibling that commits inside the window is still exposed. Closing it needs a
-    per-collection lock, which the codebase does not have anywhere yet — tracked
-    in https://github.com/xorbitsai/xagent/issues/1242 rather than invented here.
-
-    Caveat: when the config read itself fails, this fails safe and a brand-new
-    zero-document collection keeps its metadata row with no config — invisible
-    to its owner and still answering 409 for the name. That row is deliberately
-    not cleaned up on this branch: the cleanup deletes this owner's config row
-    first, so on the other reading of an unreadable state — a sibling published
-    it — it would drop settings that sibling just saved.
-    """
-    if collection_existed_before or other_document_present:
-        return False
-    return not await _collection_config_exists(
-        collection_name=collection_name,
-        user_id=user_id,
-        context=context,
-    )
-
-
-def _collection_holds_documents(
-    *,
-    collection_name: str,
-    user_id: int,
-    context: str,
-    on_error: bool,
-) -> bool:
-    """Whether the collection currently holds any document.
-
-    This is the single question behind both halves of the ingest lifecycle:
-    a collection with documents must be published and must never be cleaned up,
-    an empty one must be neither. Asking the store at decision time avoids
-    trusting `collection_existed_before`, which is stamped when the request or
-    job is submitted and goes stale while a sibling ingest runs.
-
-    The two halves need opposite behaviour when the store cannot be read, so
-    `on_error` is explicit: a cleanup passes `True` (unknown state must not
-    authorize a delete), a publish passes `False` (unknown state must not make
-    a possibly empty knowledge base visible).
-
-    Reads are owner-scoped: every decision it gates acts on the caller's own
-    rows, and an admin-wide read would match rows another tenant owns.
-
-    Callers that roll back their own document must do so before asking.
-    """
-    try:
-        records = list_document_records(
-            collection_name=collection_name,
-            user_id=user_id,
-            is_admin=False,
-            max_results=1,
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "Failed to list documents of %s/user_%s during %s, assuming %s: %s",
-            collection_name,
-            user_id,
-            context,
-            "documents exist" if on_error else "no documents",
-            exc,
-        )
-        return on_error
-    return bool(records)
 
 
 async def _cleanup_collection_metadata_after_failed_ingest(
@@ -1535,23 +1394,16 @@ async def _rollback_failed_ingestion(
                 user=user,
             )
 
-        # Compare doc_ids, not file_ids (same-path ingests share a file_id); any
-        # record but the document this run created counts as another's.
-        delete_whole_collection = await _rollback_may_delete_collection(
-            collection_name=collection_name,
-            user_id=user_id,
-            collection_existed_before=collection_existed_before,
-            other_document_present=any(
-                not register_created
-                or (
-                    record.get("doc_id")
-                    if isinstance(record, dict)
-                    else getattr(record, "doc_id", None)
-                )
-                != doc_id
-                for record in collection_records
-            ),
-            context="failed-ingest rollback",
+        delete_whole_collection = (
+            await _get_api_compatibility_facade().failed_ingest_may_delete_collection(
+                collection_name=collection_name,
+                user_id=user_id,
+                collection_existed_before=collection_existed_before,
+                collection_records=collection_records,
+                register_created=register_created,
+                doc_id=doc_id,
+                context="failed-ingest rollback",
+            )
         )
         if delete_whole_collection:
             request = RollbackFailedUploadIngestionRequest(
@@ -1654,11 +1506,13 @@ async def _rollback_failed_cloud_ingestion(
             is_admin=bool(user.is_admin),
             max_results=1,
         )
-        if await _rollback_may_delete_collection(
+        if await _get_api_compatibility_facade().failed_ingest_may_delete_collection(
             collection_name=collection_name,
             user_id=user_id,
             collection_existed_before=collection_existed_before,
-            other_document_present=bool(collection_records),
+            collection_records=collection_records,
+            register_created=False,
+            doc_id=None,
             context="failed-cloud-ingest rollback",
         ):
             collection_delete_result = delete_collection(
@@ -2761,6 +2615,8 @@ def _refresh_existing_file_if_changed(
 
     # Mark succeeded - now atomically replace the file
     backup_path = _build_ingest_backup_path(existing_path)
+    # Setup failures from here are undone in place: the coordinator only gets
+    # the compensations this handler returns, and a failed setup returns none.
     try:
         shutil.copy2(existing_path, backup_path)
     except Exception:
@@ -2912,6 +2768,8 @@ def _recreate_missing_existing_file(
         backup_path = _build_ingest_backup_path(existing_path)
         shutil.copy2(existing_path, backup_path)
 
+    # Undone in place, as in the refresh: a failed setup returns no compensations,
+    # and every restore must run even when an earlier one fails.
     try:
         _atomic_replace_file(temp_file_path, existing_path)
         file_record = _upsert_uploaded_file_record(
@@ -3333,7 +3191,7 @@ async def _save_collection_config_after_ingest(
     """
     publishes_new_collection = not collection_existed_before and (
         documents_created > 0
-        or _collection_holds_documents(
+        or _get_api_compatibility_facade().collection_holds_documents(
             collection_name=collection,
             user_id=int(user.id),
             context=context,
@@ -4161,6 +4019,8 @@ async def ingest(
             if rollback_execution.error is not None:
                 raise rollback_execution.error
         else:
+            # No file_id: no document or upload row for the coordinator to undo.
+            # The bytes are route-owned, as in _rollback_failed_ingestion.
             rollback_api_result = KBApiOperationResult(
                 result=IngestionResult(
                     status="error",

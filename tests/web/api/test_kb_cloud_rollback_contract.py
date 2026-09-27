@@ -23,6 +23,7 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
     IngestionConfig,
     IngestionResult,
 )
+from xagent.core.tools.core.RAG_tools.kb import KBApiCompatibilityFacade
 from xagent.core.tools.core.RAG_tools.utils.string_utils import (
     generate_deterministic_doc_id,
 )
@@ -76,11 +77,15 @@ def _install_leaves(
     collection_error: Optional[Exception] = None,
     restore_error: Optional[Exception] = None,
     refs_error: Optional[Exception] = None,
+    records: tuple[Any, ...] = (),
 ) -> Any:
+    seen: dict[str, Any] = {}
+
     class _Store:
         def list_document_records(self, *, collection_name, user_id, is_admin, **_kw):
             calls.append(f"list:{collection_name}")
-            return []
+            seen["records"] = list(records)
+            return seen["records"]
 
     def _delete_document(collection, doc_id, user_id, is_admin):
         calls.append("delete_document")
@@ -99,7 +104,8 @@ def _install_leaves(
             raise refs_error
         return set()
 
-    async def _may_delete(**_kwargs):
+    async def _may_delete(**kwargs):
+        seen["may_delete"] = kwargs
         calls.append("may_delete")
         return may_delete
 
@@ -123,16 +129,21 @@ def _install_leaves(
         "clear_ingestion_status": _clear_status,
         "_delete_uploaded_file_if_orphaned": _orphan,
         "_find_referenced_file_ids": _refs,
-        "_rollback_may_delete_collection": _may_delete,
         "delete_collection": _delete_collection,
         "_cleanup_failed_new_collection_metadata": _metadata_cleanup,
         "_restore_ingest_file_backup": _restore,
     }
     for name, fake in fakes.items():
         monkeypatch.setattr(kb_module, name, fake)
+    monkeypatch.setattr(
+        KBApiCompatibilityFacade,
+        "failed_ingest_may_delete_collection",
+        staticmethod(_may_delete),
+    )
     return SimpleNamespace(
         commit=lambda: calls.append("commit"),
         rollback=lambda: calls.append("rollback"),
+        seen=seen,
     )
 
 
@@ -198,6 +209,23 @@ async def test_rollback_runs_leaves_in_order(
     )
 
     assert calls == expected
+
+
+async def test_collection_decision_counts_every_remaining_record(monkeypatch) -> None:
+    """DOCUMENT already removed this run's document, so a record under its doc_id
+    is a same-path sibling's and must count."""
+    calls: list[str] = []
+    db = _install_leaves(
+        monkeypatch, calls, records=(SimpleNamespace(doc_id="doc-1", file_id="f-1"),)
+    )
+
+    await _rollback(db)
+
+    decision = db.seen["may_delete"]
+    assert decision["collection_records"] is db.seen["records"]
+    assert [r.doc_id for r in decision["collection_records"]] == ["doc-1"]
+    assert decision["register_created"] is False
+    assert decision["doc_id"] is None
 
 
 @pytest.mark.parametrize(

@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 
 from tests.web.api import test_kb_dir as kb_dir
 from xagent.core.tools.core.RAG_tools.core.schemas import IngestionResult
+from xagent.core.tools.core.RAG_tools.kb import KBApiCompatibilityFacade
 from xagent.core.tools.core.RAG_tools.utils.string_utils import (
     generate_deterministic_doc_id,
 )
@@ -164,7 +165,6 @@ def _install_leaves(
 
     fakes = {
         "get_vector_index_store": _Store,
-        "_rollback_may_delete_collection": _may_delete,
         "delete_collection": _delete_collection,
         "delete_collection_physical_dir": _physdir,
         "delete_collection_uploaded_files": _del_coll_files,
@@ -180,6 +180,11 @@ def _install_leaves(
     }
     for name, fake in fakes.items():
         monkeypatch.setattr(kb_module, name, fake)
+    monkeypatch.setattr(
+        KBApiCompatibilityFacade,
+        "failed_ingest_may_delete_collection",
+        staticmethod(_may_delete),
+    )
 
     class _Db:
         def query(self, _model):
@@ -307,28 +312,24 @@ async def test_rollback_runs_leaves_in_order(
 
 
 @pytest.mark.parametrize(
-    ("records", "other_present", "file_ids"),
+    ("records", "file_ids"),
     [
-        pytest.param([], False, set(), id="empty"),
-        pytest.param(
-            [{"doc_id": "doc-1", "file_id": "f-1"}], False, {"f-1"}, id="own-doc"
-        ),
+        pytest.param([], set(), id="empty"),
+        pytest.param([{"doc_id": "doc-1", "file_id": "f-1"}], {"f-1"}, id="own-doc"),
         pytest.param(
             [{"doc_id": "other", "file_id": "file-1"}],
-            True,
             {"file-1"},
             id="sibling-sharing-the-file-id",
         ),
         pytest.param(
             [SimpleNamespace(doc_id="other", file_id="f-2")],
-            True,
             {"f-2"},
             id="object-record",
         ),
     ],
 )
 async def test_collection_decision_compares_doc_ids(
-    monkeypatch, records, other_present, file_ids
+    monkeypatch, records, file_ids
 ) -> None:
     calls: list[str] = []
     db, seen = _install_leaves(monkeypatch, calls, records=records, may_delete=True)
@@ -339,7 +340,9 @@ async def test_collection_decision_compares_doc_ids(
         "collection_name": "coll",
         "user_id": 7,
         "collection_existed_before": False,
-        "other_document_present": other_present,
+        "collection_records": records,
+        "register_created": True,
+        "doc_id": "doc-1",
         "context": "failed-ingest rollback",
     }
     assert seen["collection_file_ids"] == file_ids
@@ -379,7 +382,7 @@ async def test_collection_existed_before_still_asks_the_decision(monkeypatch) ->
     await _rollback(db, collection_existed_before=True)
 
     assert seen["may_delete"]["collection_existed_before"] is True
-    assert seen["may_delete"]["other_document_present"] is False
+    assert seen["may_delete"]["collection_records"] == []
 
 
 @pytest.mark.parametrize(
