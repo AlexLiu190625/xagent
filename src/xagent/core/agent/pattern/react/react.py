@@ -935,7 +935,10 @@ class ReActPattern(AgentPattern):
             # of those tools can run the work that produced them again. Every
             # other turn still holds its tools and can fetch a compacted-away
             # value again. The cost is deliberate: this turn can now exceed
-            # the model's window and fail instead of answering.
+            # the model's window and fail instead of answering. A turn that
+            # offers reads adds to that volume: up to FORCED_ANSWER_READ_BUDGET
+            # reads per run, each of at most SPILL_READ_MAX_CHARS characters,
+            # accumulate on the forced turns and are not compacted either.
             if force_final_answer_now:
                 # Measures the one new failure mode this change introduces,
                 # so it carries no switch. Numbers and ids only -- never
@@ -1610,13 +1613,18 @@ class ReActPattern(AgentPattern):
                 # offers reads, so its prompt stays exactly as before whatever
                 # the counters say; _settlement_fence_active has already
                 # synced the fence flag with this turn.
-                reads_used_up = (
-                    not self._forced_answer_read_allowance_open()
-                    and not self.settlement_final_answer_fence
-                )
-                read_instruction = (
-                    f"{FORCED_ANSWER_READS_USED_UP_TEXT} " if reads_used_up else ""
-                )
+                # The sentence names the allowance that ran out, checked in
+                # the order a refused call is judged: the read allowance
+                # first, then the reject allowance.
+                read_instruction = ""
+                if not self.settlement_final_answer_fence:
+                    if self.forced_answer_reads_used >= FORCED_ANSWER_READ_BUDGET:
+                        read_instruction = f"{FORCED_ANSWER_READS_USED_UP_TEXT} "
+                    elif (
+                        self.forced_answer_reads_rejected
+                        >= FORCED_ANSWER_READ_REJECT_CAP
+                    ):
+                        read_instruction = f"{FORCED_ANSWER_READ_REJECTS_USED_UP_TEXT} "
                 tool_rule = (
                     "Do not call any other tool and do not output "
                     "tool-call markup as plain text. "

@@ -6255,21 +6255,24 @@ async def test_forced_turn_tier_a_prompt_states_unread_items(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("cell", "overrides", "tier_b"),
+    ("cell", "overrides", "sentence"),
     [
-        ("reads_used_up", {"used": 3}, True),
-        ("rejects_used_up", {"rejected": 3}, True),
-        ("empty_registry", {"stored": False}, False),
-        ("settlement_fence", {"fence": True}, False),
-        ("settlement_fence_reads_used_up", {"fence": True, "used": 3}, False),
+        ("reads_used_up", {"used": 3}, FORCED_ANSWER_READS_USED_UP_TEXT),
+        ("rejects_used_up", {"rejected": 3}, FORCED_ANSWER_READ_REJECTS_USED_UP_TEXT),
+        ("both_used_up", {"used": 3, "rejected": 3}, FORCED_ANSWER_READS_USED_UP_TEXT),
+        ("empty_registry", {"stored": False}, None),
+        ("settlement_fence", {"fence": True}, None),
+        ("settlement_fence_reads_used_up", {"fence": True, "used": 3}, None),
     ],
 )
 async def test_forced_turn_prompt_tier_follows_tool_names(
-    cell: str, overrides: dict[str, Any], tier_b: bool
+    cell: str, overrides: dict[str, Any], sentence: str | None
 ) -> None:
-    """A forced turn that does not offer reads gets the used-up sentence when
-    an allowance ran out, and otherwise the prompt a run with nothing stored
-    gets: no read sentence and the baseline tool rule."""
+    """A forced turn that does not offer reads names the allowance that ran
+    out -- the read allowance when it did, the reject allowance when only
+    that one did, the same order a refused call is judged in -- and
+    otherwise gets the prompt a run with nothing stored gets: no read
+    sentence and the baseline tool rule."""
     options = dict(overrides)
     stored = options.pop("stored", True)
 
@@ -6278,7 +6281,11 @@ async def test_forced_turn_prompt_tier_follows_tool_names(
     )
 
     prompt = run.prompt(0)
-    assert (FORCED_ANSWER_READS_USED_UP_TEXT in prompt) is tier_b
+    for text in (
+        FORCED_ANSWER_READS_USED_UP_TEXT,
+        FORCED_ANSWER_READ_REJECTS_USED_UP_TEXT,
+    ):
+        assert (text in prompt) is (text == sentence)
     assert _BASELINE_TOOL_RULE in prompt
     assert _UNREAD_ITEMS_SENTENCE not in prompt
     assert SPILL_READ_TOOL_NAME not in prompt
