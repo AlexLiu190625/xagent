@@ -4,7 +4,8 @@ Each test runs the chain a deployed tool call runs: the tool set comes from
 ToolFactory.create_all_tools with a real TaskWorkspace, an oversized result
 passes through that set's own OutputFilteredToolWrapper, the execution
 context registers it and renders the observation, and the stored file is
-read back through the same set's read_tool_result tool.
+read back through the same set's read_tool_result tool. Compacting that
+context through PatternRuntime still tells the model which file it can read.
 """
 
 import asyncio
@@ -17,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from xagent.core.agent.context import ExecutionContext
+from xagent.core.agent.runtime import PatternRuntime
 from xagent.core.tools import tool_result_spill
 from xagent.core.tools.adapters.vibe.config import ToolConfig
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
@@ -34,6 +36,7 @@ from xagent.core.tools.tool_result_spill import (
     SPILL_READ_MAX_CHARS,
     SPILL_READ_TOOL_NAME,
     SPILL_RESERVED_RESULT_KEY,
+    render_spill_notice,
     spill_dir_for_workspace,
 )
 from xagent.core.workspace import TaskWorkspace
@@ -478,3 +481,70 @@ async def test_a_stored_file_is_not_listed_as_a_user_deliverable_and_refuses_wri
             {"file_path": "output/tool-results/x.json", "content": "[1]"}
         )
     assert not (stored.parent / "x.json").exists()
+
+
+class _SummaryLLM:
+    """A compaction model that always writes the same short summary."""
+
+    context_window = 64_000
+
+    async def chat(self, **_):
+        return {"content": "The client list was fetched."}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("summarize", [True, False], ids=["summary", "drop_oldest"])
+async def test_compaction_through_the_runtime_lists_the_stored_file(
+    tmp_path, summarize
+):
+    """Compaction removes the observation that named the stored file; the
+    messages the model is sent next still name it, in the list compaction
+    builds from the registry, and that path reads the file back."""
+    tools = await _tool_set(
+        tmp_path, _returning("acme_clients", lambda: {"clients": CLIENTS})
+    )
+    ctx = _context_for(_bound_workspace(tools))
+    ctx.compact_config.threshold = 1
+    # One message of window: the drop-oldest path keeps only the latest user
+    # message, so the observation is gone on both paths.
+    ctx.compact_config.max_messages = 1
+    ctx.add_user_message("List our clients")
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "type": "function", "function": {"name": "acme_clients"}}
+        ],
+    )
+    result = await _only_tool_named(tools, "acme_clients").run_json_async({})
+    observation = ctx.add_tool_result("acme_clients", result, "call-1")
+    (relative_path,) = [record["relative_path"] for record in ctx.spilled_results]
+    assert relative_path in observation.content
+    ctx.add_user_message("Which of them are new?")
+
+    compacted = await PatternRuntime().compact_context_if_needed(
+        context=ctx, llm=_SummaryLLM() if summarize else None
+    )
+
+    assert compacted.compacted
+    assert compacted.strategy == ("llm_summary" if summarize else "truncate")
+    assert not any(message is observation for message in ctx.messages)
+    sent = ctx.get_messages_for_llm()
+    naming = [message for message in sent if relative_path in str(message["content"])]
+    assert naming == [
+        {
+            "role": "user",
+            "content": render_spill_notice(
+                list(ctx.spilled_results), style="compaction"
+            ),
+        }
+    ]
+    assert (
+        f"- {relative_path}: a JSON array of {len(CLIENTS)} items"
+        in (naming[0]["content"])
+    )
+    assert sent[-1] == {"role": "user", "content": "Which of them are new?"}
+    (listed_path,) = STORED_PATH_RE.findall(naming[0]["content"])
+    reply = await _only_tool_named(tools, SPILL_READ_TOOL_NAME).run_json_async(
+        {"path": listed_path, "start": 1, "end": 2}
+    )
+    assert json.loads(reply["output"]) == CLIENTS[:2]
