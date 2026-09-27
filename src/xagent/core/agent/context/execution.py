@@ -172,6 +172,13 @@ COMPACT_WATERMARK_METADATA_KEY = "watermark_message_id"
 # restores the summary must restore them too or it silently drops images the
 # compaction judged worth the budget.
 COMPACT_CONTEXT_REFS_METADATA_KEY = "summary_context_refs"
+# Marks the system message a compaction inserts to list this execution's
+# stored tool results. That message is written by the engine from the spill
+# registry and is not history: it is kept out of the persisted summary, out of
+# the summary request, and out of a compaction's original_count and
+# removed_count. final_count is the size of the compacted context, so it
+# includes the list.
+COMPACT_SPILL_INDEX_METADATA_KEY = "compacted_spill_index"
 
 # Floor for the per-message cap on what compaction is asked to read. Unlike
 # the summary's output budget this has no ceiling: providers cap output far
@@ -1143,7 +1150,14 @@ class ExecutionContext:
                 )
             if include_system and message_dict.get("role") == "system":
                 content = str(message_dict.get("content") or "").strip()
-                if content:
+                if content and self._is_spill_index_message(message):
+                    # Only the leading message may be a system one, so this
+                    # one is sent as a user message too. It is not an earlier
+                    # system context, though: compaction built it from the
+                    # spill registry, and its own header says what it lists,
+                    # so it goes to the model as written.
+                    messages.append({"role": "user", "content": content})
+                elif content:
                     continuity_message: dict[str, Any] = {
                         "role": "user",
                         "content": (
@@ -1873,7 +1887,15 @@ class ExecutionContext:
         if total_tokens <= self.compact_config.threshold:
             return None
 
-        visible_messages = [message for message in self.messages if not message.hidden]
+        # The stored-result list an earlier compaction inserted is not
+        # history and is not handed to the summary model: the summary written
+        # from this request is persisted and replayed into later turns, and
+        # compact_with_llm_response rebuilds the list from the registry.
+        visible_messages = [
+            message
+            for message in self.messages
+            if not message.hidden and not self._is_spill_index_message(message)
+        ]
         if not visible_messages:
             return None
 
@@ -1956,15 +1978,32 @@ class ExecutionContext:
         """Keep a tail window and discard everything before it.
 
         Lossy: the dropped turns are not summarized, recorded, or recoverable
-        from the context. ``strategy="truncate"`` on the result is the trace
-        label for that outcome, not a mode.
+        from the context; the only text re-inserted is the engine's list of
+        stored tool results, built from the spill registry. ``strategy=
+        "truncate"`` on the result is the trace label for that outcome, not a
+        mode.
 
         Note that ``compacted=True`` does not imply anything was removed. When
         the context is over budget but holds no more than ``max_messages``
         messages -- a handful of very large tool results, say -- the window
         keeps all of them and ``removed_count`` is 0. Callers that need to know
         whether the context actually shrank must read ``removed_count``.
+
+        When the registry lists stored results, that list goes in front of the
+        window as one system message, so the context then holds one message
+        more than the window. A list inserted by an earlier compaction is
+        taken out first and is not history: it is not kept in the window, not
+        counted in ``original_count`` or ``removed_count``, and not left beside
+        the new one -- which, when the window keeps every message, would
+        otherwise add one more list on every compaction.
         """
+        history = [
+            message
+            for message in self.messages
+            if not self._is_spill_index_message(message)
+        ]
+        if len(history) != len(self.messages):
+            self.messages = history
         original_count = len(self.messages)
         keep_count = min(max(0, self.compact_config.max_messages), original_count)
         retained = self._tail_window_preserving_tool_pairs(keep_count)
@@ -1976,6 +2015,9 @@ class ExecutionContext:
             [message for message in self.messages if id(message) not in retained_ids]
         )
         self.messages = retained
+        spill_notice = self._spilled_tool_results_notice()
+        if spill_notice:
+            self.messages = [self._spill_index_message(spill_notice), *retained]
         return CompactResult(
             compacted=True,
             original_count=original_count,
@@ -2031,7 +2073,8 @@ class ExecutionContext:
             self._context_refs_removed_by_compaction(latest_user)
         )
         dropped_refs_notice = self._dropped_context_refs_notice(dropped_context_refs)
-        # next_messages below keeps only the system summary and, at most, a
+        # next_messages below keeps only the system summary, at most one
+        # engine-written list of stored tool results, and at most a
         # role=="user" message, so no tool observation survives: here the whole
         # list is the diff. truncate needs a real diff; this does not.
         dropped_tool_counts = self._dropped_tool_result_counts(self.messages)
@@ -2068,6 +2111,22 @@ class ExecutionContext:
         next_messages = [summary_message]
         if latest_user is not None:
             next_messages.append(latest_user)
+        # A list inserted by an earlier compaction is replaced along with the
+        # rest, but it is not history, so it is not counted as history this
+        # summary replaced -- the same rule the message-dropping path follows.
+        original_count = sum(
+            1 for message in self.messages if not self._is_spill_index_message(message)
+        )
+        removed_count = max(0, original_count - len(next_messages))
+        # The stored-result list is its own message rather than part of
+        # summary_content: the summary is persisted below and replayed into a
+        # later turn as a system message, while the list names files that only
+        # this execution's registry vouches for -- a later turn's registry may
+        # not hold them, and its tool set may not include the tool that reads
+        # them. It goes right after the summary it supplements.
+        spill_notice = self._spilled_tool_results_notice()
+        if spill_notice:
+            next_messages.insert(1, self._spill_index_message(spill_notice))
         self.messages = next_messages
         result = CompactResult(
             compacted=True,
@@ -2075,7 +2134,7 @@ class ExecutionContext:
             final_count=len(self.messages),
             strategy="llm_summary",
             metadata={
-                "removed_count": max(0, original_count - len(self.messages)),
+                "removed_count": removed_count,
                 "summary_chars": len(summary),
                 "compact_model": getattr(llm, "model_name", None),
                 "retained_context_ref_count": len(compacted_context_refs),
@@ -2240,6 +2299,74 @@ class ExecutionContext:
                 f"- ... {omitted} additional distinct tool {name_label} omitted"
             )
         return prefix + "\n".join(lines)
+
+    def _spilled_tool_results_notice(self) -> str:
+        """List this execution's stored tool results for a compacted context.
+
+        Compaction removes the observations whose notices named these files,
+        so the list is drawn from the spill registry rather than from the
+        messages being removed. Each compaction builds the list again from
+        what the registry holds at that moment -- results stored since the
+        last one are added -- so the files are still named after the list
+        an earlier compaction inserted has itself been removed.
+
+        The registry is read through get_component, never _spill_component
+        or the spilled_results property: both attach an empty registry to a
+        context that never stored anything, and such a context's checkpoint
+        must read exactly as it would without spill support. An empty
+        registry returns "" before anything else is looked at.
+
+        Each record's file is looked up again, with the same lookup
+        registration uses, and a record whose file cannot be found is left
+        out. A registry restored from a checkpoint is not re-checked on
+        load, and the workspace behind it may be gone by now; listing such a
+        record would name a file the model cannot read. The same lookup
+        leaves out a record that is not a dict or whose path is not a
+        stored-result path, so those never reach the renderer.
+        render_spill_notice checks the remaining records' field shape and
+        drops a malformed one itself; this method writes no text of its own.
+        """
+        component = self.get_component("spilled_results")
+        records = (
+            component.records if isinstance(component, SpillRegistryComponent) else []
+        )
+        if not records:
+            return ""
+        spill_dir = self._spill_dir()
+        present = [
+            record
+            for record in records
+            if isinstance(record, dict)
+            and resolve_spilled_under(spill_dir, record.get("relative_path"))
+            is not None
+        ]
+        if len(present) < len(records):
+            # A count only: the paths are the tool's own strings. A record
+            # that is not a dict, or whose path is not a stored-result path,
+            # fails the same lookup as one whose file is gone.
+            logger.info(
+                "Compaction left %d stored tool result(s) out of its list "
+                "(missing file or malformed record)",
+                len(records) - len(present),
+            )
+        # Newest first. The registry holds results in the order they were
+        # stored, and past COMPACT_SPILL_NOTICE_MAX_ENTRIES the renderer folds
+        # the remaining entries into one "... N more" line; after compaction
+        # the latest results are the ones the next step most often needs, so
+        # the oldest are the ones folded away. The forced-answer prompt
+        # renders the registry in stored order, which its own tests pin, so
+        # past the entry cap the two lists name different files.
+        return render_spill_notice(present[::-1], style="compaction")
+
+    @staticmethod
+    def _spill_index_message(notice: str) -> Message:
+        return Message.role_system(
+            notice, metadata={COMPACT_SPILL_INDEX_METADATA_KEY: True}
+        )
+
+    @staticmethod
+    def _is_spill_index_message(message: Message) -> bool:
+        return bool((message.metadata or {}).get(COMPACT_SPILL_INDEX_METADATA_KEY))
 
     def _latest_visible_user_message(self) -> Message | None:
         for message in reversed(self.messages):

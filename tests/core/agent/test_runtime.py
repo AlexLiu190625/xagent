@@ -2571,7 +2571,9 @@ async def test_compaction_publishes_the_summary_and_its_watermark() -> None:
     assert result.strategy == "llm_summary"
     assert result.metadata[COMPACT_WATERMARK_METADATA_KEY] == 42
     # Byte-identical to the system message this turn actually ran on, so a
-    # replay reproduces the context rather than an approximation of it.
+    # replay reproduces the context rather than an approximation of it. The
+    # stored-result list compaction may insert after it is a separate message
+    # and is deliberately not part of what is replayed.
     assert result.metadata[COMPACT_SUMMARY_METADATA_KEY] == context.messages[0].content
 
 
