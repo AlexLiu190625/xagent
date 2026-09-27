@@ -149,6 +149,7 @@ on:
       - 'src/xagent/core/agent/context/execution.py'
       - 'src/xagent/core/agent/trace.py'
       - 'tests/web/services/test_injection_atomicity_postgresql.py'
+      - 'tests/web/services/test_turn_dedup_jsonb_postgresql.py'
       - 'src/xagent/web/services/task_lease_recovery.py'
       - 'tests/web/api/test_durable_message_resume_contention.py'
       - 'tests/web/api/test_recovered_delivery_outcome_unknown.py'
@@ -342,6 +343,7 @@ jobs:
             src/xagent/core/agent/context/execution.py
             src/xagent/core/agent/trace.py
             tests/web/services/test_injection_atomicity_postgresql.py
+            tests/web/services/test_turn_dedup_jsonb_postgresql.py
             src/xagent/web/services/task_lease_recovery.py
             tests/web/api/test_durable_message_resume_contention.py
             tests/web/api/test_recovered_delivery_outcome_unknown.py
@@ -775,6 +777,15 @@ jobs:
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           pytest tests/web/services/test_injection_atomicity_postgresql.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      # JSONB reorders object keys, so the accepted-turn record's eviction
+      # order is only observable through a real PostgreSQL round-trip.
+      - name: Test accepted-turn record order through JSONB (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/services/test_turn_dedup_jsonb_postgresql.py -m postgresql -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 

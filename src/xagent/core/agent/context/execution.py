@@ -142,6 +142,12 @@ TRANSCRIPT_WATERMARK_METADATA_KEY = "transcript_watermark"
 # A value under this key is only trusted when the payload it arrived in also
 # carried ``EVIDENCE_MARKER_WRITER_FIELD``; see ``ExecutionContext.from_dict``.
 TOOL_EVIDENCE_REMOVED_METADATA_KEY = "tool_evidence_removed"
+# Engine-owned record of the user turns an execution has durably accepted;
+# ``AgentRunner`` owns its shape and semantics. Defined here so that
+# ``create_child_context`` can keep it out of DAG step contexts: only the root
+# context's record is read, and copying it would repeat it in every active
+# step context serialized into pattern state.
+ACCEPTED_TURN_IDS_METADATA_KEY = "_accepted_user_turn_ids"
 # Serialized writer seal, a sibling of ``metadata`` in ``to_dict``'s payload.
 # ``from_dict`` refuses to carry ``TOOL_EVIDENCE_REMOVED_METADATA_KEY`` in
 # from a payload that arrives without it: a build that does not know that key
@@ -1601,6 +1607,7 @@ class ExecutionContext:
         # request provenance before metadata is cloned.
         top_level_user_request(self)
         child_metadata = dict(self.metadata)
+        child_metadata.pop(ACCEPTED_TURN_IDS_METADATA_KEY, None)
         if metadata:
             child_metadata.update(metadata)
         if task:
