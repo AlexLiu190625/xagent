@@ -174,8 +174,10 @@ COMPACT_WATERMARK_METADATA_KEY = "watermark_message_id"
 COMPACT_CONTEXT_REFS_METADATA_KEY = "summary_context_refs"
 # Marks the system message a compaction inserts to list this execution's
 # stored tool results. That message is written by the engine from the spill
-# registry; it is not history, so it is kept out of the persisted summary and
-# out of every count of history a compaction reports.
+# registry and is not history: it is kept out of the persisted summary, out of
+# the summary request, and out of a compaction's original_count and
+# removed_count. final_count is the size of the compacted context, so it
+# includes the list.
 COMPACT_SPILL_INDEX_METADATA_KEY = "compacted_spill_index"
 
 # Floor for the per-message cap on what compaction is asked to read. Unlike
@@ -2303,8 +2305,10 @@ class ExecutionContext:
 
         Compaction removes the observations whose notices named these files,
         so the list is drawn from the spill registry rather than from the
-        messages being removed: every later compaction lists what the first
-        one did, even after the list inserted by an earlier one is gone.
+        messages being removed. Each compaction builds the list again from
+        what the registry holds at that moment -- results stored since the
+        last one are added -- so the files are still named after the list
+        an earlier compaction inserted has itself been removed.
 
         The registry is read through get_component, never _spill_component
         or the spilled_results property: both attach an empty registry to a
@@ -2316,9 +2320,11 @@ class ExecutionContext:
         registration uses, and a record whose file cannot be found is left
         out. A registry restored from a checkpoint is not re-checked on
         load, and the workspace behind it may be gone by now; listing such a
-        record would name a file the model cannot read. Field shape is left
-        to render_spill_notice, which drops a malformed record itself: this
-        method writes no text of its own.
+        record would name a file the model cannot read. The same lookup
+        leaves out a record that is not a dict or whose path is not a
+        stored-result path, so those never reach the renderer.
+        render_spill_notice checks the remaining records' field shape and
+        drops a malformed one itself; this method writes no text of its own.
         """
         component = self.get_component("spilled_results")
         records = (
