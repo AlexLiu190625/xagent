@@ -137,7 +137,9 @@ class KBCoordinator:
         self._storage_shim = storage_shim or KBStorageShimCompatibilityFacade(
             storage_factory=self._storage_factory
         )
-        self._file_compatibility = file_compatibility or KBFileCompatibilityFacade()
+        self._file_compatibility = file_compatibility or KBFileCompatibilityFacade(
+            storage_shim=self._storage_shim
+        )
         self._management = management_facade or KBCoreManagementCompatibilityFacade(
             coordinator=self
         )

@@ -46,7 +46,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _FILE_STATUS_BATCH_SIZE = 200
-_ORPHAN_LOOKUP_BATCH_SIZE = 200
 _STALE_FILE_STATUSES = {"FAILED", "UNKNOWN", "RUNNING"}
 _DEFAULT_DELETABLE_STALE_STATUSES = {"FAILED"}
 
@@ -198,29 +197,6 @@ def _list_documents_for_user_impl(
         return query_to_list(query.limit(10000))
     finally:
         _safe_close_table(table)
-
-
-def _find_referenced_file_ids_impl(file_ids: Iterable[str]) -> set[str]:
-    """Uncapped: which of ``file_ids`` any document references, whatever its owner."""
-    normalized_file_ids = sorted({file_id for file_id in file_ids if file_id})
-    conn = get_connection_from_env()
-    ensure_documents_table(conn)
-    referenced: set[str] = set()
-    table = None
-    try:
-        table = conn.open_table("documents")
-        for offset in range(0, len(normalized_file_ids), _ORPHAN_LOOKUP_BATCH_SIZE):
-            batch = normalized_file_ids[offset : offset + _ORPHAN_LOOKUP_BATCH_SIZE]
-            rows = query_to_list(
-                table.search()
-                .where(_build_file_id_in_filter(batch))
-                .select(["file_id"])
-                .limit(-1)
-            )
-            referenced.update(str(row["file_id"]) for row in rows)
-    finally:
-        _safe_close_table(table)
-    return referenced
 
 
 def _build_uploaded_filename_map_impl(

@@ -2299,35 +2299,16 @@ def _restore_rag_document_snapshot(
 
 
 def _list_document_refs_for_uploaded_file(file_id: str) -> List[tuple[str, str]]:
-    from ...core.tools.core.RAG_tools.LanceDB.schema_manager import (
-        _safe_close_table,
-        ensure_documents_table,
+    records = _get_api_compatibility_facade().list_document_records_by_file_ids(
+        [file_id]
     )
-    from ...core.tools.core.RAG_tools.utils.lancedb_query_utils import query_to_list
-    from ...core.tools.core.RAG_tools.utils.string_utils import escape_lancedb_string
-    from ...providers.vector_store.lancedb import get_connection_from_env
-
-    conn = get_connection_from_env()
-    ensure_documents_table(conn)
-    documents_table = None
-    try:
-        documents_table = conn.open_table("documents")
-        safe_file_id = escape_lancedb_string(file_id)
-        rows = query_to_list(
-            documents_table.search()
-            .where(f"file_id = '{safe_file_id}'")
-            .select(["collection", "doc_id"])
-            .limit(-1)
-        )
-        doc_refs: List[tuple[str, str]] = []
-        for row in rows:
-            collection = str(row.get("collection") or "").strip()
-            doc_id = str(row.get("doc_id") or "").strip()
-            if collection and doc_id:
-                doc_refs.append((collection, doc_id))
-        return doc_refs
-    finally:
-        _safe_close_table(documents_table)
+    doc_refs: List[tuple[str, str]] = []
+    for record in records:
+        collection = (record.collection or "").strip()
+        doc_id = record.doc_id.strip()
+        if collection and doc_id:
+            doc_refs.append((collection, doc_id))
+    return doc_refs
 
 
 def _snapshot_ingestion_runs_for_uploaded_file(
