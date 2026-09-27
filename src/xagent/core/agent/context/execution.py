@@ -2343,7 +2343,14 @@ class ExecutionContext:
                 "(missing file or malformed record)",
                 len(records) - len(present),
             )
-        return render_spill_notice(present, style="compaction")
+        # Newest first. The registry holds results in the order they were
+        # stored, and past COMPACT_SPILL_NOTICE_MAX_ENTRIES the renderer folds
+        # the remaining entries into one "... N more" line; after compaction
+        # the latest results are the ones the next step most often needs, so
+        # the oldest are the ones folded away. The forced-answer prompt
+        # renders the registry in stored order, which its own tests pin, so
+        # past the entry cap the two lists name different files.
+        return render_spill_notice(present[::-1], style="compaction")
 
     @staticmethod
     def _spill_index_message(notice: str) -> Message:

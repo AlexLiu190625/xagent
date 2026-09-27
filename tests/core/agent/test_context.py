@@ -3979,6 +3979,12 @@ def _spill_index_messages(ctx):
     ]
 
 
+def _expected_spill_index(records):
+    """The list compaction writes for these registry records: the renderer's
+    compaction style, newest record first."""
+    return render_spill_notice(records[::-1], style="compaction")
+
+
 def _compaction_notice_header():
     # Taken from the renderer rather than copied, so this file does not pin
     # the wording a second time.
@@ -4040,7 +4046,7 @@ def test_spill_compaction_notice_drops_bad_shape_records(tmp_path, mix):
     if mix == "all_bad":
         assert notice == ""
     else:
-        assert notice == render_spill_notice(good, style="compaction")
+        assert notice == _expected_spill_index(good)
 
 
 def test_spill_compaction_notice_skips_records_whose_file_is_gone(tmp_path, caplog):
@@ -4056,7 +4062,7 @@ def test_spill_compaction_notice_skips_records_whose_file_is_gone(tmp_path, capl
     with caplog.at_level(logging.INFO, logger=execution_module.__name__):
         notice = ctx._spilled_tool_results_notice()
 
-    assert notice == render_spill_notice([beta], style="compaction")
+    assert notice == _expected_spill_index([beta])
     assert alpha["relative_path"] not in notice
     assert "tool-results/" not in caplog.text
 
@@ -4076,7 +4082,7 @@ def test_summary_compaction_carries_spill_index_as_its_own_message(tmp_path):
     assert "Summary of the work so far." in summary.content
     assert notice.metadata == {COMPACT_SPILL_INDEX_METADATA_KEY: True}
     assert notice.content.startswith(_compaction_notice_header())
-    assert notice.content == render_spill_notice(records, style="compaction")
+    assert notice.content == _expected_spill_index(records)
     for record in records:
         assert record["relative_path"] in notice.content
     assert latest_user.content == "current request"
@@ -4115,9 +4121,7 @@ def test_model_receives_the_spill_index_as_written(tmp_path, compact):
         for message in sent
         if _compaction_notice_header() in str(message.get("content"))
     ]
-    assert listed == [
-        {"role": "user", "content": render_spill_notice(records, style="compaction")}
-    ]
+    assert listed == [{"role": "user", "content": _expected_spill_index(records)}]
     assert "Previous system-context message" not in listed[0]["content"]
     assert [message["role"] for message in sent].count("system") == 1
     if compact is _compact_by_summary:
@@ -4165,7 +4169,7 @@ def test_summary_compaction_spill_index_respects_the_caps(tmp_path):
     _compact_by_summary(ctx)
 
     (notice,) = _spill_index_messages(ctx)
-    assert notice.content == render_spill_notice(records, style="compaction")
+    assert notice.content == _expected_spill_index(records)
     assert len(notice.content) <= COMPACT_SPILL_NOTICE_MAX_CHARS
     entries = [
         line for line in notice.content.split("\n")[1:] if not line.startswith("- ... ")
@@ -4174,6 +4178,28 @@ def test_summary_compaction_spill_index_respects_the_caps(tmp_path):
     # cap, is the one that binds.
     assert len(entries) == COMPACT_SPILL_NOTICE_MAX_ENTRIES
     assert notice.content.split("\n")[-1].startswith("- ... 1 more stored file(s)")
+
+
+@pytest.mark.parametrize(
+    "compact", [_compact_by_summary, _compact_by_dropping], ids=["summary", "drop"]
+)
+def test_spill_index_lists_the_newest_results_first(tmp_path, compact):
+    """Past the entry cap the list shows the latest stored results and
+    folds the oldest into the "... N more" line."""
+    names = [
+        f"stored-{index:02d}" for index in range(COMPACT_SPILL_NOTICE_MAX_ENTRIES + 1)
+    ]
+    ctx = _context_with_stored_results(tmp_path, names=names)
+
+    compact(ctx)
+
+    (notice,) = _spill_index_messages(ctx)
+    *entries, omitted = notice.content.split("\n")[1:]
+    assert [entry.split(": ", 1)[0] for entry in entries] == [
+        f"- tool-results/{name}.json" for name in reversed(names[1:])
+    ]
+    assert omitted.startswith("- ... 1 more stored file(s)")
+    assert "tool-results/stored-00.json" not in notice.content
 
 
 def test_summary_compaction_counts_exclude_the_spill_index(tmp_path):
@@ -4268,7 +4294,7 @@ def test_drop_oldest_carries_spill_index(tmp_path, registry):
     notice, *window = ctx.messages
     assert notice.role == "system"
     assert notice.metadata == {COMPACT_SPILL_INDEX_METADATA_KEY: True}
-    assert notice.content == render_spill_notice(records, style="compaction")
+    assert notice.content == _expected_spill_index(records)
     assert len(window) == len(expected_window)
     assert all(a is b for a, b in zip(window, expected_window, strict=True))
     assert result.final_count == len(expected_window) + 1
@@ -4341,7 +4367,7 @@ def test_spill_index_survives_repeated_compaction(tmp_path, first, second):
     (notice,) = _spill_index_messages(ctx)
     for record in records:
         assert record["relative_path"] in notice.content
-    assert notice.content == render_spill_notice(records, style="compaction")
+    assert notice.content == _expected_spill_index(records)
 
 
 @pytest.mark.parametrize(
@@ -4441,6 +4467,6 @@ def test_summary_compaction_without_a_latest_user_message_still_lists(tmp_path):
     summary, notice = ctx.messages
     assert summary.metadata == {"compacted_context": True}
     assert notice.metadata == {COMPACT_SPILL_INDEX_METADATA_KEY: True}
-    assert notice.content == render_spill_notice(records, style="compaction")
+    assert notice.content == _expected_spill_index(records)
     assert result.final_count == len(ctx.messages)
     assert result.metadata["removed_count"] == result.original_count - 1
