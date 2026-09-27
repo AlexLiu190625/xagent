@@ -499,3 +499,21 @@ When the retention purge expires a conversation it now leaves a record, so that 
 ### Rollback
 
 Rolling back the application leaves the table and columns in place and unwritten. Downgrading the migration drops them, which loses the record of which tasks retention expired; readers then fall back to not-found for those ids.
+
+## 2026-09-26 — v1 API reports expired tasks
+
+The `/v1` SDK API now reads the expired-task records above (#2565). Internal web surfaces and run history follow separately. No deployment configures a retention period yet, so no tombstone exists and nothing below is observable until one does.
+
+### Client-visible changes
+
+- Every route addressed by a task id — `GET /v1/chat/tasks/{id}`, `/steps`, `/events`, `POST .../messages`, `POST .../reply` and `POST /v1/chat/files?task_id=` — answers **`410`** with error code **`task_expired`** and `details: {task_id, expired_at}` when the retention policy expired a task the calling key could have seen. A key that could not have seen the task (another agent or workforce, or a task not created through the SDK) keeps getting `404 task_not_found`, and so does a task its owner deleted.
+- An events stream that is already open when its task expires closes with a terminal `stream.error` frame with code **`task_expired`** instead of `task_deleted`. Re-attaching then gets the `410`.
+- `GET .../steps` has two new fields, `steps_expired` (boolean) and `steps_expired_at` (timestamp or null). `steps_expired: true` means the retention policy removed the task's historical steps, so the list may be incomplete. It can still hold steps from turns taken after the removal.
+
+A client that does not know the new code still sees a 4xx for the REST routes and a terminal error frame on the stream — the same classes of outcome it gets today for a missing or deleted task. The new `/steps` fields are additive.
+
+### Deployment impact
+
+- No migration and no configuration.
+- Responses cached by the steps cache before this change are still served for tasks the retention policy never touched. The first read of a trace-expired task after the upgrade re-reads and re-caches it.
+- Rolling back makes the API answer `404 task_not_found` again for expired tasks and drops the two `/steps` fields.
