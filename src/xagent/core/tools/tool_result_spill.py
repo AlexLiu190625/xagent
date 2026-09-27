@@ -8,14 +8,20 @@ entry points (``read_spilled_result`` / ``list_spilled_results``), the
 report-record shape gate and notice renderer, and the constants that
 describe the on-disk and in-context contract.
 
-Spilling is wired but not enabled. OutputFilteredToolWrapper
-(adapters/vibe/output_filter_wrapper.py) strips a tool-supplied report key
-from every result and, only when it is given a SpillTarget, spills oversized
-values before ordinary output filtering. ExecutionContext
-(core/agent/context/execution.py) validates the report records a result
-carries, registers the accepted ones and renders their notice. The
-production tool factory supplies no SpillTarget, so in a deployed tool set
-the wrapper only strips the reserved key and no spill file is written.
+Spilling is enabled for tool sets that can read a stored result back.
+OutputFilteredToolWrapper (adapters/vibe/output_filter_wrapper.py) strips a
+tool-supplied report key from every result and, only when it is given a
+SpillTarget, spills oversized values before ordinary output filtering.
+ExecutionContext (core/agent/context/execution.py) validates the report
+records a result carries, registers the accepted ones and renders their
+notice. The production tool factory (adapters/vibe/factory.py) gives every
+wrapper in a tool set one shared SpillRunBudget, and one shared SpillTarget
+only when the set contains a read_tool_result bound to a TaskWorkspace,
+taking the directory from spill_dir_for_workspace; the read_tool_result
+wrapper itself gets no target, so what a read-back returns is never itself
+spilled. A tool set without such a reader -- no file tools, a mock
+workspace, or a tool policy that removed read_tool_result by name while
+keeping read_file -- keeps ordinary truncation and writes no spill file.
 
 Read-back is wired: read_tool_result, registered by
 WorkspaceFileTools.get_tools, checks workspace authority and hands the
