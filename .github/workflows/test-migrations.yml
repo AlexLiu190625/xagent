@@ -153,6 +153,9 @@ on:
       - 'tests/web/api/test_durable_message_resume_contention.py'
       - 'tests/web/api/test_recovered_delivery_outcome_unknown.py'
       - 'tests/web/services/test_unknown_delivery_postgresql.py'
+      - 'src/xagent/web/services/task_execution_controller.py'
+      - 'src/xagent/web/services/task_execution.py'
+      - 'tests/web/api/test_recovered_delivery_failed_run.py'
   pull_request:
     branches: [main]
   # Required by the merge queue: without this the two required contexts below
@@ -342,6 +345,9 @@ jobs:
             tests/web/api/test_durable_message_resume_contention.py
             tests/web/api/test_recovered_delivery_outcome_unknown.py
             tests/web/services/test_unknown_delivery_postgresql.py
+            src/xagent/web/services/task_execution_controller.py
+            src/xagent/web/services/task_execution.py
+            tests/web/api/test_recovered_delivery_failed_run.py
           )
 
           case "$EVENT_NAME" in
