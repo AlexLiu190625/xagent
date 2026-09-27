@@ -14,6 +14,7 @@ from enum import Enum
 from typing import (
     Any,
     Dict,
+    Iterable,
     Iterator,
     List,
     Literal,
@@ -227,12 +228,14 @@ class DocumentRecord:
         file_id: Optional file identifier for uploaded file tracking.
         source_path: Original source path if available.
         user_id: Optional tenant owner for owner-aware control-plane cleanup.
+        collection: Owning collection, set by lookups that span collections.
     """
 
     doc_id: str
     file_id: Optional[str] = None
     source_path: Optional[str] = None
     user_id: Optional[int] = None
+    collection: Optional[str] = None
 
 
 class FilterOperator(str, Enum):
@@ -434,6 +437,18 @@ class VectorIndexStore(ABC):
             user_id: User ID for multi-tenancy filtering.
             is_admin: Whether the user has admin privileges.
             max_results: Maximum records to return.
+        """
+
+    @abstractmethod
+    def list_document_records_by_file_ids(
+        self, file_ids: Iterable[str]
+    ) -> List[DocumentRecord]:
+        """Every document row whose ``file_id`` is one of ``file_ids``.
+
+        Uncapped, across collections and owners (rows with no owner included):
+        callers decide what a reference allows. Values come back as stored,
+        with ``None`` read as ``""`` for ``doc_id`` and ``collection``. Empty
+        candidates are skipped, and with none left nothing is read.
         """
 
     @abstractmethod

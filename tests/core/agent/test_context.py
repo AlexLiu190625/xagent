@@ -3524,6 +3524,70 @@ def test_two_existence_gate_failures_add_the_unavailable_notice_only_once(tmp_pa
     assert tool.content.count(SPILL_UNAVAILABLE_NOTICE) == 1
 
 
+_EXECUTION_LOGGER = "xagent.core.agent.context.execution"
+
+
+def _execution_warnings(caplog):
+    return [
+        record
+        for record in caplog.records
+        if record.name == _EXECUTION_LOGGER and record.levelno == logging.WARNING
+    ]
+
+
+def test_an_existence_gate_failure_without_a_workspace_logs_a_warning(caplog):
+    """A report this execution cannot look up at all -- it has no workspace
+    path -- is told to the model as unavailable and logged once, naming the
+    stored path and the missing directory as the reason."""
+    ctx = ExecutionContext()  # no attach_workspace call
+    with caplog.at_level(logging.WARNING, logger=_EXECUTION_LOGGER):
+        tool = ctx.add_tool_result(
+            "acme", {"output": "ok", SPILL_RESERVED_RESULT_KEY: [dict(VALID_RECORD)]}
+        )
+    assert tool.content.endswith(SPILL_UNAVAILABLE_NOTICE)
+    warnings = _execution_warnings(caplog)
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert VALID_RECORD["relative_path"] in message
+    assert "has no workspace path" in message
+
+
+def test_an_existence_gate_failure_for_a_missing_file_logs_a_warning(tmp_path, caplog):
+    """A report naming a file that is not under this execution's spill
+    directory -- the signal that the tool set and the execution resolved
+    different directories -- is logged once with the stored path, the
+    directory looked in, and a reason worded differently from the
+    no-workspace case."""
+    _spill_workspace(tmp_path)
+    ctx = ExecutionContext()
+    ctx.attach_workspace("ws-1", str(tmp_path))
+    record = {**VALID_RECORD, "relative_path": "tool-results/missing-result.json"}
+    with caplog.at_level(logging.WARNING, logger=_EXECUTION_LOGGER):
+        tool = ctx.add_tool_result(
+            "acme", {"output": "ok", SPILL_RESERVED_RESULT_KEY: [record]}
+        )
+    assert tool.content.endswith(SPILL_UNAVAILABLE_NOTICE)
+    warnings = _execution_warnings(caplog)
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "tool-results/missing-result.json" in message
+    assert spill_dir_for_workspace(str(tmp_path)) in message
+    assert "is not a file directly under" in message
+    assert "has no workspace path" not in message
+
+
+def test_an_accepted_spill_record_logs_no_warning(tmp_path, caplog):
+    _spill_workspace(tmp_path)
+    ctx = ExecutionContext()
+    ctx.attach_workspace("ws-1", str(tmp_path))
+    with caplog.at_level(logging.WARNING, logger=_EXECUTION_LOGGER):
+        ctx.add_tool_result(
+            "acme", {"output": "ok", SPILL_RESERVED_RESULT_KEY: [dict(VALID_RECORD)]}
+        )
+    assert ctx.spilled_results == (dict(VALID_RECORD),)
+    assert _execution_warnings(caplog) == []
+
+
 # --- observation notice wiring + no-path-in-raw_result ---------------------
 
 

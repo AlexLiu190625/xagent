@@ -7,6 +7,7 @@ import logging
 import os
 import threading
 from collections import OrderedDict, defaultdict
+from collections.abc import Iterable
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -58,6 +59,8 @@ from .lancedb_filter_utils import (
 from .logging_utils import log_audit, log_performance
 
 logger = logging.getLogger(__name__)
+
+_FILE_ID_LOOKUP_BATCH_SIZE = 200
 
 
 def _fragment_count(table: Any) -> int:
@@ -824,6 +827,48 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             return records
         finally:
             _safe_close_table(table)
+
+    def list_document_records_by_file_ids(
+        self, file_ids: Iterable[str]
+    ) -> List[DocumentRecord]:
+        from ..LanceDB.schema_manager import _safe_close_table
+
+        normalized_file_ids = sorted({file_id for file_id in file_ids if file_id})
+        if not normalized_file_ids:
+            return []
+        conn = self._get_connection()
+        ensure_documents_table(conn)
+        records: List[DocumentRecord] = []
+        table = None
+        try:
+            table = conn.open_table("documents")
+            for offset in range(
+                0, len(normalized_file_ids), _FILE_ID_LOOKUP_BATCH_SIZE
+            ):
+                batch = normalized_file_ids[
+                    offset : offset + _FILE_ID_LOOKUP_BATCH_SIZE
+                ]
+                escaped = ", ".join(f"'{escape_lancedb_string(f)}'" for f in batch)
+                rows = query_to_list(
+                    table.search()
+                    .where(f"file_id IN ({escaped})")
+                    .select(["collection", "doc_id", "file_id", "user_id"])
+                    .limit(-1)
+                )
+                records.extend(
+                    DocumentRecord(
+                        doc_id=str(row.get("doc_id") or ""),
+                        file_id=str(row["file_id"]),
+                        user_id=(
+                            None if row.get("user_id") is None else int(row["user_id"])
+                        ),
+                        collection=str(row.get("collection") or ""),
+                    )
+                    for row in rows
+                )
+        finally:
+            _safe_close_table(table)
+        return records
 
     def count_documents_grouped_by_collection(
         self,
