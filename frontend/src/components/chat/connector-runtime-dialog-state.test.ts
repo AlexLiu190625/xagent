@@ -653,17 +653,46 @@ describe("reduceDialog", () => {
 // ---------------------------------------------------------------------------
 
 describe("the dialog's endings", () => {
-  // Comments stripped, so prose that mentions a name does not count as one.
-  const source = readFileSync(path.resolve(__dirname, "./connector-runtime-dialog.tsx"), "utf8")
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .replace(/(^|[^:])\/\/.*$/gm, "$1")
+  // A text scan of the dialog's source, not a parse. What it relies on is
+  // only what the rules below spell out: the exits are arrow functions bound
+  // with `const <name> =`, and each allowed mention has the shape its rule
+  // names. Whitespace, line breaks, trailing commas and the name of the
+  // value the read effect dispatches do not matter, and the last test here
+  // pins that. A new shape outside these fails the scan with no behaviour
+  // change; the rule it fails is the thing to extend.
+  //
+  // Comments are stripped and string literals kept whole, so prose that
+  // mentions a name does not count as one, and a "//" inside a string does
+  // not swallow the rest of its line.
+  function stripComments(src: string): string {
+    return src.replace(
+      /("(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|`(?:\\.|[^`\\])*`)|\/\*[\s\S]*?\*\/|\/\/[^\n]*/g,
+      (match: string, literal: string | undefined) => literal ?? (match.startsWith("/*") ? " " : ""),
+    )
+  }
+  const raw = readFileSync(path.resolve(__dirname, "./connector-runtime-dialog.tsx"), "utf8")
+  const source = stripComments(raw)
 
+  // Whether `index` falls inside the body of the arrow function bound to any
+  // of `names`, found by balancing braces from the body's opening one.
   function within(src: string, index: number, ...names: string[]): boolean {
     return names.some((name) => {
-      const start = src.indexOf(`  const ${name} = `)
-      expect(start, name).toBeGreaterThanOrEqual(0)
-      return index > start && index < src.indexOf("\n  }\n", start)
+      const head = new RegExp(`\\bconst\\s+${name}\\s*=[^]*?=>\\s*\\{`).exec(src)
+      expect(head, name).not.toBeNull()
+      if (!head) return false
+      const open = head.index + head[0].length - 1
+      let depth = 0
+      for (let at = open; at < src.length; at++) {
+        if (src[at] === "{") depth++
+        else if (src[at] === "}" && --depth === 0) return index > open && index < at
+      }
+      return false
     })
+  }
+  // Whether the text right before `index` ends with `before` and the text
+  // from `index` on starts with `after`.
+  function around(src: string, index: number, before: RegExp, after: RegExp): boolean {
+    return before.test(src.slice(Math.max(0, index - 200), index)) && after.test(src.slice(index))
   }
   function lineAt(src: string, index: number): string {
     return src.slice(src.lastIndexOf("\n", index) + 1, src.indexOf("\n", index)).trim()
@@ -678,38 +707,62 @@ describe("the dialog's endings", () => {
     "retry-settled",
     "retry-abandoned",
   ] satisfies Array<FinishingEvent["type"]>
+  const isFinishing = (type: string) => (FINISHING_TYPES as string[]).includes(type)
+
+  // Names bound to a literal event that does not end a flow, such as the
+  // read effect's own "kept" read-settled event.
+  function nonFinishingBindings(src: string): Set<string> {
+    return new Set(Array.from(
+      src.matchAll(/\bconst\s+([A-Za-z_$][\w$]*)\s*=\s*\{\s*type\s*:\s*"([a-z-]+)"/g),
+      m => m[2] !== undefined && !isFinishing(m[2]) ? m[1] : "",
+    ).filter(Boolean))
+  }
 
   // Every mention of the name counts, not only a call spelled `name(`, so a
   // method on it (`toast.error(`), a call on some other object (`ctl.close(`)
   // or an alias is caught too. Each rule lists the only places a mention may
   // stand and returns the lines of the ones that stand anywhere else.
   const RULES = {
-    toast: (src: string) => strays(src, /\btoast\b/g, (i, line) => line.startsWith("import ") || within(src, i, "say")),
-    close: (src: string) => strays(src, /\bclose\b/g, (i, line) => (
-      line === "const { close } = useConnectorRuntimeDialog()"
-      || line.endsWith(", close])")
-      || src.startsWith("close: \"", i)
+    toast: (src: string) => strays(src, /\btoast\b/g, i => (
+      around(src, i, /\bimport\s*\{[^}]*$/, /^toast\s*[,}]/)
+      || within(src, i, "say")
+    )),
+    close: (src: string) => strays(src, /\bclose\b/g, i => (
+      around(src, i, /\bconst\s*\{\s*$/, /^close\s*,?\s*\}\s*=\s*useConnectorRuntimeDialog\s*\(\s*\)/)
+      // The last dependency of an effect that reads it.
+      || around(src, i, /[[,]\s*$/, /^close\s*,?\s*\]\s*\)/)
+      || /^close\s*:\s*"/.test(src.slice(i))
       || within(src, i, "finish")
     )),
-    // Outside the exits, only a literal non-finishing event, or the read
-    // effect's own "kept" read-settled event, may be dispatched.
-    dispatch: (src: string) => strays(src, /\bdispatch\b/g, (i, line) => {
-      if (line.startsWith("const [state, dispatch] = useReducer(") || within(src, i, "finish", "settle")) return true
-      if (!src.startsWith("dispatch(", i)) return false
-      const argument = src.slice(i + "dispatch(".length, i + "dispatch(".length + 80)
-      const literal = /^\{\s*type:\s*"([a-z-]+)"/.exec(argument)
-      return literal ? !(FINISHING_TYPES as string[]).includes(literal[1]) : argument.startsWith("kept)")
+    // Outside the exits, only a literal non-finishing event, or a name bound
+    // to one, may be dispatched.
+    dispatch: (src: string) => strays(src, /\bdispatch\b/g, (i) => {
+      if (around(src, i, /\bconst\s*\[\s*state\s*,\s*$/, /^dispatch\s*,?\s*\]\s*=\s*useReducer\s*\(/)) return true
+      if (within(src, i, "finish", "settle")) return true
+      const call = /^dispatch\s*\(\s*/.exec(src.slice(i))
+      if (!call) return false
+      const argument = src.slice(i + call[0].length)
+      const literal = /^\{\s*type\s*:\s*"([a-z-]+)"/.exec(argument)
+      if (literal) return literal[1] !== undefined && !isFinishing(literal[1])
+      const name = /^([A-Za-z_$][\w$]*)\s*,?\s*\)/.exec(argument)
+      return name !== null && name[1] !== undefined && nonFinishingBindings(src).has(name[1])
     }),
   }
-  function strays(src: string, name: RegExp, allowed: (index: number, line: string) => boolean): string[] {
+  function strays(src: string, name: RegExp, allowed: (index: number) => boolean): string[] {
     return Array.from(src.matchAll(name), m => m.index ?? -1)
-      .filter(index => !allowed(index, lineAt(src, index)))
+      .filter(index => !allowed(index))
       .map(index => lineAt(src, index))
   }
 
   it.each(["toast", "close", "dispatch"] as const)("names %s only where the exits allow", (rule) => {
     expect(RULES[rule](source)).toEqual([])
   })
+
+  function insertBeforeDismiss(src: string, line: string): string {
+    const at = src.indexOf("  const handleDismiss = ")
+    expect(at).toBeGreaterThanOrEqual(0)
+    return `${src.slice(0, at)}  ${line}\n${src.slice(at)}`
+  }
 
   it.each([
     ["toast", "toast.error(\"x\")"],
@@ -719,8 +772,43 @@ describe("the dialog's endings", () => {
     ["close", "const { close: shut } = useConnectorRuntimeDialog()"],
     ["dispatch", "dispatch({ type: \"retry-abandoned\" })"],
     ["dispatch", "const send = dispatch"],
+    ["dispatch", "dispatch(someEvent)"],
   ] as const)("catches a stray %s: %s", (rule, stray) => {
-    const at = source.indexOf("  const handleDismiss = ")
-    expect(RULES[rule](`${source.slice(0, at)}  ${stray}\n${source.slice(at)}`)).toEqual([stray])
+    expect(RULES[rule](insertBeforeDismiss(source, stray))).toEqual([stray])
+  })
+
+  it("does not let a \"//\" inside a string hide what follows it", () => {
+    const stray = "const note = \"a // b\"; toast(\"x\")"
+    expect(RULES.toast(stripComments(insertBeforeDismiss(raw, stray)))).toEqual([stray])
+  })
+
+  // Layout the rules must not depend on: every line indented further, the
+  // read effect's event under another name, and the destructurings, a
+  // dependency list and a dispatch call each spread over several lines.
+  // The same strays must still be caught in it, so a rule cannot pass the
+  // new layout by allowing more than it did.
+  it("passes the same source laid out differently, and still catches strays in it", () => {
+    const edits: Array<[string | RegExp, string]> = [
+      [/\bkept\b/g, "keptRead"],
+      ["const { close } = useConnectorRuntimeDialog()", "const {\n    close,\n  } = useConnectorRuntimeDialog()"],
+      ["const [state, dispatch] = useReducer(", "const [\n    state,\n    dispatch,\n  ] = useReducer("],
+      ["[visible, pathname, close])", "[\n    visible,\n    pathname,\n    close,\n  ])"],
+      ["dispatch({ type: \"snapshot-gone\" })", "dispatch(\n      { type: \"snapshot-gone\" },\n    )"],
+      ["import { toast } from", "import {\n  toast,\n} from"],
+      [/\n/g, "\n  "],
+    ]
+    const relaidOut = edits.reduce((src, [from, to]) => {
+      const next = src.replace(from, to)
+      expect(next, String(from)).not.toBe(src)
+      return next
+    }, source)
+    for (const [rule, stray] of [
+      ["toast", "toast.error(\"x\")"],
+      ["close", "ctl.close(\"dismissed\")"],
+      ["dispatch", "dispatch({ type: \"retry-abandoned\" })"],
+    ] as const) {
+      expect(RULES[rule](relaidOut), rule).toEqual([])
+      expect(RULES[rule](insertBeforeDismiss(relaidOut, stray)), rule).toEqual([stray])
+    }
   })
 })
