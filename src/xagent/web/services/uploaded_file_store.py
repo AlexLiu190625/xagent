@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import hashlib
 import logging
 from dataclasses import dataclass
@@ -1826,15 +1827,33 @@ class UploadedFileStore:
         *,
         delete_local: bool = True,
         local_root: Optional[Path] = None,
+        after_commit: Optional[list[tuple[str, Callable[[], None]]]] = None,
     ) -> None:
-        ManagedFileRef(file_record).delete_durable()
+        """Delete the row (flushed, not committed) and its bytes.
+
+        With ``after_commit``, the durable delete and local unlink are queued as
+        ``(label, fn)`` for the caller to run after it commits; without it they run now.
+        """
+        ref = ManagedFileRef(file_record)
+        file_id = str(getattr(file_record, "file_id", "") or "")
+        if after_commit is None:
+            ref.delete_durable()
+        elif ref.has_durable_object:
+            storage = get_user_file_storage(int(file_record.user_id))
+            key = ref.storage_key
+            after_commit.append((key, lambda: storage.delete(key)))
         if delete_local:
-            self._delete_local(file_record, local_root=local_root)
+            unlink = functools.partial(
+                self._delete_local, str(file_record.storage_path), local_root=local_root
+            )
+            if after_commit is None:
+                unlink()
+            else:
+                after_commit.append((file_id, unlink))
         # Remove any server-side PDF preview cache so derived content doesn't
         # outlive the source upload.  Called here (not only in the HTTP route)
         # so reconcile / orphan-cleanup paths that go through this service also
         # clean up the cache.
-        file_id = str(getattr(file_record, "file_id", "") or "")
         delete_registered_preview_caches(file_id)
         self.db.delete(file_record)
         self.db.flush()
@@ -1871,10 +1890,8 @@ class UploadedFileStore:
         return digest.hexdigest()
 
     @staticmethod
-    def _delete_local(
-        file_record: UploadedFile, *, local_root: Optional[Path] = None
-    ) -> None:
-        local_path = Path(str(file_record.storage_path))
+    def _delete_local(storage_path: str, *, local_root: Optional[Path] = None) -> None:
+        local_path = Path(storage_path)
         if local_root is not None:
             resolved_path = local_path.resolve()
             if not resolved_path.is_relative_to(local_root.resolve()):
