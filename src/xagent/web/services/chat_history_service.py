@@ -361,6 +361,37 @@ def mark_user_message_delivery_sync(
         return transition
 
 
+def withdraw_pending_user_message_delivery_sync(task_id: int, turn_id: str) -> bool:
+    """Delete a still-pending user row its claimant never injected.
+
+    For a live-control claim whose run ended before the message reached it:
+    removing the row lets the same turn id be accepted as a new turn, which
+    inserts its own row. Only a ``pending`` row is removed, in one conditional
+    DELETE, so a row another writer already settled is left alone. The caller
+    must know the message was never written into a run; a row an earlier
+    attempt may have injected is never withdrawn.
+
+    Returns whether the row was removed.
+    """
+
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        removed = (
+            db.query(TaskChatMessage)
+            .filter(
+                TaskChatMessage.task_id == task_id,
+                TaskChatMessage.role == "user",
+                TaskChatMessage.turn_id == turn_id,
+                TaskChatMessage.delivery_status == DELIVERY_PENDING,
+            )
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+        return removed == 1
+
+
 def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
     """Mark every assistant question row on a task as superseded, whether
     still pending or already answered.

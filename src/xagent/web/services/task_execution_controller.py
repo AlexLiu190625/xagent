@@ -56,9 +56,9 @@ class StaleTaskStateVersionError(StaleTaskRunError):
     """
 
 
-# Statuses a recovered message delivery must never resume its original run
-# out of: the run ended for good (settled FAILED by recovery, or finished).
-# A fresh message still reaches such a task through APPEND as a new run.
+# Statuses a message delivery must never resume its original run out of:
+# the run ended for good (settled FAILED by recovery, or finished). A fresh
+# message still reaches such a task through APPEND as a new run.
 NON_RESUMABLE_STATUSES: tuple[TaskStatus, ...] = (
     TaskStatus.FAILED,
     TaskStatus.COMPLETED,
@@ -70,7 +70,7 @@ class TaskStatusRefusedError(RuntimeError):
 
     Not a stale-run error: the run may still match. A caller opts in with
     ``refuse_terminal_status`` when the target state must never be entered
-    from a :data:`NON_RESUMABLE_STATUSES` row (a recovered message must not
+    from a :data:`NON_RESUMABLE_STATUSES` row (a message handoff must not
     resume an ended run), and the refusal is part of the same conditional
     UPDATE, so a status committed after the caller's snapshot is still caught.
     """

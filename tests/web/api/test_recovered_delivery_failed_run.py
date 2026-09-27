@@ -363,6 +363,7 @@ async def test_run_ended_after_the_transition_is_caught_by_the_lease_claim(
             first = None
         assert resume_spy.await_count == 1
         assert resume_spy.await_args.kwargs["refuse_terminal_status"] is True
+        assert resume_spy.await_args.kwargs["delivery_claimed_fresh"] is False
         for _ in range(200):
             if task_id not in background_manager.running_tasks:
                 break
@@ -914,11 +915,15 @@ async def test_run_rotated_at_the_transition_settles_a_recovered_claim_unknown(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", [TaskStatus.RUNNING, TaskStatus.WAITING_FOR_USER])
-async def test_fresh_live_message_passes_no_status_fence(
+async def test_fresh_live_message_is_fenced_and_still_handed_off(
     db_session,
     status: TaskStatus,
 ) -> None:
-    """Only a recovered claim opts into the terminal-status fences."""
+    """A fresh message on a live run is fenced too, and hands off as before.
+
+    The fences only refuse an ended run; this one is not, so the message is
+    handed to the resume as usual, marked as a claim this attempt made.
+    """
 
     owner = _user(db_session, f"fresh-live-owner-{status.value}")
     task = _expired_running_task(db_session, int(owner.id))
@@ -941,10 +946,13 @@ async def test_fresh_live_message_passes_no_status_fence(
             )
         resume = task_execution_service.execute_resume_background
         assert resume.call_count == 1
-        assert resume.call_args.kwargs["refuse_terminal_status"] is False
+        assert resume.call_args.kwargs["refuse_terminal_status"] is True
+        assert resume.call_args.kwargs["delivery_claimed_fresh"] is True
 
     assert transition_spy.call_count == 1
-    assert transition_spy.call_args.kwargs["refuse_terminal_status"] is False
+    assert transition_spy.call_args.kwargs["refuse_terminal_status"] is True
+    db_session.expire_all()
+    assert db_session.get(Task, int(task.id)).status == status
 
 
 def _processing_command_row(db, task: Task, owner, command) -> None:

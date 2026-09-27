@@ -1410,6 +1410,7 @@ def _fake_acquire_with_prior_status(lease: TaskLease, prior_status: TaskStatus):
         prior_status_out: list[Any] | None = None,
         refuse_terminal_status: bool = False,
         run_not_resumable_out: list[bool] | None = None,
+        ended_status_out: list[Any] | None = None,
     ) -> TaskLease:
         if prior_status_out is not None:
             prior_status_out.append(prior_status)

@@ -252,8 +252,11 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     # that are not answered from the durable command row.
     # A live handoff refused by another lease acquisition adds an
     # outcome-unknown ack and a not-accepted, resend-with-new-id ack.
-    assert result.producers == 42, (
-        f"expected exactly 42 producers, matched {result.producers}; "
+    # A deferred resume that withdraws a fresh message from an ended run adds
+    # one not-accepted, resend-with-new-id ack, and the handler's retry of a
+    # message withdrawn from an ended run one more.
+    assert result.producers == 44, (
+        f"expected exactly 44 producers, matched {result.producers}; "
         "review the changed sites and bump deliberately"
     )
     # #1658 removed ``_resync_client_to_running_task``'s stale-client ``error``

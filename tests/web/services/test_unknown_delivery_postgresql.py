@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from tests.shared.postgres_disposable import disposable_database_factory
 from tests.web.api.test_durable_message_resume_contention import (
     _live_control_environment,
+    _message_command,
     _user,
 )
 from tests.web.api.test_recovered_delivery_outcome_unknown import (
@@ -41,14 +42,17 @@ from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.services import task_command_execution as command_execution_service
+from xagent.web.services import task_execution_controller as controller_module
 from xagent.web.services import task_lease_recovery
 from xagent.web.services.chat_history_service import (
     DELIVERY_COMPLETED,
     DELIVERY_DISPATCHED,
     DELIVERY_PENDING,
     mark_user_message_delivery,
+    withdraw_pending_user_message_delivery_sync,
 )
 from xagent.web.services.task_command_execution import execute_durable_task_command
+from xagent.web.services.task_command_transport import TaskCommandKind
 from xagent.web.services.task_execution import (
     ResumeReservationOutcome,
     _acquire_resume_task_lease,
@@ -489,3 +493,144 @@ def test_resume_lease_claim_waits_on_completion_and_refuses_completed_pg(
         assert stored.control_state == TaskControlState.COMPLETED.value
         assert stored.output == "final answer"
         assert stored.runner_id is None
+
+
+@pytest.mark.parametrize("ended_status", [TaskStatus.FAILED, TaskStatus.COMPLETED])
+def test_fresh_claim_waits_on_the_ending_write_and_withdraws_its_row_pg(
+    pg_sessions: sessionmaker[Session],
+    db_session: Session,
+    ended_status: TaskStatus,
+) -> None:
+    """The resume claim for a fresh message races the run's end.
+
+    It waits on the ending write's row lock, is refused once that commits,
+    and reports the ended status, which lets the never-injected row be
+    withdrawn so the message can start a new turn.
+    """
+
+    owner = _user(db_session, f"pg-fresh-claim-{ended_status.value}")
+    task = _expired_task(db_session, int(owner.id), suffix="fresh-claim")
+    task_id = int(task.id)
+    row_id = _add_row(db_session, task, TURN_ID)
+    ended: list[TaskStatus] = []
+
+    ending = _ending_writer(pg_sessions, task_id, ended_status)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            claim = pool.submit(
+                _acquire_resume_task_lease,
+                task_id,
+                int(owner.id),
+                "run-fresh-claim",
+                refuse_terminal_status=True,
+                ended_status_out=ended,
+            )
+            _wait_until_blocked_on_a_lock(pg_sessions)
+            ending.commit()
+            assert claim.result(timeout=_BLOCKED_SECONDS) is None
+    finally:
+        ending.rollback()
+        ending.close()
+
+    assert ended == [ended_status]
+    assert withdraw_pending_user_message_delivery_sync(task_id, TURN_ID)
+    with pg_sessions() as db:
+        assert db.get(TaskChatMessage, row_id) is None
+        stored = db.get(Task, task_id)
+        assert stored.status == ended_status
+        assert stored.runner_id is None
+        assert stored.run_id == "run-fresh-claim"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ended_status", [TaskStatus.FAILED, TaskStatus.COMPLETED])
+async def test_fresh_message_whose_run_ends_at_the_transition_appends_pg(
+    pg_sessions: sessionmaker[Session],
+    db_session: Session,
+    ended_status: TaskStatus,
+) -> None:
+    """Withdrawal, then the new turn's insert of the same turn id, on PG."""
+
+    owner = _user(db_session, f"pg-fresh-transition-{ended_status.value}")
+    task = _expired_task(db_session, int(owner.id), suffix="fresh-transition")
+    # The run the command targeted.
+    task.run_id = "live-run"
+    db_session.commit()
+    task_id = int(task.id)
+    reply = _RecordingReply()
+    begin_turn = AsyncMock(wraps=TaskTurnOrchestrator.begin_turn)
+    real_sync = controller_module.transition_task_control_state_sync
+
+    def end_then_transition(*args, **kwargs):
+        ending = _ending_writer(pg_sessions, task_id, ended_status)
+        ending.commit()
+        ending.close()
+        return real_sync(*args, **kwargs)
+
+    with (
+        _live_control_environment(outcome=ResumeReservationOutcome.RESERVED) as (
+            agent,
+            _,
+        ),
+        patch.object(command_execution_service, "command_reply", return_value=reply),
+        patch.object(TaskTurnOrchestrator, "begin_turn", begin_turn),
+        patch.object(
+            controller_module,
+            "transition_task_control_state_sync",
+            side_effect=end_then_transition,
+        ),
+    ):
+        result = await execute_durable_task_command(
+            _message_command(task, owner, TURN_ID, attempt_count=1)
+        )
+
+    assert result == {
+        "task_id": task_id,
+        "command_id": TURN_ID,
+        "kind": TaskCommandKind.MESSAGE.value,
+    }
+    agent.post_user_message.assert_not_awaited()
+    begin_turn.assert_awaited_once()
+    rows = [row for row in _user_rows(db_session, task_id) if row.turn_id == TURN_ID]
+    assert len(rows) == 1
+    db_session.expire_all()
+    stored = db_session.get(Task, task_id)
+    assert stored.status == TaskStatus.RUNNING
+    assert stored.run_id not in {None, "live-run"}
+    assert stored.error_message is None
+
+
+def test_withdrawal_waits_on_a_concurrent_row_write_and_then_refuses_pg(
+    pg_sessions: sessionmaker[Session],
+    db_session: Session,
+) -> None:
+    """A withdrawal racing another writer of the same row never forces it.
+
+    The DELETE waits on the uncommitted write's row lock; once it commits
+    ``dispatched``, READ COMMITTED re-evaluates the ``pending`` predicate,
+    nothing is deleted, and the caller settles conservatively.
+    """
+
+    owner = _user(db_session, "pg-withdraw-race")
+    task = _expired_task(db_session, int(owner.id), suffix="withdraw-race")
+    task_id = int(task.id)
+    row_id = _add_row(db_session, task, TURN_ID)
+
+    writing = pg_sessions()
+    try:
+        transition = mark_user_message_delivery(
+            writing, task_id=task_id, turn_id=TURN_ID, status=DELIVERY_DISPATCHED
+        )
+        assert transition.status == DELIVERY_DISPATCHED
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            withdrawal = pool.submit(
+                withdraw_pending_user_message_delivery_sync, task_id, TURN_ID
+            )
+            _wait_until_blocked_on_a_lock(pg_sessions)
+            writing.commit()
+            assert withdrawal.result(timeout=_BLOCKED_SECONDS) is False
+    finally:
+        writing.rollback()
+        writing.close()
+
+    assert _status(pg_sessions, row_id) == DELIVERY_DISPATCHED

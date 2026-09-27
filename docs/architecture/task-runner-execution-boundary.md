@@ -182,11 +182,60 @@ crash or a lost write acknowledgement between the row write and the
 command's own settlement answers from it instead of reporting the turn
 accepted.
 
-Known gaps, not closed here: a fresh (non-recovered) message whose run ends
-FAILED or COMPLETED between routing and the resume lease claim can still
-resume that run, because only recovered claims opt into the status fences.
-And the check is a denylist of FAILED and COMPLETED: a terminal status added
-later is not refused until it joins that list.
+A fresh (non-recovered) message routed live can see its run end FAILED or
+COMPLETED anywhere between the routing snapshot and the resume lease claim.
+The same two fences refuse it, so an ended run is never flipped back to
+RUNNING. A snapshot that already shows an ended run with a resume request
+still pending routes the message to APPEND before the live path. What the
+refusal means depends on whether the message reached the run:
+
+- Not injected (the usual case: the handler defers it to the resume). The
+  row was claimed by this attempt and never written into a run, so it is
+  withdrawn (a conditional delete of the still-`pending` row) and the
+  message becomes a new turn, as if the snapshot had already shown the
+  ended run. A refused transition starts that APPEND in the same handler.
+  If the task has moved on by the time it is re-read (another turn
+  started), or `begin_turn` refuses it only as not ready yet (typically
+  `bg_inflight` while the ended run's coroutine unwinds), the command
+  defers instead, resend-safe because nothing of the message remains, and
+  its retry routes afresh. A refused lease claim comes after the handler
+  returned: the resume withdraws the row, the command defers, and its retry
+  finds no row and appends. If the row can no longer be withdrawn (another
+  writer settled it, or the delete failed and the row may still be there),
+  the refusal is settled as outcome unknown, like a recovered claim, in the
+  handler and in the resume alike.
+- Injected before the run ended. Whether the run read it is unknown; it is
+  neither resumed nor resent. At the transition the command settles as
+  outcome unknown; after the handoff, the posted-claim notice above applies.
+
+An outcome-unknown settlement whose row write finds the row gone treats it
+as withdrawn: while the task exists, only a withdrawal removes a single
+delivery row (deleting a user bulk-deletes its tasks' rows), and a withdrawn
+message was never delivered. It is not answered unknown; the unknown
+record written just before is dropped, the command defers, and the retry
+appends the message. This covers a retry that read the row still pending
+while this worker's own resume withdrew it, and a withdrawal whose delete
+committed but whose acknowledgement was lost.
+
+A lease claim a fresh message loses to a live owner, or to a replaced run
+that has not ended, keeps the ordinary failed delivery.
+
+The non-durable answers on this path (not accepted, resend) are defensive:
+in production `handle_task_message` runs under a durable command, or
+through `handle_missing_task_message` for a task it creates, which never
+reaches the live path.
+
+Known gaps, not closed here: the check is a denylist of FAILED and
+COMPLETED, so a terminal status added later is not refused until it joins
+that list. And a retry of the command that runs before its own resume has
+reached the claim reads the still-pending row as a recovered claim; if the
+run has ended by then and that retry advances the row first, it settles
+outcome unknown and the resume can no longer withdraw the row. The retry
+waits at least one second, so on this worker this needs a resume that is
+slow to reach its claim. A narrow cross-worker form remains: after the local
+run releases its lease (the row's `runner_id` is NULL) and before this
+worker's resume claims, the deferred command's retry can be routed to
+another worker, which settles it the same way.
 
 Rows that no owner can settle any more are reconciled by lease recovery,
 which never redrives the turn. Recovering an expired lease advances that

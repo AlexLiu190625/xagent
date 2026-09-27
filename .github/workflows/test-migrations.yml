@@ -158,6 +158,7 @@ on:
       - 'tests/web/services/test_pause_lease_fence_postgresql.py'
       - 'src/xagent/web/services/task_execution.py'
       - 'tests/web/api/test_recovered_delivery_failed_run.py'
+      - 'tests/web/api/test_fresh_message_ended_run.py'
   pull_request:
     branches: [main]
   # Required by the merge queue: without this the two required contexts below
@@ -352,6 +353,7 @@ jobs:
             tests/web/services/test_pause_lease_fence_postgresql.py
             src/xagent/web/services/task_execution.py
             tests/web/api/test_recovered_delivery_failed_run.py
+            tests/web/api/test_fresh_message_ended_run.py
           )
 
           case "$EVENT_NAME" in
