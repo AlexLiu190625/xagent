@@ -451,7 +451,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   const finish = (answer: Finish): void => {
     say(answer.tell)
     if (answer.event) dispatch(answer.event)
-    if (answer.close) close(answer.close)
+    if (answer.close) close(answer.close, request.taskId)
   }
 
   // Where every flow comes back after an await it started from `seqAtStart`,

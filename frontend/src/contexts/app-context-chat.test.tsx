@@ -7960,7 +7960,7 @@ describe("connector runtime dialog trigger", () => {
     act(() => { dialogActions?.recordDelivery({ taskId: 1, clientMessageId: "x", text: "hi" }) })
     expect(appRenderCount).toBe(0)
 
-    act(() => { dialogActions?.close("dismissed") })
+    act(() => { dialogActions?.close("dismissed", 1) })
     expect(appRenderCount).toBe(0)
 
     // Control: a real app-state dispatch does bump the counter, proving it

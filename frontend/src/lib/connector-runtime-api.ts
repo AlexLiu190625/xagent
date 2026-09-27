@@ -700,6 +700,10 @@ export function resolveDialogOutcome(report: ConnectorRuntimeReport): DialogOutc
   return { kind: "fillable", blocking: blockingS }
 }
 
+// Why a dialog request was opened. Kept here so the dialog's pure modules
+// and its provider can both name it without this module importing either.
+export type ConnectorRuntimeDialogTrigger = "turn_failure" | "session_open" | "first_gate"
+
 export type ConnectorRuntimeDialogAction = "saveAndResend" | "saveOnly" | "acknowledge"
 
 /**

@@ -1813,7 +1813,7 @@ describe("ignores a resend result superseded by a new request", () => {
     // turn a second time.
     await act(async () => { resolveRetry() })
     expect(screen.getByRole("dialog")).toBeInTheDocument()
-    expect(closeSpy).not.toHaveBeenCalledWith("resent")
+    expect(closeSpy.mock.calls.map(([outcome]) => outcome)).not.toContain("resent")
     expect(toastMock.mock.calls).toEqual([["connectorRuntime.resendSupersededSent"]])
   })
 
@@ -2494,7 +2494,7 @@ describe("does not open off the host routes", () => {
     pathnameRef.current = "/settings"
     first.rerender(providerTree())
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
-    expect(closeSpy).toHaveBeenCalledWith("left-host")
+    expect(closeSpy).toHaveBeenCalledWith("left-host", 1)
     expect(latestState.request).toBeNull()
     expect((latestState.payload as { clientMessageId: string } | null)?.clientMessageId).toBe("z")
     cleanup()

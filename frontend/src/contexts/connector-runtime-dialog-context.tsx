@@ -3,11 +3,11 @@
 // A thin state container for the connector-runtime dialog: it holds which
 // task (if any) the dialog is being asked to open a request for, the most
 // recently delivered turn on this tab that a dialog could offer to resend,
-// and the turns handed to the transport but not yet acknowledged as
-// delivered (see ConnectorRuntimePendingDelivery below). It never issues a
-// request itself, never reads the viewed-task/`sendMessage` context (it sits
-// above that provider in the tree and cannot reach it), and never looks at
-// the route.
+// the turns handed to the transport but not yet acknowledged as delivered
+// (see ConnectorRuntimePendingDelivery below), and the task whose session
+// check the user closed (dismissedCheck). It never issues a request itself,
+// never reads the viewed-task/`sendMessage` context (it sits above that
+// provider in the tree and cannot reach it), and never looks at the route.
 //
 // A widget or share guest never reaches this provider, and that is a
 // structural fact rather than a runtime check, backed by three independent
@@ -28,6 +28,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react"
 
 import { useAuth } from "@/contexts/auth-context"
+import type { ConnectorRuntimeDialogTrigger } from "@/lib/connector-runtime-api"
 
 export interface ConnectorRuntimeResendPayload {
   taskId: number
@@ -56,10 +57,15 @@ export interface ConnectorRuntimePendingDelivery {
 
 export type ConnectorRuntimeDialogCloseOutcome = "dismissed" | "resent" | "not-shown" | "left-host"
 
+// Why the task page asks: it started viewing the task, or its connection came back.
+export type SessionCheckCause = "opened" | "reconnected"
+
 export interface ConnectorRuntimeDialogRequest {
   taskId: number
   seq: number
+  // Only a turn_failure request carries one: a session check has no message.
   resendPayload: ConnectorRuntimeResendPayload | null
+  trigger: ConnectorRuntimeDialogTrigger
 }
 
 export interface ConnectorRuntimeDialogState {
@@ -67,11 +73,15 @@ export interface ConnectorRuntimeDialogState {
   request: ConnectorRuntimeDialogRequest | null
   payload: ConnectorRuntimeResendPayload | null
   pending: ConnectorRuntimePendingDelivery[]
+  // Whose session check the user closed this view (see transitionRequest).
+  dismissedCheck: number | null
 }
 
 export interface ConnectorRuntimeDialogActions {
   openForTask: (taskId: number) => void
-  close: (outcome: ConnectorRuntimeDialogCloseOutcome) => void
+  openSessionCheck: (taskId: number, cause: SessionCheckCause) => void
+  // Closes the request only if it is still for `taskId`, the closing dialog's.
+  close: (outcome: ConnectorRuntimeDialogCloseOutcome, taskId: number) => void
   recordDelivery: (delivery: {
     taskId: number
     clientMessageId: string
@@ -128,6 +138,7 @@ function warnCalledOutsideProvider(action: string): void {
 // provider-shaped field to the context value.
 export const NOOP_ACTIONS: ConnectorRuntimeDialogActions = {
   openForTask: () => warnCalledOutsideProvider("openForTask"),
+  openSessionCheck: () => warnCalledOutsideProvider("openSessionCheck"),
   close: () => warnCalledOutsideProvider("close"),
   recordDelivery: () => warnCalledOutsideProvider("recordDelivery"),
   retainOnlyTask: () => warnCalledOutsideProvider("retainOnlyTask"),
@@ -143,6 +154,7 @@ export const NOOP_ACTIONS: ConnectorRuntimeDialogActions = {
 // returns this instead of NOOP_ACTIONS in that case.
 const NOOP_ACTIONS_SILENT: ConnectorRuntimeDialogActions = {
   openForTask: () => {},
+  openSessionCheck: () => {},
   close: () => {},
   recordDelivery: () => {},
   retainOnlyTask: () => {},
@@ -160,8 +172,9 @@ const ConnectorRuntimeDialogStateContext =
 
 // Everything that can move the current request, as data.
 export type RequestInput =
-  | { type: "open"; taskId: number }
-  | { type: "close"; outcome: ConnectorRuntimeDialogCloseOutcome }
+  | { type: "open"; taskId: number; trigger: "turn_failure" }
+  | { type: "open"; taskId: number; trigger: "session_open"; cause: SessionCheckCause }
+  | { type: "close"; taskId: number; outcome: ConnectorRuntimeDialogCloseOutcome }
   | { type: "retain"; taskId: number | null }
   | { type: "forget"; taskId: number }
   | { type: "identity-changed" }
@@ -173,6 +186,22 @@ export function transitionRequest(prev: ConnectorRuntimeDialogState, input: Requ
   switch (input.type) {
     case "open": {
       const { taskId } = input
+      if (input.trigger === "session_open") {
+        // A session check never touches the stash or the tickets, and yields to
+        // a message on its way: a ticket (queued or unacknowledged), or on a
+        // fresh view a stash (delivered, turn not ended). A reconnect ignores
+        // the stash, since a failure frame lost while disconnected is never
+        // replayed, but stays quiet for a check the user closed this view.
+        const { cause } = input
+        const base = cause === "opened" && prev.dismissedCheck !== null ? { ...prev, dismissedCheck: null } : prev
+        if (
+          base.request?.taskId === taskId
+          || base.pending.some(p => p.taskId === taskId)
+          || (cause === "opened" ? base.payload?.taskId === taskId : base.dismissedCheck === taskId)
+        ) return base
+        const seq = base.seq + 1
+        return { ...base, seq, request: { taskId, seq, resendPayload: null, trigger: "session_open" } }
+      }
       // A staged, not-yet-acknowledged turn for this task outranks the
       // confirmed stash: it is the more recently sent one. Only an
       // unambiguous single in-flight turn can be claimed, though -- the
@@ -208,6 +237,7 @@ export function transitionRequest(prev: ConnectorRuntimeDialogState, input: Requ
       // so a second tab's broadcast frame cannot make an in-flight resend
       // button disappear.
       const kept = prev.request?.taskId === taskId ? prev.request.resendPayload : null
+      // An open session check for this task is upgraded (its `kept` is null).
       const seq = prev.seq + 1
       return {
         seq,
@@ -215,33 +245,42 @@ export function transitionRequest(prev: ConnectorRuntimeDialogState, input: Requ
           taskId,
           seq,
           resendPayload: ambiguous ? (kept ?? null) : (staged ?? stashed ?? kept),
+          trigger: "turn_failure",
         },
         payload: stashed ? null : prev.payload,
         pending: prev.pending.filter(p => p.taskId !== taskId),
+        dismissedCheck: prev.dismissedCheck === taskId ? null : prev.dismissedCheck,
       }
     }
     case "close": {
       const { outcome } = input
-      if (prev.request === null) return prev
+      // Another task's dialog (mounted for a render after a switch) cannot close it.
+      if (prev.request === null || prev.request.taskId !== input.taskId) return prev
       // "dismissed": the user ended a dialog they saw (close, Esc, Got it,
-      //   or a save that settled it without a resend) -- drop the stash too.
+      //   or a save that settled it without a resend) -- drop the stash too,
+      //   but only for a turn_failure request, the one the stash is about. A
+      //   dismissed session check is remembered instead (dismissedCheck).
       // "resent": the stash now holds the turn that was just resent; keep it.
       // "not-shown": the dialog never became visible; keep the stash.
       // "left-host": the user navigated off the host pages after seeing
       //   it; they did not choose to give up, so keep the stash.
-      return { ...prev, request: null, payload: outcome === "dismissed" ? null : prev.payload }
+      const dismissed = outcome === "dismissed" ? prev.request.trigger : null
+      const dismissedCheck = dismissed === "session_open" ? input.taskId : prev.dismissedCheck
+      return { ...prev, request: null, payload: dismissed === "turn_failure" ? null : prev.payload, dismissedCheck }
     }
     case "retain": {
       const { taskId } = input
       const nextRequest = prev.request && prev.request.taskId === taskId ? prev.request : null
       const nextPayload = prev.payload && prev.payload.taskId === taskId ? prev.payload : null
       const nextPending = prev.pending.filter(p => p.taskId === taskId)
+      const dismissedCheck = prev.dismissedCheck === taskId ? taskId : null
       if (
         nextRequest === prev.request
         && nextPayload === prev.payload
         && nextPending.length === prev.pending.length
+        && dismissedCheck === prev.dismissedCheck
       ) return prev
-      return { ...prev, request: nextRequest, payload: nextPayload, pending: nextPending }
+      return { ...prev, request: nextRequest, payload: nextPayload, pending: nextPending, dismissedCheck }
     }
     case "forget": {
       const { taskId } = input
@@ -278,12 +317,13 @@ export function transitionRequest(prev: ConnectorRuntimeDialogState, input: Requ
     }
     case "identity-changed":
       return prev.request === null && prev.payload === null && prev.pending.length === 0
+        && prev.dismissedCheck === null
         ? prev
-        : { ...prev, request: null, payload: null, pending: [] }
+        : { ...prev, request: null, payload: null, pending: [], dismissedCheck: null }
   }
 }
 
-const INITIAL_STATE: ConnectorRuntimeDialogState = { seq: 0, request: null, payload: null, pending: [] }
+const INITIAL_STATE: ConnectorRuntimeDialogState = { seq: 0, request: null, payload: null, pending: [], dismissedCheck: null }
 
 export function ConnectorRuntimeDialogProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<ConnectorRuntimeDialogState>(INITIAL_STATE)
@@ -292,10 +332,9 @@ export function ConnectorRuntimeDialogProvider({ children }: { children: React.R
   const apply = useCallback((input: RequestInput) => setState(prev => transitionRequest(prev, input)), [])
 
   // A signed-in identity change (logout, or another tab switching accounts)
-  // clears the request, the stash, and any pending candidates. This also
-  // runs on mount, when all three are already empty, so it is harmless
-  // there; React's strict-mode double-invoke of effects is likewise
-  // harmless for the same reason.
+  // clears the request, the stash, any pending candidates and dismissedCheck.
+  // This also runs on mount, when all four are already empty, so it is
+  // harmless there; so is React's strict-mode double-invoke of effects.
   useEffect(() => {
     apply({ type: "identity-changed" })
   }, [userId, apply])
@@ -303,10 +342,14 @@ export function ConnectorRuntimeDialogProvider({ children }: { children: React.R
   const actions = useMemo<ConnectorRuntimeDialogActions>(() => ({
     openForTask: (taskId) => {
       if (!Number.isInteger(taskId) || taskId <= 0) return
-      apply({ type: "open", taskId })
+      apply({ type: "open", taskId, trigger: "turn_failure" })
     },
-    close: (outcome) => {
-      apply({ type: "close", outcome })
+    openSessionCheck: (taskId, cause) => {
+      if (!Number.isInteger(taskId) || taskId <= 0) return
+      apply({ type: "open", taskId, trigger: "session_open", cause })
+    },
+    close: (outcome, taskId) => {
+      apply({ type: "close", taskId, outcome })
     },
     recordDelivery: (delivery) => {
       // Ticket taken up: only a delivery whose clientMessageId matches a

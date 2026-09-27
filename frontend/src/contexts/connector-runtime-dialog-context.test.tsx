@@ -15,10 +15,12 @@ import {
   transitionRequest,
   type ConnectorRuntimeDialogActions,
   type ConnectorRuntimeDialogCloseOutcome,
+  type ConnectorRuntimeDialogRequest,
   type ConnectorRuntimeDialogState,
   type ConnectorRuntimeDialogValue,
   type ConnectorRuntimeResendPayload,
   type RequestInput,
+  type SessionCheckCause,
 } from "./connector-runtime-dialog-context"
 
 afterEach(() => {
@@ -44,7 +46,7 @@ describe("useConnectorRuntimeDialogActionsIfMounted", () => {
     render(<Probe />)
     act(() => {
       actions?.openForTask(1)
-      actions?.close("dismissed")
+      actions?.close("dismissed", 1)
       actions?.recordDelivery({ taskId: 1, clientMessageId: "x", text: "hi" })
       actions?.retainOnlyTask(1)
       actions?.forgetDelivery(1)
@@ -337,30 +339,41 @@ describe("pending candidate state machine", () => {
   })
 })
 
+// Shared by the two transitionRequest tables below.
+const delivery = (taskId: number, clientMessageId: string) => ({
+  taskId, clientMessageId, text: clientMessageId, files: [] as File[],
+})
+const stash1 = delivery(1, "stash-1")
+const stash2 = delivery(2, "stash-2")
+const staged1 = delivery(1, "staged-1")
+const staged1b = delivery(1, "staged-1b")
+const staged2 = delivery(2, "staged-2")
+const keptSnap = delivery(1, "kept-1")
+const request = (
+  taskId: number,
+  seq: number,
+  resendPayload: ConnectorRuntimeResendPayload | null = null,
+  trigger: ConnectorRuntimeDialogRequest["trigger"] = "turn_failure",
+): ConnectorRuntimeDialogRequest => ({ taskId, seq, resendPayload, trigger })
+const state = (overrides: Partial<ConnectorRuntimeDialogState> = {}): ConnectorRuntimeDialogState => (
+  { seq: 4, request: null, payload: null, pending: [], dismissedCheck: null, ...overrides }
+)
+const open = (taskId: number): RequestInput => ({ type: "open", taskId, trigger: "turn_failure" })
+const closeAs = (outcome: ConnectorRuntimeDialogCloseOutcome, taskId = 1): RequestInput => (
+  { type: "close", taskId, outcome }
+)
+const check = (taskId: number, cause: SessionCheckCause): RequestInput => (
+  { type: "open", taskId, trigger: "session_open", cause }
+)
+const sessionCheck = (taskId: number, seq = 4) => request(taskId, seq, null, "session_open")
+
+
 // Every request transition the provider's actions made before they were
 // moved into transitionRequest, pinned as data: each row is one previous
 // state, one input, and the state that must come out. A row whose expected
 // state is `"same"` must return the very object it was given -- the
 // provider relies on that to skip a re-render when nothing changed.
 describe("transitionRequest keeps today's transitions", () => {
-  const delivery = (taskId: number, clientMessageId: string) => ({
-    taskId, clientMessageId, text: clientMessageId, files: [] as File[],
-  })
-  const stash1 = delivery(1, "stash-1")
-  const stash2 = delivery(2, "stash-2")
-  const staged1 = delivery(1, "staged-1")
-  const staged1b = delivery(1, "staged-1b")
-  const staged2 = delivery(2, "staged-2")
-  const keptSnap = delivery(1, "kept-1")
-  const request = (taskId: number, seq: number, resendPayload: ConnectorRuntimeResendPayload | null = null) => (
-    { taskId, seq, resendPayload }
-  )
-  const state = (overrides: Partial<ConnectorRuntimeDialogState> = {}): ConnectorRuntimeDialogState => (
-    { seq: 4, request: null, payload: null, pending: [], ...overrides }
-  )
-  const open = (taskId: number): RequestInput => ({ type: "open", taskId })
-  const closeAs = (outcome: ConnectorRuntimeDialogCloseOutcome): RequestInput => ({ type: "close", outcome })
-
   const rows: Array<[string, ConnectorRuntimeDialogState, RequestInput, ConnectorRuntimeDialogState | "same"]> = [
     ["open with nothing to claim", state(), open(1),
       state({ seq: 5, request: request(1, 5) })],
@@ -413,5 +426,135 @@ describe("transitionRequest keeps today's transitions", () => {
   it("keeps an unchanged request object when retaining its own task", () => {
     const prev = state({ request: request(1, 4, keptSnap), payload: stash2 })
     expect(transitionRequest(prev, { type: "retain", taskId: 1 }).request).toBe(prev.request)
+  })
+})
+
+// Session checks, the per-task close and the dismissed-check mark, as data.
+// Columns follow the current request: none, a turn failure (TF) or a
+// session check (SO); the first-gate column does not exist yet.
+describe("transitionRequest opens and closes requests by trigger", () => {
+  const tf = (taskId: number, snap: ConnectorRuntimeResendPayload | null = null) => request(taskId, 4, snap)
+  const rows: Array<[string, ConnectorRuntimeDialogState, RequestInput, ConnectorRuntimeDialogState | "same"]> = [
+    // B0: a close from another task's dialog leaves every request alone.
+    ["B0 none: close from task 2", state({ payload: stash1 }), closeAs("dismissed", 2), "same"],
+    ["B0 TF: close from task 2 keeps task 1's turn failure", state({ request: tf(1, keptSnap), payload: stash1 }), closeAs("dismissed", 2), "same"],
+    ["B0 SO: close from task 2 keeps task 1's session check", state({ request: sessionCheck(1) }), closeAs("not-shown", 2), "same"],
+    // B1: a turn failure for the same task upgrades a session check.
+    ["B1a SO: upgrade claims the stash", state({ request: sessionCheck(1), payload: stash1 }), open(1),
+      state({ seq: 5, request: request(1, 5, stash1), payload: null })],
+    ["B1a SO: upgrade claims the one staged turn", state({ request: sessionCheck(1), payload: stash1, pending: [staged1] }), open(1),
+      state({ seq: 5, request: request(1, 5, staged1), payload: null, pending: [] })],
+    ["B1b SO: another task's turn failure replaces it", state({ request: sessionCheck(2) }), open(1),
+      state({ seq: 5, request: request(1, 5) })],
+    // B2a: nothing new for a task that already has a request.
+    ["B2a TF: opened", state({ request: tf(1, keptSnap) }), check(1, "opened"), "same"],
+    ["B2a TF: reconnected", state({ request: tf(1, keptSnap) }), check(1, "reconnected"), "same"],
+    ["B2a SO: opened", state({ request: sessionCheck(1) }), check(1, "opened"), "same"],
+    // B2b: a session check touches neither the stash nor the tickets.
+    ["B2b none: opened", state({ payload: stash2, pending: [staged2] }), check(1, "opened"),
+      state({ seq: 5, request: request(1, 5, null, "session_open"), payload: stash2, pending: [staged2] })],
+    ["B2b TF: replaces another task's turn failure", state({ request: tf(2, stash2), payload: stash2 }), check(1, "opened"),
+      state({ seq: 5, request: request(1, 5, null, "session_open"), payload: stash2 })],
+    ["B2b SO: replaces another task's session check", state({ request: sessionCheck(2) }), check(1, "reconnected"),
+      state({ seq: 5, request: request(1, 5, null, "session_open") })],
+    ["B2b none: a reconnect does not yield to this task's stash", state({ payload: stash1 }), check(1, "reconnected"),
+      state({ seq: 5, request: request(1, 5, null, "session_open"), payload: stash1 })],
+    // B2c: a ticket for this task, for either cause.
+    ["B2c none: opened yields to a ticket", state({ pending: [staged1] }), check(1, "opened"), "same"],
+    ["B2c none: reconnected yields to a ticket", state({ pending: [staged1] }), check(1, "reconnected"), "same"],
+    ["B2c TF: yields without replacing another task's request", state({ request: tf(2), pending: [staged1] }), check(1, "opened"), "same"],
+    ["B2c SO: yields without replacing another task's request", state({ request: sessionCheck(2), pending: [staged1] }), check(1, "reconnected"), "same"],
+    // B2d: a fresh view yields to this task's stash.
+    ["B2d none: opened yields to the stash", state({ payload: stash1 }), check(1, "opened"), "same"],
+    ["B2d SO: opened yields to the stash", state({ request: sessionCheck(2), payload: stash1 }), check(1, "opened"), "same"],
+    // B2e: a reconnect stays quiet for a check the user closed this view.
+    ["B2e none: reconnected after the user closed it", state({ dismissedCheck: 1 }), check(1, "reconnected"), "same"],
+    ["B2e TF: reconnected after the user closed it", state({ request: tf(2), dismissedCheck: 1 }), check(1, "reconnected"), "same"],
+    // B4-B7: closing a session check never drops the stash.
+    ["B4 SO: dismissed keeps the stash and marks the task", state({ request: sessionCheck(1), payload: stash1 }), closeAs("dismissed"),
+      state({ payload: stash1, dismissedCheck: 1 })],
+    ["B5 SO: resent keeps the stash", state({ request: sessionCheck(1), payload: stash1 }), closeAs("resent"),
+      state({ payload: stash1 })],
+    ["B6 SO: not-shown keeps the stash, no mark", state({ request: sessionCheck(1), payload: stash1 }), closeAs("not-shown"),
+      state({ payload: stash1 })],
+    ["B7 SO: left-host keeps the stash, no mark", state({ request: sessionCheck(1), payload: stash1 }), closeAs("left-host"),
+      state({ payload: stash1 })],
+    ["B4 TF: dismissed drops the stash and marks nothing", state({ request: tf(1), payload: stash1 }), closeAs("dismissed"),
+      state()],
+    // B8-B10 for a session check.
+    ["B8a SO: retain its own task", state({ request: sessionCheck(1) }), { type: "retain", taskId: 1 }, "same"],
+    ["B8b SO: retain another task", state({ request: sessionCheck(1) }), { type: "retain", taskId: 2 }, state()],
+    ["B9a SO: forget keeps the request object", state({ request: sessionCheck(1), payload: stash1 }), { type: "forget", taskId: 1 },
+      state({ request: sessionCheck(1) })],
+    ["B9b SO: forget another task", state({ request: sessionCheck(1) }), { type: "forget", taskId: 2 }, "same"],
+    ["B10 SO: identity change", state({ request: sessionCheck(1) }), { type: "identity-changed" }, state()],
+    // The dismissed-check mark: what clears it.
+    ["mark: a fresh view clears it and checks again", state({ dismissedCheck: 1 }), check(1, "opened"),
+      state({ seq: 5, request: request(1, 5, null, "session_open") })],
+    ["mark: a fresh view of another task clears it", state({ dismissedCheck: 1, pending: [staged2] }), check(2, "opened"),
+      state({ pending: [staged2] })],
+    ["mark: a turn failure for that task clears it", state({ dismissedCheck: 1 }), open(1),
+      state({ seq: 5, request: request(1, 5) })],
+    ["mark: a turn failure for another task keeps it", state({ dismissedCheck: 1 }), open(2),
+      state({ seq: 5, request: request(2, 5), dismissedCheck: 1 })],
+    ["mark: switching away clears it", state({ dismissedCheck: 1 }), { type: "retain", taskId: 2 }, state()],
+    ["mark: staying on that task keeps it", state({ dismissedCheck: 1 }), { type: "retain", taskId: 1 }, "same"],
+    ["mark: an identity change clears it even with nothing else held", state({ dismissedCheck: 1 }), { type: "identity-changed" }, state()],
+  ]
+
+  it.each(rows)("%s", (_name, prev, input, expected) => {
+    const next = transitionRequest(prev, input)
+    if (expected === "same") expect(next).toBe(prev)
+    else expect(next).toEqual(expected)
+  })
+
+  it("stays quiet on a reconnect only until the task is viewed afresh", () => {
+    const steps: RequestInput[] = [check(1, "opened"), closeAs("dismissed"), check(1, "reconnected")]
+    const afterReconnect = steps.reduce(transitionRequest, state())
+    expect(afterReconnect.request).toBeNull()
+    const reopened = transitionRequest(afterReconnect, check(1, "opened"))
+    expect(reopened.request).toEqual(request(1, 6, null, "session_open"))
+    const closedUnseen = transitionRequest(reopened, closeAs("not-shown"))
+    expect(transitionRequest(closedUnseen, check(1, "reconnected")).request).toEqual(request(1, 7, null, "session_open"))
+  })
+
+  it("keeps a session check when another task's dialog closes in the same batch", () => {
+    let actions: ConnectorRuntimeDialogActions | undefined
+    let value: ConnectorRuntimeDialogValue | undefined
+    function Probe() {
+      actions = useConnectorRuntimeDialogActions()
+      value = useConnectorRuntimeDialog()
+      return null
+    }
+    render(<ConnectorRuntimeDialogProvider><Probe /></ConnectorRuntimeDialogProvider>)
+    act(() => { actions?.openSessionCheck(1, "opened") })
+    act(() => {
+      actions?.openSessionCheck(2, "opened")
+      actions?.close("not-shown", 1)
+    })
+    expect(value?.request).toMatchObject({ taskId: 2, trigger: "session_open" })
+    act(() => {
+      actions?.openSessionCheck(0, "opened")
+      actions?.openSessionCheck(-3, "reconnected")
+      actions?.openSessionCheck(1.5, "opened")
+    })
+    expect(value?.request).toMatchObject({ taskId: 2 })
+  })
+
+  it("gives openSessionCheck the same two no-provider defaults as every other action", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
+    let silent: ConnectorRuntimeDialogActions | undefined
+    let plain: ConnectorRuntimeDialogActions | undefined
+    function Probe() {
+      silent = useConnectorRuntimeDialogActionsIfMounted()
+      plain = useConnectorRuntimeDialogActions()
+      return null
+    }
+    render(<Probe />)
+    silent?.openSessionCheck(1, "opened")
+    expect(warnSpy).not.toHaveBeenCalled()
+    plain?.openSessionCheck(1, "opened")
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("openSessionCheck() was called outside"))
+    warnSpy.mockRestore()
   })
 })
