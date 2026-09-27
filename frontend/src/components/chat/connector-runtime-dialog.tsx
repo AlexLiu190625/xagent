@@ -365,7 +365,8 @@ function noticeText(
 // met line covers the rest: no snapshot at all, a send-failed panel that
 // already carries the message and its own retry button, and a resend of this
 // very message still on the wire. Short of met, the line says why the dialog
-// is open.
+// is open; a session check asks the user to fill something in only while the
+// report still has something this dialog can fill.
 function descriptionKey(
   kind: DialogOutcome["kind"],
   trigger: ConnectorRuntimeDialogTrigger,
@@ -373,7 +374,8 @@ function descriptionKey(
 ): TranslationKey {
   if (kind === "met") return metHoldingSnapshot ? "connectorRuntime.metNotResent" : "connectorRuntime.metNothingLeft"
   switch (trigger) {
-    case "session_open": return "connectorRuntime.sessionOpenDescription"
+    case "session_open":
+      return kind === "fillable" ? "connectorRuntime.sessionOpenDescription" : "connectorRuntime.sessionOpenNotFillable"
     case "turn_failure": return "connectorRuntime.description"
     default: return assertNever(trigger)
   }

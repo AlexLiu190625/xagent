@@ -4181,6 +4181,30 @@ describe("a session check shows only what the user can fill", () => {
   })
 
   it.each([
+    ["unsupported_only", () => ok(report(false, [
+      connector(REF_A, "A", [input({ section: "secrets", key: "api_key", type: "string", required: true })]),
+    ]))],
+    ["nothing_fillable", () => ok(report(false, []))],
+  ] as const)("stops asking the user to fill it in when a shown check re-reads %s", async (_name, result) => {
+    fetchMock.mockResolvedValueOnce(fillable())
+    renderHarness()
+    await openSessionCheck()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce({
+      ok: false, kind: "coded", status: 409, code: "runtime_context_immutable",
+      reason: "conflict.context.token", connectorRef: REF_A,
+    })
+    fetchMock.mockResolvedValueOnce(result())
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.acknowledge")).toBeInTheDocument())
+    expect(screen.getByText("connectorRuntime.sessionOpenNotFillable")).toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.sessionOpenDescription")).not.toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.description")).not.toBeInTheDocument()
+  })
+
+  it.each([
     ["met", () => ok(report(true, []))],
     ["unsupported_only", () => ok(report(false, [
       connector(REF_A, "A", [input({ section: "secrets", key: "api_key", type: "string", required: true })]),
