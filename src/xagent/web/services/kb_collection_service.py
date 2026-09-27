@@ -214,13 +214,18 @@ def _delete_collection_uploaded_files_impl(
             deleted_file_ids.add(current_file_id)
 
     if collection_dir is not None:
-        prefix = str(collection_dir.resolve()) + os.sep
-        dir_str = str(collection_dir.resolve())
+        # Rows hold the composed or the resolved path; they differ behind a symlink.
+        dirs = {str(collection_dir), str(collection_dir.resolve())}
+        prefixes = tuple(d + os.sep for d in dirs)
         query = db.query(UploadedFile).filter(
             UploadedFile.user_id == user_id,
             or_(
-                UploadedFile.storage_path.startswith(prefix),
-                UploadedFile.storage_path == dir_str,
+                UploadedFile.storage_path.in_(dirs),
+                *(
+                    # PostgreSQL's LIKE would otherwise take a backslash as an escape.
+                    UploadedFile.storage_path.startswith(p, autoescape=True)
+                    for p in prefixes
+                ),
             ),
         )
         # Exclude file_ids already deleted in the first pass to avoid double-count
@@ -228,6 +233,10 @@ def _delete_collection_uploaded_files_impl(
             query = query.filter(UploadedFile.file_id.notin_(deleted_file_ids))
         store = UploadedFileStore(db)
         for file_record in query.all():
+            path = str(file_record.storage_path)
+            # SQLite's LIKE ignores ASCII case.
+            if path not in dirs and not path.startswith(prefixes):
+                continue
             store.delete(file_record, delete_local=False, after_commit=after_commit)
             deleted_uploaded_files += 1
 
