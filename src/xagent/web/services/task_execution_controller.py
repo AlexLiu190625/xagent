@@ -13,13 +13,16 @@ import enum
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, AsyncIterator
+from typing import TYPE_CHECKING, Any, AsyncIterator
 from uuid import uuid4
 
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, false, func, or_, select, update
 from sqlalchemy.orm import object_session
 
 from ..models.task import Task, TaskStatus, task_status_predicate
+
+if TYPE_CHECKING:
+    from .task_lease_service import TaskLease
 
 
 class TaskControlState(str, enum.Enum):
@@ -122,6 +125,35 @@ def task_control_snapshot(task: Task) -> TaskControlSnapshot:
     )
 
 
+def live_foreign_owner_absent(owner_lease: "TaskLease | None") -> Any:
+    """SQL condition: no acquisition but ``owner_lease`` owns the row live.
+
+    True when the row has no owner, its lease has expired, or it is still
+    held by exactly ``owner_lease`` (runner and attempt). An owner-free row is
+    the normal state after a local run settled itself -- a non-shared release
+    clears ``runner_id`` and the attempt but keeps ``run_id`` -- and an
+    expired one is what lease acquisition may take over, so neither is a
+    reason to refuse. Only a live, different acquisition is.
+    """
+    from .task_lease_service import utc_now
+
+    now = utc_now()
+    is_owner = (
+        and_(
+            Task.runner_id == owner_lease.runner_id,
+            Task.lease_attempt_id == owner_lease.attempt_id,
+        )
+        if owner_lease is not None and owner_lease.attempt_id is not None
+        else false()
+    )
+    return or_(
+        Task.runner_id.is_(None),
+        Task.lease_expires_at.is_(None),
+        Task.lease_expires_at < now,
+        is_owner,
+    )
+
+
 def apply_task_control_transition(
     task: Task,
     control_state: TaskControlState,
@@ -130,12 +162,21 @@ def apply_task_control_transition(
     new_run: bool = False,
     expected_run_id: str | None = None,
     expected_state_version: int | None = None,
+    fence_live_owner: bool = False,
+    owner_lease: "TaskLease | None" = None,
     refuse_terminal_status: bool = False,
 ) -> TaskControlSnapshot:
     """Mutate one ORM task with a monotonic control-state transition.
 
     The caller owns the transaction. This lets terminal task status and its
     assistant transcript row continue to commit atomically.
+
+    ``fence_live_owner`` refuses the write while an acquisition other than
+    ``owner_lease`` (the caller's own, or ``None`` when it holds none) owns
+    the row unexpired -- see :func:`live_foreign_owner_absent`. An expired
+    RUNNING takeover keeps ``run_id``, so the run fence alone would let a
+    caller stamp the write onto a successor's run. A refusal raises
+    :class:`StaleTaskRunError`, as a rotated run does.
 
     ``refuse_terminal_status`` raises :class:`TaskStatusRefusedError` instead
     of transitioning a :data:`NON_RESUMABLE_STATUSES` row, checked in the
@@ -161,7 +202,6 @@ def apply_task_control_transition(
             f"task {task.id} state changed from version "
             f"{expected_state_version} to {current_state_version}"
         )
-
     if new_run:
         current_run_id = str(uuid4())
     elif current_run_id is None and control_state not in {
@@ -193,6 +233,8 @@ def apply_task_control_transition(
             statement = statement.where(
                 func.coalesce(Task.state_version, 0) == expected_state_version
             )
+        if fence_live_owner:
+            statement = statement.where(live_foreign_owner_absent(owner_lease))
         if refused:
             statement = statement.where(task_status_predicate.not_in(refused))
         # Keep unrelated caller-owned pending objects out of this helper's
@@ -229,6 +271,11 @@ def apply_task_control_transition(
                 raise error_type(
                     f"task {task_id} no longer matches run {expected_run_id} "
                     f"at state version {expected_state_version}"
+                    + (
+                        ", or another live lease acquisition owns it"
+                        if fence_live_owner
+                        else ""
+                    )
                 )
             session.refresh(task)
         return task_control_snapshot(task)
@@ -253,6 +300,8 @@ def transition_task_control_state_sync(
     new_run: bool = False,
     expected_run_id: str | None = None,
     expected_state_version: int | None = None,
+    fence_live_owner: bool = False,
+    owner_lease: "TaskLease | None" = None,
     refuse_terminal_status: bool = False,
 ) -> TaskControlSnapshot:
     from ..models.database import get_session_local
@@ -269,6 +318,8 @@ def transition_task_control_state_sync(
             new_run=new_run,
             expected_run_id=expected_run_id,
             expected_state_version=expected_state_version,
+            fence_live_owner=fence_live_owner,
+            owner_lease=owner_lease,
             refuse_terminal_status=refuse_terminal_status,
         )
         db.commit()
@@ -385,6 +436,8 @@ class TaskExecutionController:
         new_run: bool = False,
         expected_run_id: str | None = None,
         expected_state_version: int | None = None,
+        fence_live_owner: bool = False,
+        owner_lease: "TaskLease | None" = None,
         refuse_terminal_status: bool = False,
     ) -> TaskControlSnapshot:
         """Apply one control transition, optionally fenced on an exact row.
@@ -408,6 +461,8 @@ class TaskExecutionController:
             new_run=new_run,
             expected_run_id=expected_run_id,
             expected_state_version=expected_state_version,
+            fence_live_owner=fence_live_owner,
+            owner_lease=owner_lease,
             refuse_terminal_status=refuse_terminal_status,
         )
 

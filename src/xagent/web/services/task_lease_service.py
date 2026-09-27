@@ -1670,6 +1670,73 @@ def registered_task_lease(snapshot: TaskLease | None) -> TaskLease | None:
     return entry.lease
 
 
+def local_task_lease_holders(task_id: int, run_id: str) -> tuple[TaskLease, ...]:
+    """Every acquisition this process holds for one task run, lookup only.
+
+    The inverse of :func:`registered_task_lease`: that one starts from a
+    database observation, this one starts from what the process holds, so a
+    caller can learn whether its own live run is still the row's owner
+    without reading the row first. Shared execution holds the coordinator's
+    acquisition; local execution holds its heartbeat registrations. Neither
+    is an ownership grant -- a successor may have taken the row over since,
+    because an expired RUNNING takeover keeps ``run_id`` and mints only a new
+    ``lease_attempt_id``. Writers pass the result to
+    :func:`task_lease_holder_predicate` so the database decides.
+    """
+    from .task_coordinator_runtime import current_task_coordinator
+
+    holders: list[TaskLease] = []
+    coordinator = current_task_coordinator(task_id)
+    if coordinator is not None and coordinator.lease is not None:
+        holders.append(
+            TaskLease(
+                task_id=task_id,
+                runner_id=coordinator.lease.runner_id,
+                run_id=run_id,
+                attempt_id=coordinator.lease.attempt_id,
+            )
+        )
+    manager = _task_lease_heartbeat_manager
+    if manager is not None and manager._loop is asyncio.get_running_loop():
+        for (entry_task_id, _, entry_run_id, _), entry in manager._entries.items():
+            if (
+                entry_task_id == task_id
+                and entry_run_id == run_id
+                and not entry.terminal_event.is_set()
+            ):
+                holders.append(entry.lease)
+    return tuple(holders)
+
+
+def task_lease_holder_predicate(
+    holders: Sequence[TaskLease], *, now: datetime
+) -> ColumnElement[bool]:
+    """SQL fence: the row is still owned, unexpired, by one of ``holders``.
+
+    Missing run or attempt tokens never match, and no holders never matches.
+    A lease is live through ``lease_expires_at == now``, matching takeover
+    and the live-owner fence, which only treat ``lease_expires_at < now`` as
+    expired -- otherwise a row at exactly that instant would be neither
+    takeable nor pausable by its holder.
+    """
+    fences = [
+        and_(
+            Task.runner_id == holder.runner_id,
+            Task.run_id == holder.run_id,
+            task_lease_attempt_predicate(holder),
+        )
+        for holder in holders
+        if holder.run_id is not None and holder.attempt_id is not None
+    ]
+    if not fences:
+        return false()
+    return and_(
+        or_(*fences),
+        Task.lease_expires_at.is_not(None),
+        Task.lease_expires_at >= now,
+    )
+
+
 async def wait_for_heartbeat_manager_idle() -> None:
     """Wait for the current loop's shared heartbeat worker to become idle."""
     manager = _task_lease_heartbeat_manager

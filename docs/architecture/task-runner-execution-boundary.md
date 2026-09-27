@@ -162,8 +162,9 @@ outcome-unknown answer and the task keeps its terminal status, control state,
 run, diagnostic and result. The routing snapshot can be stale, so the
 `resume_requested` transition and the resume lease claim for a recovered
 claim each refuse a FAILED or COMPLETED row in their own conditional UPDATE.
-A refusal at the transition (including a run replaced since the snapshot)
-advances the row to `dispatched` like the case above. A refused lease claim
+A refusal at the transition (including a run replaced since the snapshot, or
+one owned by another live lease acquisition) advances the row to
+`dispatched` like the case above. A refused lease claim
 happens after the command handed off; for a recovered claim every refusal,
 including one by a live owner of the same run, records the row as
 `outcome_unknown`, from which the retried command gives the same answer. If
@@ -267,6 +268,50 @@ shared `commandId` identifies the internal deterministic command, whereas its
 nonshared error correlates with the original `messageId`. Nonshared SDK replies
 return a correlation ID, not a new durable deduplication guarantee. Check task
 state before deciding whether to resume or send new input.
+
+## Live-control writes and lease takeover
+
+Taking over an expired RUNNING lease keeps the row's `run_id` and mints only a
+new `lease_attempt_id`. A process whose lease was taken over while its local
+run kept going (a zombie of the earlier attempt) therefore still matches a run
+id fence. Settlement is already fenced on runner, attempt and run. The two
+control writes a live run makes mid-flight carry the same fence:
+
+- PAUSE interrupts the local run first, unconditionally: a zombie has no
+  business continuing, and its settlement is discarded anyway. It then writes
+  `pause_requested` only if the row is still held, unexpired, by an
+  acquisition this process holds for that run: the coordinator's lease in
+  shared execution, or a live heartbeat registration otherwise
+  (`local_task_lease_holders`). When the row is still this RUNNING run but
+  another acquisition owns it, the command is deferred rather than rejected
+  or acknowledged. The current lease owner can claim the retry (the row names
+  it as runner) and applies the pause to its own run; the zombie, if it
+  claims the retry instead, defers again while that owner's lease is live.
+  A retry that finds the targeted run already PAUSED settles as applied: an
+  earlier attempt interrupted it, for example a holder whose own lease had
+  expired, whose run then paused through its own settlement. A first attempt
+  that finds the task paused still reports that it is already paused.
+- The live-message `resume_requested` handoff, for a row routed as RUNNING,
+  is refused while a live acquisition other than the one this process routed
+  through owns the row. An owner-free row passes, because the local run may
+  have settled itself meanwhile (a non-shared release clears the owner but
+  keeps the run), and so does an expired one, which the resume may take
+  over. A refusal is treated like a rotated run.
+  Such a refusal settles a recovered claim as outcome unknown, the same way
+  as the recovered-claim status refusal described earlier; keeps an accepted
+  injection outcome unknown; and otherwise defers a durable command for
+  retry. It never reports a task failure.
+- PAUSE, CANCEL and MESSAGE commands defer while another runner holds a live
+  lease on the task, so the owner applies them; a MESSAGE whose delivery row
+  already settled is answered from that row instead. A MESSAGE whose
+  delivery no attempt has claimed also defers while this runner owns the
+  RUNNING row under an attempt it does not hold locally, for example between
+  its heartbeat stopping and its settlement.
+
+A result that arrives after its row already settled COMPLETED or FAILED, for
+example after an external cancel that timed out waiting for the runner, is
+ignored. It never turns the row back into PAUSED or rewrites FAILED as
+COMPLETED.
 
 ## Context cache lifetime
 

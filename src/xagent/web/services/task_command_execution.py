@@ -15,6 +15,7 @@ from typing import (
     Iterator,
     Literal,
     Optional,
+    Sequence,
     Union,
     assert_never,
     cast,
@@ -66,7 +67,13 @@ from .task_interaction_close import (
     ActiveInteractionFound,
     ActiveInteractionUnavailable,
 )
-from .task_lease_service import registered_task_lease
+from .task_lease_service import (
+    get_runner_id,
+    local_task_lease_holders,
+    registered_task_lease,
+    task_lease_holder_predicate,
+    utc_now,
+)
 
 if TYPE_CHECKING:
     from .task_orchestrator import TaskTurnPayload, _PreparedTurn
@@ -856,6 +863,10 @@ class _TaskCommandRoutingSnapshot:
     status: TaskStatus
     control_state: str | None
     run_id: str | None
+    # Carried so a write decided on this snapshot can fence on it: a reply
+    # or A2A resume prelease moves a resting row to RUNNING under the same
+    # ``run_id`` and bumps only this.
+    state_version: int
     task_lease: TaskLease | None
     task_input: str
     task_info: dict[str, Any]
@@ -958,6 +969,7 @@ def _load_task_command_routing_snapshot(
             status=status,
             control_state=_task_control_state_value(task),
             run_id=_task_run_id(task),
+            state_version=int(task.state_version or 0),
             task_lease=_task_lease_snapshot(task),
             task_input=str(task.input or ""),
             task_info={
@@ -2120,22 +2132,122 @@ async def handle_task_message(
                             task_id,
                             TaskControlState.RESUME_REQUESTED,
                             expected_run_id=task_run_id,
+                            # An expired-lease takeover keeps the run id, so the
+                            # run fence alone would let this handoff land on a
+                            # successor's running run. For a row routed as
+                            # RUNNING, refuse while a live acquisition other than
+                            # the one this process routed through (``None`` when
+                            # it holds none) owns the row. An owner-free row
+                            # passes: the local run may have settled itself in
+                            # the meantime -- possibly paused by this very
+                            # message's interrupt -- and a non-shared release
+                            # clears the owner but keeps the run.
+                            #
+                            # A row routed as not RUNNING is fenced on the
+                            # routing snapshot's ``state_version`` instead of
+                            # its owner (a shared coordinator keeps owning a
+                            # settled task). A resting row can still be taken:
+                            # the HTTP reply and A2A resume preleases
+                            # (``_acquire_reply_prelease_sync`` /
+                            # ``_acquire_a2a_resume_prelease_sync``) bypass the
+                            # durable queue and move it to RUNNING keeping its
+                            # run id, so the run fence alone would land this
+                            # handoff on the run they just started. Nothing
+                            # this handler does between routing and here bumps
+                            # the version (the delivery claim writes only the
+                            # message row, the admission check only reads, and
+                            # no injection is attempted without a live lease),
+                            # so a moved version is always another writer. A
+                            # RUNNING row takes no version fence: this very
+                            # message's interrupt may legitimately move it.
+                            fence_live_owner=task_status == TaskStatus.RUNNING,
+                            owner_lease=live_task_lease,
+                            expected_state_version=(
+                                None
+                                if task_status == TaskStatus.RUNNING
+                                else routing.state_version
+                            ),
                             refuse_terminal_status=delivery_recovered_claim,
                         )
-                    except (TaskStatusRefusedError, StaleTaskRunError):
-                        # The run ended, or was replaced, after the routing
-                        # snapshot. Only a recovered claim opts into the
-                        # status fence; a stale run on any other message keeps
-                        # its existing handling. A recovered claim may already
-                        # have been applied, so it is never failed: same answer
-                        # as the early refusal above, and the task's status,
-                        # control state and run are untouched.
-                        if not delivery_recovered_claim:
-                            raise
+                    except (
+                        TaskStatusRefusedError,
+                        # A subclass of StaleTaskRunError, named for the
+                        # reader: the version fence on a row routed as not
+                        # RUNNING.
+                        StaleTaskStateVersionError,
+                        StaleTaskRunError,
+                    ):
                         task_execution_service.background_task_manager.release_resume_reservation(
                             task_id
                         )
-                        await settle_accepted_outcome_unknown()
+                        if delivery_recovered_claim:
+                            # The run ended, was replaced, is owned by an
+                            # acquisition this process does not hold, or a
+                            # resting row was taken by another writer, after
+                            # the routing snapshot. A recovered claim may
+                            # already have been applied, so it is never
+                            # failed: same answer as the early refusal above,
+                            # and the task's status, control state and run are
+                            # untouched.
+                            await settle_accepted_outcome_unknown()
+                            return
+                        # Only a recovered claim opts into the status fence,
+                        # so what reaches here is a run, owner or state
+                        # version mismatch.
+                        current_control = await task_execution_controller.snapshot(
+                            task_id
+                        )
+                        if current_control is None or (
+                            current_control.run_id != task_run_id
+                        ):
+                            # A rotated run keeps its existing handling.
+                            raise
+                        # Same run, but a live acquisition this process does
+                        # not hold owns it: a successor, or this runner's own
+                        # attempt in a window where its heartbeat is not
+                        # registered (start-up, or between heartbeat stop and
+                        # settlement). For a row routed as not RUNNING, the
+                        # same run moved under another writer since routing
+                        # (a reply or A2A resume prelease started it). Nothing
+                        # about the task failed, so no task-wide failure is
+                        # broadcast.
+                        logger.info(
+                            "task %s run %s is owned by a lease acquisition "
+                            "this process does not hold, or moved since "
+                            "routing; not handing off message %s here",
+                            task_id,
+                            task_run_id,
+                            turn_id,
+                        )
+                        if posted:
+                            # The injection was accepted; only its handoff is
+                            # uncertain, so it must not invite a resend.
+                            await finish_delivery_failure(
+                                client_error_message(
+                                    ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN
+                                ),
+                                error_code=ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
+                            )
+                            return
+                        if suppress_delivery_ack:
+                            # A durable command retries once the owner is
+                            # settled or its heartbeat is registered. The
+                            # claimed delivery row stays pending, so the retry
+                            # takes the recovered path and no resend is safe.
+                            message_data["_durable_command_defer"] = turn_id
+                            message_data["_durable_command_defer_reason"] = (
+                                f"Message {turn_id} is waiting for the active "
+                                "task lease owner"
+                            )
+                            message_data["_durable_command_defer_unsafe"] = turn_id
+                            return
+                        await finish_delivery_failure(
+                            client_error_message(
+                                ClientErrorCode.MESSAGE_DELIVERY_FAILED
+                            ),
+                            error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED.value,
+                            retry_with_new_id=True,
+                        )
                         return
 
                     previous_task = task_execution_service.background_task_manager.running_tasks.get(
@@ -2701,6 +2813,11 @@ async def handle_task_message(
             # gets the message-processing code while task subscribers get the
             # neutral task-failure code.
             logger.error("Runtime error in agent execution: %s", e, exc_info=True)
+            if delivery_recovered_claim:
+                # As in the generic arm below: an earlier attempt may have
+                # applied this recovered turn, so a failure here cannot prove
+                # it was not accepted, and a resend could duplicate it.
+                delivery_outcome_unknown = True
             if not await answer_durable_turn_failure(
                 ClientErrorCode.MESSAGE_PROCESSING_FAILED
             ):
@@ -2842,8 +2959,23 @@ def _apply_pause_requested_isolated(
     task_id: int,
     *,
     expected_run_id: str | None,
+    owner_leases: Sequence[TaskLease],
 ) -> bool:
-    """Persist PAUSE_REQUESTED for the exact RUNNING run in a short Session."""
+    """Persist PAUSE_REQUESTED for the exact RUNNING run in a short Session.
+
+    ``owner_leases`` are the acquisitions this process holds for the run
+    (``local_task_lease_holders``). The write is fenced on one of them still
+    owning the row, unexpired: an expired RUNNING takeover keeps ``run_id``
+    and mints only a new ``lease_attempt_id``, so a run id fence alone would
+    let a zombie of the earlier attempt -- whose local run just accepted the
+    interrupt -- stamp the pause onto its successor's run, where nothing acts
+    on it. A refusal on a row that is still this RUNNING run therefore means
+    another acquisition owns it: the command is deferred so the retry reaches
+    that owner instead of reporting a pause that nothing will honour.
+
+    A legacy RUNNING row with no run id is left unfenced: every acquisition
+    assigns a run id, so ``run_id IS NULL`` already excludes any leased owner.
+    """
 
     SessionLocal = get_session_local()
     with SessionLocal() as db:
@@ -2863,7 +2995,10 @@ def _apply_pause_requested_isolated(
         statement = (
             statement.where(Task.run_id.is_(None))
             if expected_run_id is None
-            else statement.where(Task.run_id == expected_run_id)
+            else statement.where(
+                Task.run_id == expected_run_id,
+                task_lease_holder_predicate(owner_leases, now=utc_now()),
+            )
         )
         result = db.execute(
             statement.values(**values).execution_options(synchronize_session=False)
@@ -2880,7 +3015,40 @@ def _apply_pause_requested_isolated(
                     f"task {task_id} run changed from {expected_run_id} "
                     f"to {current_run_id}"
                 )
+            if expected_run_id is not None and current[1] == TaskStatus.RUNNING:
+                logger.warning(
+                    "task %s run %s is owned by another lease acquisition; "
+                    "deferring the pause for that owner",
+                    task_id,
+                    expected_run_id,
+                )
+                raise ClientVisibleTaskCommandDeferred(
+                    "Pause command is waiting for the active task lease owner"
+                )
         return False
+
+
+def _pause_retry_found_its_run_paused(
+    status: TaskStatus, run_id: str | None, message_data: dict
+) -> bool:
+    """Whether a durable PAUSE retry finds the run it targeted paused.
+
+    The discriminator is a prior attempt of the same command
+    (``attempt_count > 1``) plus the row resting PAUSED on exactly the run the
+    command targeted. A first attempt that finds the task paused keeps
+    reporting "already paused": the pause predates the command. Any earlier
+    attempt -- deferred after interrupting, or crashed mid-handler -- may have
+    been what paused it, and either way the targeted run is paused as asked.
+    ``defer_count`` alone would miss the crashed-attempt case.
+    """
+
+    target_run_id = message_data.get("_durable_target_run_id")
+    return (
+        status == TaskStatus.PAUSED
+        and target_run_id is not None
+        and run_id == target_run_id
+        and int(message_data.get("_durable_attempt_count") or 1) > 1
+    )
 
 
 async def pause_task(reply: CommandReply, task_id: int, message_data: dict) -> None:
@@ -2955,6 +3123,17 @@ async def pause_task(reply: CommandReply, task_id: int, message_data: dict) -> N
 
         # Check if agent supports pause functionality
         if hasattr(agent_service, "pause_execution"):
+            # Read which acquisitions this process holds before interrupting:
+            # a run that settles quickly after the interrupt unregisters its
+            # heartbeat, and the fenced write below only needs to know whose
+            # run this process was driving. The interrupt itself stays
+            # unconditional -- a zombie of an earlier attempt has no business
+            # continuing either, and its settlement is attempt-fenced.
+            owner_leases = (
+                local_task_lease_holders(task_id, expected_run_id)
+                if expected_run_id is not None
+                else ()
+            )
             logger.info("Agent supports pause_execution, calling it...")
             pause_result = await agent_service.pause_execution()
             if pause_result is False:
@@ -2972,6 +3151,23 @@ async def pause_task(reply: CommandReply, task_id: int, message_data: dict) -> N
                     # START registers its outer handle before AgentRunner is
                     # ready. Preserve a queued pause through that startup gap.
                     raise TaskCommandDeferred("Task execution is still starting")
+                if _pause_retry_found_its_run_paused(
+                    task_fields.status, task_fields.run_id, message_data
+                ):
+                    # An earlier attempt of this command already interrupted
+                    # the run -- typically a lease holder whose fenced write
+                    # was deferred, whose run then settled PAUSED on its own.
+                    # The user's pause took effect; that settlement already
+                    # published the durable PAUSED ``task_info``, so answer
+                    # success without a second pause event. The pause marker
+                    # is not set: nothing is pending for it to hold back.
+                    logger.info(
+                        "Task %s run %s is paused; pause command retry settles "
+                        "as applied",
+                        task_id,
+                        task_fields.run_id,
+                    )
+                    return
                 # ``pause_execution`` reports on the live run only, so it says
                 # "no" both for a task that is already paused and for one that
                 # is not running at all. Those read very differently to a user,
@@ -2996,6 +3192,7 @@ async def pause_task(reply: CommandReply, task_id: int, message_data: dict) -> N
                 lambda: _apply_pause_requested_isolated(
                     task_id,
                     expected_run_id=expected_run_id,
+                    owner_leases=owner_leases,
                 )
             )
             if not pause_applied:
@@ -3768,6 +3965,44 @@ def _message_outcome_unknown_result(task_id: int, command_id: str) -> dict[str, 
     }
 
 
+def _load_live_self_owned_attempt(task_id: int) -> tuple[str, str] | None:
+    """The run and attempt when this runner owns the RUNNING row unexpired."""
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        row = (
+            db.query(Task.run_id, Task.lease_attempt_id)
+            .filter(
+                Task.id == task_id,
+                Task.status == TaskStatus.RUNNING,
+                Task.runner_id == get_runner_id(),
+                Task.run_id.is_not(None),
+                Task.lease_attempt_id.is_not(None),
+                Task.lease_expires_at.is_not(None),
+                Task.lease_expires_at >= utc_now(),
+            )
+            .first()
+        )
+    if row is None:
+        return None
+    return str(row[0]), str(row[1])
+
+
+def _message_never_reached_delivery(
+    command: ClaimedTaskCommand, delivery_status: str | None
+) -> bool:
+    """Whether a deferred MESSAGE provably never reached delivery.
+
+    ``attempt_count == defer_count + 1`` proves every earlier attempt ended in
+    a settled deferral (claiming is the only writer of ``attempt_count``,
+    deferral the only writer of ``defer_count``; an operator retry resets only
+    the latter, the safe direction). A deferral can still follow a delivery
+    claim, so the absence of the turn's delivery row is required as well.
+    """
+
+    return command.attempt_count == command.defer_count + 1 and delivery_status is None
+
+
 def _record_command_outcome_unknown_sync(
     task_id: int, command_id: str, *, attempt_count: int
 ) -> bool:
@@ -3900,16 +4135,66 @@ async def _execute_durable_task_command(
                 f"{command.command_id} was applied",
                 reason="stale_run",
             )
-    if command.kind in {
-        TaskCommandKind.PAUSE,
-        TaskCommandKind.CANCEL,
-    } and await run_db_io_cancellation_safe(
+    # A MESSAGE whose delivery row already settled is answered from that row
+    # without touching the run, whoever owns it; only an unclaimed or pending
+    # one still has to reach the run, and so waits for its owner below.
+    message_delivery_status: str | None = None
+    message_needs_run = False
+    if command.kind == TaskCommandKind.MESSAGE:
+        message_delivery_status = await run_db_io_cancellation_safe(
+            lambda: _load_command_message_delivery_status(
+                command.task_id, command.command_id
+            )
+        )
+        message_needs_run = message_delivery_status in {None, DELIVERY_PENDING}
+    # A live foreign owner applies its own control and live input; routing
+    # lets it claim the retry because the row names it as runner. MESSAGE is
+    # included because an expired-lease takeover keeps the run id, so a
+    # message routed here would otherwise hand a resume to a run this process
+    # cannot acquire. Expired or absent owners are not "live", so recovery of
+    # an abandoned run (the recovered-delivery paths) still proceeds here.
+    if (
+        command.kind in {TaskCommandKind.PAUSE, TaskCommandKind.CANCEL}
+        or message_needs_run
+    ) and await run_db_io_cancellation_safe(
         lambda: task_has_live_foreign_runner(command.task_id)
     ):
-        raise ClientVisibleTaskCommandDeferred(
+        deferral = ClientVisibleTaskCommandDeferred(
             f"{command.kind.value.title()} command {command.command_id} is waiting "
             "for the active task lease owner"
         )
+        if command.kind == TaskCommandKind.MESSAGE:
+            deferral.resend_safe = _message_never_reached_delivery(
+                command, message_delivery_status
+            )
+        raise deferral
+    if command.kind == TaskCommandKind.MESSAGE and message_delivery_status is None:
+        # This runner owns the RUNNING row live, but under an attempt no
+        # heartbeat or coordinator here holds: its own run between heartbeat
+        # stop and settlement, before its heartbeat registered, or a newer
+        # attempt of this runner. The foreign-owner check above cannot see it,
+        # and the live handoff would refuse it only after claiming the
+        # delivery. Only a message no attempt has claimed yet waits here; a
+        # recovered claim keeps its own settlement (it may belong to a turn
+        # the earlier attempt started), and a refusal at the handoff settles
+        # it as outcome unknown.
+        self_owned = await run_db_io_cancellation_safe(
+            lambda: _load_live_self_owned_attempt(command.task_id)
+        )
+        if self_owned is not None:
+            run_id, attempt_id = self_owned
+            if not any(
+                holder.attempt_id == attempt_id
+                for holder in local_task_lease_holders(command.task_id, run_id)
+            ):
+                deferral = ClientVisibleTaskCommandDeferred(
+                    f"Message command {command.command_id} is waiting for the "
+                    "active task lease owner"
+                )
+                deferral.resend_safe = _message_never_reached_delivery(
+                    command, message_delivery_status
+                )
+                raise deferral
 
     resume_result: ResumeCommandResult | None = None
     if command.kind == TaskCommandKind.MESSAGE:
