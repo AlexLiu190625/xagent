@@ -735,8 +735,21 @@ class ExecutionContext:
         (existence) failures are real reports pointing at a file that is
         gone (e.g. an external-credential task's workspace was removed at
         the end of the previous turn); those count toward the caller's
-        unavailable-value notice. Gate 3 (capacity) stops registering new
-        files once the registry is full but still returns the record for
+        unavailable-value notice and each one logs a warning, worded
+        differently for "this execution has no spill directory" and "the
+        file is not under it". Outside the removed-workspace case, a gate 2
+        failure means the tool layer wrote a file this execution cannot
+        find -- the tool set and the execution resolved different
+        directories -- and every spill then reaches the model as
+        "unavailable", which is worse than not spilling; the warning is how
+        that shows up in the logs. Logging relative_path is safe: gate 1
+        has already held it to the canonical spilled-result path, whose
+        file name uses only the filename character set. The writer's
+        per-run file cap bounds how many records one tool set produces; a
+        replay re-validates the same records and logs them again.
+
+        Gate 3 (capacity) stops registering new files once the registry is
+        full but still returns the record for
         this message's own observation text, the same way an
         already-registered relative_path is returned without being
         duplicated.
@@ -765,10 +778,24 @@ class ExecutionContext:
             if not spill_record_shape_is_valid(record):
                 continue
             relative_path = record["relative_path"]
-            if (
-                spill_dir is None
-                or resolve_spilled_under(spill_dir, relative_path) is None
-            ):
+            if spill_dir is None:
+                logger.warning(
+                    "Stored tool result %s cannot be registered: this "
+                    "execution has no workspace path, so it has no spill "
+                    "directory to look in. The model is told the value is "
+                    "unavailable.",
+                    relative_path,
+                )
+                unavailable_count += 1
+                continue
+            if resolve_spilled_under(spill_dir, relative_path) is None:
+                logger.warning(
+                    "Stored tool result %s cannot be registered: it is not a "
+                    "file directly under this execution's spill directory %s. "
+                    "The model is told the value is unavailable.",
+                    relative_path,
+                    spill_dir,
+                )
                 unavailable_count += 1
                 continue
             accepted.append(record)
