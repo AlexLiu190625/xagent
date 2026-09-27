@@ -470,6 +470,8 @@ describe("transitionRequest opens and closes requests by trigger", () => {
     // B2e: a reconnect stays quiet for a check the user closed this view.
     ["B2e none: reconnected after the user closed it", state({ dismissedCheck: 1 }), check(1, "reconnected"), "same"],
     ["B2e TF: reconnected after the user closed it", state({ request: tf(2), dismissedCheck: 1 }), check(1, "reconnected"), "same"],
+    ["B2e none: another task's mark does not keep a reconnect quiet", state({ dismissedCheck: 2 }), check(1, "reconnected"),
+      state({ seq: 5, request: request(1, 5, null, "session_open"), dismissedCheck: 2 })],
     // B4-B7: closing a session check never drops the stash.
     ["B4 SO: dismissed keeps the stash and marks the task", state({ request: sessionCheck(1), payload: stash1 }), closeAs("dismissed"),
       state({ payload: stash1, dismissedCheck: 1 })],

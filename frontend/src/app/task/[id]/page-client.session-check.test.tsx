@@ -104,6 +104,9 @@ describe("nextSessionCheck", () => {
       [3, 3, true, "opened"], [null, 3, true, null], [5, 5, true, "opened"], [5, 5, true, null],
       [5, 5, false, null], [5, 5, true, null], [5, 5, false, null], [5, 5, true, "reconnected"],
     ]],
+    ["E19 the URL briefly disagrees, then shows the same task again: its connection is this view's own", [
+      [5, 5, true, "opened"], [null, 5, true, null], [5, 5, true, "opened"], [5, 5, false, null], [5, 5, true, "reconnected"],
+    ]],
   ])("%s", (_name, steps) => {
     expect(replay(steps)).toEqual(steps.map(step => step[3]))
   })
