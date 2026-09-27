@@ -358,6 +358,10 @@ async def _load_mcp_connection_test_tools(connection: dict[str, Any]) -> Any:
     * When the request reaches that deadline, or is cancelled, the load is
       cancelled too; its slot is given back once the cancelled load has
       returned, which the loader makes prompt.
+    * The loader returns from a cancelled load without waiting for the load's
+      transport to shut down, so this cap counts loads, not transports a
+      cancelled load leaves behind. Those are bounded by the loader's own
+      per-server cap on concurrent initializations.
     * At the deadline the request gets the loader's own timeout result.
     * A timeout of 0 disables the deadline: wait for a slot as long as it
       takes, await the load directly, and let cancellation reach it.
@@ -381,6 +385,19 @@ async def _load_mcp_connection_test_tools(connection: dict[str, Any]) -> Any:
         finally:
             gate.release()
 
+    def _consume_abandoned(task: "asyncio.Task[Any]") -> None:
+        # The request stopped waiting for this load, so nothing else will
+        # retrieve its outcome; do it here so a late failure is not reported
+        # as an exception that was never retrieved.
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.debug(
+                "MCP connection-test load abandoned by its request finished with %s",
+                type(exc).__name__,
+            )
+
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_seconds
     try:
@@ -400,13 +417,6 @@ async def _load_mcp_connection_test_tools(connection: dict[str, Any]) -> Any:
     def _give_back(task: "asyncio.Task[Any]") -> None:
         _mcp_connection_test_loads.discard(task)
         gate.release()
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc is not None:
-            logger.debug(
-                "MCP connection-test load finished with %s", type(exc).__name__
-            )
 
     load.add_done_callback(_give_back)
     try:
@@ -415,10 +425,12 @@ async def _load_mcp_connection_test_tools(connection: dict[str, Any]) -> Any:
         )
     except asyncio.CancelledError:
         load.cancel()
+        load.add_done_callback(_consume_abandoned)
         raise
     if load in done:
         return load.result()
     load.cancel()
+    load.add_done_callback(_consume_abandoned)
     logger.error(
         "MCP connection test did not finish within %ss; reporting a timeout",
         timeout_seconds,
