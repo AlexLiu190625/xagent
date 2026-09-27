@@ -768,7 +768,10 @@ async def test_factory_wires_a_spill_target_when_read_tool_result_is_workspace_b
     target = read_file._spill_target
 
     assert target is not None
-    assert Path(target.spill_dir).parts[-2:] == ("output", "tool-results")
+    assert Path(target.spill_dir).parts[-2:] == (
+        tool_result_spill.SPILL_WORKSPACE_OUTPUT_DIR_NAME,
+        tool_result_spill.SPILL_DIR_NAME,
+    )
     assert target.spill_dir == spill_dir_for_workspace(workspace.workspace_dir)
     assert target.max_chars == read_file._filter.max_chars
 
@@ -819,7 +822,7 @@ async def test_factory_leaves_spill_target_none_for_a_mock_workspace(tmp_path, c
         "read_tool_result is not bound to a task workspace" in message
         for message in disabled
     )
-    assert not (Path(workspace.workspace_dir) / "output" / "tool-results").exists()
+    assert not Path(spill_dir_for_workspace(workspace.workspace_dir)).exists()
 
 
 class _ExtensionReader(AbstractBaseTool):
