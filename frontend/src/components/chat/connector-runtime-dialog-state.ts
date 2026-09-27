@@ -403,7 +403,7 @@ export const INITIAL_DIALOG_STATE: DialogState = {
   read: { nonce: 0, settledKey: null },
 }
 
-/** Events that end a flow, each in the phase it ends (see finishFrom). */
+/** Events that end a flow, each in the phase, or save step, it ends (see finishFrom). */
 export type FinishingEvent =
   // The request moved on while the flow was out: never installs a report,
   // touches the field error or closes. `retryAttempt` is the merged verdict
@@ -506,25 +506,41 @@ function idle(phase: Phase): Phase {
 type Shown = Extract<DialogState, { stage: "shown" }>
 
 /**
- * One finishing event, applied only in `expected`, the phase it ends, and
+ * Where a flow is: the phase kind, with the save's two steps told apart,
+ * because the events that end a save each end exactly one of them -- a
+ * rejection or a landing ends the POST, the re-read a rejection asked for
+ * ends the refresh.
+ */
+type FlowStage = Exclude<Phase["kind"], "saving"> | "saving/post" | "saving/refresh"
+
+function stageOf(phase: Phase): FlowStage {
+  if (phase.kind !== "saving") return phase.kind
+  return phase.step === "post" ? "saving/post" : "saving/refresh"
+}
+
+/**
+ * One finishing event, applied only in `expected`, the stage it ends, and
  * leaving the dialog idle there. Anywhere else it changes nothing: a flow's
- * own finishing event always arrives in that flow's own phase, so a busy
- * phase other than `expected` belongs to another flow still in flight, and
- * releasing it would reopen the save gate under that flow. That flow's own
- * finishing event releases it.
+ * own finishing event always arrives in that flow's own stage, so any other
+ * busy stage belongs to a flow still in flight, and releasing it would
+ * reopen the save gate under that flow. That flow's own finishing event
+ * releases it.
  */
 function finishFrom(
   state: Shown,
-  expected: Phase["kind"],
+  expected: FlowStage,
   apply: (state: Shown) => Shown,
 ): DialogState {
-  return state.phase.kind === expected ? apply(state) : state
+  return stageOf(state.phase) === expected ? apply(state) : state
 }
 
 /**
  * The dialog's only state transition. Pure -- no requests, no toasts, no
  * translation -- because React may call it twice for one event. An event
- * that cannot arrive in the current phase returns the state unchanged.
+ * that starts, advances or ends a flow returns the state unchanged when it
+ * arrives in a phase, or save step, it cannot arrive in. Reads, draft
+ * edits, blur marks and a failed attempt's verdict are not about the phase
+ * and apply whatever it is.
  */
 export function reduceDialog(state: DialogState, event: DialogEvent): DialogState {
   switch (event.type) {
@@ -598,24 +614,23 @@ export function reduceDialog(state: DialogState, event: DialogEvent): DialogStat
       return next === phase ? state : { ...state, phase: next }
     }
     case "save-rejected":
-      return finishFrom(state, "saving", s => (
-        s.phase.kind === "saving" && s.phase.step === "post"
-          ? { ...s, phase: OPEN, view: { ...s.view, fieldError: event.disposition } }
-          : { ...s, phase: OPEN }
-      ))
+      return finishFrom(state, "saving/post", s => ({
+        ...s,
+        phase: OPEN,
+        view: { ...s.view, fieldError: event.disposition },
+      }))
     case "reject-refresh-settled":
-      return finishFrom(state, "saving", (s) => {
-        if (s.phase.kind !== "saving" || s.phase.step !== "refresh") return { ...s, phase: OPEN }
+      return finishFrom(state, "saving/refresh", (s) => {
         if (!event.refreshed) return { ...s, phase: OPEN }
         const { report, seq } = event.refreshed
         return { ...s, phase: OPEN, view: installReport(s.view, report, seq, { rejection: event.disposition }) }
       })
     case "save-landed":
-      return finishFrom(state, "saving", s => (
-        s.phase.kind === "saving" && s.phase.step === "post"
-          ? { ...s, phase: OPEN, view: { ...s.view, report: event.report, reportSeq: event.seq, fieldError: null } }
-          : { ...s, phase: OPEN }
-      ))
+      return finishFrom(state, "saving/post", s => ({
+        ...s,
+        phase: OPEN,
+        view: { ...s.view, report: event.report, reportSeq: event.seq, fieldError: null },
+      }))
     case "resend-settled":
       return finishFrom(state, "sending", s => ({
         ...s,

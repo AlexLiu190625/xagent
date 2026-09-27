@@ -405,18 +405,18 @@ const STATES: Array<[string, DialogState]> = [
   ...PHASES.map(([name, phase]): [string, DialogState] => [name, shown(phase, { fieldError: NETWORK })]),
 ]
 
-const FINISHING: FinishingEvent[] = [
-  { type: "superseded", retryAttempt: null },
-  { type: "superseded", retryAttempt: { merged: "outcome_unknown" } },
-  { type: "save-rejected", disposition: NETWORK },
-  { type: "reject-refresh-settled", disposition: CONFLICT, refreshed: { report: MET_REPORT, seq: 1 } },
-  { type: "reject-refresh-settled", disposition: CONFLICT, refreshed: null },
-  { type: "save-landed", report: MET_REPORT, seq: 1 },
-  { type: "resend-settled", failure: null },
-  { type: "resend-settled", failure: FAILURE },
-  { type: "retry-settled", result: { kind: "sent" } },
-  { type: "retry-settled", result: { kind: "failed", merged: "outcome_unknown" } },
-  { type: "retry-abandoned" },
+const FINISHING: Array<[string, FinishingEvent]> = [
+  ["superseded", { type: "superseded", retryAttempt: null }],
+  ["superseded, retry failed", { type: "superseded", retryAttempt: { merged: "outcome_unknown" } }],
+  ["save-rejected", { type: "save-rejected", disposition: NETWORK }],
+  ["reject-refresh-settled", { type: "reject-refresh-settled", disposition: CONFLICT, refreshed: { report: MET_REPORT, seq: 1 } }],
+  ["reject-refresh-settled, re-read failed", { type: "reject-refresh-settled", disposition: CONFLICT, refreshed: null }],
+  ["save-landed", { type: "save-landed", report: MET_REPORT, seq: 1 }],
+  ["resend-settled, sent", { type: "resend-settled", failure: null }],
+  ["resend-settled, failed", { type: "resend-settled", failure: FAILURE }],
+  ["retry-settled, sent", { type: "retry-settled", result: { kind: "sent" } }],
+  ["retry-settled, failed", { type: "retry-settled", result: { kind: "failed", merged: "outcome_unknown" } }],
+  ["retry-abandoned", { type: "retry-abandoned" }],
 ]
 
 const MID: MidEvent[] = [
@@ -427,18 +427,47 @@ const MID: MidEvent[] = [
   { type: "resend-failed", snapshotId: "cid-1", verdict: "outcome_unknown" },
 ]
 
-// The phase each finishing event ends. `superseded` ends whichever flow is out.
-const ENDS: Record<Exclude<FinishingEvent["type"], "superseded">, Phase["kind"]> = {
-  "save-rejected": "saving",
-  "reject-refresh-settled": "saving",
-  "save-landed": "saving",
-  "resend-settled": "sending",
-  "retry-settled": "retrying",
-  "retry-abandoned": "send-failed",
+const OPEN_PHASE: Phase = { kind: "open" }
+const PANEL: Phase = { kind: "send-failed", failure: FAILURE }
+const PANEL_RETRY_UNKNOWN: Phase = { kind: "send-failed", failure: { ...FAILURE, disposition: "outcome_unknown" } }
+
+// Every cell where a finishing event applies, and the phase it must leave.
+// Each event ends one stage -- the save's two steps count apart -- and
+// `superseded` ends whichever flow is out. A cell missing here must leave
+// the state untouched.
+const APPLIES: Record<string, Phase> = {
+  "open + superseded": OPEN_PHASE,
+  "saving/post + superseded": OPEN_PHASE,
+  "saving/refresh + superseded": OPEN_PHASE,
+  "sending + superseded": OPEN_PHASE,
+  "send-failed + superseded": PANEL,
+  // A superseded retry that learned nothing new goes back to its panel
+  // with the failure it was pressed on.
+  "retrying + superseded": PANEL,
+  "retrying, panel recycled + superseded": OPEN_PHASE,
+  "open + superseded, retry failed": OPEN_PHASE,
+  "saving/post + superseded, retry failed": OPEN_PHASE,
+  "saving/refresh + superseded, retry failed": OPEN_PHASE,
+  "sending + superseded, retry failed": OPEN_PHASE,
+  "send-failed + superseded, retry failed": PANEL,
+  // ...and one that failed carries what it established onto that panel.
+  "retrying + superseded, retry failed": PANEL_RETRY_UNKNOWN,
+  "retrying, panel recycled + superseded, retry failed": OPEN_PHASE,
+  "saving/post + save-rejected": OPEN_PHASE,
+  "saving/refresh + reject-refresh-settled": OPEN_PHASE,
+  "saving/refresh + reject-refresh-settled, re-read failed": OPEN_PHASE,
+  "saving/post + save-landed": OPEN_PHASE,
+  "sending + resend-settled, sent": OPEN_PHASE,
+  "sending + resend-settled, failed": PANEL,
+  "retrying + retry-settled, sent": OPEN_PHASE,
+  "retrying, panel recycled + retry-settled, sent": OPEN_PHASE,
+  "retrying + retry-settled, failed": PANEL_RETRY_UNKNOWN,
+  "retrying, panel recycled + retry-settled, failed": OPEN_PHASE,
+  "send-failed + retry-abandoned": OPEN_PHASE,
 }
 
-function combos<A, B extends { type: string }>(as: Array<[string, A]>, bs: B[]): Array<[string, string, A, B]> {
-  return as.flatMap(([name, a]) => bs.map((b): [string, string, A, B] => [name, b.type, a, b]))
+function combos<A, B>(as: Array<[string, A]>, bs: Array<[string, B]>): Array<[string, string, A, B]> {
+  return as.flatMap(([aName, a]) => bs.map(([bName, b]): [string, string, A, B] => [aName, bName, a, b]))
 }
 
 describe("reduceDialog", () => {
@@ -446,34 +475,38 @@ describe("reduceDialog", () => {
   // nothing will lower again holds every save button and every way of
   // closing the dialog shut for good. Arriving in another flow's phase, it
   // must change nothing, or it would release that flow's hold.
-  it.each(combos(STATES, FINISHING))("a finishing event ends only its own phase: %s + %s", (_name, _type, state, event) => {
+  it.each(combos(STATES, FINISHING))("a finishing event ends only its own stage: %s + %s", (name, eventName, state, event) => {
     const next = reduceDialog(state, event)
-    if (state.stage !== "shown" || (event.type !== "superseded" && ENDS[event.type] !== state.phase.kind)) {
+    const expected = APPLIES[`${name} + ${eventName}`]
+    if (expected === undefined) {
       expect(next).toBe(state)
       return
     }
+    if (state.stage !== "shown" || next.stage !== "shown") throw new Error("expected a shown dialog")
+    expect(next.phase).toEqual(expected)
     expect(busyOf(next)).toBe(false)
     // The request moved on while the flow was out: nothing the flow learned
     // may be installed or pinned onto whatever the dialog now shows.
-    if (event.type === "superseded" && state.stage === "shown" && next.stage === "shown") {
+    if (event.type === "superseded") {
       expect(next.view.fieldError).toBe(state.view.fieldError)
       expect(next.view.report).toBe(state.view.report)
     }
     // A landed save installs a fresh report: a rejection shown before it must
-    // go, not linger next to the report that reversed it. Only the POST step
-    // is the save this event actually lands (see reduceDialog's own step
-    // check); arriving during the refresh step is an unreached cell that
-    // only clears the phase, not the field error, the same as the other
-    // finishing events checked against a step they were not started from.
-    if (event.type === "save-landed" && state.phase.kind === "saving" && state.phase.step === "post" && next.stage === "shown") {
+    // go, not linger next to the report that reversed it.
+    if (event.type === "save-landed") {
       expect(next.view.fieldError).toBeNull()
     }
+  })
+
+  it("lists only cells the table walks", () => {
+    const walked = new Set(combos(STATES, FINISHING).map(([name, eventName]) => `${name} + ${eventName}`))
+    expect(Object.keys(APPLIES).filter(cell => !walked.has(cell))).toEqual([])
   })
 
   // The re-read a rejected save asks for, the resend a landed save runs, and
   // any read or failed attempt that settles in between all keep the flow
   // going: the save buttons must stay closed until the flow itself ends.
-  it.each(combos(BUSY_PHASES, MID))("a mid-flow event keeps a busy phase busy: %s + %s", (_name, _type, phase, event) => {
+  it.each(combos(BUSY_PHASES, MID.map((event): [string, MidEvent] => [event.type, event])))("a mid-flow event keeps a busy phase busy: %s + %s", (_name, _type, phase, event) => {
     const next = reduceDialog(shown(phase), event)
     expect(busyOf(next)).toBe(true)
     const expected: Phase = phase.kind === "saving" && phase.step === "post"
@@ -482,17 +515,6 @@ describe("reduceDialog", () => {
         : event.type === "save-landed-resending" ? { kind: "sending" } : phase
       : phase
     expect(next.stage === "shown" && next.phase).toEqual(expected)
-  })
-
-  it("settles a superseded retry back onto its panel, carrying what the attempt established", () => {
-    const next = reduceDialog(
-      shown({ kind: "retrying", failure: FAILURE }),
-      { type: "superseded", retryAttempt: { merged: "outcome_unknown" } },
-    )
-    expect(next.stage === "shown" && next.phase).toEqual({
-      kind: "send-failed",
-      failure: { snapshotId: "cid-1", disposition: "outcome_unknown" },
-    })
   })
 
   // Two places install a report under a live rejection, and they reconcile
