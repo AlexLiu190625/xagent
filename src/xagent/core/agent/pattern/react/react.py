@@ -583,8 +583,9 @@ class ReActPattern(AgentPattern):
         # Reads on a forced answer turn, and reads refused there because the
         # path is not a stored result, add iterations on top of this bound
         # (forced_answer_extra_iterations, at most FORCED_ANSWER_READ_BUDGET +
-        # FORCED_ANSWER_READ_REJECT_CAP per run); this value itself does not
-        # count them.
+        # FORCED_ANSWER_READ_REJECT_CAP per run). Only forced answer turns may
+        # use them; every other turn stops at this value, which itself does
+        # not count them.
         max_iterations: int = 200,
         tool_choice: str | dict[str, Any] | None = "required",
         reasoning_mode: ReActReasoningMode | str = ReActReasoningMode.TOOL_CALLING,
@@ -846,10 +847,13 @@ class ReActPattern(AgentPattern):
         )
 
         # The bound is re-read on every pass because a forced-turn read raises
-        # it; with no such reads the iterations are exactly
+        # it for forced answer turns; every other turn, and every turn of a
+        # run that made no such read, stays within
         # range(self.current_iteration, self.max_iterations).
         for iteration in itertools.count(self.current_iteration):
-            if iteration >= self.max_iterations + self.forced_answer_extra_iterations:
+            if not self._within_iteration_bound(
+                iteration, runtime=runtime, context=context
+            ):
                 break
             self.current_iteration = iteration
             if self.pending_tool_calls:
@@ -876,14 +880,8 @@ class ReActPattern(AgentPattern):
                     return decision_result
 
             settlement_fence = self._settlement_fence_active(runtime)
-            force_final_answer_now = (
-                self.force_final_answer_next
-                or settlement_fence
-                or (
-                    self.finalize_after_tool_result
-                    and not self.pending_tool_calls
-                    and self._latest_tool_result_success(context)
-                )
+            force_final_answer_now = self._forced_answer_turn_now(
+                context, settlement_fence=settlement_fence
             )
             normal_tool_schemas = self._tool_schemas_with_spill_read(
                 base_tool_schemas, spill_read_schema, context
@@ -1048,6 +1046,14 @@ class ReActPattern(AgentPattern):
                         "protocol_code": exc.code,
                     },
                 )
+                if (
+                    unavailable_tool_call
+                    and not settlement_fence
+                    and iteration >= self.max_iterations
+                ):
+                    # Past max_iterations only a forced answer turn may run;
+                    # stop rather than restore the full tool set there.
+                    break
                 try:
                     # The settlement fence outranks unavailable-tool recovery:
                     # restoring the full tool set here is exactly the hole that
@@ -1157,6 +1163,11 @@ class ReActPattern(AgentPattern):
                         allowed_tool_names=recovery_allowed_names,
                     )
                 )
+                if recover_full_tool_set and iteration >= self.max_iterations:
+                    # Past max_iterations only a forced answer turn may run.
+                    # Handing this one the full tool set would run ordinary
+                    # work there, so stop as the loop does at its bound.
+                    break
                 empty_final_answer = self._empty_final_answer_call(normalized)
                 if empty_final_answer is not None:
                     logger.warning(
@@ -2120,6 +2131,38 @@ class ReActPattern(AgentPattern):
         """
         self.force_final_answer_next = False
         self._forced_answer_read_open = False
+
+    def _forced_answer_turn_now(self, context: Any, *, settlement_fence: bool) -> bool:
+        """Whether the turn about to call the model is a forced answer turn."""
+        return (
+            self.force_final_answer_next
+            or settlement_fence
+            or (
+                self.finalize_after_tool_result
+                and not self.pending_tool_calls
+                and self._latest_tool_result_success(context)
+            )
+        )
+
+    def _within_iteration_bound(
+        self, iteration: int, *, runtime: PatternRuntime, context: Any
+    ) -> bool:
+        """Whether the loop may run this iteration.
+
+        max_iterations bounds every turn, as it always has. The iterations
+        forced-turn reads added extend it only for a forced answer turn, or
+        for the pending calls such a turn left behind, so an ordinary turn
+        never runs past max_iterations.
+        """
+        if iteration < self.max_iterations:
+            return True
+        if iteration >= self.max_iterations + self.forced_answer_extra_iterations:
+            return False
+        if self.pending_tool_calls:
+            return self._forced_answer_read_open or self.force_final_answer_next
+        return self._forced_answer_turn_now(
+            context, settlement_fence=self._settlement_fence_active(runtime)
+        )
 
     def _forced_answer_read_allowance_open(self) -> bool:
         """Both per-run forced-turn read allowances still have room."""

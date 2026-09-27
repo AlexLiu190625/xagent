@@ -6377,17 +6377,17 @@ def _visited_iterations(run: _ForcedRun) -> list[int]:
         (3, 2, 0, [2]),
         (3, 3, 0, []),
         (3, 4, 0, []),
-        (2, 0, 2, [0, 1, 2, 3]),
+        (2, 0, 2, [0, 1]),
     ],
     ids=["from_0", "from_max_minus_1", "from_max", "from_max_plus_1", "extra_2"],
 )
 async def test_iterations_match_the_fixed_range_without_forced_reads(
     max_iterations: int, start: int, extra: int, visited: list[int]
 ) -> None:
-    """With no forced-turn read the loop visits exactly
-    range(current_iteration, max_iterations); extra iterations extend that
-    range, and the iteration-limit failure reports them next to
-    max_iterations."""
+    """With no forced answer turn the loop visits exactly
+    range(current_iteration, max_iterations): extra iterations that reads
+    earned do not extend it for ordinary turns. The iteration-limit failure
+    reports them next to max_iterations."""
     pattern = _react(max_iterations=max_iterations, **_NO_REPEATED_TOOL_DECISION)
     pattern.current_iteration = start
     pattern.forced_answer_extra_iterations = extra
@@ -6408,8 +6408,13 @@ async def test_extra_iterations_are_bounded_per_run() -> None:
     offers reads with a work-tool call on every other turn cannot keep
     raising the loop bound: the read allowances are per run, so the extra
     iterations stay at most six and the run ends after a bounded number of
-    model calls. The repeated-tool decision is switched off, because it is
-    not a hard stop."""
+    model calls. Nor can it spend those iterations on work: past
+    max_iterations only a forced answer turn runs, and the one that would be
+    handed the full tool set stops instead, so the work tool runs only on
+    the first turn. The same model on the base commit runs it twice there,
+    because its forced turn at the last counted iteration recovers the full
+    tool set; here that turn is spent on reads. The repeated-tool decision
+    is switched off, because it is not a hard stop."""
     extra_cap = 6
     calls_cap = 2 * (2 + extra_cap) + 1
     safety_stop = 200
@@ -6426,6 +6431,7 @@ async def test_extra_iterations_are_bounded_per_run() -> None:
             )
         return _calculator_call(f"call_calc_{call_number}")
 
+    calculator = FakeTool()
     run = await _run_pattern(
         _react(
             max_iterations=2,
@@ -6433,7 +6439,7 @@ async def test_extra_iterations_are_bounded_per_run() -> None:
             **_NO_REPEATED_TOOL_DECISION,
         ),
         _RespondingLLM(respond),
-        tools=[FakeTool(), RecordingReadToolResultTool()],
+        tools=[calculator, RecordingReadToolResultTool()],
     )
 
     observed_extra = [
@@ -6444,6 +6450,35 @@ async def test_extra_iterations_are_bounded_per_run() -> None:
     assert run.pattern.forced_answer_extra_iterations <= extra_cap
     assert len(run.llm.calls) <= calls_cap
     assert run.result["success"] is False
+    assert run.result["status"] == "max_iterations"
+    assert len(calculator.calls) == 1
+    assert _visited_iterations(run) == [0, 1, 2]
+
+
+@pytest.mark.asyncio
+async def test_ordinary_turn_after_a_recovery_stops_at_max_iterations() -> None:
+    """Reads on a forced turn earn extra iterations, and a later call to a
+    tool the forced turn did not offer gets the full tool set back. The
+    ordinary turn that follows is past max_iterations, so it does not run:
+    the work tool ran once, on the recovered turn, and the loop stops at its
+    bound as it would without the reads."""
+    calculator = FakeTool()
+
+    def respond(kwargs: dict[str, Any], call_number: int) -> Any:
+        if call_number == 1:
+            return _read_batch([{"path": _STORED_PATH}] * 2)
+        return _calculator_call(f"call_calc_{call_number}")
+
+    run = await _run_pattern(
+        _forced_turn_pattern(max_iterations=2, **_NO_REPEATED_TOOL_DECISION),
+        _RespondingLLM(respond),
+        tools=[calculator, RecordingReadToolResultTool()],
+    )
+
+    assert run.pattern.forced_answer_extra_iterations == 2
+    assert run.retry_labels() == ["unavailable_tool_call_recovery"]
+    assert len(calculator.calls) == 1
+    assert _visited_iterations(run) == [0, 1]
     assert run.result["status"] == "max_iterations"
 
 
