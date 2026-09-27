@@ -5042,6 +5042,11 @@ def _read_batch(arguments: Any, prefix: str = "call_read") -> dict[str, Any]:
     )
 
 
+def _refused(text: str) -> dict[str, Any]:
+    """The result a refused forced-turn read gets, carrying that refusal."""
+    return {"success": False, "status": "refused", "error": text}
+
+
 def _always_calculator() -> _RespondingLLM:
     """A fake model that calls the calculator on every call."""
     return _RespondingLLM(lambda kwargs, n: _calculator_call(f"call_{n}"))
@@ -5878,7 +5883,7 @@ async def test_forced_turn_path_matching_and_counters(
         assert reader.calls[0]["path"] == path
     else:
         assert run.tool_outputs(SPILL_READ_TOOL_NAME) == [
-            {"output": FORCED_ANSWER_READ_UNLISTED_PATH_TEXT}
+            _refused(FORCED_ANSWER_READ_UNLISTED_PATH_TEXT)
         ]
 
 
@@ -5900,9 +5905,9 @@ async def test_forced_turn_offset_continuation_counts_as_one_read() -> None:
     assert [call["offset"] for call in reader.calls] == offsets[:3]
     assert run.pattern.forced_answer_reads_used == 3
     assert run.pattern.forced_answer_extra_iterations == 3
-    assert run.tool_outputs(SPILL_READ_TOOL_NAME)[-1] == {
-        "output": FORCED_ANSWER_READS_USED_UP_TEXT
-    }
+    assert run.tool_outputs(SPILL_READ_TOOL_NAME)[-1] == _refused(
+        FORCED_ANSWER_READS_USED_UP_TEXT
+    )
 
 
 @pytest.mark.asyncio
@@ -5992,7 +5997,7 @@ async def test_forced_turn_refusals_once_an_allowance_is_used_up(
     assert run.result["success"] is True
     assert len(reader.calls) == reads_run
     assert run.tool_outputs(SPILL_READ_TOOL_NAME)[reads_run:] == [
-        {"output": text} for text in outputs
+        _refused(text) for text in outputs
     ]
     counters = (
         run.pattern.forced_answer_reads_used,
@@ -6000,6 +6005,60 @@ async def test_forced_turn_refusals_once_an_allowance_is_used_up(
     )
     assert counters == ((3, 0) if used else (0, 3))
     assert run.pattern.forced_answer_extra_iterations == 1
+
+
+class _ToolEventRecordingRuntime(PatternRuntime):
+    """A PatternRuntime that records the tool call ids it was told about."""
+
+    def __init__(self) -> None:
+        super().__init__(execution_id="refused-read")
+        self.tool_events: list[tuple[str, Any]] = []
+
+    async def on_tool_start(self, *, tool_call: dict[str, Any]) -> None:
+        self.tool_events.append(("start", tool_call.get("id")))
+        await super().on_tool_start(tool_call=tool_call)
+
+    async def on_tool_end(self, *, tool_call: dict[str, Any], result: Any) -> None:
+        self.tool_events.append(("end", tool_call.get("id")))
+        await super().on_tool_end(tool_call=tool_call, result=result)
+
+
+@pytest.mark.asyncio
+async def test_a_refused_read_is_closed_like_a_cancelled_call() -> None:
+    """A refused read gets a failed result carrying the refusal text, which
+    the model reads in its observation, and a ledger record with status
+    "refused". Like a cancelled call it sends no tool start or end event:
+    the read never ran, and the start event is where a run is metered."""
+    reader = RecordingReadToolResultTool()
+    context = _forced_turn_context(True, _SPILL_PATH)
+    runtime = _ToolEventRecordingRuntime()
+    reads = [
+        ("call_good", SPILL_READ_TOOL_NAME, {"path": _SPILL_PATH}),
+        ("call_bad", SPILL_READ_TOOL_NAME, {"path": "tool-results/x.json"}),
+    ]
+
+    result = await _forced_turn_pattern(max_iterations=8).run(
+        context=context,
+        tools=[FakeTool(), reader],
+        llm=FakeLLM([_batch_response(*reads), _final_call()]),
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    pattern_ledger = runtime.checkpoints[-1]["pattern_state"]["tool_ledger"]
+    refused = pattern_ledger["call_bad"]
+    assert refused["status"] == "refused"
+    assert refused["result"] == _refused(FORCED_ANSWER_READ_UNLISTED_PATH_TEXT)
+    assert not tool_result_succeeded(refused["result"])
+    assert pattern_ledger["call_good"]["status"] == "completed"
+    observation = next(
+        message.content
+        for message in context.messages
+        if message.role == "tool" and message.tool_call_id == "call_bad"
+    )
+    assert FORCED_ANSWER_READ_UNLISTED_PATH_TEXT in str(observation)
+    assert ("start", "call_good") in runtime.tool_events
+    assert all(call_id != "call_bad" for _, call_id in runtime.tool_events)
 
 
 class _InterruptingReader(RecordingReadToolResultTool):

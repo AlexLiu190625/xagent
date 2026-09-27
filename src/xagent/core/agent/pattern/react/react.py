@@ -4274,6 +4274,21 @@ class ReActPattern(AgentPattern):
                 result=result,
             )
 
+    def _refuse_forced_answer_read(
+        self, tool_call: dict[str, Any], refusal: str, context: Any
+    ) -> None:
+        """Close a forced-turn read the read policy refused.
+
+        Closed the way _cancel_tool_calls closes a call that will never run:
+        one failed result the model reads, carrying the refusal text in
+        error, and one ledger record, here with status "refused". No tool
+        start or end event is sent, as for a cancelled call: on_tool_start
+        is where a tool invocation is metered, and this read never ran.
+        """
+        result = {"success": False, "status": "refused", "error": refusal}
+        self._backfill_result(tool_call, result, context)
+        self._record_tool_call(tool_call, status="refused", result=result)
+
     async def _pause_for_tool_results(
         self,
         *,
@@ -4576,7 +4591,7 @@ class ReActPattern(AgentPattern):
                     segment, context
                 )
                 for refused_call, refusal in refused:
-                    self._backfill_result(refused_call, {"output": refusal}, context)
+                    self._refuse_forced_answer_read(refused_call, refusal, context)
                 if refused:
                     refused_ids = {id(call) for call, _ in refused}
                     self.pending_tool_calls = [

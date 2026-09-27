@@ -423,10 +423,18 @@ async def test_forced_turn_policy_applies_within_one_batch(cell: str) -> None:
     refused = [
         entry["tool_call_id"]
         for entry in context.tool_results
-        if entry["result"] == {"output": FORCED_ANSWER_READS_USED_UP_TEXT}
+        if entry["result"]
+        == {
+            "success": False,
+            "status": "refused",
+            "error": FORCED_ANSWER_READS_USED_UP_TEXT,
+        }
     ]
     read_ids = [call["id"] for call in calls if call["name"] == SPILL_READ_TOOL_NAME]
     assert refused == read_ids[3:]
+    assert [pattern.tool_ledger[call_id].status for call_id in read_ids[3:]] == [
+        "refused"
+    ] * 5
     assert _forced_read_counts(pattern) == (3, 0, 3)
 
 
