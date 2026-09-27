@@ -4127,3 +4127,145 @@ def test_compaction_unchanged_without_spill(tmp_path, monkeypatch, compact):
     assert result.final_count == len(ctx.messages)
     assert result.metadata["removed_count"] == result.original_count - len(ctx.messages)
     assert "spilled_results" not in ctx.components
+
+
+@pytest.mark.parametrize("registry", ["stored_results", "no_registry"])
+def test_drop_oldest_carries_spill_index(tmp_path, registry):
+    names = [f"stored-{index:02d}" for index in range(12)]
+    ctx = _context_with_stored_results(tmp_path, names=names)
+    records = list(ctx.get_component("spilled_results").records)
+    if registry == "no_registry":
+        ctx.components.pop("spilled_results")
+    expected_window = ctx._tail_window_preserving_tool_pairs(
+        ctx.compact_config.max_messages
+    )
+    assert len(ctx.messages) > len(expected_window)
+
+    result = _compact_by_dropping(ctx)
+
+    assert result.strategy == "truncate"
+    assert result.metadata["removed_count"] == result.original_count - len(
+        expected_window
+    )
+    assert result.final_count == len(ctx.messages)
+    if registry == "no_registry":
+        assert ctx.messages == expected_window
+        assert _spill_index_messages(ctx) == []
+        return
+    notice, *window = ctx.messages
+    assert notice.role == "system"
+    assert notice.metadata == {COMPACT_SPILL_INDEX_METADATA_KEY: True}
+    assert notice.content == render_spill_notice(records, style="compaction")
+    assert len(window) == len(expected_window)
+    assert all(a is b for a, b in zip(window, expected_window, strict=True))
+    assert result.final_count == len(expected_window) + 1
+
+
+def test_drop_oldest_keeps_one_spill_index_across_repeated_compaction(tmp_path):
+    """A context under max_messages but still over budget is compacted again
+    every turn with its window keeping every message; the list from the
+    last compaction must be replaced, not joined by another."""
+    ctx = _context_with_stored_results(tmp_path)
+    history_count = len(ctx.messages)
+    assert history_count < ctx.compact_config.max_messages
+
+    for _ in range(4):
+        result = _compact_by_dropping(ctx)
+
+        assert len(_spill_index_messages(ctx)) == 1
+        assert _spill_index_messages(ctx)[0] is ctx.messages[0]
+        assert len(ctx.messages) == history_count + 1
+        assert result.original_count == history_count
+        assert result.metadata["removed_count"] == 0
+
+
+def test_drop_oldest_removed_count_ignores_the_previous_spill_index(tmp_path):
+    """removed_count > 0 is how the runtime tells that history was lost, so
+    taking out the list an earlier compaction inserted must not register as
+    a dropped message."""
+    names = [f"stored-{index:02d}" for index in range(12)]
+    ctx = _context_with_stored_results(tmp_path, names=names)
+    baseline = _context_with_stored_results(tmp_path, names=names)
+    baseline.components.pop("spilled_results")
+
+    for compaction in range(3):
+        result = _compact_by_dropping(ctx)
+        expected = _compact_by_dropping(baseline)
+
+        assert result.metadata["removed_count"] == expected.metadata["removed_count"]
+        assert (
+            result.metadata["dropped_tool_result_count"]
+            == expected.metadata["dropped_tool_result_count"]
+        )
+        assert result.original_count == expected.original_count
+        assert result.final_count == len(ctx.messages) == len(baseline.messages) + 1
+        if compaction:
+            assert result.metadata["removed_count"] == 0
+        assert len(_spill_index_messages(ctx)) == 1
+
+
+@pytest.mark.parametrize(
+    "first, second",
+    [
+        (_compact_by_dropping, _compact_by_dropping),
+        (_compact_by_summary, _compact_by_summary),
+        (_compact_by_dropping, _compact_by_summary),
+        (_compact_by_summary, _compact_by_dropping),
+    ],
+    ids=["drop_drop", "summary_summary", "drop_summary", "summary_drop"],
+)
+def test_spill_index_survives_repeated_compaction(tmp_path, first, second):
+    """The list is built from the registry, not from the messages being
+    removed: after the first list has itself been compacted away, the next
+    one still names every stored file."""
+    ctx = _context_with_stored_results(tmp_path, names=("alpha-result", "beta-result"))
+    records = list(ctx.get_component("spilled_results").records)
+
+    first(ctx)
+    ctx.add_user_message("next request")
+    second(ctx)
+
+    (notice,) = _spill_index_messages(ctx)
+    for record in records:
+        assert record["relative_path"] in notice.content
+    assert notice.content == render_spill_notice(records, style="compaction")
+
+
+@pytest.mark.parametrize(
+    "compact", [_compact_by_summary, _compact_by_dropping], ids=["summary", "drop"]
+)
+def test_spill_index_keeps_superseded_records(tmp_path, compact):
+    """A superseded observation loses its raw result, but its file is still
+    on disk and its registry record stays; the list keeps naming it."""
+    spill_dir = tmp_path / "output" / "tool-results"
+    spill_dir.mkdir(parents=True)
+    (spill_dir / "page-view.json").write_text("[1,2,3]", encoding="utf-8")
+    record = _stored_result_record("page-view")
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.attach_workspace("ws-1", str(tmp_path))
+    ctx.add_user_message("Browse the dashboard")
+    for index, result in enumerate(
+        [
+            {"output": "view 0", SPILL_RESERVED_RESULT_KEY: [record]},
+            {"output": "view 1"},
+        ]
+    ):
+        call_id = f"call-{index}"
+        ctx.add_assistant_message(
+            "",
+            tool_calls=[
+                {"id": call_id, "type": "function", "function": {"name": "computer"}}
+            ],
+        )
+        ctx.add_tool_result(
+            "computer", {**result, SUPERSEDES_SCOPE_KEY: "computer:task-1"}, call_id
+        )
+    superseded = ctx.messages[2]
+    assert superseded.metadata["superseded"] is True
+    assert SPILL_RESERVED_RESULT_KEY not in superseded.metadata["raw_result"]
+
+    compact(ctx)
+
+    (notice,) = _spill_index_messages(ctx)
+    assert record["relative_path"] in notice.content

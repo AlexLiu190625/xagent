@@ -1927,15 +1927,32 @@ class ExecutionContext:
         """Keep a tail window and discard everything before it.
 
         Lossy: the dropped turns are not summarized, recorded, or recoverable
-        from the context. ``strategy="truncate"`` on the result is the trace
-        label for that outcome, not a mode.
+        from the context; the only text re-inserted is the engine's list of
+        stored tool results, built from the spill registry. ``strategy=
+        "truncate"`` on the result is the trace label for that outcome, not a
+        mode.
 
         Note that ``compacted=True`` does not imply anything was removed. When
         the context is over budget but holds no more than ``max_messages``
         messages -- a handful of very large tool results, say -- the window
         keeps all of them and ``removed_count`` is 0. Callers that need to know
         whether the context actually shrank must read ``removed_count``.
+
+        When the registry lists stored results, that list goes in front of the
+        window as one system message, so the context then holds one message
+        more than the window. A list inserted by an earlier compaction is
+        taken out first and is not history: it is not kept in the window, not
+        counted in ``original_count`` or ``removed_count``, and not left beside
+        the new one -- which, when the window keeps every message, would
+        otherwise add one more list on every compaction.
         """
+        history = [
+            message
+            for message in self.messages
+            if not self._is_spill_index_message(message)
+        ]
+        if len(history) != len(self.messages):
+            self.messages = history
         original_count = len(self.messages)
         keep_count = min(max(0, self.compact_config.max_messages), original_count)
         retained = self._tail_window_preserving_tool_pairs(keep_count)
@@ -1947,6 +1964,9 @@ class ExecutionContext:
             [message for message in self.messages if id(message) not in retained_ids]
         )
         self.messages = retained
+        spill_notice = self._spilled_tool_results_notice()
+        if spill_notice:
+            self.messages = [self._spill_index_message(spill_notice), *retained]
         return CompactResult(
             compacted=True,
             original_count=original_count,
@@ -2273,6 +2293,10 @@ class ExecutionContext:
         return Message.role_system(
             notice, metadata={COMPACT_SPILL_INDEX_METADATA_KEY: True}
         )
+
+    @staticmethod
+    def _is_spill_index_message(message: Message) -> bool:
+        return bool((message.metadata or {}).get(COMPACT_SPILL_INDEX_METADATA_KEY))
 
     def _latest_visible_user_message(self) -> Message | None:
         for message in reversed(self.messages):
