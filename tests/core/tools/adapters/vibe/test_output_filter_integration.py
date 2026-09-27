@@ -17,10 +17,12 @@ from xagent.core.tools.adapters.vibe import output_filter_wrapper
 from xagent.core.tools.adapters.vibe.base import AbstractBaseTool, ToolCategory
 from xagent.core.tools.adapters.vibe.config import ToolConfig
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
+from xagent.core.tools.adapters.vibe.function import FunctionTool
 from xagent.core.tools.adapters.vibe.output_filter import DEFAULT_TRUNCATION_MESSAGE
 from xagent.core.tools.adapters.vibe.output_filter_wrapper import (
     OutputFilteredToolWrapper,
 )
+from xagent.core.tools.adapters.vibe.sandboxed_tool import sandbox_config
 from xagent.core.tools.adapters.vibe.sandboxed_tool.sandbox_config import (
     extract_bound_method_target,
 )
@@ -890,6 +892,60 @@ async def test_factory_leaves_spill_target_none_for_a_read_tool_result_that_is_n
     )
 
 
+@pytest.mark.asyncio
+async def test_factory_leaves_spill_target_none_for_a_closure_read_tool_result(
+    tmp_path, caplog, monkeypatch
+):
+    """A FunctionTool under the reader's name whose function is a closure,
+    not a bound method, may well read from a real workspace, but the factory
+    has no instance to find that workspace on: it passes the FunctionTool
+    check and stops at the bound-method one, and the tool set gets no spill
+    target anywhere."""
+    config = ToolConfig(
+        {
+            "workspace": {"task_id": "closure-reader", "base_dir": str(tmp_path)},
+            "file_tools_enabled": False,
+        }
+    )
+    closed_over = TaskWorkspace("closure-reader", str(tmp_path))
+
+    def read_tool_result(path: str = "") -> dict:
+        """Read a stored result through a closure over a workspace."""
+        return {"output": str(closed_over.workspace_dir / path)}
+
+    closure_reader = FunctionTool(read_tool_result, name=SPILL_READ_TOOL_NAME)
+    extracted = []
+    real_extract = sandbox_config.extract_bound_method_target
+
+    def recording_extract(tool):
+        target = real_extract(tool)
+        extracted.append((tool, target))
+        return target
+
+    monkeypatch.setattr(
+        sandbox_config, "extract_bound_method_target", recording_extract
+    )
+    with caplog.at_level(logging.INFO, logger=FACTORY_LOGGER):
+        tools = await ToolFactory.create_all_tools(
+            config, additional_tools=[closure_reader]
+        )
+
+    assert _only_tool_named(tools, SPILL_READ_TOOL_NAME)._target is closure_reader
+    assert (closure_reader, None) in extracted
+    wrappers = [tool for tool in tools if isinstance(tool, OutputFilteredToolWrapper)]
+    assert wrappers
+    assert all(wrapper._spill_target is None for wrapper in wrappers)
+    disabled = [
+        record for record in caplog.records if "spill disabled" in record.getMessage()
+    ]
+    assert disabled
+    assert all(record.levelno == logging.INFO for record in disabled)
+    assert all(
+        "read_tool_result is not bound to a task workspace" in record.getMessage()
+        for record in disabled
+    )
+
+
 # --- a production tool set wires a spill target ---------------------------
 
 
@@ -1009,8 +1065,15 @@ async def test_the_read_back_tool_gets_no_spill_target(tmp_path, max_chars):
         assert SPILL_RESERVED_RESULT_KEY not in reply
         assert reply[text_key] != SPILL_PLACEHOLDER_TEXT
         assert reply == plain._filter_result(raw)
+        # plain is built like reader, so the equality above holds by
+        # construction; these pin what the text itself becomes.
         if max_chars >= tool_result_spill.SPILL_READ_MAX_CHARS:
             assert reply[text_key] == raw[text_key]
+        else:
+            assert (
+                reply[text_key]
+                == raw[text_key][:max_chars] + DEFAULT_TRUNCATION_MESSAGE
+            )
         assert sorted(spill_dir.iterdir()) == stored_files
     assert set(raw) >= {
         "content_preview",

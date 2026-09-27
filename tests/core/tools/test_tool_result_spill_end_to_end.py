@@ -282,30 +282,6 @@ async def _assert_left_to_truncation(tmp_path, caplog, bound_tool_name, **config
     assert observation.content == today.content
 
 
-@pytest.mark.asyncio
-async def test_a_deployment_without_a_workspace_bound_read_tool_result_is_unchanged(
-    tmp_path, caplog
-):
-    """Tool policy leaves write_file, still bound to the task workspace, but
-    none of the reading tools: nothing in the set gets a spill target and an
-    oversized value is truncated exactly as before."""
-    await _assert_left_to_truncation(
-        tmp_path, caplog, "write_file", allowed_tools=["write_file", "acme_big"]
-    )
-
-
-@pytest.mark.asyncio
-async def test_a_legacy_allowlist_without_read_tool_result_stores_nothing(
-    tmp_path, caplog
-):
-    """A concrete allowed_tools list written before read_tool_result existed
-    keeps read_file and drops the reader. A stored value could not be read
-    back, so nothing is stored."""
-    await _assert_left_to_truncation(
-        tmp_path, caplog, "read_file", allowed_tools=["read_file", "acme_big"]
-    )
-
-
 class _ReaderDisabledConfig(ToolConfig):
     """A per-user disabled-tools table that turns off only the reader."""
 
@@ -313,14 +289,31 @@ class _ReaderDisabledConfig(ToolConfig):
         return {SPILL_READ_TOOL_NAME: {"enabled": False}}
 
 
+# Three tool policies that remove read_tool_result while a tool bound to the
+# task workspace stays in the set:
+# - write_file-only: the policy leaves write_file, still bound to the task
+#   workspace, but none of the reading tools.
+# - legacy-allowlist: a concrete allowed_tools list written before
+#   read_tool_result existed keeps read_file and drops the reader.
+# - per-user-disabled: a user disables read_tool_result on its own from the
+#   tool list, which keeps read_file.
 @pytest.mark.asyncio
-async def test_a_per_user_disabled_read_tool_result_stores_nothing(tmp_path, caplog):
-    """A user can disable read_tool_result on its own from the tool list,
-    which keeps read_file. A stored value could not be read back, so
-    nothing is stored."""
-    await _assert_left_to_truncation(
-        tmp_path, caplog, "read_file", config_cls=_ReaderDisabledConfig
-    )
+@pytest.mark.parametrize(
+    ("bound_tool_name", "config"),
+    [
+        ("write_file", {"allowed_tools": ["write_file", "acme_big"]}),
+        ("read_file", {"allowed_tools": ["read_file", "acme_big"]}),
+        ("read_file", {"config_cls": _ReaderDisabledConfig}),
+    ],
+    ids=["write_file-only", "legacy-allowlist", "per-user-disabled"],
+)
+async def test_a_tool_set_without_a_workspace_bound_read_tool_result_stores_nothing(
+    tmp_path, caplog, bound_tool_name, config
+):
+    """A stored value could not be read back, so nothing in the set gets a
+    spill target, nothing is stored, and an oversized value is truncated
+    exactly as before."""
+    await _assert_left_to_truncation(tmp_path, caplog, bound_tool_name, **config)
 
 
 @pytest.mark.asyncio
