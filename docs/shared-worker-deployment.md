@@ -87,6 +87,11 @@ Shared workers process and settle commands under the task coordinator's owner
 attempt. The Registry continues renewing task ownership in batches; shared
 commands no longer have an independent processing lease or heartbeat.
 `retry_available_at` records a business retry delay and is never heartbeat-renewed.
+Every shared agent run holds the task lease. `AgentServiceManager.execute_task`
+refuses to start a run that has none: the caller must pass the lease it owns,
+or let `execute_task` acquire one for a task id. Checkpoints, command results,
+and task settlement are all fenced by that lease, so an unleased run would
+write them unfenced.
 
 Stop all old executors before applying `20260918_command_retry_at`. The migration
 copies pending commands' retry deadlines into `retry_available_at` and preserves

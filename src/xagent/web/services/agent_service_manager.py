@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from ...config import (
     get_external_upload_dirs,
+    get_shared_task_execution_enabled,
 )
 from ...core.agent.service import AgentService
 from ...core.execution_scope import (
@@ -3316,16 +3317,35 @@ class AgentServiceManager:
                 snapshot, leaving tasks stuck RUNNING for SDK clients.
             task_lease: Lease owned by an outer orchestrator. Its run id fences
                 tracker writes when this method does not manage the lease.
+                Under shared task execution a run must hold a lease: either
+                this one, or one acquired here for a task id when
+                ``manage_task_lease`` is true.
             task_lease_heartbeat_task: Heartbeat owned by an inline transport
                 for ``task_lease``. When provided, definitive ownership loss
                 cancels and drains agent execution before this method returns.
 
         Returns:
             Execution result dictionary
+
+        Raises:
+            RuntimeError: Shared task execution is enabled and the run would
+                hold no task lease.
         """
         # Initialize tracker if db_session and task_id are provided
         tracker = None
         tracker_task_id = tracking_task_id or task_id
+        # Shared workers fence checkpoints, command results and task
+        # settlement by the current lease. A run without one would write them
+        # unfenced, so refuse it before any side effect instead of running it.
+        if (
+            task_lease is None
+            and not (manage_task_lease and tracker_task_id)
+            and get_shared_task_execution_enabled()
+        ):
+            raise RuntimeError(
+                "Shared task execution requires a task lease: pass task_lease "
+                "or let execute_task manage the lease for a task id."
+            )
         lease = None
         lease_stop_event = None
         lease_heartbeat_task = None

@@ -70,7 +70,7 @@ from xagent.web.services.chat_history_service import (
     DELIVERY_DISPATCHED,
     DELIVERY_FAILED,
     DELIVERY_PENDING,
-    claim_user_message_delivery,
+    claim_user_message_delivery_no_commit,
     inspect_user_message_delivery,
     mark_user_message_delivery,
     persist_assistant_message,
@@ -3724,13 +3724,14 @@ async def test_schedule_bg_does_not_overwrite_terminal_status_from_execute(
 def _claim_pending_delivery(db, *, task_id: int, user_id: int, turn_id: str) -> None:
     """Create a committed ``pending`` delivery row, mirroring a turn claim."""
 
-    claim = claim_user_message_delivery(
+    claim = claim_user_message_delivery_no_commit(
         db,
         task_id,
         user_id,
         "hello there",
         turn_id=turn_id,
     )
+    db.commit()
     assert claim.claimed is True
     assert claim.pending is True
 
