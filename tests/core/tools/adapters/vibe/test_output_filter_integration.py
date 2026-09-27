@@ -1029,7 +1029,9 @@ async def test_the_factory_the_context_and_the_read_tool_agree_on_the_spill_dire
     """The factory's target, the execution context that registers a spill,
     and read_tool_result all take the directory from spill_dir_for_workspace.
     One workspace object feeds all three here, so this pins the shared
-    spelling, not two separately built workspace objects agreeing."""
+    spelling; test_the_factory_and_the_runner_resolve_one_spill_directory
+    (tests/core/agent/test_agent_service_spill_directory.py) covers two
+    separately built workspace objects agreeing."""
     config = ToolConfig(
         {"workspace": {"task_id": "spill-dir-agree", "base_dir": str(tmp_path)}}
     )
