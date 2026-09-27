@@ -8369,6 +8369,60 @@ describe("connector runtime dialog trigger", () => {
     )
   })
 
+  // The task page counts on this order when it checks a conversation it has
+  // just started showing: sendMessage stages the first message's ticket in
+  // the same synchronous stretch that sets the new task id, so a check asked
+  // for from an effect on that task id always finds the ticket and yields.
+  it("stages a new conversation's first message before an effect on its task id can ask for a check", async () => {
+    apiRequestMock.mockImplementation(async (url: string) => {
+      if (typeof url === "string" && url.endsWith("/api/chat/task/create")) {
+        return jsonResponse({ task_id: 31, title: "hello", description: "hello", status: "pending" })
+      }
+      if (typeof url === "string" && url.includes("connector-runtime-requirements")) {
+        return jsonResponse(CONNECTOR_RUNTIME_REPORT_NEEDS_FILL)
+      }
+      return jsonResponse({})
+    })
+    const checked: number[] = []
+    let send: (() => Promise<void>) | undefined
+    function NewConversationPage() {
+      const { state, sendMessage } = useApp()
+      const { openSessionCheck } = useConnectorRuntimeDialogActions()
+      send = () => sendMessage("hello", { clientMessageId: "turn-first" })
+      React.useEffect(() => {
+        if (state.taskId === null) return
+        checked.push(state.taskId)
+        openSessionCheck(state.taskId, "opened")
+      }, [state.taskId, openSessionCheck])
+      return null
+    }
+    // Disconnected, so the first message stays queued with its ticket held.
+    wsHarness.isConnected = false
+    render(
+      <ConnectorRuntimeDialogProvider>
+        <AppProvider token="token">
+          <ConnectorRuntimeStateProbe />
+          <NewConversationPage />
+        </AppProvider>
+      </ConnectorRuntimeDialogProvider>
+    )
+    let delivery: Promise<void> | undefined
+    await act(async () => {
+      delivery = send?.()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    expect(checked).toEqual([31])
+    expect(connectorRuntimeState.request).toBeNull()
+
+    await act(async () => {
+      wsHarness.isConnected = true
+      webSocketOptions.current?.onConnect?.()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    await act(async () => { await delivery })
+    expect(sendChatMessageMock).toHaveBeenCalledTimes(1)
+  })
+
   it("counts a socket open as a same-task reconnect only when the task was already connected", () => {
     let reconnects: number | undefined
     let setTask: ((taskId: number) => void) | undefined
