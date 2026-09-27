@@ -3358,7 +3358,7 @@ describe("words a settlement that takes the snapshot mid save-and-resend off the
   /** One save-and-resend of `orig-1` whose resend fails with `disposition`. */
   async function firstResendOfOrig1EndsIn(disposition: "outcome_unknown" | "not_sent") {
     fetchMock.mockResolvedValueOnce(ok(fillableReport()))
-    renderHarness()
+    const view = renderHarness()
     await recordThenOpen({ taskId: 1, clientMessageId: "orig-1", text: "hi" })
     await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
     fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
@@ -3366,6 +3366,7 @@ describe("words a settlement that takes the snapshot mid save-and-resend off the
     sendMessageMock.mockRejectedValueOnce(deliveryFailure(disposition))
     fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
     await waitFor(() => expect(screen.getByText("connectorRuntime.actions.resend")).toBeInTheDocument())
+    return view
   }
 
   /**
@@ -3373,26 +3374,30 @@ describe("words a settlement that takes the snapshot mid save-and-resend off the
    * report turns down, leaving the rows and `orig-1` still in the snapshot.
    */
   async function panelDownAfter(disposition: "outcome_unknown" | "not_sent") {
-    await firstResendOfOrig1EndsIn(disposition)
+    const view = await firstResendOfOrig1EndsIn(disposition)
     fetchMock.mockResolvedValueOnce(ok(fillableReport()))
     await openForTask() // a same-task terminal frame; the snapshot stays
     await waitFor(() => expect(screen.getByText("connectorRuntime.actions.resend")).toBeEnabled())
     fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
     expect(screen.queryByText("connectorRuntime.actions.resend")).not.toBeInTheDocument()
     toastMock.mockClear()
+    return view
   }
 
   /**
    * A save-and-resend of whatever the snapshot holds now, whose save is
    * still in flight when a settlement frame for this task takes the snapshot
    * away. The save then lands, and there is nothing left to resend.
+   * `alsoMidSave` runs after the settlement frame, while the save is still
+   * in flight.
    */
-  async function snapshotTakenMidSave() {
+  async function snapshotTakenMidSave(alsoMidSave?: () => Promise<void>) {
     fireEvent.change(screen.getByLabelText("token"), { target: { value: "y" } })
     let resolveSave: (value: unknown) => void = () => {}
     submitMock.mockReturnValueOnce(new Promise((res) => { resolveSave = res }))
     fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
     await act(async () => { latestActions.forgetDelivery(1) })
+    await alsoMidSave?.()
     await act(async () => { resolveSave(ok(report(true, []))) })
   }
 
@@ -3419,6 +3424,36 @@ describe("words a settlement that takes the snapshot mid save-and-resend off the
 
     expect(sendMessageMock).toHaveBeenCalledTimes(1)
     expect(toastMock.mock.calls).toEqual([["connectorRuntime.sendFailed"]])
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+  })
+
+  // The two ways the view can go away under that same save. Either one ends
+  // the flow when the save lands, before the resend step runs, so the only
+  // toast says this press did not resend -- which leaves the earlier "may
+  // have been sent" standing -- rather than saying the message was not sent.
+  it("does not say \"not sent\" when the dialog unmounts mid save after an unknown outcome", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    const view = await panelDownAfter("outcome_unknown")
+    await snapshotTakenMidSave(async () => {
+      view.rerender(<ConnectorRuntimeDialogProvider><Probe mounted={false} /></ConnectorRuntimeDialogProvider>)
+    })
+
+    expect(sendMessageMock).toHaveBeenCalledTimes(1)
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.savedNotResentUnmounted"]])
+    expect(warn).not.toHaveBeenCalledWith("[connector-runtime] resend attempted with no snapshot to send")
+  })
+
+  it("does not say \"not sent\" when a same-task frame retargets the dialog mid save after an unknown outcome", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    await panelDownAfter("outcome_unknown")
+    await snapshotTakenMidSave(async () => {
+      fetchMock.mockResolvedValueOnce(ok(fillableReport()))
+      await openForTask() // a same-task terminal frame retargets this dialog
+    })
+
+    expect(sendMessageMock).toHaveBeenCalledTimes(1)
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.savedNotResentSuperseded"]])
+    expect(warn).not.toHaveBeenCalledWith("[connector-runtime] resend attempted with no snapshot to send")
     expect(screen.getByRole("dialog")).toBeInTheDocument()
   })
 

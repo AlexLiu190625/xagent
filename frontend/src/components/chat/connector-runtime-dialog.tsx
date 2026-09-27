@@ -297,6 +297,17 @@ type ResendOutcome =
   | { kind: "nothing-to-send"; disposition: MessageDeliveryDisposition | null }
 
 /**
+ * The verdict a resend outcome leaves its message with: null once it went
+ * out, otherwise the merged verdict either way of not sending carries. Every
+ * reader of a resend outcome words itself off this one value, so no exit can
+ * drop the carried verdict and take back an earlier unknown outcome, whether
+ * or not that exit is reachable with a given kind today.
+ */
+function resendVerdict(outcome: ResendOutcome): MessageDeliveryDisposition | null {
+  return outcome.kind === "sent" ? null : outcome.disposition
+}
+
+/**
  * Why the message was not resent, for a report canResendReport turns down.
  * Returns null for a met report, which has no such reason. Shared by the two
  * resend entry points so a user who reaches the same dead end from the
@@ -867,11 +878,11 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
 
     dispatch({ type: "save-landed-resending", ...landed })
     const resendOutcome = await doResend(resendFor)
-    // Both ways of not sending are worded off the verdict they carry, so a
-    // snapshot taken mid-save cannot un-say an earlier unknown outcome.
-    const notSent: Tell = {
-      notice: { kind: "resend-not-sent", disposition: resendOutcome.kind === "sent" ? null : resendOutcome.disposition },
-    }
+    // Both ways of not sending are worded off the verdict they carry -- the
+    // toasts below and the panel alike -- so a snapshot taken mid-save cannot
+    // un-say an earlier unknown outcome.
+    const verdict = resendVerdict(resendOutcome)
+    const notSent: Tell = { notice: { kind: "resend-not-sent", disposition: verdict } }
     // Read after the await: when settle finds the request still current,
     // the snapshot it carries is the one doResend read, which is what the
     // panel raised below is about and what its retry button would send.
@@ -904,7 +915,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
               type: "resend-settled",
               failure: {
                 snapshotId: failedSnapshotId,
-                disposition: resendOutcome.kind === "failed" ? resendOutcome.disposition : null,
+                disposition: verdict,
               },
             },
           },
@@ -974,7 +985,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     // returns, which already folds in every earlier attempt for this message
     // (see DeliveryVerdicts in connector-runtime-dialog-state.ts), so a
     // refusal cannot un-say an earlier unknown outcome.
-    const merged = resendOutcome.kind === "sent" ? null : resendOutcome.disposition
+    const merged = resendVerdict(resendOutcome)
     const notSent: Tell = { notice: { kind: "resend-not-sent", disposition: merged } }
     settle(seqAtStart, {
       // A failed retry leaves no panel in an unmounted tree, so without this
