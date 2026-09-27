@@ -264,3 +264,25 @@ def test_flag_true_puts_framing_only_on_the_latest_of_two_identical_text_answers
         "The exact allowlisted question and clean answer are in the canonical "
         "request-language evidence in the system context."
     ) in latest_answer_content
+
+
+def test_both_texts_are_pinned_literally() -> None:
+    """Every other test takes its expected text from these two constants, so a
+    reworded constant -- for instance one that drops the approval sentences --
+    would leave them all green. This is the one place the model-facing wording
+    is written out in full.
+    """
+    assert FORM_ANSWER_FRAMING == (
+        "It answers the form you asked for; use it to continue the current "
+        "user request. "
+    )
+    assert FORM_ANSWER_CONTINUATION_INSTRUCTION == (
+        "The latest user message answers the form you asked for. Use those "
+        "answers to continue the current user request. Do not ask again for "
+        "information those answers already provide; if something required is "
+        "still missing or unusable, ask only for that. If the answers change or "
+        "cancel the request, follow the answers. This does not replace any "
+        "confirmation or approval your instructions require before an action. "
+        "Approving one proposal does not approve a changed or different "
+        "action.\n\n"
+    )

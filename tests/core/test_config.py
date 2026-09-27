@@ -661,6 +661,11 @@ class TestFormAnswerContinuationConfig:
             monkeypatch.setenv(FORM_ANSWER_CONTINUATION_MODELS, value)
         assert get_form_answer_continuation_models() == expected
 
+    def test_env_var_name_constant(self):
+        assert (
+            FORM_ANSWER_CONTINUATION_MODELS == "XAGENT_FORM_ANSWER_CONTINUATION_MODELS"
+        )
+
 
 class TestMCPOAuthConfig:
     def test_allow_private_hosts_defaults_false(self, monkeypatch):
