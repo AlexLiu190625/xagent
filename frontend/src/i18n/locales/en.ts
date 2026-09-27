@@ -4948,6 +4948,8 @@ Build when you need.`,
   connectorRuntime: {
     title: "This connector needs more information",
     description: "The last message could not run because a connector it uses is missing some required input.",
+    sessionOpenDescription: "A connector this conversation uses is missing some required input. Fill it in before you send your next message.",
+    sessionOpenNotFillable: "A connector this conversation uses is missing some required input.",
     metTitle: "This connector has everything it needs",
     metNotResent: "Nothing is missing for this connector any more. The message that failed was not sent again; send it once more from the message box when you want it to run.",
     metNothingLeft: "Everything this connector needs is saved.",

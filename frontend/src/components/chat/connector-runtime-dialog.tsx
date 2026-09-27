@@ -16,6 +16,7 @@ import {
   hasLiveInvalidObjectMark,
   INITIAL_DIALOG_STATE,
   mergeSendFailureDisposition,
+  opensOnFirstRead,
   reduceDialog,
   uniqueKeys,
   type Exit,
@@ -59,6 +60,7 @@ import {
   resolveDialogOutcome,
   submitTaskConnectorRuntimeValues,
   type ConnectorRuntimeConnector,
+  type ConnectorRuntimeDialogTrigger,
   type ConnectorRuntimeErrorMessageKey,
   type ConnectorRuntimeFailureDisposition,
   type ConnectorRuntimeInput,
@@ -357,6 +359,28 @@ function noticeText(
   }
 }
 
+// The line under the title. Pointing the user back at the message box is
+// only right while this dialog is holding a message it will not send and has
+// nothing else in flight -- metHoldingSnapshot's own conditions. The neutral
+// met line covers the rest: no snapshot at all, a send-failed panel that
+// already carries the message and its own retry button, and a resend of this
+// very message still on the wire. Short of met, the line says why the dialog
+// is open; a session check asks the user to fill something in only while the
+// report still has something this dialog can fill.
+function descriptionKey(
+  kind: DialogOutcome["kind"],
+  trigger: ConnectorRuntimeDialogTrigger,
+  metHoldingSnapshot: boolean,
+): TranslationKey {
+  if (kind === "met") return metHoldingSnapshot ? "connectorRuntime.metNotResent" : "connectorRuntime.metNothingLeft"
+  switch (trigger) {
+    case "session_open":
+      return kind === "fillable" ? "connectorRuntime.sessionOpenDescription" : "connectorRuntime.sessionOpenNotFillable"
+    case "turn_failure": return "connectorRuntime.description"
+    default: return assertNever(trigger)
+  }
+}
+
 function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDialogRequest }) {
   const pathname = usePathname()
   const pathnameRef = useRef(pathname)
@@ -451,7 +475,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   const finish = (answer: Finish): void => {
     say(answer.tell)
     if (answer.event) dispatch(answer.event)
-    if (answer.close) close(answer.close)
+    if (answer.close) close(answer.close, request.taskId)
   }
 
   // Where every flow comes back after an await it started from `seqAtStart`,
@@ -536,10 +560,11 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
         return
       }
       const outcome = resolveDialogOutcome(result.report)
-      // A met report the user has never seen is the one case where nothing
-      // is installed at all: there is no dialog to keep open and nothing
-      // for it to say.
-      if (outcome.kind === "met" && !wasVisible) {
+      // A report the user has never seen and this request's trigger does
+      // not open on (see opensOnFirstRead) is the one case where nothing is
+      // installed at all: there is no dialog to keep open and nothing for it
+      // to say. For a turn failure that is only a met report.
+      if (!opensOnFirstRead(outcome.kind, request.trigger) && !wasVisible) {
         dispatch(kept)
         finish({ tell: { silent: "never-shown" }, event: null, close: "not-shown" })
         return
@@ -1059,20 +1084,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
             {t(outcome.kind === "met" ? "connectorRuntime.metTitle" : "connectorRuntime.title")}
           </DialogTitle>
           <DialogDescription>
-            {t(
-              outcome.kind !== "met"
-                ? "connectorRuntime.description"
-                // Pointing the user back at the message box is only right
-                // while this dialog is holding a message it will not send
-                // and has nothing else in flight -- metHoldingSnapshot's own
-                // conditions. The neutral line covers the rest: no snapshot
-                // at all, a send-failed panel that already carries the
-                // message and its own retry button, and a resend of this
-                // very message still on the wire.
-                : metHoldingSnapshot
-                  ? "connectorRuntime.metNotResent"
-                  : "connectorRuntime.metNothingLeft",
-            )}
+            {t(descriptionKey(outcome.kind, request.trigger, metHoldingSnapshot))}
           </DialogDescription>
         </DialogHeader>
 

@@ -2044,6 +2044,9 @@ interface AppContextType {
   selectStep: (stepId: string | null) => void
   clearMessages: () => void
   isConnected: boolean
+  // Counts onConnect's same-task branch: the socket reopened for the task it
+  // was last connected to. The first connect for a task does not count.
+  sameTaskReconnects: number
   connectionError: Error | null
   startNewConversation: () => Promise<void>
   isConversationResetPending: boolean
@@ -2306,6 +2309,7 @@ export function AppProvider({
   const { t } = useI18n()
   const router = useRouter()
   const lastConnectedTaskId = useRef<number | null>(null)
+  const [sameTaskReconnects, setSameTaskReconnects] = useState(0)
   const sharedStreamRef = useRef<{
     taskId?: number
     runId?: string | null
@@ -2531,6 +2535,7 @@ export function AppProvider({
     // This prevents stale data issues and fixes race conditions
     if (lastConnectedTaskId.current === stateRef.current.taskId) {
       // Reconnection to SAME task -> Clear messages
+      setSameTaskReconnects(count => count + 1)
       dispatch({
         type: "CLEAR_MESSAGES",
         payload: {
@@ -7337,6 +7342,7 @@ export function AppProvider({
           selectStep,
           clearMessages,
           isConnected,
+          sameTaskReconnects,
           connectionError,
           startNewConversation,
           isConversationResetPending:

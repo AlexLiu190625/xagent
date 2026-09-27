@@ -7960,7 +7960,7 @@ describe("connector runtime dialog trigger", () => {
     act(() => { dialogActions?.recordDelivery({ taskId: 1, clientMessageId: "x", text: "hi" }) })
     expect(appRenderCount).toBe(0)
 
-    act(() => { dialogActions?.close("dismissed") })
+    act(() => { dialogActions?.close("dismissed", 1) })
     expect(appRenderCount).toBe(0)
 
     // Control: a real app-state dispatch does bump the counter, proving it
@@ -8367,6 +8367,88 @@ describe("connector runtime dialog trigger", () => {
     await waitFor(() =>
       expect(apiRequestMock).toHaveBeenCalledWith(...connectorRuntimeReadCall)
     )
+  })
+
+  // The task page counts on this order when it checks a conversation it has
+  // just started showing: sendMessage stages the first message's ticket in
+  // the same synchronous stretch that sets the new task id, so a check asked
+  // for from an effect on that task id always finds the ticket and yields.
+  it("stages a new conversation's first message before an effect on its task id can ask for a check", async () => {
+    apiRequestMock.mockImplementation(async (url: string) => {
+      if (typeof url === "string" && url.endsWith("/api/chat/task/create")) {
+        return jsonResponse({ task_id: 31, title: "hello", description: "hello", status: "pending" })
+      }
+      if (typeof url === "string" && url.includes("connector-runtime-requirements")) {
+        return jsonResponse(CONNECTOR_RUNTIME_REPORT_NEEDS_FILL)
+      }
+      return jsonResponse({})
+    })
+    const checked: number[] = []
+    let send: (() => Promise<void>) | undefined
+    function NewConversationPage() {
+      const { state, sendMessage } = useApp()
+      const { openSessionCheck } = useConnectorRuntimeDialogActions()
+      send = () => sendMessage("hello", { clientMessageId: "turn-first" })
+      React.useEffect(() => {
+        if (state.taskId === null) return
+        checked.push(state.taskId)
+        openSessionCheck(state.taskId, "opened")
+      }, [state.taskId, openSessionCheck])
+      return null
+    }
+    // Disconnected, so the first message stays queued with its ticket held.
+    wsHarness.isConnected = false
+    render(
+      <ConnectorRuntimeDialogProvider>
+        <AppProvider token="token">
+          <ConnectorRuntimeStateProbe />
+          <NewConversationPage />
+        </AppProvider>
+      </ConnectorRuntimeDialogProvider>
+    )
+    let delivery: Promise<void> | undefined
+    await act(async () => {
+      delivery = send?.()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    expect(checked).toEqual([31])
+    expect(connectorRuntimeState.request).toBeNull()
+
+    await act(async () => {
+      wsHarness.isConnected = true
+      webSocketOptions.current?.onConnect?.()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    await act(async () => { await delivery })
+    expect(sendChatMessageMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("counts a socket open as a same-task reconnect only when the task was already connected", () => {
+    let reconnects: number | undefined
+    let setTask: ((taskId: number) => void) | undefined
+    function ReconnectProbe() {
+      const app = useApp()
+      reconnects = app.sameTaskReconnects
+      setTask = (taskId) => app.setTaskId(taskId, { navigate: false })
+      return null
+    }
+    render(<AppProvider token="token"><ReconnectProbe /></AppProvider>)
+    const open = () => act(() => { webSocketOptions.current?.onConnect?.() })
+
+    act(() => { setTask?.(5) })
+    open()
+    expect(reconnects).toBe(0)
+    open()
+    expect(reconnects).toBe(1)
+    act(() => { setTask?.(6) })
+    open()
+    expect(reconnects).toBe(1)
+    // Two opens that land before one render still count as two.
+    act(() => {
+      webSocketOptions.current?.onConnect?.()
+      webSocketOptions.current?.onConnect?.()
+    })
+    expect(reconnects).toBe(3)
   })
 
   // A companion assertion -- this context runs with no
