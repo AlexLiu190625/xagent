@@ -48,7 +48,6 @@ from xagent.web.api.kb import (
     _RagDocumentSnapshot,
     _recreate_missing_existing_file,
     _refresh_existing_file_if_changed,
-    _restore_rag_snapshot_rows,
     _rollback_failed_web_document_ingestion,
     _upsert_uploaded_file_record,
     _WebFileLock,
@@ -2002,7 +2001,7 @@ class TestWebFileRefreshHelpers:
     def test_web_rollback_exception_path_uses_file_id_after_empty_snapshot(
         self,
     ) -> None:
-        snapshot = _RagDocumentSnapshot(doc_refs=[], rows_by_table={})
+        snapshot = _RagDocumentSnapshot(doc_refs=[], collections=[])
         with (
             patch(
                 "xagent.web.api.kb._restore_rag_document_snapshot"
@@ -2031,134 +2030,6 @@ class TestWebFileRefreshHelpers:
             user_id=1,
             is_admin=False,
         )
-
-    def test_restore_rag_snapshot_rows_batches_unknown_table_delete(self) -> None:
-        table = MagicMock()
-        table.schema.names = []
-
-        _restore_rag_snapshot_rows(
-            table,
-            table_name="custom_table",
-            snapshot_rows=[{"collection": "c1", "doc_id": "doc-old"}],
-            current_rows=[
-                {"collection": "c1", "doc_id": "doc-1"},
-                {"collection": "c1", "doc_id": "doc-2"},
-            ],
-            user_id=1,
-            is_admin=False,
-        )
-
-        table.delete.assert_called_once()
-        delete_filter = table.delete.call_args.args[0]
-        assert "(collection = 'c1' and doc_id = 'doc-1')" in delete_filter
-        assert "(collection = 'c1' and doc_id = 'doc-2')" in delete_filter
-        assert " or " in delete_filter
-        table.add.assert_called_once_with([{"collection": "c1", "doc_id": "doc-old"}])
-
-    def test_restore_rag_snapshot_rows_batches_stale_row_delete(self) -> None:
-        table = MagicMock()
-        table.schema.names = []
-
-        _restore_rag_snapshot_rows(
-            table,
-            table_name="chunks",
-            snapshot_rows=[
-                {
-                    "collection": "c1",
-                    "doc_id": "doc-1",
-                    "parse_hash": "hash",
-                    "chunk_id": "chunk-old",
-                }
-            ],
-            current_rows=[
-                {
-                    "collection": "c1",
-                    "doc_id": "doc-1",
-                    "parse_hash": "hash",
-                    "chunk_id": "chunk-old",
-                },
-                {
-                    "collection": "c1",
-                    "doc_id": "doc-1",
-                    "parse_hash": "hash",
-                    "chunk_id": "chunk-stale",
-                },
-                {
-                    "collection": "c1",
-                    "doc_id": "doc-1",
-                    "parse_hash": "hash",
-                    "chunk_id": "chunk-stale-2",
-                },
-            ],
-            user_id=1,
-            is_admin=False,
-        )
-
-        table.merge_insert.assert_called_once_with(
-            ["collection", "doc_id", "parse_hash", "chunk_id"]
-        )
-        table.delete.assert_called_once()
-        delete_filter = table.delete.call_args.args[0]
-        assert "chunk_id = 'chunk-old'" not in delete_filter
-        assert "(collection = 'c1'" in delete_filter
-        assert "chunk_id = 'chunk-stale'" in delete_filter
-        assert "chunk_id = 'chunk-stale-2'" in delete_filter
-        assert " or " in delete_filter
-
-    def test_restore_rag_snapshot_rows_keys_embeddings_by_parse_and_model(
-        self,
-    ) -> None:
-        table = MagicMock()
-        table.schema.names = []
-
-        _restore_rag_snapshot_rows(
-            table,
-            table_name="embeddings_text_embedding_v4",
-            snapshot_rows=[
-                {
-                    "collection": "c1",
-                    "doc_id": "doc-1",
-                    "chunk_id": "chunk-1",
-                    "parse_hash": "parse-old",
-                    "model": "model-a",
-                }
-            ],
-            current_rows=[
-                {
-                    "collection": "c1",
-                    "doc_id": "doc-1",
-                    "chunk_id": "chunk-1",
-                    "parse_hash": "parse-old",
-                    "model": "model-a",
-                },
-                {
-                    "collection": "c1",
-                    "doc_id": "doc-1",
-                    "chunk_id": "chunk-1",
-                    "parse_hash": "parse-new",
-                    "model": "model-a",
-                },
-                {
-                    "collection": "c1",
-                    "doc_id": "doc-1",
-                    "chunk_id": "chunk-1",
-                    "parse_hash": "parse-old",
-                    "model": "model-b",
-                },
-            ],
-            user_id=1,
-            is_admin=False,
-        )
-
-        table.merge_insert.assert_called_once_with(
-            ["collection", "doc_id", "chunk_id", "parse_hash", "model"]
-        )
-        table.delete.assert_called_once()
-        delete_filter = table.delete.call_args.args[0]
-        assert "parse_hash = 'parse-new'" in delete_filter
-        assert "model = 'model-b'" in delete_filter
-        assert "parse_hash = 'parse-old' and model = 'model-a'" not in delete_filter
-        assert " or " in delete_filter
 
     def test_get_file_sha256_changes_with_content(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

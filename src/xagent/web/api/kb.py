@@ -81,7 +81,10 @@ from ...core.tools.core.RAG_tools.kb import (
 from ...core.tools.core.RAG_tools.kb.config_merge import (
     merge_collection_config_json,
 )
-from ...core.tools.core.RAG_tools.kb.models import RollbackFailedUploadIngestionRequest
+from ...core.tools.core.RAG_tools.kb.models import (
+    KBDocumentRowsSnapshot,
+    RollbackFailedUploadIngestionRequest,
+)
 from ...core.tools.core.RAG_tools.management.status import clear_ingestion_status
 from ...core.tools.core.RAG_tools.pipelines.web_ingestion import FileHandlerResult
 from ...core.tools.core.RAG_tools.progress import get_progress_manager
@@ -1817,7 +1820,7 @@ class _IngestionRunsSnapshot:
 @dataclass
 class _RagDocumentSnapshot:
     doc_refs: List[tuple[str, str]]
-    rows_by_table: Dict[str, List[Dict[str, Any]]]
+    collections: List[KBDocumentRowsSnapshot]
 
 
 def _ingestion_run_filter(collection: str, doc_id: str) -> str:
@@ -1828,53 +1831,8 @@ def _ingestion_run_filter(collection: str, doc_id: str) -> str:
     return f"collection = '{safe_collection}' and doc_id = '{safe_doc_id}'"
 
 
-def _table_has_user_id_column(table: Any) -> bool:
-    schema = getattr(table, "schema", None)
-    names = getattr(schema, "names", None) or []
-    return "user_id" in names
-
-
-def _rag_document_filter(
-    table: Any,
-    *,
-    collection: str,
-    doc_id: str,
-    user_id: int,
-    is_admin: bool,
-) -> str:
-    from ...core.tools.core.RAG_tools.utils.string_utils import escape_lancedb_string
-
-    safe_collection = escape_lancedb_string(collection)
-    safe_doc_id = escape_lancedb_string(doc_id)
-    expr = f"collection = '{safe_collection}' and doc_id = '{safe_doc_id}'"
-    if not is_admin and _table_has_user_id_column(table):
-        expr = f"{expr} and user_id = {int(user_id)}"
-    return expr
-
-
 def _combine_lancedb_filters(filters: List[str]) -> str:
     return " or ".join(f"({filter_expr})" for filter_expr in filters)
-
-
-def _rag_document_refs_filter(
-    table: Any,
-    doc_refs: List[tuple[str, str]],
-    *,
-    user_id: int,
-    is_admin: bool,
-) -> str:
-    return _combine_lancedb_filters(
-        [
-            _rag_document_filter(
-                table,
-                collection=collection,
-                doc_id=doc_id,
-                user_id=user_id,
-                is_admin=is_admin,
-            )
-            for collection, doc_id in doc_refs
-        ]
-    )
 
 
 def _snapshot_rag_documents_for_uploaded_file(
@@ -1885,68 +1843,20 @@ def _snapshot_rag_documents_for_uploaded_file(
 ) -> Optional[_RagDocumentSnapshot]:
     """Snapshot RAG rows for documents associated with an UploadedFile."""
     try:
-        from ...core.tools.core.RAG_tools.LanceDB.schema_manager import (
-            _safe_close_table,
-            ensure_chunks_table,
-            ensure_documents_table,
-            ensure_ingestion_runs_table,
-            ensure_main_pointers_table,
-            ensure_parses_table,
-        )
-        from ...core.tools.core.RAG_tools.utils.lancedb_query_utils import (
-            list_table_names,
-            query_to_list,
-        )
-        from ...providers.vector_store.lancedb import get_connection_from_env
-
         doc_refs = _list_document_refs_for_uploaded_file(file_id)
-        conn = get_connection_from_env()
-        ensure_documents_table(conn)
-        ensure_parses_table(conn)
-        ensure_chunks_table(conn)
-        ensure_main_pointers_table(conn)
-        ensure_ingestion_runs_table(conn)
-
-        table_names = set(list_table_names(conn))
-        target_tables = [
-            table_name
-            for table_name in (
-                "documents",
-                "parses",
-                "chunks",
-                "main_pointers",
-                "ingestion_runs",
-            )
-            if table_name in table_names
-        ]
-        target_tables.extend(
-            sorted(name for name in table_names if name.startswith("embeddings_"))
+        doc_ids_by_collection: Dict[str, List[str]] = {}
+        for collection, doc_id in doc_refs:
+            doc_ids_by_collection.setdefault(collection, []).append(doc_id)
+        coordinator = get_kb_coordinator()
+        return _RagDocumentSnapshot(
+            doc_refs=doc_refs,
+            collections=[
+                coordinator.capture_document_rows_sync(
+                    collection, doc_ids, user_id=user_id, is_admin=is_admin
+                )
+                for collection, doc_ids in doc_ids_by_collection.items()
+            ],
         )
-
-        rows_by_table: Dict[str, List[Dict[str, Any]]] = {}
-        for table_name in target_tables:
-            table = None
-            try:
-                table = conn.open_table(table_name)
-                if doc_refs:
-                    rows = query_to_list(
-                        table.search()
-                        .where(
-                            _rag_document_refs_filter(
-                                table,
-                                doc_refs,
-                                user_id=user_id,
-                                is_admin=is_admin,
-                            )
-                        )
-                        .limit(-1)
-                    )
-                else:
-                    rows = []
-                rows_by_table[table_name] = rows
-            finally:
-                _safe_close_table(table)
-        return _RagDocumentSnapshot(doc_refs=doc_refs, rows_by_table=rows_by_table)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "Failed to snapshot RAG document rows before web file refresh: file_id=%s, error=%s",
@@ -1957,114 +1867,6 @@ def _snapshot_rag_documents_for_uploaded_file(
         return None
 
 
-def _rag_snapshot_key_columns(table_name: str) -> Optional[tuple[str, ...]]:
-    if table_name == "documents":
-        return ("collection", "doc_id")
-    if table_name == "parses":
-        return ("collection", "doc_id", "parse_hash")
-    if table_name == "chunks":
-        return ("collection", "doc_id", "parse_hash", "chunk_id")
-    if table_name == "main_pointers":
-        return ("collection", "doc_id", "step_type", "model_tag")
-    if table_name == "ingestion_runs":
-        return ("collection", "doc_id")
-    if table_name.startswith("embeddings_"):
-        return ("collection", "doc_id", "chunk_id", "parse_hash", "model")
-    return None
-
-
-def _rag_snapshot_row_key(
-    row: Dict[str, Any], key_columns: tuple[str, ...]
-) -> tuple[Any, ...]:
-    return tuple(row.get(column) for column in key_columns)
-
-
-def _lancedb_literal(value: Any) -> str:
-    from ...core.tools.core.RAG_tools.utils.string_utils import escape_lancedb_string
-
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return str(value)
-    return f"'{escape_lancedb_string(str(value))}'"
-
-
-def _rag_snapshot_key_filter(
-    table: Any,
-    row: Dict[str, Any],
-    key_columns: tuple[str, ...],
-    *,
-    user_id: int,
-    is_admin: bool,
-) -> str:
-    clauses = []
-    for column in key_columns:
-        value = row.get(column)
-        if value is None:
-            clauses.append(f"{column} IS NULL")
-        else:
-            clauses.append(f"{column} = {_lancedb_literal(value)}")
-    if not is_admin and _table_has_user_id_column(table):
-        clauses.append(f"user_id = {int(user_id)}")
-    return " and ".join(clauses)
-
-
-def _restore_rag_snapshot_rows(
-    table: Any,
-    *,
-    table_name: str,
-    snapshot_rows: List[Dict[str, Any]],
-    current_rows: List[Dict[str, Any]],
-    user_id: int,
-    is_admin: bool,
-) -> None:
-    """Upsert old rows before deleting stale rows introduced by a failed refresh."""
-    key_columns = _rag_snapshot_key_columns(table_name)
-    if key_columns is None:
-        delete_filters = [
-            _rag_snapshot_key_filter(
-                table,
-                row,
-                ("collection", "doc_id"),
-                user_id=user_id,
-                is_admin=is_admin,
-            )
-            for row in current_rows
-        ]
-        if delete_filters:
-            table.delete(_combine_lancedb_filters(delete_filters))
-        if snapshot_rows:
-            table.add(snapshot_rows)
-        return
-
-    if snapshot_rows:
-        (
-            table.merge_insert(list(key_columns))
-            .when_matched_update_all()
-            .when_not_matched_insert_all()
-            .execute(snapshot_rows)
-        )
-
-    snapshot_keys = {_rag_snapshot_row_key(row, key_columns) for row in snapshot_rows}
-    stale_rows = [
-        row
-        for row in current_rows
-        if _rag_snapshot_row_key(row, key_columns) not in snapshot_keys
-    ]
-    delete_filters = [
-        _rag_snapshot_key_filter(
-            table,
-            row,
-            key_columns,
-            user_id=user_id,
-            is_admin=is_admin,
-        )
-        for row in stale_rows
-    ]
-    if delete_filters:
-        table.delete(_combine_lancedb_filters(delete_filters))
-
-
 def _restore_rag_document_snapshot(
     snapshot: _RagDocumentSnapshot,
     *,
@@ -2072,84 +1874,11 @@ def _restore_rag_document_snapshot(
     is_admin: bool,
 ) -> None:
     """Restore RAG document rows after a failed refresh of an existing web file."""
-    from ...core.tools.core.RAG_tools.LanceDB.schema_manager import (
-        _safe_close_table,
-        ensure_chunks_table,
-        ensure_documents_table,
-        ensure_ingestion_runs_table,
-        ensure_main_pointers_table,
-        ensure_parses_table,
-    )
-    from ...core.tools.core.RAG_tools.utils.lancedb_query_utils import (
-        list_table_names,
-        query_to_list,
-    )
-    from ...providers.vector_store.lancedb import get_connection_from_env
-
-    vector_store = get_vector_index_store()
-    conn = get_connection_from_env()
-    ensure_documents_table(conn)
-    ensure_parses_table(conn)
-    ensure_chunks_table(conn)
-    ensure_main_pointers_table(conn)
-    ensure_ingestion_runs_table(conn)
-
-    current_table_names = set(list_table_names(conn))
-    restore_table_names = [
-        table_name
-        for table_name in (
-            "documents",
-            "parses",
-            "chunks",
-            "main_pointers",
-            "ingestion_runs",
+    coordinator = get_kb_coordinator()
+    for collection_snapshot in snapshot.collections:
+        coordinator.restore_document_rows_sync(
+            collection_snapshot, user_id=user_id, is_admin=is_admin
         )
-        if table_name in current_table_names or table_name in snapshot.rows_by_table
-    ]
-    for table_name in sorted(current_table_names):
-        if table_name.startswith("embeddings_"):
-            restore_table_names.append(table_name)
-    for table_name in snapshot.rows_by_table:
-        if (
-            table_name.startswith("embeddings_")
-            and table_name not in restore_table_names
-        ):
-            restore_table_names.append(table_name)
-
-    for table_name in restore_table_names:
-        snapshot_rows = snapshot.rows_by_table.get(table_name, [])
-        table = None
-        try:
-            table = conn.open_table(table_name)
-            if snapshot.doc_refs:
-                current_rows = query_to_list(
-                    table.search()
-                    .where(
-                        _rag_document_refs_filter(
-                            table,
-                            snapshot.doc_refs,
-                            user_id=user_id,
-                            is_admin=is_admin,
-                        )
-                    )
-                    .limit(-1)
-                )
-            else:
-                current_rows = []
-            _restore_rag_snapshot_rows(
-                table,
-                table_name=table_name,
-                snapshot_rows=snapshot_rows,
-                current_rows=current_rows,
-                user_id=user_id,
-                is_admin=is_admin,
-            )
-        finally:
-            _safe_close_table(table)
-
-    invalidate_cache = getattr(vector_store, "invalidate_table_cache", None)
-    if callable(invalidate_cache):
-        invalidate_cache()
 
 
 def _list_document_refs_for_uploaded_file(file_id: str) -> List[tuple[str, str]]:
