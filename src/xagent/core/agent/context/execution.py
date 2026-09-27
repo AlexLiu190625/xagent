@@ -2286,10 +2286,12 @@ class ExecutionContext:
             is not None
         ]
         if len(present) < len(records):
-            # A count only: the paths are the tool's own strings.
+            # A count only: the paths are the tool's own strings. A record
+            # that is not a dict, or whose path is not a stored-result path,
+            # fails the same lookup as one whose file is gone.
             logger.info(
-                "Compaction left %d stored tool result(s) out of its list; "
-                "their files could not be found",
+                "Compaction left %d stored tool result(s) out of its list "
+                "(missing file or malformed record)",
                 len(records) - len(present),
             )
         return render_spill_notice(present, style="compaction")

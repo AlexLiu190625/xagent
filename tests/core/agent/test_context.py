@@ -4292,3 +4292,44 @@ def test_summary_compaction_counts_ignore_a_previous_spill_index(tmp_path):
     assert result.metadata["removed_count"] == expected.metadata["removed_count"]
     assert result.final_count == len(ctx.messages) == len(baseline.messages) + 1
     assert len(_spill_index_messages(ctx)) == 1
+
+
+@pytest.mark.parametrize("earlier", ["replayed_summary", "summary_compaction"])
+def test_drop_oldest_strips_only_the_previous_spill_index(tmp_path, earlier):
+    """Only the message carrying the list key is taken out before the window
+    is chosen. A summary is a system message too -- replayed from a previous
+    turn, or written by a summary compaction earlier in this one -- and it is
+    history that must stay."""
+    ctx = _context_with_stored_results(tmp_path)
+    if earlier == "replayed_summary":
+        ctx.messages.insert(
+            0, Message.role_system("Compacted conversation summary: earlier")
+        )
+        summary = ctx.messages[0]
+    else:
+        _compact_by_summary(ctx)
+        summary = ctx.messages[0]
+        assert summary.metadata == {"compacted_context": True}
+        ctx.add_user_message("next request")
+
+    _compact_by_dropping(ctx)
+    _compact_by_dropping(ctx)
+
+    assert any(message is summary for message in ctx.messages)
+    assert len(_spill_index_messages(ctx)) == 1
+
+
+def test_summary_compaction_without_a_latest_user_message_still_lists(tmp_path):
+    ctx = _context_with_stored_results(tmp_path)
+    ctx.messages = [message for message in ctx.messages if message.role != "user"]
+    records = list(ctx.get_component("spilled_results").records)
+
+    result = _compact_by_summary(ctx)
+
+    assert result.compacted
+    summary, notice = ctx.messages
+    assert summary.metadata == {"compacted_context": True}
+    assert notice.metadata == {COMPACT_SPILL_INDEX_METADATA_KEY: True}
+    assert notice.content == render_spill_notice(records, style="compaction")
+    assert result.final_count == len(ctx.messages)
+    assert result.metadata["removed_count"] == result.original_count - 1
