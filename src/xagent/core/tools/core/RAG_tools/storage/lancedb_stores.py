@@ -32,6 +32,7 @@ from ..core.schemas import CollectionInfo, IndexResult
 from ..LanceDB.schema_manager import ensure_documents_table
 from ..utils.lancedb_query_utils import (
     build_fts_query,
+    list_embeddings_table_names,
     list_table_names,
     query_to_list,
 )
@@ -869,6 +870,103 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         finally:
             _safe_close_table(table)
         return records
+
+    def list_document_rows(
+        self,
+        user_id: Optional[int],
+        is_admin: bool,
+        max_results: int = DEFAULT_VECTOR_STORE_SCAN_LIMIT,
+    ) -> List[Dict[str, Any]]:
+        from ..LanceDB.schema_manager import _safe_close_table
+
+        conn = self._get_connection()
+        ensure_documents_table(conn)
+        table = None
+        try:
+            table = conn.open_table("documents")
+            user_filter = UserPermissions.get_user_filter(user_id, is_admin=is_admin)
+            query = table.search()
+            if user_filter:
+                query = query.where(user_filter)
+            return query_to_list(query.limit(max_results))
+        finally:
+            _safe_close_table(table)
+
+    def list_indexed_doc_refs(
+        self,
+        doc_refs: Iterable[Tuple[str, str]],
+        user_id: Optional[int],
+        is_admin: bool,
+    ) -> set[Tuple[str, str]]:
+        from ..LanceDB.schema_manager import _safe_close_table
+
+        candidate_refs = set(doc_refs)
+        indexed_refs: set[Tuple[str, str]] = set()
+        if not candidate_refs:
+            return indexed_refs
+        doc_ids_by_collection: Dict[str, set[str]] = defaultdict(set)
+        for collection, doc_id in sorted(candidate_refs):
+            doc_ids_by_collection[collection].add(doc_id)
+        user_filter = UserPermissions.get_user_filter(user_id, is_admin=is_admin)
+
+        conn = self._get_connection()
+        for table_name in ["chunks", *list_embeddings_table_names(conn)]:
+            if indexed_refs.issuperset(candidate_refs):
+                return indexed_refs
+            table = None
+            try:
+                table = conn.open_table(table_name)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "Skipping indexed status fallback table '%s': %s", table_name, exc
+                )
+                continue
+
+            try:
+                for collection, doc_ids in doc_ids_by_collection.items():
+                    pending_doc_ids = {
+                        doc_id
+                        for doc_id in doc_ids
+                        if (collection, doc_id) not in indexed_refs
+                    }
+                    if not pending_doc_ids:
+                        continue
+                    collection_filter = build_lancedb_filter_expression(
+                        {"collection": collection},
+                        skip_user_filter=True,
+                    )
+                    escaped = ", ".join(
+                        f"'{escape_lancedb_string(doc_id)}'"
+                        for doc_id in sorted(pending_doc_ids)
+                    )
+                    combined_filter = (
+                        f"({collection_filter}) and (doc_id IN ({escaped}))"
+                    )
+                    if user_filter:
+                        combined_filter = f"({combined_filter}) and ({user_filter})"
+                    try:
+                        query = table.search().where(combined_filter)
+                        rows = query_to_list(
+                            query.select(["collection", "doc_id"]).limit(-1)
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug(
+                            "Failed indexed status fallback query on '%s' for collection '%s': %s",
+                            table_name,
+                            collection,
+                            exc,
+                        )
+                        continue
+
+                    for row in rows:
+                        row_collection = str(row.get("collection") or "").strip()
+                        row_doc_id = str(row.get("doc_id") or "").strip()
+                        if row_collection and row_doc_id:
+                            indexed_refs.add((row_collection, row_doc_id))
+            finally:
+                _safe_close_table(table)
+
+        return indexed_refs
 
     def count_documents_grouped_by_collection(
         self,

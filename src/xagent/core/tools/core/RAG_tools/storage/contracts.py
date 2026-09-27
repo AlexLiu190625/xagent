@@ -452,6 +452,32 @@ class VectorIndexStore(ABC):
         """
 
     @abstractmethod
+    def list_document_rows(
+        self,
+        user_id: Optional[int],
+        is_admin: bool,
+        max_results: int = DEFAULT_VECTOR_STORE_SCAN_LIMIT,
+    ) -> List[Dict[str, Any]]:
+        """``documents`` rows the user may see in any collection, every column as stored.
+
+        Unlike ``list_document_records``, rows without a ``doc_id`` are kept and
+        nothing is audit-logged. At most ``max_results`` rows.
+        """
+
+    @abstractmethod
+    def list_indexed_doc_refs(
+        self,
+        doc_refs: Iterable[Tuple[str, str]],
+        user_id: Optional[int],
+        is_admin: bool,
+    ) -> set[Tuple[str, str]]:
+        """Which ``(collection, doc_id)`` refs have chunk or embedding rows the user may see.
+
+        Best effort: a table or query that fails is skipped. With no refs
+        nothing is read.
+        """
+
+    @abstractmethod
     def count_documents_grouped_by_collection(
         self,
         collection_names: Sequence[str],

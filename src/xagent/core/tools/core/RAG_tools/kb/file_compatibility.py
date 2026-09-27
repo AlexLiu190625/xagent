@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Set, Union
 
@@ -39,6 +41,17 @@ class KBFileCompatibilityFacade:
     ) -> None:
         self._storage_shim = storage_shim
 
+    @contextmanager
+    def _storage_context(self) -> Iterator[None]:
+        if self._storage_shim is None:
+            yield
+            return
+
+        from ..storage.factory import bind_storage_shim_for_current_context
+
+        with bind_storage_shim_for_current_context(self._storage_shim):
+            yield
+
     def upsert_uploaded_file_record(
         self,
         db: Session,
@@ -69,15 +82,14 @@ class KBFileCompatibilityFacade:
         *,
         user_id: Optional[int] = None,
         is_admin: bool,
-        collection_name: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        from xagent.web.services.kb_file_service import _list_documents_for_user_impl
+        with self._storage_context():
+            from ..storage.factory import get_vector_index_store
 
-        return _list_documents_for_user_impl(
-            user_id=user_id,
-            is_admin=is_admin,
-            collection_name=collection_name,
-        )
+            return get_vector_index_store().list_document_rows(
+                user_id=user_id,
+                is_admin=is_admin,
+            )
 
     def find_referenced_file_ids(self, file_ids: Iterable[str]) -> set[str]:
         from ..storage.factory import get_vector_index_store
@@ -231,12 +243,13 @@ class KBFileCompatibilityFacade:
             _aggregate_uploaded_file_statuses_impl,
         )
 
-        return _aggregate_uploaded_file_statuses_impl(
-            file_ids=file_ids,
-            user_id=user_id,
-            is_admin=is_admin,
-            use_cache=use_cache,
-        )
+        with self._storage_context():
+            return _aggregate_uploaded_file_statuses_impl(
+                file_ids=file_ids,
+                user_id=user_id,
+                is_admin=is_admin,
+                use_cache=use_cache,
+            )
 
     def reconcile_uploaded_files(
         self,
@@ -252,14 +265,15 @@ class KBFileCompatibilityFacade:
             _reconcile_uploaded_files_impl,
         )
 
-        return _reconcile_uploaded_files_impl(
-            db,
-            user_id=user_id,
-            is_admin=is_admin,
-            stale_ttl_hours=stale_ttl_hours,
-            delete_stale=delete_stale,
-            deletable_statuses=deletable_statuses,
-        )
+        with self._storage_context():
+            return _reconcile_uploaded_files_impl(
+                db,
+                user_id=user_id,
+                is_admin=is_admin,
+                stale_ttl_hours=stale_ttl_hours,
+                delete_stale=delete_stale,
+                deletable_statuses=deletable_statuses,
+            )
 
     def cleanup_local_copied_file(
         self,
