@@ -368,6 +368,46 @@ def test_trace_expiry_does_not_move_the_retention_anchor(sessions) -> None:
     assert _as_utc(anchor) == _age(100)
 
 
+def test_trace_expiry_clears_a_dangling_pointer_without_trace_rows(sessions) -> None:
+    """A checkpoint pointer can go dangling with no trace row behind it.
+
+    The stored pointer can lag what still exists (#2580), or a run set it for
+    a row an earlier sweep already removed. Either way the purge must still
+    clear the pointer, but with nothing actually removed it must not claim a
+    trace history was expired.
+    """
+    with sessions() as db:
+        user_id = _make_user(db, "t4")
+        task_id = _make_task(db, user_id=user_id, anchor=_age(100))
+        db.execute(
+            sa.update(Task)
+            .where(Task.id == task_id)
+            .values(last_checkpoint_event_id="evt-dangling")
+        )
+        db.commit()
+        before = db.execute(
+            sa.select(Task.updated_at).where(Task.id == task_id)
+        ).scalar_one()
+
+    assert _purge(sessions, task_id) is RetentionPurgeAction.PURGED_TRACES
+
+    with sessions() as db:
+        row = db.execute(
+            sa.select(
+                Task.last_checkpoint_event_id,
+                Task.last_checkpoint_trace_event_id,
+                Task.traces_expired_at,
+                Task.updated_at,
+            ).where(Task.id == task_id)
+        ).one()
+    assert (row.last_checkpoint_event_id, row.last_checkpoint_trace_event_id) == (
+        None,
+        None,
+    )
+    assert row.traces_expired_at is None
+    assert row.updated_at == before
+
+
 def _as_utc(value: datetime | None) -> datetime | None:
     """SQLite returns ``DateTime(timezone=True)`` naive; PostgreSQL aware."""
     if value is None or value.tzinfo is not None:

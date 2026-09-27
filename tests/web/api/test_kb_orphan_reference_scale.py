@@ -18,6 +18,7 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
 from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import (
     ensure_documents_table,
 )
+from xagent.core.tools.core.RAG_tools.storage import lancedb_stores
 from xagent.core.tools.core.RAG_tools.storage.lancedb_stores import (
     LanceDBVectorIndexStore,
 )
@@ -25,7 +26,6 @@ from xagent.providers.vector_store.lancedb import get_connection_from_env
 from xagent.web.api import kb as kb_module
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
-from xagent.web.services import kb_file_service
 
 test_env = kb_dir.test_env
 temp_uploads = kb_dir.temp_uploads
@@ -171,7 +171,9 @@ def _break_reference_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
     def _raise(*_args, **_kwargs):
         raise RuntimeError("refs down")
 
-    monkeypatch.setattr(kb_file_service, "query_to_list", _raise)
+    monkeypatch.setattr(
+        LanceDBVectorIndexStore, "list_document_records_by_file_ids", _raise
+    )
 
 
 def test_document_delete_keeps_file_referenced_past_scan_cap(test_env, temp_uploads):
@@ -456,7 +458,7 @@ def test_reference_lookup_returns_referenced_candidates_of_any_owner(
     test_env, monkeypatch
 ):
     _app, _headers, user, _sessions = test_env
-    monkeypatch.setattr(kb_file_service, "_ORPHAN_LOOKUP_BATCH_SIZE", 2)
+    monkeypatch.setattr(lancedb_stores, "_FILE_ID_LOOKUP_BATCH_SIZE", 2)
     table = _documents()
     table.add(
         [

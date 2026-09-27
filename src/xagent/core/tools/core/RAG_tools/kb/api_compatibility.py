@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import (
@@ -39,6 +39,7 @@ from .operation_compatibility import (
 from .pipeline_compatibility import KB_STORAGE_METADATA_KEY
 
 if TYPE_CHECKING:
+    from ..storage.contracts import DocumentRecord
     from .coordinator import KBCoordinator
     from .operation_compatibility import KBOperationCompatibilityFacade
     from .storage_shim import KBStorageShimCompatibilityFacade
@@ -633,6 +634,14 @@ class KBApiCompatibilityFacade:
             if max_results is not None:
                 kwargs["max_results"] = max_results
             return store.list_document_records(**kwargs)
+
+    def list_document_records_by_file_ids(
+        self, file_ids: Iterable[str]
+    ) -> list[DocumentRecord]:
+        with self._storage_context():
+            from ..storage.factory import get_vector_index_store
+
+            return get_vector_index_store().list_document_records_by_file_ids(file_ids)
 
     def delete_document(
         self,

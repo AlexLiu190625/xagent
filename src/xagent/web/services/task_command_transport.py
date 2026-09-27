@@ -1112,6 +1112,15 @@ def finish_task_command(
         return updated
 
 
+def _records_message_outcome_unknown(result: Any) -> bool:
+    from .chat_history_service import DELIVERY_OUTCOME_UNKNOWN
+
+    return (
+        isinstance(result, dict)
+        and result.get("delivery_outcome") == DELIVERY_OUTCOME_UNKNOWN
+    )
+
+
 def fail_task_command(
     command_db_id: int,
     runner_id: str,
@@ -1158,6 +1167,7 @@ def fail_task_command(
         snapshot_query = db.query(
             TaskExecutionCommand.failure_count,
             TaskExecutionCommand.attempt_count,
+            TaskExecutionCommand.result,
         ).filter(
             TaskExecutionCommand.id == command_db_id,
             TaskExecutionCommand.status == COMMAND_PROCESSING,
@@ -1172,6 +1182,11 @@ def fail_task_command(
             return False
         observed_failure_count = int(snapshot.failure_count or 0)
         observed_attempt_count = int(snapshot.attempt_count or 0)
+        if result is None and _records_message_outcome_unknown(snapshot.result):
+            # A MESSAGE attempt recorded that its turn's ``dispatched`` row
+            # means "outcome unknown" before it failed. That record is the
+            # retry's only way to tell it from an accepted turn; keep it.
+            result = snapshot.result
         failure_count = observed_failure_count + 1
         terminal = force_terminal or failure_count >= MAX_COMMAND_FAILURES
         updated = (

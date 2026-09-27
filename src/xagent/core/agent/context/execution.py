@@ -142,6 +142,12 @@ TRANSCRIPT_WATERMARK_METADATA_KEY = "transcript_watermark"
 # A value under this key is only trusted when the payload it arrived in also
 # carried ``EVIDENCE_MARKER_WRITER_FIELD``; see ``ExecutionContext.from_dict``.
 TOOL_EVIDENCE_REMOVED_METADATA_KEY = "tool_evidence_removed"
+# Engine-owned record of the user turns an execution has durably accepted;
+# ``AgentRunner`` owns its shape and semantics. Defined here so that
+# ``create_child_context`` can keep it out of DAG step contexts: only the root
+# context's record is read, and copying it would repeat it in every active
+# step context serialized into pattern state.
+ACCEPTED_TURN_IDS_METADATA_KEY = "_accepted_user_turn_ids"
 # Serialized writer seal, a sibling of ``metadata`` in ``to_dict``'s payload.
 # ``from_dict`` refuses to carry ``TOOL_EVIDENCE_REMOVED_METADATA_KEY`` in
 # from a payload that arrives without it: a build that does not know that key
@@ -740,8 +746,21 @@ class ExecutionContext:
         (existence) failures are real reports pointing at a file that is
         gone (e.g. an external-credential task's workspace was removed at
         the end of the previous turn); those count toward the caller's
-        unavailable-value notice. Gate 3 (capacity) stops registering new
-        files once the registry is full but still returns the record for
+        unavailable-value notice and each one logs a warning, worded
+        differently for "this execution has no spill directory" and "the
+        file is not under it". Outside the removed-workspace case, a gate 2
+        failure means the tool layer wrote a file this execution cannot
+        find -- the tool set and the execution resolved different
+        directories -- and every spill then reaches the model as
+        "unavailable", which is worse than not spilling; the warning is how
+        that shows up in the logs. Logging relative_path is safe: gate 1
+        has already held it to the canonical spilled-result path, whose
+        file name uses only the filename character set. The writer's
+        per-run file cap bounds how many records one tool set produces; a
+        replay re-validates the same records and logs them again.
+
+        Gate 3 (capacity) stops registering new files once the registry is
+        full but still returns the record for
         this message's own observation text, the same way an
         already-registered relative_path is returned without being
         duplicated.
@@ -770,10 +789,24 @@ class ExecutionContext:
             if not spill_record_shape_is_valid(record):
                 continue
             relative_path = record["relative_path"]
-            if (
-                spill_dir is None
-                or resolve_spilled_under(spill_dir, relative_path) is None
-            ):
+            if spill_dir is None:
+                logger.warning(
+                    "Stored tool result %s cannot be registered: this "
+                    "execution has no workspace path, so it has no spill "
+                    "directory to look in. The model is told the value is "
+                    "unavailable.",
+                    relative_path,
+                )
+                unavailable_count += 1
+                continue
+            if resolve_spilled_under(spill_dir, relative_path) is None:
+                logger.warning(
+                    "Stored tool result %s cannot be registered: it is not a "
+                    "file directly under this execution's spill directory %s. "
+                    "The model is told the value is unavailable.",
+                    relative_path,
+                    spill_dir,
+                )
                 unavailable_count += 1
                 continue
             accepted.append(record)
@@ -1579,6 +1612,7 @@ class ExecutionContext:
         # request provenance before metadata is cloned.
         top_level_user_request(self)
         child_metadata = dict(self.metadata)
+        child_metadata.pop(ACCEPTED_TURN_IDS_METADATA_KEY, None)
         if metadata:
             child_metadata.update(metadata)
         if task:

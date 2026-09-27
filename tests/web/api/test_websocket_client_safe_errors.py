@@ -250,8 +250,13 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     # A fenced-run rejection adds one live and one deferred delivery-failed ack.
     # Settling a recovered turn as outcome unknown adds one ack for callers
     # that are not answered from the durable command row.
-    assert result.producers == 40, (
-        f"expected exactly 40 producers, matched {result.producers}; "
+    # A live handoff refused by another lease acquisition adds an
+    # outcome-unknown ack and a not-accepted, resend-with-new-id ack.
+    # A deferred resume that withdraws a fresh message from an ended run adds
+    # one not-accepted, resend-with-new-id ack, and the handler's retry of a
+    # message withdrawn from an ended run one more.
+    assert result.producers == 44, (
+        f"expected exactly 44 producers, matched {result.producers}; "
         "review the changed sites and bump deliberately"
     )
     # #1658 removed ``_resync_client_to_running_task``'s stale-client ``error``

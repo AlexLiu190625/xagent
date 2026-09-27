@@ -486,10 +486,15 @@ async def test_api_facade_storage_operations_rebind_storage_context() -> None:
         def __init__(self) -> None:
             self.list_calls: list[dict[str, object]] = []
             self.rename_calls: list[dict[str, object]] = []
+            self.file_id_calls: list[list[str]] = []
 
         def list_document_records(self, **kwargs: object) -> list[str]:
             self.list_calls.append(kwargs)
             return ["record"]
+
+        def list_document_records_by_file_ids(self, file_ids: list[str]) -> list[str]:
+            self.file_id_calls.append(list(file_ids))
+            return ["by-file"]
 
         def rename_collection_data(self, **kwargs: object) -> list[str]:
             self.rename_calls.append(kwargs)
@@ -550,6 +555,7 @@ async def test_api_facade_storage_operations_rebind_storage_context() -> None:
             user_id=7,
             is_admin=False,
         ) == ["record"]
+        assert facade.list_document_records_by_file_ids(["f"]) == ["by-file"]
         await facade.save_collection_config(
             collection="old",
             config_json="{}",
@@ -591,6 +597,7 @@ async def test_api_facade_storage_operations_rebind_storage_context() -> None:
         assert get_bound_storage_shim_for_current_context() is outer_shim
 
     assert outer_vector.list_calls == []
+    assert outer_vector.file_id_calls == []
     assert outer_vector.rename_calls == []
     assert outer_metadata.saved_configs == []
     assert outer_metadata.loaded_configs == []

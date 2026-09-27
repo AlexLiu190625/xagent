@@ -3618,8 +3618,8 @@ def test_trigger_reindex_returns_false_for_unopenable_table(
 def test_vector_index_store_contract_defaults_to_no_compaction() -> None:
     """A backend that does not implement compaction inherits safe no-ops.
 
-    Calls the base-class bodies unbound: VectorIndexStore has 42 abstract
-    methods, so a stub subclass would be 40 lines of noise to test two.
+    Calls the base-class bodies unbound: a stub subclass would have to
+    implement every abstract method of VectorIndexStore to test two.
     """
     from xagent.core.tools.core.RAG_tools.storage.contracts import VectorIndexStore
 

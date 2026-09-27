@@ -149,10 +149,16 @@ on:
       - 'src/xagent/core/agent/context/execution.py'
       - 'src/xagent/core/agent/trace.py'
       - 'tests/web/services/test_injection_atomicity_postgresql.py'
+      - 'tests/web/services/test_turn_dedup_jsonb_postgresql.py'
       - 'src/xagent/web/services/task_lease_recovery.py'
       - 'tests/web/api/test_durable_message_resume_contention.py'
       - 'tests/web/api/test_recovered_delivery_outcome_unknown.py'
       - 'tests/web/services/test_unknown_delivery_postgresql.py'
+      - 'src/xagent/web/services/task_execution_controller.py'
+      - 'tests/web/services/test_pause_lease_fence_postgresql.py'
+      - 'src/xagent/web/services/task_execution.py'
+      - 'tests/web/api/test_recovered_delivery_failed_run.py'
+      - 'tests/web/api/test_fresh_message_ended_run.py'
   pull_request:
     branches: [main]
   # Required by the merge queue: without this the two required contexts below
@@ -338,10 +344,16 @@ jobs:
             src/xagent/core/agent/context/execution.py
             src/xagent/core/agent/trace.py
             tests/web/services/test_injection_atomicity_postgresql.py
+            tests/web/services/test_turn_dedup_jsonb_postgresql.py
             src/xagent/web/services/task_lease_recovery.py
             tests/web/api/test_durable_message_resume_contention.py
             tests/web/api/test_recovered_delivery_outcome_unknown.py
             tests/web/services/test_unknown_delivery_postgresql.py
+            src/xagent/web/services/task_execution_controller.py
+            tests/web/services/test_pause_lease_fence_postgresql.py
+            src/xagent/web/services/task_execution.py
+            tests/web/api/test_recovered_delivery_failed_run.py
+            tests/web/api/test_fresh_message_ended_run.py
           )
 
           case "$EVENT_NAME" in
@@ -770,6 +782,15 @@ jobs:
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
+      # JSONB reorders object keys, so the accepted-turn record's eviction
+      # order is only observable through a real PostgreSQL round-trip.
+      - name: Test accepted-turn record order through JSONB (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/services/test_turn_dedup_jsonb_postgresql.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
       # Orphaned-delivery reconciliation and recovered outcome-unknown
       # settlement depend on PostgreSQL row locks and READ COMMITTED
       # re-evaluation (a sweep must neither block on nor see an uncommitted
@@ -778,6 +799,17 @@ jobs:
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           pytest tests/web/services/test_unknown_delivery_postgresql.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      # The live-control pause and resume-handoff fences are single UPDATEs
+      # whose WHERE clause PostgreSQL re-evaluates after waiting on a
+      # concurrent takeover's row lock; SQLite serializes writers and cannot
+      # show that re-check.
+      - name: Test live-control lease fences against PostgreSQL (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/services/test_pause_lease_fence_postgresql.py -m postgresql -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
