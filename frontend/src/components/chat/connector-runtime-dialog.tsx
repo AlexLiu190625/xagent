@@ -365,7 +365,7 @@ function noticeText(
 // met line covers the rest: no snapshot at all, a send-failed panel that
 // already carries the message and its own retry button, and a resend of this
 // very message still on the wire. Short of met, the line says why the dialog
-// is open (nothing opens a first gate yet; it shares the turn-failure line).
+// is open.
 function descriptionKey(
   kind: DialogOutcome["kind"],
   trigger: ConnectorRuntimeDialogTrigger,
@@ -374,7 +374,7 @@ function descriptionKey(
   if (kind === "met") return metHoldingSnapshot ? "connectorRuntime.metNotResent" : "connectorRuntime.metNothingLeft"
   switch (trigger) {
     case "session_open": return "connectorRuntime.sessionOpenDescription"
-    case "turn_failure": case "first_gate": return "connectorRuntime.description"
+    case "turn_failure": return "connectorRuntime.description"
     default: return assertNever(trigger)
   }
 }

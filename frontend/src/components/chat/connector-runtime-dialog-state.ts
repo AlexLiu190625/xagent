@@ -351,7 +351,7 @@ export function isBusy(phase: Phase): boolean {
 export function opensOnFirstRead(kind: DialogOutcomeKind, trigger: ConnectorRuntimeDialogTrigger): boolean {
   switch (trigger) {
     case "turn_failure": return kind !== "met"
-    case "session_open": case "first_gate": return kind === "fillable"
+    case "session_open": return kind === "fillable"
     default: return assertNever(trigger)
   }
 }

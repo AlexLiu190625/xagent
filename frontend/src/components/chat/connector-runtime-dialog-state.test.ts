@@ -815,7 +815,7 @@ describe("the dialog's endings", () => {
 })
 
 // Whether the read that would first show the dialog shows it, per trigger
-// and per outcome: every one of the twelve pairs spelled out.
+// and per outcome: every one of the eight pairs spelled out.
 describe("opensOnFirstRead", () => {
   it.each([
     ["turn_failure", "met", false],
@@ -826,10 +826,6 @@ describe("opensOnFirstRead", () => {
     ["session_open", "unsupported_only", false],
     ["session_open", "nothing_fillable", false],
     ["session_open", "fillable", true],
-    ["first_gate", "met", false],
-    ["first_gate", "unsupported_only", false],
-    ["first_gate", "nothing_fillable", false],
-    ["first_gate", "fillable", true],
   ] as const)("%s + %s -> %s", (trigger, kind, opens) => {
     expect(opensOnFirstRead(kind, trigger)).toBe(opens)
   })
