@@ -9,6 +9,7 @@ import {
   INITIAL_DIALOG_STATE,
   isBusy,
   mergeSendFailureDisposition,
+  opensOnFirstRead,
   reduceDialog,
   uniqueKeys,
   type DialogEvent,
@@ -810,5 +811,26 @@ describe("the dialog's endings", () => {
       expect(RULES[rule](relaidOut), rule).toEqual([])
       expect(RULES[rule](insertBeforeDismiss(relaidOut, stray)), rule).toEqual([stray])
     }
+  })
+})
+
+// Whether the read that would first show the dialog shows it, per trigger
+// and per outcome: every one of the twelve pairs spelled out.
+describe("opensOnFirstRead", () => {
+  it.each([
+    ["turn_failure", "met", false],
+    ["turn_failure", "unsupported_only", true],
+    ["turn_failure", "nothing_fillable", true],
+    ["turn_failure", "fillable", true],
+    ["session_open", "met", false],
+    ["session_open", "unsupported_only", false],
+    ["session_open", "nothing_fillable", false],
+    ["session_open", "fillable", true],
+    ["first_gate", "met", false],
+    ["first_gate", "unsupported_only", false],
+    ["first_gate", "nothing_fillable", false],
+    ["first_gate", "fillable", true],
+  ] as const)("%s + %s -> %s", (trigger, kind, opens) => {
+    expect(opensOnFirstRead(kind, trigger)).toBe(opens)
   })
 })

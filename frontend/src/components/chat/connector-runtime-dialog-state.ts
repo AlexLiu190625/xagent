@@ -21,12 +21,14 @@ import {
   resolveDialogOutcome,
   type ConnectorRuntimeConnector,
   type ConnectorRuntimeDialogAction,
+  type ConnectorRuntimeDialogTrigger,
   type ConnectorRuntimeErrorMessageKey,
   type ConnectorRuntimeFailureDisposition,
   type ConnectorRuntimeInput,
   type ConnectorRuntimeReport,
   type ConnectorRuntimeSubmitItem,
   type DialogOutcome,
+  type DialogOutcomeKind,
 } from "@/lib/connector-runtime-api"
 
 // Why a draft failed the object-field blur check: "invalid" for anything
@@ -341,6 +343,16 @@ export function isBusy(phase: Phase): boolean {
       return false
     default:
       return assertNever(phase)
+  }
+}
+
+// Whether a first read finding `kind` shows a hidden dialog: after a failed
+// turn, anything short of met; for a check, only what can be filled in here.
+export function opensOnFirstRead(kind: DialogOutcomeKind, trigger: ConnectorRuntimeDialogTrigger): boolean {
+  switch (trigger) {
+    case "turn_failure": return kind !== "met"
+    case "session_open": case "first_gate": return kind === "fillable"
+    default: return assertNever(trigger)
   }
 }
 

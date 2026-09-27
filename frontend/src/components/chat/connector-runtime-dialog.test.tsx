@@ -4139,3 +4139,144 @@ describe("keeps the save gate closed across two same-task retargets in a row", (
     expect(screen.getByText("connectorRuntime.actions.saveOnly")).toBeEnabled()
   })
 })
+
+// A session check: the task page asks whether the task it shows is missing
+// anything, with no failed turn behind the question.
+describe("a session check shows only what the user can fill", () => {
+  const fillable = () => ok(report(false, [
+    connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+  ]))
+  async function openSessionCheck(taskId = 1) {
+    await act(async () => { latestActions.openSessionCheck(taskId, "opened") })
+  }
+
+  it("shows a fillable report with save only, under the session-check line", async () => {
+    fetchMock.mockResolvedValueOnce(fillable())
+    renderHarness()
+    await openSessionCheck()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    expect(screen.getByText("connectorRuntime.sessionOpenDescription")).toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.actions.saveOnly")).toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.actions.saveAndResend")).not.toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.actions.acknowledge")).not.toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.description")).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ["met", () => ok(report(true, []))],
+    ["unsupported_only", () => ok(report(false, [
+      connector(REF_A, "A", [input({ section: "secrets", key: "api_key", type: "string", required: true })]),
+    ]))],
+    ["nothing_fillable", () => ok(report(false, []))],
+    ["a failed read", () => ({ ok: false, kind: "http", status: 500 })],
+  ] as const)("stays hidden and closes as not-shown on %s", async (_name, result) => {
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    fetchMock.mockResolvedValueOnce(result())
+    renderHarness()
+    const closeSpy = vi.spyOn(latestActions, "close")
+    await openSessionCheck()
+    await waitFor(() => expect(latestState.request).toBeNull())
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+    expect(closeSpy.mock.calls).toEqual([["not-shown", 1]])
+  })
+})
+
+describe("a failure frame upgrades an open session check", () => {
+  it("keeps the dialog and the draft, and offers the claimed resend", async () => {
+    fetchMock.mockResolvedValue(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    renderHarness()
+    await act(async () => { latestActions.openSessionCheck(1, "opened") })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "draft" } })
+    await act(async () => {
+      latestActions.stagePendingDelivery({ taskId: 1, clientMessageId: "turn-1", text: "hi" })
+    })
+    await openForTask()
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.saveAndResend")).toBeInTheDocument())
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+    expect(screen.getByLabelText("token")).toHaveValue("draft")
+    expect(screen.getByText("connectorRuntime.actions.saveOnly")).toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.description")).toBeInTheDocument()
+    expect(latestState.request).toMatchObject({
+      taskId: 1, trigger: "turn_failure", resendPayload: { clientMessageId: "turn-1" },
+    })
+  })
+})
+
+describe("closing a session check keeps the stash", () => {
+  async function visibleCheckWithStash() {
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    renderHarness()
+    await act(async () => { latestActions.openSessionCheck(1, "opened") })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    // A turn for this task delivered while the check is on screen.
+    await stageThenRecord({ taskId: 1, clientMessageId: "sent-1", text: "hi" })
+  }
+
+  it("keeps it when the user closes the dialog", async () => {
+    await visibleCheckWithStash()
+    fireEvent.click(screen.getByRole("button", { name: "Close" }))
+    await waitFor(() => expect(latestState.request).toBeNull())
+    expect((latestState.payload as { clientMessageId: string } | null)?.clientMessageId).toBe("sent-1")
+  })
+
+  it("keeps it when save only lands met and closes the dialog", async () => {
+    await visibleCheckWithStash()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+    await waitFor(() => expect(latestState.request).toBeNull())
+    expect((latestState.payload as { clientMessageId: string } | null)?.clientMessageId).toBe("sent-1")
+  })
+})
+
+describe("a session check keeps to the three host pages", () => {
+  const fillable = () => ok(report(false, [
+    connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+  ]))
+
+  it("reads nothing when it mounts off the host pages, even on the new-conversation page", async () => {
+    for (const path of ["/settings", "/task"]) {
+      pathnameRef.current = path
+      fetchMock.mockReset()
+      renderHarness()
+      const closeSpy = vi.spyOn(latestActions, "close")
+      await act(async () => { latestActions.openSessionCheck(1, "opened") })
+      await waitFor(() => expect(latestState.request).toBeNull())
+      expect(fetchMock).not.toHaveBeenCalled()
+      expect(closeSpy.mock.calls).toEqual([["not-shown", 1]])
+      cleanup()
+    }
+  })
+
+  it("closes as not-shown when the path leaves while the read is in flight", async () => {
+    let resolveRead: (value: unknown) => void = () => {}
+    fetchMock.mockReturnValueOnce(new Promise((res) => { resolveRead = res }))
+    const view = render(providerTree())
+    const closeSpy = vi.spyOn(latestActions, "close")
+    await act(async () => { latestActions.openSessionCheck(1, "opened") })
+    pathnameRef.current = "/settings"
+    view.rerender(providerTree())
+    await act(async () => { resolveRead(fillable()) })
+    await waitFor(() => expect(latestState.request).toBeNull())
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+    expect(closeSpy.mock.calls).toEqual([["not-shown", 1]])
+  })
+
+  it("closes as left-host when the path leaves after it was shown", async () => {
+    fetchMock.mockResolvedValueOnce(fillable())
+    const view = render(providerTree())
+    await act(async () => { latestActions.openSessionCheck(1, "opened") })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    const closeSpy = vi.spyOn(latestActions, "close")
+    pathnameRef.current = "/settings"
+    view.rerender(providerTree())
+    await waitFor(() => expect(latestState.request).toBeNull())
+    expect(closeSpy.mock.calls).toEqual([["left-host", 1]])
+  })
+})

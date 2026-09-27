@@ -4943,6 +4943,7 @@ const zh = {
   connectorRuntime: {
     title: "这个连接器还需要一些信息",
     description: "上一条消息没能运行，因为它用到的一个连接器缺少必要的输入。",
+    sessionOpenDescription: "这个会话用到的连接器还缺一些必填信息。补上后再发下一条消息。",
     metTitle: "这个连接器需要的信息都齐了",
     metNotResent: "这个连接器现在不缺任何输入了。刚才失败的那条消息没有被重新发送；想让它运行，请在输入框里再发一次。",
     metNothingLeft: "这个连接器需要的信息都已保存。",

@@ -7,11 +7,46 @@ import { Button } from "@/components/ui/button"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 import { ProgressPanel, type ProgressStepView } from "@/components/task/progress-panel"
 import { isTerminalTaskStatus, useApp } from "@/contexts/app-context-chat"
+import { useConnectorRuntimeDialogActions, type SessionCheckCause } from "@/contexts/connector-runtime-dialog-context"
 import { useI18n } from "@/contexts/i18n-context"
 import { cn, getApiUrl } from "@/lib/utils"
 
+export interface SessionCheckWatch {
+  viewed: number | null // the task last seen both in the URL and in the app state
+  lastStateTaskId: number | null
+  lastConnected: boolean
+  armed: boolean // whether this view has already seen its first connect
+}
+
+export const INITIAL_SESSION_CHECK_WATCH: SessionCheckWatch = {
+  viewed: null, lastStateTaskId: null, lastConnected: false, armed: false,
+}
+
+// When this page asks the connector-runtime dialog to check the viewed task:
+// once when a view of it starts, and again whenever the same view's
+// connection comes back -- except the first connect of a view, which is just
+// the page coming up. On the render that switches tasks `isConnected` still
+// describes the previous task's socket, so a view that starts right after
+// another task was in the app state does not count that value as its first
+// connect.
+export function nextSessionCheck(
+  prev: SessionCheckWatch,
+  now: { viewed: number | null; stateTaskId: number | null; isConnected: boolean },
+): { next: SessionCheckWatch; check: SessionCheckCause | null } {
+  const seen = { ...prev, lastStateTaskId: now.stateTaskId, lastConnected: now.isConnected }
+  if (now.viewed === null) return { next: { ...seen, viewed: null, armed: false }, check: null }
+  if (now.viewed !== prev.viewed) {
+    const last = prev.lastStateTaskId
+    const suspect = last !== null && Number.isInteger(last) && last > 0 && last !== now.viewed
+    return { next: { ...seen, viewed: now.viewed, armed: !suspect && now.isConnected }, check: "opened" }
+  }
+  if (!now.isConnected || prev.lastConnected) return { next: seen, check: null }
+  return { next: { ...seen, armed: true }, check: prev.armed ? "reconnected" : null }
+}
+
 function TaskDetailContent() {
-  const { state, setTaskId, closeFilePreview } = useApp()
+  const { state, setTaskId, closeFilePreview, isConnected } = useApp()
+  const { openSessionCheck } = useConnectorRuntimeDialogActions()
   const { t } = useI18n()
   const params = useParams()
   const router = useRouter()
@@ -33,6 +68,17 @@ function TaskDetailContent() {
       closeFilePreview()
     }
   }, [closeFilePreview])
+
+  // Asks the connector-runtime dialog to check the viewed task (see
+  // nextSessionCheck); the dialog's provider decides whether that opens anything.
+  const urlTaskId = typeof taskIdFromUrl === "string" ? parseInt(taskIdFromUrl, 10) : NaN
+  const viewed = state.taskId !== null && state.taskId > 0 && state.taskId === urlTaskId ? state.taskId : null
+  const sessionCheckRef = useRef(INITIAL_SESSION_CHECK_WATCH)
+  useEffect(() => {
+    const { next, check } = nextSessionCheck(sessionCheckRef.current, { viewed, stateTaskId: state.taskId, isConnected })
+    sessionCheckRef.current = next
+    if (check !== null && next.viewed !== null) openSessionCheck(next.viewed, check)
+  }, [viewed, state.taskId, isConnected, openSessionCheck])
 
   // progressPanelOpen/dismissedProgressRunKeyRef are mount-local state, not
   // scoped to the viewed task - a soft A-to-B navigation (setTaskId without a
