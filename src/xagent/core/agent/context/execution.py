@@ -1878,7 +1878,15 @@ class ExecutionContext:
         if total_tokens <= self.compact_config.threshold:
             return None
 
-        visible_messages = [message for message in self.messages if not message.hidden]
+        # The stored-result list an earlier compaction inserted is not
+        # history and is not handed to the summary model: the summary written
+        # from this request is persisted and replayed into later turns, and
+        # compact_with_llm_response rebuilds the list from the registry.
+        visible_messages = [
+            message
+            for message in self.messages
+            if not message.hidden and not self._is_spill_index_message(message)
+        ]
         if not visible_messages:
             return None
 

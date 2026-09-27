@@ -4098,6 +4098,9 @@ def test_summary_compaction_keeps_the_spill_index_out_of_the_persisted_summary(
 
 
 def test_compact_request_is_unchanged_by_the_spill_registry(tmp_path):
+    """The summary model reads the same request with or without stored
+    results, including on a later compaction: the list an earlier one
+    inserted is left out, since the summary is persisted and replayed."""
     ctx = _context_with_stored_results(tmp_path)
     request = ctx.build_llm_compact_request_if_needed(context_window=32_000)
     ctx.components.pop("spilled_results")
@@ -4106,6 +4109,21 @@ def test_compact_request_is_unchanged_by_the_spill_registry(tmp_path):
 
     assert request == without_registry
     assert _compaction_notice_header() not in json.dumps(request["messages"])
+
+    ctx = _context_with_stored_results(tmp_path)
+    baseline = _context_with_stored_results(tmp_path)
+    baseline.components.pop("spilled_results")
+    for context in (ctx, baseline):
+        _compact_by_summary(context)
+        context.add_user_message("next request")
+    assert len(_spill_index_messages(ctx)) == 1
+
+    second = ctx.build_llm_compact_request_if_needed(context_window=32_000)
+    expected = baseline.build_llm_compact_request_if_needed(context_window=32_000)
+
+    assert second["messages"] == expected["messages"]
+    assert _compaction_notice_header() not in json.dumps(second["messages"])
+    assert VALID_RECORD["relative_path"] not in json.dumps(second["messages"])
 
 
 def test_summary_compaction_spill_index_respects_the_caps(tmp_path):
