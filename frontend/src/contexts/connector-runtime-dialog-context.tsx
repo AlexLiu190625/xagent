@@ -25,7 +25,7 @@
 // or share dependency instead of the authenticated one, layers (1) and (3)
 // stop holding at the same time, and this dialog's page-scoping must be
 // re-examined from scratch rather than assumed to still isolate guests.
-import React, { createContext, useContext, useEffect, useMemo, useState } from "react"
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react"
 
 import { useAuth } from "@/contexts/auth-context"
 
@@ -62,7 +62,7 @@ export interface ConnectorRuntimeDialogRequest {
   resendPayload: ConnectorRuntimeResendPayload | null
 }
 
-interface ConnectorRuntimeDialogState {
+export interface ConnectorRuntimeDialogState {
   seq: number
   request: ConnectorRuntimeDialogRequest | null
   payload: ConnectorRuntimeResendPayload | null
@@ -158,11 +158,138 @@ const ConnectorRuntimeDialogActionsContext =
 const ConnectorRuntimeDialogStateContext =
   createContext<ConnectorRuntimeDialogValue>(NOOP_VALUE)
 
+// Everything that can move the current request, as data.
+export type RequestInput =
+  | { type: "open"; taskId: number }
+  | { type: "close"; outcome: ConnectorRuntimeDialogCloseOutcome }
+  | { type: "retain"; taskId: number | null }
+  | { type: "forget"; taskId: number }
+  | { type: "identity-changed" }
+
+// Pure, and the one place the current request is written: every rule for how
+// one is opened, closed or dropped reads (and is tested) as one table. React
+// may run an updater more than once, so nothing here may have a side effect.
+export function transitionRequest(prev: ConnectorRuntimeDialogState, input: RequestInput): ConnectorRuntimeDialogState {
+  switch (input.type) {
+    case "open": {
+      const { taskId } = input
+      // A staged, not-yet-acknowledged turn for this task outranks the
+      // confirmed stash: it is the more recently sent one. Only an
+      // unambiguous single in-flight turn can be claimed, though -- the
+      // terminal frame carries no turn identity (xorbitsai/xagent#2465),
+      // so with two staged turns there is no way to tell which one
+      // failed. Ambiguity withholds the whole fallback chain, not just
+      // the staged pick: neither staged candidate nor the confirmed
+      // stash is offered. The one exception is a snapshot an
+      // already-open dialog for this task is already carrying (`kept`)
+      // -- that one survives, so a resend button already on screen does
+      // not disappear out from under the user. Offering save-only, or
+      // leaving that button alone, is the safe degradation; resending
+      // the wrong turn is not.
+      const mine = prev.pending.filter(p => p.taskId === taskId)
+      const ambiguous = mine.length > 1
+      const staged = mine.length === 1 ? mine[0] : null
+      // Clear the stash in the same update that builds the request. When
+      // this frame's snapshot comes from the stash, the handoff and the
+      // clearing cannot be two separate setState calls without a window
+      // where a "save and resend" click would read an already-cleared
+      // stash. The other two branches clear it with no handoff at all --
+      // a staged turn outranks it, or the frame is ambiguous and nothing
+      // is claimed -- for forgetDelivery's reason rather than this one:
+      // the frame carries no turn identity (xorbitsai/xagent#2465), so a
+      // stash left behind is a turn this very frame may be about. It
+      // would then survive a "not-shown" or "left-host" close, be
+      // claimed unambiguously by the next frame for this task, and be
+      // offered as a one-click resend of a turn nobody could confirm had
+      // failed.
+      const stashed = prev.payload?.taskId === taskId ? prev.payload : null
+      // A second request for a task whose dialog is already open (or
+      // already read) keeps whatever snapshot the first request carried,
+      // so a second tab's broadcast frame cannot make an in-flight resend
+      // button disappear.
+      const kept = prev.request?.taskId === taskId ? prev.request.resendPayload : null
+      const seq = prev.seq + 1
+      return {
+        seq,
+        request: {
+          taskId,
+          seq,
+          resendPayload: ambiguous ? (kept ?? null) : (staged ?? stashed ?? kept),
+        },
+        payload: stashed ? null : prev.payload,
+        pending: prev.pending.filter(p => p.taskId !== taskId),
+      }
+    }
+    case "close": {
+      const { outcome } = input
+      if (prev.request === null) return prev
+      // "dismissed": the user ended a dialog they saw (close, Esc, Got it,
+      //   or a save that settled it without a resend) -- drop the stash too.
+      // "resent": the stash now holds the turn that was just resent; keep it.
+      // "not-shown": the dialog never became visible; keep the stash.
+      // "left-host": the user navigated off the host pages after seeing
+      //   it; they did not choose to give up, so keep the stash.
+      return { ...prev, request: null, payload: outcome === "dismissed" ? null : prev.payload }
+    }
+    case "retain": {
+      const { taskId } = input
+      const nextRequest = prev.request && prev.request.taskId === taskId ? prev.request : null
+      const nextPayload = prev.payload && prev.payload.taskId === taskId ? prev.payload : null
+      const nextPending = prev.pending.filter(p => p.taskId === taskId)
+      if (
+        nextRequest === prev.request
+        && nextPayload === prev.payload
+        && nextPending.length === prev.pending.length
+      ) return prev
+      return { ...prev, request: nextRequest, payload: nextPayload, pending: nextPending }
+    }
+    case "forget": {
+      const { taskId } = input
+      // Drops every pending candidate for this task, not just the one that
+      // settled: a settlement frame carries no turn identity, so "which
+      // turn just ended" and "which other turn is still in flight" cannot
+      // be told apart (xorbitsai/xagent#2465). Clearing all of them trades
+      // an interleaved send's still-live candidate for the guarantee that a
+      // later failure never resends the wrong message.
+      //
+      // An open dialog for this task holds its own copy of the snapshot,
+      // handed over by openForTask, and that copy is what its resend button
+      // reads -- so clearing only the stash would leave a one-click resend
+      // on screen for a turn this frame has just settled. The copy goes
+      // too, but nothing else about the request does: the request stays,
+      // `seq` does not move, so the dialog stays open on the report it is
+      // showing, the user's draft survives, and only the resend button
+      // disappears. Closing the dialog here instead would throw away a
+      // draft the user is in the middle of typing over a frame they did
+      // not cause.
+      const nextRequest = prev.request?.taskId === taskId && prev.request.resendPayload !== null
+        ? { ...prev.request, resendPayload: null }
+        : prev.request
+      const nextPayload = prev.payload?.taskId === taskId ? null : prev.payload
+      const nextPending = prev.pending.some(p => p.taskId === taskId)
+        ? prev.pending.filter(p => p.taskId !== taskId)
+        : prev.pending
+      if (
+        nextRequest === prev.request
+        && nextPayload === prev.payload
+        && nextPending === prev.pending
+      ) return prev
+      return { ...prev, request: nextRequest, payload: nextPayload, pending: nextPending }
+    }
+    case "identity-changed":
+      return prev.request === null && prev.payload === null && prev.pending.length === 0
+        ? prev
+        : { ...prev, request: null, payload: null, pending: [] }
+  }
+}
+
 const INITIAL_STATE: ConnectorRuntimeDialogState = { seq: 0, request: null, payload: null, pending: [] }
 
 export function ConnectorRuntimeDialogProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<ConnectorRuntimeDialogState>(INITIAL_STATE)
   const userId = useAuth().user?.id ?? null
+  // How every action and effect below moves the request (setState is stable).
+  const apply = useCallback((input: RequestInput) => setState(prev => transitionRequest(prev, input)), [])
 
   // A signed-in identity change (logout, or another tab switching accounts)
   // clears the request, the stash, and any pending candidates. This also
@@ -170,76 +297,16 @@ export function ConnectorRuntimeDialogProvider({ children }: { children: React.R
   // there; React's strict-mode double-invoke of effects is likewise
   // harmless for the same reason.
   useEffect(() => {
-    setState(prev =>
-      prev.request === null && prev.payload === null && prev.pending.length === 0
-        ? prev
-        : { ...prev, request: null, payload: null, pending: [] },
-    )
-  }, [userId])
+    apply({ type: "identity-changed" })
+  }, [userId, apply])
 
   const actions = useMemo<ConnectorRuntimeDialogActions>(() => ({
     openForTask: (taskId) => {
       if (!Number.isInteger(taskId) || taskId <= 0) return
-      setState(prev => {
-        // A staged, not-yet-acknowledged turn for this task outranks the
-        // confirmed stash: it is the more recently sent one. Only an
-        // unambiguous single in-flight turn can be claimed, though -- the
-        // terminal frame carries no turn identity (xorbitsai/xagent#2465),
-        // so with two staged turns there is no way to tell which one
-        // failed. Ambiguity withholds the whole fallback chain, not just
-        // the staged pick: neither staged candidate nor the confirmed
-        // stash is offered. The one exception is a snapshot an
-        // already-open dialog for this task is already carrying (`kept`)
-        // -- that one survives, so a resend button already on screen does
-        // not disappear out from under the user. Offering save-only, or
-        // leaving that button alone, is the safe degradation; resending
-        // the wrong turn is not.
-        const mine = prev.pending.filter(p => p.taskId === taskId)
-        const ambiguous = mine.length > 1
-        const staged = mine.length === 1 ? mine[0] : null
-        // Clear the stash in the same update that builds the request. When
-        // this frame's snapshot comes from the stash, the handoff and the
-        // clearing cannot be two separate setState calls without a window
-        // where a "save and resend" click would read an already-cleared
-        // stash. The other two branches clear it with no handoff at all --
-        // a staged turn outranks it, or the frame is ambiguous and nothing
-        // is claimed -- for forgetDelivery's reason rather than this one:
-        // the frame carries no turn identity (xorbitsai/xagent#2465), so a
-        // stash left behind is a turn this very frame may be about. It
-        // would then survive a "not-shown" or "left-host" close, be
-        // claimed unambiguously by the next frame for this task, and be
-        // offered as a one-click resend of a turn nobody could confirm had
-        // failed.
-        const stashed = prev.payload?.taskId === taskId ? prev.payload : null
-        // A second request for a task whose dialog is already open (or
-        // already read) keeps whatever snapshot the first request carried,
-        // so a second tab's broadcast frame cannot make an in-flight resend
-        // button disappear.
-        const kept = prev.request?.taskId === taskId ? prev.request.resendPayload : null
-        const seq = prev.seq + 1
-        return {
-          seq,
-          request: {
-            taskId,
-            seq,
-            resendPayload: ambiguous ? (kept ?? null) : (staged ?? stashed ?? kept),
-          },
-          payload: stashed ? null : prev.payload,
-          pending: prev.pending.filter(p => p.taskId !== taskId),
-        }
-      })
+      apply({ type: "open", taskId })
     },
     close: (outcome) => {
-      setState((prev) => {
-        if (prev.request === null) return prev
-        // "dismissed": the user ended a dialog they saw (close, Esc, Got it,
-        //   or a save that settled it without a resend) -- drop the stash too.
-        // "resent": the stash now holds the turn that was just resent; keep it.
-        // "not-shown": the dialog never became visible; keep the stash.
-        // "left-host": the user navigated off the host pages after seeing
-        //   it; they did not choose to give up, so keep the stash.
-        return { ...prev, request: null, payload: outcome === "dismissed" ? null : prev.payload }
-      })
+      apply({ type: "close", outcome })
     },
     recordDelivery: (delivery) => {
       // Ticket taken up: only a delivery whose clientMessageId matches a
@@ -263,51 +330,10 @@ export function ConnectorRuntimeDialogProvider({ children }: { children: React.R
       })
     },
     retainOnlyTask: (taskId) => {
-      setState((prev) => {
-        const nextRequest = prev.request && prev.request.taskId === taskId ? prev.request : null
-        const nextPayload = prev.payload && prev.payload.taskId === taskId ? prev.payload : null
-        const nextPending = prev.pending.filter(p => p.taskId === taskId)
-        if (
-          nextRequest === prev.request
-          && nextPayload === prev.payload
-          && nextPending.length === prev.pending.length
-        ) return prev
-        return { ...prev, request: nextRequest, payload: nextPayload, pending: nextPending }
-      })
+      apply({ type: "retain", taskId })
     },
     forgetDelivery: (taskId) => {
-      // Drops every pending candidate for this task, not just the one that
-      // settled: a settlement frame carries no turn identity, so "which
-      // turn just ended" and "which other turn is still in flight" cannot
-      // be told apart (xorbitsai/xagent#2465). Clearing all of them trades
-      // an interleaved send's still-live candidate for the guarantee that a
-      // later failure never resends the wrong message.
-      //
-      // An open dialog for this task holds its own copy of the snapshot,
-      // handed over by openForTask, and that copy is what its resend button
-      // reads -- so clearing only the stash would leave a one-click resend
-      // on screen for a turn this frame has just settled. The copy goes
-      // too, but nothing else about the request does: the request stays,
-      // `seq` does not move, so the dialog stays open on the report it is
-      // showing, the user's draft survives, and only the resend button
-      // disappears. Closing the dialog here instead would throw away a
-      // draft the user is in the middle of typing over a frame they did
-      // not cause.
-      setState(prev => {
-        const nextRequest = prev.request?.taskId === taskId && prev.request.resendPayload !== null
-          ? { ...prev.request, resendPayload: null }
-          : prev.request
-        const nextPayload = prev.payload?.taskId === taskId ? null : prev.payload
-        const nextPending = prev.pending.some(p => p.taskId === taskId)
-          ? prev.pending.filter(p => p.taskId !== taskId)
-          : prev.pending
-        if (
-          nextRequest === prev.request
-          && nextPayload === prev.payload
-          && nextPending === prev.pending
-        ) return prev
-        return { ...prev, request: nextRequest, payload: nextPayload, pending: nextPending }
-      })
+      apply({ type: "forget", taskId })
     },
     stagePendingDelivery: (delivery) => {
       setState(prev => {

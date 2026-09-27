@@ -12,8 +12,13 @@ import {
   useConnectorRuntimeDialog,
   useConnectorRuntimeDialogActions,
   useConnectorRuntimeDialogActionsIfMounted,
+  transitionRequest,
   type ConnectorRuntimeDialogActions,
+  type ConnectorRuntimeDialogCloseOutcome,
+  type ConnectorRuntimeDialogState,
   type ConnectorRuntimeDialogValue,
+  type ConnectorRuntimeResendPayload,
+  type RequestInput,
 } from "./connector-runtime-dialog-context"
 
 afterEach(() => {
@@ -329,5 +334,84 @@ describe("pending candidate state machine", () => {
       latestActions.openForTask(1)
     })
     expect(latestState.request?.resendPayload).toBeNull()
+  })
+})
+
+// Every request transition the provider's actions made before they were
+// moved into transitionRequest, pinned as data: each row is one previous
+// state, one input, and the state that must come out. A row whose expected
+// state is `"same"` must return the very object it was given -- the
+// provider relies on that to skip a re-render when nothing changed.
+describe("transitionRequest keeps today's transitions", () => {
+  const delivery = (taskId: number, clientMessageId: string) => ({
+    taskId, clientMessageId, text: clientMessageId, files: [] as File[],
+  })
+  const stash1 = delivery(1, "stash-1")
+  const stash2 = delivery(2, "stash-2")
+  const staged1 = delivery(1, "staged-1")
+  const staged1b = delivery(1, "staged-1b")
+  const staged2 = delivery(2, "staged-2")
+  const keptSnap = delivery(1, "kept-1")
+  const request = (taskId: number, seq: number, resendPayload: ConnectorRuntimeResendPayload | null = null) => (
+    { taskId, seq, resendPayload }
+  )
+  const state = (overrides: Partial<ConnectorRuntimeDialogState> = {}): ConnectorRuntimeDialogState => (
+    { seq: 4, request: null, payload: null, pending: [], ...overrides }
+  )
+  const open = (taskId: number): RequestInput => ({ type: "open", taskId })
+  const closeAs = (outcome: ConnectorRuntimeDialogCloseOutcome): RequestInput => ({ type: "close", outcome })
+
+  const rows: Array<[string, ConnectorRuntimeDialogState, RequestInput, ConnectorRuntimeDialogState | "same"]> = [
+    ["open with nothing to claim", state(), open(1),
+      state({ seq: 5, request: request(1, 5) })],
+    ["open for a task whose request already carries a snapshot keeps it", state({ request: request(1, 4, keptSnap) }), open(1),
+      state({ seq: 5, request: request(1, 5, keptSnap) })],
+    ["open claims exactly one staged turn over the stash, and clears both", state({ payload: stash1, pending: [staged1, staged2] }), open(1),
+      state({ seq: 5, request: request(1, 5, staged1), payload: null, pending: [staged2] })],
+    ["open claims the stash when nothing is staged", state({ payload: stash1 }), open(1),
+      state({ seq: 5, request: request(1, 5, stash1), payload: null })],
+    ["open leaves another task's stash alone", state({ payload: stash2 }), open(1),
+      state({ seq: 5, request: request(1, 5), payload: stash2 })],
+    ["open claims nothing when two turns are staged", state({ payload: stash1, pending: [staged1, staged1b] }), open(1),
+      state({ seq: 5, request: request(1, 5), payload: null, pending: [] })],
+    ["open keeps an open request's snapshot when two turns are staged", state({ request: request(1, 4, keptSnap), pending: [staged1, staged1b] }), open(1),
+      state({ seq: 5, request: request(1, 5, keptSnap), pending: [] })],
+    ["open for another task replaces the request and drops its snapshot", state({ request: request(2, 4, stash2) }), open(1),
+      state({ seq: 5, request: request(1, 5) })],
+    ["close with no request", state({ payload: stash1 }), closeAs("dismissed"), "same"],
+    ["close dismissed drops the stash", state({ request: request(1, 4), payload: stash1 }), closeAs("dismissed"),
+      state({ payload: null })],
+    ["close resent keeps the stash", state({ request: request(1, 4), payload: stash1 }), closeAs("resent"),
+      state({ payload: stash1 })],
+    ["close not-shown keeps the stash", state({ request: request(1, 4), payload: stash1 }), closeAs("not-shown"),
+      state({ payload: stash1 })],
+    ["close left-host keeps the stash", state({ request: request(1, 4), payload: stash1 }), closeAs("left-host"),
+      state({ payload: stash1 })],
+    ["retain the request's own task", state({ request: request(1, 4), payload: stash2, pending: [staged1, staged2] }), { type: "retain", taskId: 1 },
+      state({ request: request(1, 4), payload: null, pending: [staged1] })],
+    ["retain another task", state({ request: request(1, 4), payload: stash1, pending: [staged1] }), { type: "retain", taskId: 2 },
+      state()],
+    ["retain no task", state({ request: request(1, 4), payload: stash1, pending: [staged2] }), { type: "retain", taskId: null },
+      state()],
+    ["retain with nothing to drop", state({ request: request(1, 4), payload: stash1, pending: [staged1] }), { type: "retain", taskId: 1 }, "same"],
+    ["forget takes the snapshot off an open request, seq unchanged", state({ request: request(1, 4, keptSnap), payload: stash1, pending: [staged1, staged2] }), { type: "forget", taskId: 1 },
+      state({ request: request(1, 4), payload: null, pending: [staged2] })],
+    ["forget leaves a request with no snapshot as is", state({ request: request(1, 4), payload: stash1 }), { type: "forget", taskId: 1 },
+      state({ request: request(1, 4), payload: null })],
+    ["forget with nothing for that task", state({ request: request(2, 4, stash2), payload: stash2, pending: [staged2] }), { type: "forget", taskId: 1 }, "same"],
+    ["identity change with nothing held", state(), { type: "identity-changed" }, "same"],
+    ["identity change drops the request, the stash and every staged turn", state({ request: request(1, 4, keptSnap), payload: stash2, pending: [staged1] }), { type: "identity-changed" },
+      state()],
+  ]
+
+  it.each(rows)("%s", (_name, prev, input, expected) => {
+    const next = transitionRequest(prev, input)
+    if (expected === "same") expect(next).toBe(prev)
+    else expect(next).toEqual(expected)
+  })
+
+  it("keeps an unchanged request object when retaining its own task", () => {
+    const prev = state({ request: request(1, 4, keptSnap), payload: stash2 })
+    expect(transitionRequest(prev, { type: "retain", taskId: 1 }).request).toBe(prev.request)
   })
 })
