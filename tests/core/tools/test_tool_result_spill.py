@@ -67,6 +67,7 @@ from xagent.core.tools.tool_result_spill import (
     _spill_kind_of,
     _spill_slice,
     _spill_text_lines,
+    _write_spill_file,
     list_spilled_results,
     normalize_spilled_relative_path,
     read_spilled_result,
@@ -74,6 +75,7 @@ from xagent.core.tools.tool_result_spill import (
     resolve_spilled_under,
     spill_dir_for_workspace,
     spill_oversized_values,
+    spill_read_page_chars,
     spill_read_unavailable,
     spill_record_shape_is_valid,
     strip_reserved_spill_key,
@@ -532,6 +534,107 @@ def test_spill_read_unavailable_rejects_an_undefined_reason():
     # than surfacing a bare KeyError from the message table.
     with pytest.raises(ValueError):
         spill_read_unavailable("typo")
+
+
+@pytest.mark.parametrize(
+    ("max_chars", "expected"),
+    [(51_200, 12_000), (12_000, 12_000), (8_000, 8_000), (1, 1), (0, 1), (-5, 1)],
+)
+def test_spill_read_page_chars_is_the_smaller_of_the_cap_and_the_output_limit(
+    max_chars, expected
+):
+    # Written out rather than derived: a page is never longer than the
+    # output limit or the read tool's own cap, and a limit of 0 or below
+    # still gives a page that moves forward.
+    assert spill_read_page_chars(max_chars) == expected
+
+
+def _letters(count):
+    """A string whose characters differ from their neighbours, so a skipped
+    or repeated stretch shows up in an equality check."""
+    return "".join(chr(ord("a") + index % 26) for index in range(count))
+
+
+def test_read_spilled_result_pages_at_page_chars_without_a_gap(tmp_path):
+    """A 15,000-character line read with 8,000-character pages comes back in
+    two replies; the second starts at offset 8,000, where the first ended,
+    and the two pages join to the line."""
+    line = _letters(15_000)
+    rel = _write_spill_file(str(tmp_path), "acme", line, "text")
+
+    first = read_spilled_result(tmp_path, rel, start=1, end=1, page_chars=8_000)
+    second = read_spilled_result(
+        tmp_path, rel, start=1, end=1, offset=8_000, page_chars=8_000
+    )
+
+    assert first == {
+        "relative_path": rel,
+        "content_preview": line[:8_000],
+        "content_truncated": True,
+        "original_chars": 15_000,
+        "item_count": 1,
+        "offset": 0,
+        "instruction": SPILL_READ_TRUNCATED_INSTRUCTION,
+    }
+    assert second == {
+        "relative_path": rel,
+        "content_preview": line[8_000:],
+        "content_truncated": False,
+        "original_chars": 15_000,
+        "item_count": 1,
+        "offset": 8_000,
+    }
+    assert first["content_preview"] + second["content_preview"] == line
+
+
+def test_read_spilled_result_whole_reply_threshold_follows_page_chars(tmp_path):
+    """A 10,000-character text fits one default page and comes back whole,
+    but with 8,000-character pages it takes the preview shape, which tells
+    the model how long the text is and that more follows."""
+    text = _letters(10_000)
+    rel = _write_spill_file(str(tmp_path), "acme", text, "text")
+
+    assert read_spilled_result(tmp_path, rel) == {
+        "relative_path": rel,
+        "output": text,
+    }
+    assert read_spilled_result(tmp_path, rel, page_chars=8_000) == {
+        "relative_path": rel,
+        "content_preview": text[:8_000],
+        "content_truncated": True,
+        "original_chars": 10_000,
+        "item_count": 1,
+        "offset": 0,
+        "instruction": SPILL_READ_TRUNCATED_INSTRUCTION,
+    }
+
+
+@pytest.mark.parametrize("page_chars", [0, SPILL_READ_MAX_CHARS + 1, True])
+def test_read_spilled_result_rejects_a_page_size_outside_its_range(
+    tmp_path, page_chars
+):
+    # page_chars comes from the engine, never from the model, so a value
+    # outside 1..SPILL_READ_MAX_CHARS is a caller bug and raises, even for a
+    # path that names a readable stored result.
+    rel = _write_spill_file(str(tmp_path), "acme", "abc", "text")
+
+    with pytest.raises(ValueError, match="page_chars"):
+        read_spilled_result(tmp_path, rel, page_chars=page_chars)
+
+
+@pytest.mark.parametrize("page_chars", [1, SPILL_READ_MAX_CHARS])
+def test_read_spilled_result_accepts_both_ends_of_the_page_size_range(
+    tmp_path, page_chars
+):
+    rel = _write_spill_file(str(tmp_path), "acme", "abc", "text")
+
+    reply = read_spilled_result(tmp_path, rel, page_chars=page_chars)
+
+    if page_chars == 1:
+        assert reply["content_preview"] == "a"
+        assert reply["content_truncated"] is True
+    else:
+        assert reply == {"relative_path": rel, "output": "abc"}
 
 
 # --- walk, second tier, envelope, report construction ----------

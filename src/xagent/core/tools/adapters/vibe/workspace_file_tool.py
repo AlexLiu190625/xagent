@@ -20,6 +20,7 @@ from ...tool_result_spill import (
     SPILL_MAX_FILES_PER_RUN,
     SPILL_READ_MAX_CHARS,
     SPILL_READ_TOOL_NAME,
+    spill_read_page_chars,
 )
 from .base import ToolCategory
 from .function import FunctionTool
@@ -48,15 +49,23 @@ class WorkspaceFileTools(WorkspaceFileOperations):
     file operations restricted to that workspace.
     """
 
-    def __init__(self, workspace: TaskWorkspace):
+    def __init__(
+        self, workspace: TaskWorkspace, *, page_chars: int = SPILL_READ_MAX_CHARS
+    ):
         """
         Initialize with workspace binding.
 
         Args:
             workspace: The workspace to bind to
+            page_chars: How many characters one read_tool_result reply
+                carries, from spill_read_page_chars. It is fixed here, not
+                taken per call, because read_tool_result's signature is the
+                model's argument list; get_tools() states the same number in
+                the tool description.
         """
         self.inner = WorkspaceFileOperations(workspace)
         self.workspace = workspace
+        self.read_page_chars = page_chars
 
     def read_file(
         self,
@@ -164,15 +173,28 @@ class WorkspaceFileTools(WorkspaceFileOperations):
         """Get output file list from current workspace"""
         return self.inner.get_workspace_output_files()
 
-    def read_tool_result(
+    def read_tool_result(  # type: ignore[override]
         self,
         path: str | None = None,
         start: int | None = None,
         end: int | None = None,
         offset: int = 0,
     ) -> Dict[str, Any]:
-        """Read one engine-stored large tool result, or list them with no path."""
-        return self.inner.read_tool_result(path, start=start, end=end, offset=offset)
+        """Read one engine-stored large tool result, or list them with no path.
+
+        The core method's ``page_chars`` is deliberately absent from this
+        signature: FunctionTool turns every parameter into a field of the
+        tool schema, so exposing it would let the model pick a page longer
+        than the output limit. The page size this instance was built with
+        is passed instead.
+        """
+        return self.inner.read_tool_result(
+            path,
+            start=start,
+            end=end,
+            offset=offset,
+            page_chars=self.read_page_chars,
+        )
 
     def list_all_user_files(  # type: ignore[override]
         self,
@@ -332,7 +354,7 @@ class WorkspaceFileTools(WorkspaceFileOperations):
                     "numbers: array elements for a JSON array, top-level entries for a "
                     "JSON object, and lines only for plain text. Omit both to read the "
                     "whole result. One call returns at most "
-                    f"{SPILL_READ_MAX_CHARS:,} characters; offset is a 0-based "
+                    f"{self.read_page_chars:,} characters; offset is a 0-based "
                     "character position in the text the selected items render to, and "
                     "the reply starts there. When a reply is cut short, call again "
                     "with the same start and end and a larger offset to continue, "
@@ -349,17 +371,21 @@ class WorkspaceFileTools(WorkspaceFileOperations):
         ]
 
 
-def create_workspace_file_tools(workspace: TaskWorkspace) -> List[FunctionTool]:
+def create_workspace_file_tools(
+    workspace: TaskWorkspace, *, page_chars: int = SPILL_READ_MAX_CHARS
+) -> List[FunctionTool]:
     """
     Create list of file tools bound to specified workspace
 
     Args:
         workspace: Workspace to bind to
+        page_chars: Characters per read_tool_result reply, from
+            spill_read_page_chars
 
     Returns:
         List of tool instances
     """
-    tools_instance = WorkspaceFileTools(workspace)
+    tools_instance = WorkspaceFileTools(workspace, page_chars=page_chars)
     return tools_instance.get_tools()
 
 
@@ -373,7 +399,12 @@ if TYPE_CHECKING:
 
 @register_tool(categories={"file"})
 async def create_file_tools(config: "BaseToolConfig") -> List[Any]:
-    """Create workspace-bound file tools."""
+    """Create workspace-bound file tools.
+
+    read_tool_result pages at the same limit the factory's output filter
+    applies to every tool (config.get_max_output_length()), read from this
+    same config object, so a page is never cut by that filter.
+    """
     if not config.get_file_tools_enabled():
         return []
 
@@ -382,7 +413,8 @@ async def create_file_tools(config: "BaseToolConfig") -> List[Any]:
         return []
 
     try:
-        return create_workspace_file_tools(workspace)
+        page_chars = spill_read_page_chars(config.get_max_output_length())
+        return create_workspace_file_tools(workspace, page_chars=page_chars)
     except Exception as e:
         logger.warning(f"Failed to create file tools: {e}")
         return []

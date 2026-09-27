@@ -23,6 +23,7 @@ from ...file_ref import (
 )
 from ...workspace import DEFAULT_USER_FILE_LIST_LIMIT, TaskWorkspace
 from ..tool_result_spill import (
+    SPILL_READ_MAX_CHARS,
     list_spilled_results,
     read_spilled_result,
     spill_dir_for_workspace,
@@ -974,6 +975,7 @@ class WorkspaceFileOperations:
         start: int | None = None,
         end: int | None = None,
         offset: int = 0,
+        page_chars: int = SPILL_READ_MAX_CHARS,
     ) -> Dict[str, Any]:
         """Read one engine-stored tool result, or list them with no path.
 
@@ -988,11 +990,20 @@ class WorkspaceFileOperations:
         meaning for that listing; a non-zero offset without a path is
         rejected rather than ignored.
 
+        page_chars is how many characters one read returns, passed through
+        to read_spilled_result. It is not a model argument: the model-facing
+        tool (WorkspaceFileTools.read_tool_result in adapters/vibe) keeps it
+        out of its own signature and supplies the value it was built with
+        from the tool output limit (spill_read_page_chars). The listing
+        pages by entry count, so it does not use page_chars.
+
         Rejections come back as classified failures rather than exceptions,
         because the caller records the return value as the tool observation
-        the model reads. The one exception is the workspace authority check:
+        the model reads. The workspace authority check is the exception:
         its ValueError propagates unchanged, as it does from every other
-        File Operation method that calls _require_workspace_authority.
+        File Operation method that calls _require_workspace_authority. A
+        page_chars read_spilled_result does not accept is a caller bug, not
+        a model request, and its ValueError propagates too.
         """
         self._require_workspace_authority()
         spill_dir = spill_dir_for_workspace(self.workspace.workspace_dir)
@@ -1000,7 +1011,14 @@ class WorkspaceFileOperations:
             if offset != 0:
                 return spill_read_unavailable("invalid_range")
             return list_spilled_results(spill_dir, start=start, end=end)
-        return read_spilled_result(spill_dir, path, start=start, end=end, offset=offset)
+        return read_spilled_result(
+            spill_dir,
+            path,
+            start=start,
+            end=end,
+            offset=offset,
+            page_chars=page_chars,
+        )
 
 
 def _get_workspace_ops(workspace_id: str) -> WorkspaceFileOperations:

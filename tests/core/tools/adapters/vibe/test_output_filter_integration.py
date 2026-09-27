@@ -4,6 +4,7 @@ Integration tests for output filter with tool factory.
 
 import asyncio
 import logging
+import re
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import BaseModel
 
+from xagent.config import TOOL_MAX_OUTPUT_LENGTH
 from xagent.core.agent.context import ExecutionContext
 from xagent.core.tools import tool_result_spill
 from xagent.core.tools.adapters.vibe import output_filter_wrapper
@@ -1018,13 +1020,14 @@ def _store_for_reading(spill_dir, value, max_chars):
 async def test_the_read_back_tool_gets_no_spill_target(tmp_path, max_chars):
     """What read_tool_result returns is never spilled again, in either of its
     success shapes: the whole shape carries the text in output, and the
-    preview shape for one item longer than SPILL_READ_MAX_CHARS carries it
-    in content_preview, which is not an envelope field. With the output
-    limit lowered to 12,000 or 8,000 a spill target on this wrapper would
-    write a file for either shape or put the placeholder where the text
-    was. Without one, the reply is exactly what the output filter alone
-    makes of it: unchanged at 12,000, and truncated the way every other
-    over-limit string is at 8,000."""
+    preview shape for one item longer than a page carries it in
+    content_preview, which is not an envelope field. Each shape here
+    carries one full page, which is 12,000 characters at a 12,000 limit
+    and 8,000 at an 8,000 limit, and with the output limit lowered that far
+    a spill target on this wrapper would write a file for either shape or
+    put the placeholder where the text was. Without one, the reply is
+    exactly what the output filter alone makes of it, and since a page is
+    never longer than the limit, that is the reply unchanged."""
     config = ToolConfig(
         {
             "workspace": {
@@ -1042,7 +1045,8 @@ async def test_the_read_back_tool_gets_no_spill_target(tmp_path, max_chars):
             _bound_workspace(_only_tool_named(tools, "read_file")).workspace_dir
         )
     )
-    whole_text = "x" * tool_result_spill.SPILL_READ_MAX_CHARS
+    page_chars = tool_result_spill.spill_read_page_chars(max_chars)
+    whole_text = "x" * page_chars
     whole_path = _store_for_reading(spill_dir, whole_text, max_chars=100)
     long_items = ["y" * 15_000, "z" * 15_000]
     preview_path = _store_for_reading(spill_dir, long_items, max_chars=20_000)
@@ -1059,21 +1063,16 @@ async def test_the_read_back_tool_gets_no_spill_target(tmp_path, max_chars):
         ({"path": preview_path, "start": 1, "end": 1}, "content_preview"),
     ):
         raw = await reader._target.run_json_async(args)
-        assert len(raw[text_key]) == tool_result_spill.SPILL_READ_MAX_CHARS
+        assert len(raw[text_key]) == page_chars
         reply = await reader.run_json_async(args)
 
         assert SPILL_RESERVED_RESULT_KEY not in reply
         assert reply[text_key] != SPILL_PLACEHOLDER_TEXT
         assert reply == plain._filter_result(raw)
         # plain is built like reader, so the equality above holds by
-        # construction; these pin what the text itself becomes.
-        if max_chars >= tool_result_spill.SPILL_READ_MAX_CHARS:
-            assert reply[text_key] == raw[text_key]
-        else:
-            assert (
-                reply[text_key]
-                == raw[text_key][:max_chars] + DEFAULT_TRUNCATION_MESSAGE
-            )
+        # construction; these pin that the filter leaves the text alone.
+        assert reply == raw
+        assert DEFAULT_TRUNCATION_MESSAGE not in reply[text_key]
         assert sorted(spill_dir.iterdir()) == stored_files
     assert set(raw) >= {
         "content_preview",
@@ -1083,6 +1082,88 @@ async def test_the_read_back_tool_gets_no_spill_target(tmp_path, max_chars):
         "offset",
         "instruction",
     }
+
+
+async def _read_back_tool(tmp_path, task_id, max_output_length=None):
+    """The factory-built, filter-wrapped read_tool_result and its spill
+    directory, for a workspace under ``tmp_path``."""
+    settings = {"workspace": {"task_id": task_id, "base_dir": str(tmp_path)}}
+    if max_output_length is not None:
+        settings["max_output_length"] = max_output_length
+    tools = await ToolFactory.create_all_tools(ToolConfig(settings))
+    reader = _only_tool_named(tools, SPILL_READ_TOOL_NAME)
+    spill_dir = spill_dir_for_workspace(_bound_workspace(reader).workspace_dir)
+    return reader, spill_dir
+
+
+def _stated_page_chars(reader):
+    """The per-call character count the read tool's description states."""
+    stated = re.search(r"returns at most ([\d,]+) characters", reader.description)
+    assert stated is not None, reader.description
+    return int(stated.group(1).replace(",", ""))
+
+
+@pytest.mark.asyncio
+async def test_read_back_pages_at_a_lower_output_limit_join_to_the_stored_text(
+    tmp_path,
+):
+    """With the output limit at 8,000, one 15,000-character line read
+    through the factory's wrapped read_tool_result, stepping offset by the
+    page size the description states, comes back whole: each page fits the
+    limit, so the output filter cuts nothing and no stretch is skipped."""
+    reader, spill_dir = await _read_back_tool(tmp_path, "read-back-pages", 8_000)
+    step = _stated_page_chars(reader)
+    line = "".join(chr(ord("a") + index % 26) for index in range(15_000))
+    path = _store_for_reading(spill_dir, line, max_chars=100)
+
+    pages = []
+    offset = 0
+    while True:
+        reply = await reader.run_json_async(
+            {"path": path, "start": 1, "end": 1, "offset": offset}
+        )
+        assert DEFAULT_TRUNCATION_MESSAGE not in reply["content_preview"]
+        pages.append(reply["content_preview"])
+        if not reply["content_truncated"]:
+            break
+        offset += step
+
+    assert step == 8_000
+    assert [len(page) for page in pages] == [8_000, 7_000]
+    assert "".join(pages) == line
+
+
+@pytest.mark.asyncio
+async def test_read_back_page_size_is_stated_in_the_description_not_an_argument(
+    tmp_path,
+):
+    """The page size is fixed when the tool is built and stated in its
+    description; the model's argument list, generated from the method
+    signature, stays path, start, end and offset."""
+    reader, _ = await _read_back_tool(tmp_path, "read-back-args", 8_000)
+
+    assert "One call returns at most 8,000 characters" in reader.description
+    assert set(reader.args_type().model_fields) == {"path", "start", "end", "offset"}
+
+
+@pytest.mark.asyncio
+async def test_read_back_page_size_follows_the_config_override_not_the_environment(
+    tmp_path, monkeypatch
+):
+    """The output filter takes its limit from the config object, and a
+    ToolConfig max_output_length overrides XAGENT_TOOL_MAX_OUTPUT_LENGTH
+    there; the page size is read from the same object, so it follows the
+    override. Without an override both follow the environment."""
+    monkeypatch.setenv(TOOL_MAX_OUTPUT_LENGTH, "5000")
+
+    overridden, _ = await _read_back_tool(tmp_path, "read-back-override", 8_000)
+    from_env, _ = await _read_back_tool(tmp_path, "read-back-env")
+
+    for reader, limit in ((overridden, 8_000), (from_env, 5_000)):
+        instance, _ = extract_bound_method_target(reader._target)
+        assert reader._filter.max_chars == limit
+        assert instance.read_page_chars == limit
+        assert _stated_page_chars(reader) == limit
 
 
 @pytest.mark.asyncio
