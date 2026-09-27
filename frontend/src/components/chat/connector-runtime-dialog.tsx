@@ -391,12 +391,6 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   // change what closing does on four separate paths mid-write and is not
   // part of this change.
   const busy = facts.busy
-  // A superseded retry's toast is decided after an await, when this
-  // render's `facts` is stale; this mirror lets that decision say whether
-  // the send-failed panel is still up rather than assume one from what it
-  // said before the await (see handleRetryResend).
-  const heldFailureRef = useRef(facts.heldFailure)
-  heldFailureRef.current = facts.heldFailure
   // Every value this dialog derives from its own state and the request it
   // is currently showing, gathered in one call placed after the reducer
   // above: the render-period recycle check right below needs
@@ -967,10 +961,11 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       // Sent: the panel may stay up with its button re-enabled, and without
       // a toast a second press would send this turn again. Not sent: said
       // according to whether the panel this retry was pressed on is still
-      // up. A same-task retarget that swapped in a different snapshot has
-      // already recycled it (snapshot-gone, from render) before this
-      // settles, and `heldFailureRef` reads that live rather than the
-      // wording captured before the await: with the panel gone a toast is
+      // up. The panel stands only while the request still carries the
+      // snapshot it is about, so that is read live off the request here,
+      // not off the render this click came from: a same-task retarget that
+      // swapped in a different snapshot has taken the panel away (render
+      // recycles it with snapshot-gone), and with the panel gone a toast is
       // the only report left, so every failed outcome gets one, as in the
       // unmounted case. A panel still up takes the merged wording, and a
       // toast fires only when that wording crosses from "definitely not
@@ -979,7 +974,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       superseded: resendOutcome.kind === "sent"
         ? { tell: { notice: { kind: "resend-already-sent" } } }
         : {
-          tell: heldFailureRef.current === null
+          tell: requestRef.current.resendPayload?.clientMessageId !== sendFailure.snapshotId
             || (sendOutcomeMayHaveLanded(merged) && !sendOutcomeMayHaveLanded(dispositionBefore))
             ? notSent
             : { silent: sendOutcomeMayHaveLanded(dispositionBefore) ? "panel-carries-it" : "nothing-irreversible" },
