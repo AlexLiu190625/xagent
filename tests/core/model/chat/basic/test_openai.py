@@ -49,6 +49,12 @@ def _tool_call_delta(index, call_id, name, arguments, call_type="function"):
     )
 
 
+async def _empty_stream():
+    """A stream that ends without yielding any chunk."""
+    if False:
+        yield None
+
+
 def _response_format_bad_request(message: str) -> openai.BadRequestError:
     """A 400 whose text matches the response_format fallback's trigger check."""
     return openai.BadRequestError(
@@ -121,8 +127,9 @@ class TestOpenAILLM:
         assert call_args.kwargs["model"] == "gpt-4o-mini"
         assert call_args.kwargs["messages"] == messages
         assert call_args.kwargs["temperature"] == 0.7
-        # max_tokens should not be in the call if not explicitly provided
-        assert "max_tokens" not in call_args.kwargs
+        # The configured default_max_tokens (models.max_tokens) applies when
+        # the caller passes none, consistent with the other provider classes.
+        assert call_args.kwargs["max_tokens"] == 1024
 
     @pytest.mark.asyncio
     async def test_tool_calling(self, llm, mock_tool_call_completion, mocker):
@@ -216,12 +223,8 @@ class TestOpenAILLM:
     ):
         """Thinking intent should not add unsupported OpenAI chat parameters."""
 
-        async def empty_stream():
-            if False:
-                yield None
-
         mock_client = mocker.AsyncMock()
-        mock_client.chat.completions.create.return_value = empty_stream()
+        mock_client.chat.completions.create.return_value = _empty_stream()
         mocker.patch(
             "xagent.core.model.chat.basic.openai.AsyncOpenAI",
             return_value=mock_client,
@@ -606,6 +609,79 @@ class TestOpenAILLM:
         assert call_args.kwargs["max_tokens"] == 50
 
     @pytest.mark.asyncio
+    async def test_stream_chat_uses_default_max_tokens(self, openai_llm_config, mocker):
+        """stream_chat falls back to the configured default_max_tokens."""
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = _empty_stream()
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        _ = [
+            chunk
+            async for chunk in llm.stream_chat([{"role": "user", "content": "Hi"}])
+        ]
+
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert call_kwargs["max_tokens"] == 1024
+
+    @pytest.mark.asyncio
+    async def test_explicit_max_tokens_overrides_default_on_stream_and_vision(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """An explicit max_tokens (e.g. the compaction budget) wins over the default."""
+
+        mock_client = mocker.AsyncMock()
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+
+        mock_client.chat.completions.create.return_value = _empty_stream()
+        _ = [
+            chunk
+            async for chunk in llm.stream_chat(
+                [{"role": "user", "content": "Hi"}], max_tokens=50
+            )
+        ]
+        assert mock_client.chat.completions.create.call_args.kwargs["max_tokens"] == 50
+
+        mock_client.chat.completions.create.return_value = mock_chat_completion
+        await llm.vision_chat([{"role": "user", "content": "Hi"}], max_tokens=60)
+        assert mock_client.chat.completions.create.call_args.kwargs["max_tokens"] == 60
+
+    @pytest.mark.asyncio
+    async def test_no_default_max_tokens_omits_parameter(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """Without a configured default the request keeps the API's own default."""
+
+        mock_client = mocker.AsyncMock()
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        config = {**openai_llm_config, "default_max_tokens": None}
+        llm = OpenAILLM(**config, abilities=["chat", "vision"])
+        messages = [{"role": "user", "content": "Hi"}]
+
+        mock_client.chat.completions.create.return_value = mock_chat_completion
+        await llm.chat(messages)
+        await llm.vision_chat(messages)
+        mock_client.chat.completions.create.return_value = _empty_stream()
+        _ = [chunk async for chunk in llm.stream_chat(messages)]
+
+        calls = mock_client.chat.completions.create.call_args_list
+        assert len(calls) == 3
+        for call in calls:
+            assert "max_tokens" not in call.kwargs
+            assert "max_completion_tokens" not in call.kwargs
+
+    @pytest.mark.asyncio
     async def test_vision_chat_preserves_zero_temperature(
         self, openai_llm_config, mock_chat_completion, mocker
     ):
@@ -640,7 +716,7 @@ class TestOpenAILLM:
 
         call_args = mock_client.chat.completions.create.call_args
         assert call_args.kwargs["temperature"] == 0.0
-        assert "max_tokens" not in call_args.kwargs
+        assert call_args.kwargs["max_tokens"] == 1024
 
     @pytest.mark.asyncio
     async def test_vision_chat_returns_the_response_format_retry_result(
@@ -1774,9 +1850,10 @@ _REASONING_TOOLS_REJECTION = (
 class TestRejectedParameterDegrade:
     """Reasoning models spell the output budget ``max_completion_tokens``.
 
-    Context compaction is the only caller that sends an output budget at all,
-    so without this a reasoning model converses normally while every
-    compaction fails and falls back to dropping messages.
+    Context compaction always sends an output budget, and a configured
+    ``default_max_tokens`` sends one on every call, so without this a
+    reasoning model converses normally while every compaction fails and
+    falls back to dropping messages.
     """
 
     @pytest.mark.asyncio
@@ -1804,6 +1881,62 @@ class TestRejectedParameterDegrade:
         # summary from re-triggering the next compaction.
         assert "max_tokens" not in retry_kwargs
         assert retry_kwargs["max_completion_tokens"] == 5000
+
+    @pytest.mark.asyncio
+    async def test_chat_renames_default_max_tokens(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """A budget that came from default_max_tokens rides the same rename."""
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(_MAX_TOKENS_REJECTION),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        response = await llm.chat([{"role": "user", "content": "Summarize."}])
+
+        assert response["content"] == "Hello World"
+        first_kwargs = mock_client.chat.completions.create.call_args_list[0].kwargs
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert first_kwargs["max_tokens"] == 1024
+        assert "max_tokens" not in retry_kwargs
+        assert retry_kwargs["max_completion_tokens"] == 1024
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_renames_default_max_tokens(
+        self, openai_llm_config, mocker
+    ):
+        """Main agent turns stream with no explicit budget, so the
+        default-sourced one must ride the same rename on that path."""
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(_MAX_TOKENS_REJECTION),
+            _empty_stream(),
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        _ = [
+            chunk
+            async for chunk in llm.stream_chat(
+                [{"role": "user", "content": "Summarize."}]
+            )
+        ]
+
+        assert mock_client.chat.completions.create.await_count == 2
+        first_kwargs = mock_client.chat.completions.create.call_args_list[0].kwargs
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert first_kwargs["max_tokens"] == 1024
+        assert "max_tokens" not in retry_kwargs
+        assert retry_kwargs["max_completion_tokens"] == 1024
 
     @pytest.mark.asyncio
     async def test_chat_disables_reasoning_for_function_tools(

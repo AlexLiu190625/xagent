@@ -580,10 +580,14 @@ class OpenAICompatibleLLM(BaseLLM):
             **kwargs,
         }
 
-        # Only add max_tokens if explicitly provided
-        # Don't set default values - let API use its own defaults
+        # An explicit max_tokens (e.g. the compaction budget) wins; otherwise
+        # fall back to the configured ``default_max_tokens`` (for hub models,
+        # ``models.max_tokens``), consistent with the other provider classes.
+        # Without either, the API's own default applies.
         if max_tokens is not None:
             completion_params["max_tokens"] = max_tokens
+        elif self.default_max_tokens is not None:
+            completion_params["max_tokens"] = self.default_max_tokens
 
         if temperature is not None:
             completion_params["temperature"] = temperature
@@ -952,8 +956,11 @@ class OpenAICompatibleLLM(BaseLLM):
             **kwargs,
         }
 
+        # See ``chat()``: explicit max_tokens wins, then the configured default.
         if max_tokens is not None:
             completion_params["max_tokens"] = max_tokens
+        elif self.default_max_tokens is not None:
+            completion_params["max_tokens"] = self.default_max_tokens
 
         if temperature is not None:
             completion_params["temperature"] = temperature
@@ -1200,9 +1207,11 @@ class OpenAICompatibleLLM(BaseLLM):
             **kwargs,
         }
 
-        # Only set max_tokens if explicitly provided
+        # See ``chat()``: explicit max_tokens wins, then the configured default.
         if max_tokens is not None:
             completion_params["max_tokens"] = max_tokens
+        elif self.default_max_tokens is not None:
+            completion_params["max_tokens"] = self.default_max_tokens
 
         if temperature is not None:
             completion_params["temperature"] = temperature
