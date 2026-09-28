@@ -616,7 +616,7 @@ describe("transitionRequest settles a first gate exactly once, whoever ends it",
     ["B7 FG: left-host clears it", holding(), closeAs("left-host"), state({ gates: [ended(7, "cleared")] })],
     ["B8a FG: retaining its task keeps it held", holding(), { type: "retain", taskId: 1 }, "same"],
     ["B8b FG: retaining another task clears it", holding(), { type: "retain", taskId: 2 }, state({ gates: [ended(7, "cleared")] })],
-    ["B8b FG: retaining no task clears it", holding(), { type: "retain", taskId: null }, state({ gates: [ended(7, "cleared")] })],
+    ["B8c FG: retaining no task clears it", holding(), { type: "retain", taskId: null }, state({ gates: [ended(7, "cleared")] })],
     ["B9a FG: a settlement for its task drops tickets and stash, keeps it held", holding({ payload: stash1, pending: [staged1] }), { type: "forget", taskId: 1 },
       holding()],
     ["B9b FG: a settlement for another task", holding(), { type: "forget", taskId: 2 }, "same"],
@@ -790,7 +790,14 @@ describe("the provider hands a held first message its ending after commit", () =
 })
 
 describe("a first gate under StrictMode", () => {
-  it("answers once, and only the real unmount answers cleared", async () => {
+  // StrictMode re-runs the provider's effects only on mount, and a gate
+  // opened in that same commit (a child's mount effect) ends cleared by the
+  // identity effect's own mount run whatever the re-run does, so this cannot
+  // show an effect teardown the provider survives; the unmount fallback's
+  // check for that case is pinned by the source scan below. What this pins:
+  // every gate opened after mount is answered exactly once, and the real
+  // unmount answers the one still held.
+  it("answers a gate opened after mount once, and the real unmount answers cleared", async () => {
     let actions: ConnectorRuntimeDialogActions | undefined
     function Probe() {
       actions = useConnectorRuntimeDialogActions()
@@ -820,26 +827,68 @@ describe("a first gate under StrictMode", () => {
 
 // Where the provider may write its state and hand a held message its ending,
 // read off the source: every request and account write goes through apply
-// (transitionRequest), and an ending is handed over only after commit.
+// (transitionRequest), and an ending is handed over only after commit. Each
+// rule names the only regions a call may stand in, cut out by bracket
+// balance rather than by line, so reformatting does not matter and a call
+// moved to another place fails even when the count stays the same.
 describe("keeps the held-message account behind one writer and one exit", () => {
   const source = readFileSync(path.resolve(__dirname, "./connector-runtime-dialog-context.tsx"), "utf8")
-  const linesWith = (pattern: RegExp) => source.split("\n").filter(line => pattern.test(line)).map(line => line.trim())
+  // Comments go first: prose may name these functions and hold brackets.
+  const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "")
+  const count = (text: string, pattern: RegExp) => Array.from(text.matchAll(pattern)).length
+
+  // The bracketed group that opens at the first `open` at or after `from`.
+  function group(from: number, open: "(" | "{"): string {
+    const close = open === "(" ? ")" : "}"
+    const start = code.indexOf(open, from)
+    expect(start).toBeGreaterThanOrEqual(0)
+    let depth = 0
+    for (let i = start; i < code.length; i++) {
+      if (code[i] === open) depth += 1
+      else if (code[i] === close && --depth === 0) return code.slice(start, i + 1)
+    }
+    throw new Error(`unbalanced ${open} at ${start}`)
+  }
+  // The group right after the one place `pattern` matches.
+  function after(pattern: RegExp, open: "(" | "{"): string {
+    const hits = Array.from(code.matchAll(new RegExp(pattern.source, "g")))
+    expect(hits).toHaveLength(1)
+    const hit = hits[0]
+    return group((hit?.index ?? 0) + (hit?.[0].length ?? 0), open)
+  }
+  // The argument list of every useEffect call, in source order.
+  const effects = () => Array.from(code.matchAll(/\buseEffect\s*(?=\()/g), m => group(m.index ?? 0, "("))
 
   it("calls setState only in apply and the three ticket actions", () => {
-    expect(linesWith(/\bsetState\(/)).toEqual([
-      "const apply = useCallback((input: RequestInput) => setState(prev => transitionRequest(prev, input)), [])",
-      "setState(prev => {",
-      "setState(prev => {",
-      "setState(prev => {",
-    ])
+    const apply = after(/\bconst\s+apply\s*=\s*useCallback\s*/, "(")
+    expect(apply).toMatch(/^\(\s*\(\s*input\s*:\s*RequestInput\s*\)\s*=>\s*setState\s*\(\s*prev\s*=>\s*transitionRequest\s*\(\s*prev\s*,\s*input\s*\)\s*\)/)
+    // The three ticket actions, as the provider's action object defines them
+    // (the interface and the no-provider defaults name them too).
+    const actionsObject = after(/\bconst\s+actions\s*=\s*useMemo\s*<\s*ConnectorRuntimeDialogActions\s*>\s*/, "(")
+    const tickets = ["recordDelivery", "stagePendingDelivery", "discardPendingDelivery"].map(name => {
+      const at = actionsObject.search(new RegExp(`\\b${name}\\s*:\\s*\\([^)]*\\)\\s*=>\\s*\\{`))
+      expect(at).toBeGreaterThanOrEqual(0)
+      return group(code.indexOf(actionsObject) + at, "{")
+    })
+    expect([apply, ...tickets].map(text => count(text, /\bsetState\s*\(/g))).toEqual([1, 1, 1, 1])
+    expect(count(code, /\bsetState\s*\(/g)).toBe(4)
   })
 
   it("settles a gate only from the exit effect and the unmount fallback", () => {
-    expect(linesWith(/\bsettleGate\(/)).toEqual([
-      "function settleGate(resolvers: GateResolvers, id: number, decision: FirstGateDecision): void {",
-      "for (const { id, decision } of due) settleGate(resolversRef.current, id, decision)",
-      "for (const id of Array.from(resolvers.keys())) settleGate(resolvers, id, \"cleared\")",
-    ])
-    expect(linesWith(/\.get\(/)).toEqual(["const resolve = resolvers.get(id)"])
+    const settles = /\bsettleGate\s*\(/g
+    // The declaration, plus one call in each of the two effects below.
+    expect(count(code, settles)).toBe(3)
+    expect(count(after(/\bfunction\s+settleGate\s*/, "("), settles)).toBe(0)
+    const exit = effects().filter(effect => /\bgatesToSettle\s*\(\s*state\s*\)/.test(effect))
+    const fallback = effects().filter(effect => /\bqueueMicrotask\s*\(/.test(effect))
+    expect([exit.length, fallback.length]).toEqual([1, 1])
+    expect([count(exit[0] ?? "", settles), count(fallback[0] ?? "", settles)]).toEqual([1, 1])
+    expect(fallback[0]).toMatch(/settleGate\s*\(\s*resolvers\s*,\s*id\s*,\s*"cleared"\s*\)/)
+    // Answers only a real unmount: the teardown marks the provider gone,
+    // and the deferred check gives up if a re-setup marked it back.
+    expect(fallback[0]).toMatch(/^\(\s*\(\s*\)\s*=>\s*\{\s*mountedRef\.current\s*=\s*true\b/)
+    expect(fallback[0]).toMatch(/return\s*\(\s*\)\s*=>\s*\{\s*mountedRef\.current\s*=\s*false\s*queueMicrotask\s*\(\s*\(\s*\)\s*=>\s*\{\s*if\s*\(\s*mountedRef\.current\s*\)\s*return\b/)
+    expect(count(code, /\.get\s*\(/g)).toBe(1)
+    expect(after(/\bfunction\s+settleGate\s*\([^)]*\)\s*:\s*void\s*/, "{")).toMatch(/\bresolvers\.get\s*\(\s*id\s*\)/)
   })
 })

@@ -440,11 +440,26 @@ export function ConnectorRuntimeDialogProvider({ children }: { children: React.R
     apply({ type: "gates-drained", ids: due.map(d => d.id) })
   }, [state, apply])
 
-  // No commit follows an unmount, so the effect above cannot answer then.
+  // No commit follows an unmount, so the effect above cannot answer then;
+  // this does, but only for a real one. React also tears effects down and
+  // sets them up again on a provider that stays mounted (Fast Refresh in
+  // development, and StrictMode's mount re-run), and a held request is still
+  // held there: answering "cleared" then would end the message while its
+  // dialog stays up, and the real decision would later find nobody to
+  // answer. So the teardown only marks the provider gone and checks again
+  // once the current task finishes -- a re-setup in between marks it back.
+  // Assumes the provider is never kept alive with its effects torn down (a
+  // hidden <Activity>): that would read as an unmount.
+  const mountedRef = useRef(false)
   useEffect(() => {
+    mountedRef.current = true
     const resolvers = resolversRef.current
     return () => {
-      for (const id of Array.from(resolvers.keys())) settleGate(resolvers, id, "cleared")
+      mountedRef.current = false
+      queueMicrotask(() => {
+        if (mountedRef.current) return
+        for (const id of Array.from(resolvers.keys())) settleGate(resolvers, id, "cleared")
+      })
     }
   }, [])
 
