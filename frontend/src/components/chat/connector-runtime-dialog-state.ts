@@ -347,11 +347,12 @@ export function isBusy(phase: Phase): boolean {
 }
 
 // Whether a first read finding `kind` shows a hidden dialog: after a failed
-// turn, anything short of met; for a check, only what can be filled in here.
+// turn, anything short of met; for a check or a held first message, only
+// what can be filled in here.
 export function opensOnFirstRead(kind: DialogOutcomeKind, trigger: ConnectorRuntimeDialogTrigger): boolean {
   switch (trigger) {
     case "turn_failure": return kind !== "met"
-    case "session_open": return kind === "fillable"
+    case "session_open": case "first_gate": return kind === "fillable"
     default: return assertNever(trigger)
   }
 }

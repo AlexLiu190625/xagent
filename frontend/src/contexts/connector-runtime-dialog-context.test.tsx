@@ -1,4 +1,6 @@
 import React from "react"
+import { readFileSync } from "node:fs"
+import path from "node:path"
 import { act, cleanup, render } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
@@ -13,12 +15,15 @@ import {
   useConnectorRuntimeDialogActions,
   useConnectorRuntimeDialogActionsIfMounted,
   transitionRequest,
+  gatesToSettle,
   type ConnectorRuntimeDialogActions,
   type ConnectorRuntimeDialogCloseOutcome,
   type ConnectorRuntimeDialogRequest,
   type ConnectorRuntimeDialogState,
   type ConnectorRuntimeDialogValue,
   type ConnectorRuntimeResendPayload,
+  type FirstGateDecision,
+  type HeldGate,
   type RequestInput,
   type SessionCheckCause,
 } from "./connector-runtime-dialog-context"
@@ -27,6 +32,9 @@ afterEach(() => {
   cleanup()
   authUserRef.current = { id: "u1" }
 })
+
+// Lets committed effects and the promise callbacks they resolve run.
+const flush = () => act(async () => {})
 
 describe("useConnectorRuntimeDialogActionsIfMounted", () => {
   it("does not warn when called with no provider above it", () => {
@@ -567,5 +575,271 @@ describe("transitionRequest opens and closes requests by trigger", () => {
     plain?.openSessionCheck(1, "opened")
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("openSessionCheck() was called outside"))
     warnSpy.mockRestore()
+  })
+})
+
+// First gates, as data: the first-gate (FG) column of every transition, and
+// opening one with no request. A held first message's account must move in
+// the very step that moves its request, whichever input takes it away.
+describe("transitionRequest settles a first gate exactly once, whoever ends it", () => {
+  const fg = (taskId: number, gateId: number, seq = 4): ConnectorRuntimeDialogRequest => (
+    { taskId, seq, resendPayload: null, trigger: "first_gate", gateId }
+  )
+  const held = (id: number): HeldGate => ({ id, decision: null })
+  const ended = (id: number, decision: FirstGateDecision): HeldGate => ({ id, decision })
+  const gate = (taskId: number, gateId: number): RequestInput => ({ type: "open", taskId, trigger: "first_gate", gateId })
+  const holding = (overrides: Partial<ConnectorRuntimeDialogState> = {}) => (
+    state({ request: fg(1, 7), gates: [held(7)], ...overrides })
+  )
+  const rows: Array<[string, ConnectorRuntimeDialogState, RequestInput, ConnectorRuntimeDialogState | "same"]> = [
+    ["B3 none: opens and holds, touching neither the stash nor the tickets", state({ payload: stash1, pending: [staged1] }), gate(1, 7),
+      state({ seq: 5, request: fg(1, 7, 5), payload: stash1, pending: [staged1], gates: [held(7)] })],
+    ["B0 FG: a close from task 2 leaves it held", holding(), closeAs("resent", 2), "same"],
+    ["B1a FG: a failure frame for its task claims nothing and keeps it held", holding({ payload: stash1, pending: [staged1, staged2] }), open(1),
+      holding({ payload: null, pending: [staged2] })],
+    ["B1b FG: another task's failure frame clears it", holding(), open(2),
+      state({ seq: 5, request: request(2, 5), gates: [ended(7, "cleared")] })],
+    ["B2a FG: a session check for its task does nothing", holding(), check(1, "opened"), "same"],
+    ["B2b FG: another task's session check clears it", holding(), check(2, "opened"),
+      state({ seq: 5, request: sessionCheck(2, 5), gates: [ended(7, "cleared")] })],
+    ["B2c FG: a check yielding to its own task's ticket leaves it held", holding({ pending: [staged2] }), check(2, "reconnected"), "same"],
+    ["B2d FG: a check yielding to its own task's stash leaves it held", holding({ payload: stash2 }), check(2, "opened"), "same"],
+    ["B2e FG: a reconnect check kept quiet by the mark leaves it held", holding({ dismissedCheck: 2 }), check(2, "reconnected"), "same"],
+    ["B3a FG: a second gate for its task replaces it and clears the first", holding(), gate(1, 8),
+      state({ seq: 5, request: fg(1, 8, 5), gates: [ended(7, "cleared"), held(8)] })],
+    ["B3b FG: a gate for another task replaces it and clears the first", holding(), gate(2, 8),
+      state({ seq: 5, request: fg(2, 8, 5), gates: [ended(7, "cleared"), held(8)] })],
+    ["B4 FG: dismissed discards it, keeps the stash, sets the mark", holding({ payload: stash1 }), closeAs("dismissed"),
+      state({ payload: stash1, dismissedCheck: 1, gates: [ended(7, "discarded")] })],
+    ["B5 FG: resent releases it", holding(), closeAs("resent"), state({ gates: [ended(7, "released")] })],
+    ["B6 FG: not-shown releases it", holding(), closeAs("not-shown"), state({ gates: [ended(7, "released")] })],
+    ["B7 FG: left-host clears it", holding(), closeAs("left-host"), state({ gates: [ended(7, "cleared")] })],
+    ["B8a FG: retaining its task keeps it held", holding(), { type: "retain", taskId: 1 }, "same"],
+    ["B8b FG: retaining another task clears it", holding(), { type: "retain", taskId: 2 }, state({ gates: [ended(7, "cleared")] })],
+    ["B8b FG: retaining no task clears it", holding(), { type: "retain", taskId: null }, state({ gates: [ended(7, "cleared")] })],
+    ["B9a FG: a settlement for its task drops tickets and stash, keeps it held", holding({ payload: stash1, pending: [staged1] }), { type: "forget", taskId: 1 },
+      holding()],
+    ["B9b FG: a settlement for another task", holding(), { type: "forget", taskId: 2 }, "same"],
+    ["B10 FG: an identity change clears it", holding({ payload: stash1 }), { type: "identity-changed" }, state({ gates: [ended(7, "cleared")] })],
+    ["B12: handed-over entries leave the account, the held one stays", state({ request: fg(1, 8), gates: [ended(7, "released"), held(8)] }),
+      { type: "gates-drained", ids: [7] }, state({ request: fg(1, 8), gates: [held(8)] })],
+    ["B12: nothing to drop", holding(), { type: "gates-drained", ids: [9] }, "same"],
+    ["an ended entry outlives a branch that builds its state from scratch", state({ gates: [ended(7, "released")] }), open(2),
+      state({ seq: 5, request: request(2, 5), gates: [ended(7, "released")] })],
+  ]
+
+  it.each(rows)("%s", (_name, prev, input, expected) => {
+    const next = transitionRequest(prev, input)
+    if (expected === "same") expect(next).toBe(prev)
+    else expect(next).toEqual(expected)
+  })
+
+  it.each([
+    ["a failure frame for its task", open(1)],
+    ["a settlement for its task", { type: "forget", taskId: 1 } as RequestInput],
+  ])("keeps the very request object, seq and all, through %s", (_name, input) => {
+    const prev = holding({ payload: stash1, pending: [staged1] })
+    expect(transitionRequest(prev, input).request).toBe(prev.request)
+  })
+
+  it("keeps the request and payload objects when the account is drained", () => {
+    const prev = state({ request: request(2, 4, stash2), payload: stash2, gates: [ended(7, "cleared")] })
+    const next = transitionRequest(prev, { type: "gates-drained", ids: [7] })
+    expect(next.request).toBe(prev.request)
+    expect(next.payload).toBe(prev.payload)
+  })
+
+  it.each([
+    ["an ended entry", state({ gates: [ended(7, "discarded")] }), [{ id: 7, decision: "discarded" }]],
+    ["an entry its committed request still holds", holding(), []],
+    ["an entry held by a request that is not the committed one", state({ request: fg(1, 8), gates: [held(7), held(8)] }),
+      [{ id: 7, decision: "cleared" }]],
+    ["an entry held with no committed request", state({ gates: [held(7)] }), [{ id: 7, decision: "cleared" }]],
+    ["a state with no account", state(), []],
+  ] as const)("hands over %s", (_name, committed, due) => {
+    expect(gatesToSettle(committed)).toEqual(due)
+  })
+})
+
+describe("the provider hands a held first message its ending after commit", () => {
+  let actions: ConnectorRuntimeDialogActions | undefined
+  let value: ConnectorRuntimeDialogValue | undefined
+  function Probe() {
+    actions = useConnectorRuntimeDialogActions()
+    value = useConnectorRuntimeDialog()
+    return null
+  }
+  const tree = () => <ConnectorRuntimeDialogProvider><Probe /></ConnectorRuntimeDialogProvider>
+  function hold(taskId: number): FirstGateDecision[] {
+    const seen: FirstGateDecision[] = []
+    act(() => { void actions?.openFirstGate(taskId)?.then(d => { seen.push(d) }) })
+    return seen
+  }
+
+  it("opens nothing for an invalid task id", () => {
+    render(tree())
+    for (const taskId of [0, -3, 1.5]) expect(actions?.openFirstGate(taskId)).toBeNull()
+    expect(value?.request).toBeNull()
+  })
+
+  it("gives openFirstGate the same two no-provider defaults as every other action", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
+    let silent: ConnectorRuntimeDialogActions | undefined
+    let plain: ConnectorRuntimeDialogActions | undefined
+    function Outside() {
+      silent = useConnectorRuntimeDialogActionsIfMounted()
+      plain = useConnectorRuntimeDialogActions()
+      return null
+    }
+    render(<Outside />)
+    expect(silent?.openFirstGate(1)).toBeNull()
+    expect(warnSpy).not.toHaveBeenCalled()
+    expect(plain?.openFirstGate(1)).toBeNull()
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("openFirstGate() was called outside"))
+    warnSpy.mockRestore()
+  })
+
+  it.each([
+    ["resent", "released"],
+    ["not-shown", "released"],
+    ["dismissed", "discarded"],
+    ["left-host", "cleared"],
+  ] as const)("answers a %s close with %s, once", async (outcome, decision) => {
+    const view = render(tree())
+    const seen = hold(1)
+    expect(value?.request).toMatchObject({ taskId: 1, trigger: "first_gate", resendPayload: null })
+    act(() => { actions?.close(outcome, 1) })
+    await flush()
+    expect(seen).toEqual([decision])
+    view.unmount()
+    await Promise.resolve()
+    expect(seen).toEqual([decision])
+  })
+
+  it.each([
+    ["a task switch", () => actions?.retainOnlyTask(null)],
+    ["another task's failure frame", () => actions?.openForTask(2)],
+    ["another task's session check", () => actions?.openSessionCheck(2, "opened")],
+  ])("answers cleared when %s takes the request away", async (_name, takeAway) => {
+    render(tree())
+    const seen = hold(1)
+    act(() => { takeAway() })
+    await flush()
+    expect(seen).toEqual(["cleared"])
+  })
+
+  it("answers cleared when the signed-in identity changes", async () => {
+    const view = render(tree())
+    const seen = hold(1)
+    authUserRef.current = { id: "u2" }
+    view.rerender(tree())
+    await flush()
+    expect(seen).toEqual(["cleared"])
+  })
+
+  it("answers cleared when the provider unmounts with the message still held", async () => {
+    const view = render(tree())
+    const seen = hold(1)
+    await Promise.resolve()
+    expect(seen).toEqual([])
+    view.unmount()
+    await flush()
+    expect(seen).toEqual(["cleared"])
+  })
+
+  it("keeps a gate held when another task's dialog closes in the same batch", async () => {
+    render(tree())
+    act(() => { actions?.openSessionCheck(1, "opened") })
+    const seen: FirstGateDecision[] = []
+    act(() => {
+      void actions?.openFirstGate(2)?.then(d => { seen.push(d) })
+      actions?.close("not-shown", 1)
+    })
+    await Promise.resolve()
+    expect(value?.request).toMatchObject({ taskId: 2, trigger: "first_gate" })
+    expect(seen).toEqual([])
+  })
+
+  it("does not re-render a subscriber when it drains the account", () => {
+    let renders = 0
+    const requests: unknown[] = []
+    const payloads: unknown[] = []
+    function Subscriber() {
+      const { request, payload } = useConnectorRuntimeDialog()
+      renders += 1
+      requests.push(request)
+      payloads.push(payload)
+      return null
+    }
+    render(<ConnectorRuntimeDialogProvider><Probe /><Subscriber /></ConnectorRuntimeDialogProvider>)
+    hold(1)
+    const before = renders
+    // Replacing the gate's request records "cleared"; draining it afterwards
+    // must not hand a subscriber a new request or payload object.
+    act(() => { actions?.openForTask(2) })
+    expect(renders).toBe(before + 1)
+    expect(new Set(requests.slice(before)).size).toBe(1)
+    expect(new Set(payloads.slice(before)).size).toBe(1)
+    // Control: a change to the state half is seen by this subscriber.
+    act(() => {
+      actions?.stagePendingDelivery({ taskId: 3, clientMessageId: "c3", text: "x" })
+      actions?.recordDelivery({ taskId: 3, clientMessageId: "c3", text: "x" })
+    })
+    expect(renders).toBe(before + 2)
+  })
+})
+
+describe("a first gate under StrictMode", () => {
+  it("answers once, and only the real unmount answers cleared", async () => {
+    let actions: ConnectorRuntimeDialogActions | undefined
+    function Probe() {
+      actions = useConnectorRuntimeDialogActions()
+      return null
+    }
+    const tree = () => (
+      <React.StrictMode>
+        <ConnectorRuntimeDialogProvider><Probe /></ConnectorRuntimeDialogProvider>
+      </React.StrictMode>
+    )
+    const view = render(tree())
+    const first: FirstGateDecision[] = []
+    act(() => { void actions?.openFirstGate(1)?.then(d => { first.push(d) }) })
+    act(() => { actions?.close("resent", 1) })
+    await flush()
+    expect(first).toEqual(["released"])
+    const second: FirstGateDecision[] = []
+    act(() => { void actions?.openFirstGate(2)?.then(d => { second.push(d) }) })
+    await Promise.resolve()
+    expect(second).toEqual([])
+    view.unmount()
+    await flush()
+    expect(second).toEqual(["cleared"])
+    expect(first).toEqual(["released"])
+  })
+})
+
+// Where the provider may write its state and hand a held message its ending,
+// read off the source: every request and account write goes through apply
+// (transitionRequest), and an ending is handed over only after commit.
+describe("keeps the held-message account behind one writer and one exit", () => {
+  const source = readFileSync(path.resolve(__dirname, "./connector-runtime-dialog-context.tsx"), "utf8")
+  const linesWith = (pattern: RegExp) => source.split("\n").filter(line => pattern.test(line)).map(line => line.trim())
+
+  it("calls setState only in apply and the three ticket actions", () => {
+    expect(linesWith(/\bsetState\(/)).toEqual([
+      "const apply = useCallback((input: RequestInput) => setState(prev => transitionRequest(prev, input)), [])",
+      "setState(prev => {",
+      "setState(prev => {",
+      "setState(prev => {",
+    ])
+  })
+
+  it("settles a gate only from the exit effect and the unmount fallback", () => {
+    expect(linesWith(/\bsettleGate\(/)).toEqual([
+      "function settleGate(resolvers: GateResolvers, id: number, decision: FirstGateDecision): void {",
+      "for (const { id, decision } of due) settleGate(resolversRef.current, id, decision)",
+      "for (const id of Array.from(resolvers.keys())) settleGate(resolvers, id, \"cleared\")",
+    ])
+    expect(linesWith(/\.get\(/)).toEqual(["const resolve = resolvers.get(id)"])
   })
 })

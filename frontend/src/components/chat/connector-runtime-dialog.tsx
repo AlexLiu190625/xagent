@@ -366,12 +366,17 @@ function noticeText(
 // already carries the message and its own retry button, and a resend of this
 // very message still on the wire. Short of met, the line says why the dialog
 // is open; a session check asks the user to fill something in only while the
-// report still has something this dialog can fill.
+// report still has something this dialog can fill. A held first message was
+// never sent, so its two lines say that whatever the report: fill in and send
+// while something is fillable, otherwise send or leave it unsent.
 function descriptionKey(
   kind: DialogOutcome["kind"],
   trigger: ConnectorRuntimeDialogTrigger,
   metHoldingSnapshot: boolean,
 ): TranslationKey {
+  if (trigger === "first_gate") {
+    return kind === "fillable" ? "connectorRuntime.firstGateDescription" : "connectorRuntime.firstGateReadyDescription"
+  }
   if (kind === "met") return metHoldingSnapshot ? "connectorRuntime.metNotResent" : "connectorRuntime.metNothingLeft"
   switch (trigger) {
     case "session_open":
