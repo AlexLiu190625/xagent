@@ -23,6 +23,7 @@ from ...file_ref import (
 )
 from ...workspace import DEFAULT_USER_FILE_LIST_LIMIT, TaskWorkspace
 from ..tool_result_spill import (
+    SPILL_READ_MAX_CHARS,
     list_spilled_results,
     read_spilled_result,
     spill_dir_for_workspace,
@@ -203,8 +204,23 @@ class WorkspaceFileOperations:
     It works with workspace instances to ensure operations are restricted to workspace boundaries.
     """
 
-    def __init__(self, workspace: TaskWorkspace):
+    def __init__(
+        self, workspace: TaskWorkspace, *, page_chars: int = SPILL_READ_MAX_CHARS
+    ):
+        """
+        Args:
+            workspace: The workspace every operation is restricted to.
+            page_chars: How many characters one read_tool_result reply
+                carries, passed through to read_spilled_result. It is set
+                once here rather than taken per call because it is not a
+                model argument: the model-facing tool (WorkspaceFileTools in
+                adapters/vibe) computes it from the tool output limit with
+                spill_read_page_chars and exposes only path, start, end and
+                offset. read_spilled_result rejects a value outside 1 to
+                SPILL_READ_MAX_CHARS with ValueError on every read.
+        """
         self.workspace = workspace
+        self.read_page_chars = page_chars
 
     def _require_workspace_authority(self) -> None:
         """Fail closed before marked workspace-only reads or writes.
@@ -988,11 +1004,17 @@ class WorkspaceFileOperations:
         meaning for that listing; a non-zero offset without a path is
         rejected rather than ignored.
 
+        One read returns at most read_page_chars characters, the page size
+        this instance was built with (see __init__). The listing pages by
+        entry count, so it does not use the page size.
+
         Rejections come back as classified failures rather than exceptions,
         because the caller records the return value as the tool observation
-        the model reads. The one exception is the workspace authority check:
+        the model reads. The workspace authority check is the exception:
         its ValueError propagates unchanged, as it does from every other
-        File Operation method that calls _require_workspace_authority.
+        File Operation method that calls _require_workspace_authority. A
+        page size read_spilled_result does not accept is a caller bug, not
+        a model request, and its ValueError propagates too.
         """
         self._require_workspace_authority()
         spill_dir = spill_dir_for_workspace(self.workspace.workspace_dir)
@@ -1000,7 +1022,14 @@ class WorkspaceFileOperations:
             if offset != 0:
                 return spill_read_unavailable("invalid_range")
             return list_spilled_results(spill_dir, start=start, end=end)
-        return read_spilled_result(spill_dir, path, start=start, end=end, offset=offset)
+        return read_spilled_result(
+            spill_dir,
+            path,
+            start=start,
+            end=end,
+            offset=offset,
+            page_chars=self.read_page_chars,
+        )
 
 
 def _get_workspace_ops(workspace_id: str) -> WorkspaceFileOperations:

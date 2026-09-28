@@ -121,6 +121,8 @@ SPILL_READ_UNAVAILABLE_MESSAGES = {
 # mirrors READ_FILE_CONTEXT_LIMIT (core/agent/context/execution.py), and a
 # test pins the two equal: the context layer's own preview cap applies only
 # to read_file's plain-string results, so the read tool has to cap itself.
+# It is the most one reply ever carries; spill_read_page_chars lowers the
+# page further when the tool output limit is smaller.
 SPILL_READ_TOOL_NAME = "read_tool_result"
 SPILL_READ_MAX_CHARS = 12_000
 SPILL_READ_TRUNCATED_INSTRUCTION = (
@@ -548,6 +550,28 @@ def spill_read_unavailable(
     return {"success": False, "is_error": True, "status": "error", "output": message}
 
 
+def spill_read_page_chars(max_chars: int) -> int:
+    """The number of characters one read_tool_result reply carries.
+
+    ``max_chars`` is the tool output limit the output filter applies to
+    every string the read tool returns (BaseToolConfig.get_max_output_length).
+    A page longer than that limit would be cut by the filter, and the next
+    offset the model computes from the page size would skip the characters
+    the filter dropped, so a page is never longer than the limit and never
+    longer than SPILL_READ_MAX_CHARS.
+
+    The result is clamped to at least 1. The configuration layer does not
+    enforce a lower bound, so a limit of 0 or below reaches here unchanged,
+    and a page of 0 characters would return the same empty preview for
+    every offset without ever moving forward. Under such a limit the output
+    filter already mangles every string (a limit of 0 leaves only the
+    truncation marker, a negative limit drops that many characters from the
+    end), so the clamp does not make the read tool usable; it only keeps its
+    paging from standing still.
+    """
+    return max(1, min(SPILL_READ_MAX_CHARS, max_chars))
+
+
 def read_spilled_result(
     spill_dir: str | Path | None,
     name: Any,
@@ -555,6 +579,7 @@ def read_spilled_result(
     start: int | None = None,
     end: int | None = None,
     offset: int = 0,
+    page_chars: int = SPILL_READ_MAX_CHARS,
 ) -> dict[str, Any]:
     """Read one stored result from ``spill_dir`` without any path search.
 
@@ -581,14 +606,20 @@ def read_spilled_result(
     top-level entries in document order, anything else addresses physical
     lines. The registry is not consulted and the extension is not trusted.
 
-    At most SPILL_READ_MAX_CHARS characters come back per call. offset is a
+    At most ``page_chars`` characters come back per call. offset is a
     0-based character position in the text the selected items render to,
-    and the reply starts there; it is how a single item longer than the cap
+    and the reply starts there; it is how a single item longer than one page
     -- one long line of text, or one large array element or object entry --
     is read to its end, since no start/end range is narrower than one item.
     A reply that is not the whole selected text uses the preview shape
     below, which says where it starts, how long the whole text is, how many
     items the stored result holds, and whether more follows.
+
+    ``page_chars`` is set by the engine, never by the model: the tool that
+    wraps this function computes it once with spill_read_page_chars and
+    does not expose it as a tool argument. It must be an int from 1 to
+    SPILL_READ_MAX_CHARS; any other value is a bug in the caller and raises
+    ValueError, as an unknown reason does in spill_read_unavailable.
 
     Every rejection is returned as a classified failure
     (spill_read_unavailable) rather than raised, because the caller
@@ -597,6 +628,15 @@ def read_spilled_result(
     before the slice, so reaching it with a bad range is a bug in this
     function, not a model mistake, and it propagates.
     """
+    if (
+        isinstance(page_chars, bool)
+        or not isinstance(page_chars, int)
+        or not 1 <= page_chars <= SPILL_READ_MAX_CHARS
+    ):
+        raise ValueError(
+            f"read_spilled_result page_chars must be an int from 1 to "
+            f"{SPILL_READ_MAX_CHARS}, got {page_chars!r}"
+        )
     relative_path = normalize_spilled_relative_path(name)
     if relative_path is None:
         return spill_read_unavailable("invalid_path")
@@ -680,7 +720,7 @@ def read_spilled_result(
         last = total if end is None else min(end, total)
         output = _spill_slice(kind, value, content, first, last)
 
-    if offset == 0 and len(output) <= SPILL_READ_MAX_CHARS:
+    if offset == 0 and len(output) <= page_chars:
         return {"relative_path": relative_path, "output": output}
     # offset 0 always starts inside the text, even an empty one; any other
     # offset has to name a character that exists.
@@ -691,7 +731,7 @@ def read_spilled_result(
         # count, so only this path parses a file read without a range.
         parsed = _spill_kind_of(content)
     item_count = _spill_item_count(parsed[0], parsed[1], content)
-    window_end = offset + SPILL_READ_MAX_CHARS
+    window_end = offset + page_chars
     truncated = window_end < len(output)
     # Mirror read_file's over-limit shape (execution.py's
     # READ_FILE_CONTEXT_LIMIT branch): no "output" key, so

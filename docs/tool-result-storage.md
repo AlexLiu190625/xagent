@@ -57,15 +57,25 @@ registered at least one stored result. It has three uses:
   character position inside the selected text, used to continue reading an
   item longer than one reply.
 
-One reply returns at most `SPILL_READ_MAX_CHARS` (12000) characters. A
-longer selection returns a preview that says where it starts, how long the
-whole text is, and whether more follows. A file that is gone, or whose bytes
-no longer match the digest in its name, is reported as unavailable.
+One reply returns at most the smaller of `SPILL_READ_MAX_CHARS` (12000) and
+`XAGENT_TOOL_MAX_OUTPUT_LENGTH` characters, and the tool description states
+that number. A longer selection returns a preview that says where it starts,
+how long the whole text is, and whether more follows. A file that is gone, or
+whose bytes no longer match the digest in its name, is reported as
+unavailable.
+
+The reply goes through the same output filter as every other tool and is
+never stored again. For any positive limit the text of one reply, in `output`
+or `content_preview`, is never longer than the output limit, so the filter
+does not cut it, and advancing `offset` by the number in the tool description
+continues exactly where the previous reply ended. The other fields of a reply
+can still be cut; see Known limitations.
 
 ## Settings and limits
 
 - `XAGENT_TOOL_MAX_OUTPUT_LENGTH` (environment, see `example.env`): the
-  per-string truncation limit and the storing threshold.
+  per-string truncation limit and the storing threshold. Below
+  `SPILL_READ_MAX_CHARS` it is also the size of one `read_tool_result` reply.
 - `SPILL_MAX_FILES_PER_RESULT`, `SPILL_MAX_FILES_PER_RUN`,
   `SPILL_MAX_FILE_BYTES` and `SPILL_READ_MAX_CHARS` are constants in
   `src/xagent/core/tools/tool_result_spill.py`, not settings.
@@ -74,7 +84,10 @@ no longer match the digest in its name, is reported as unavailable.
 
 - Only dict results are stored. A tool that returns a plain string or a list
   is truncated as before.
-- The reply of `read_tool_result` goes through the same output filter and is
-  never stored again. If `XAGENT_TOOL_MAX_OUTPUT_LENGTH` is below
-  `SPILL_READ_MAX_CHARS`, a longer read-back is truncated by that filter, so
-  the model receives less than one full reply per call.
+- The output filter still cuts the short string fields of a `read_tool_result`
+  preview when the output limit is shorter than the field: `instruction` (160
+  characters) under a limit below 160, and `relative_path` (at most 130
+  characters) under a limit below its own length.
+- A listing page holds up to `SPILL_MAX_FILES_PER_RUN` (64) entries, and the
+  output filter also caps every list at `XAGENT_TOOL_MAX_FIELD_COUNT` items. A
+  deployment that sets that count below 64 gets a truncated listing.
