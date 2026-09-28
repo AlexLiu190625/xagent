@@ -1656,7 +1656,7 @@ async def test_dag_waiting_resume_keeps_memory_input_for_later_child() -> None:
     assert result["success"] is True, result
     assert restored.memory_input_text == typed
     assert memory_store.added
-    assert memory_store.added[-1].metadata["task"] == typed
+    assert "task" not in memory_store.added[-1].metadata
     assert {call["query"] for call in memory_store.searches} == {
         typed,
         "User chose option B.",
@@ -2739,7 +2739,9 @@ async def test_dag_pattern_passes_compact_llm_to_step_react_compaction() -> None
 
 
 @pytest.mark.asyncio
-async def test_dag_compaction_resume_preserves_clean_memory_metadata() -> None:
+async def test_dag_compaction_resume_keeps_request_text_out_of_memory_metadata() -> (
+    None
+):
     class CrudMemoryStore:
         def __init__(self) -> None:
             self.notes = {
@@ -2852,8 +2854,8 @@ async def test_dag_compaction_resume_preserves_clean_memory_metadata() -> None:
     )
 
     assert result["success"] is True, result
-    assert memory_store.added[0].metadata["task"] == typed
-    assert memory_store.updated[0].metadata["updated_by_task"] == typed
+    assert "task" not in memory_store.added[0].metadata
+    assert "updated_by_task" not in memory_store.updated[0].metadata
 
 
 @pytest.mark.asyncio
@@ -6290,8 +6292,7 @@ async def test_dag_pattern_enriches_plan_prompt_with_memory() -> None:
         "Plan this",
         "User prefers concise summaries.",
     ]
-    assert memory_store.added[0].metadata["task"] == "Plan this"
-    assert "/private/runtime/input.txt" not in memory_store.added[0].metadata["task"]
+    assert "task" not in memory_store.added[0].metadata
     prompt_payload = json.loads(llm.call_kwargs[0]["messages"][1]["content"])
     assert (
         "Split this project using the historical DAG pattern."

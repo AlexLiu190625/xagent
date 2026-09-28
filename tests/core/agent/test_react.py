@@ -7950,7 +7950,7 @@ async def test_react_resume_waiting_cancels_stale_pending_from_legacy_checkpoint
 
 
 @pytest.mark.asyncio
-async def test_react_pattern_resume_binds_original_task_to_store_memory() -> None:
+async def test_react_pattern_resume_keeps_original_memory_input() -> None:
     llm = FakeLLM(
         responses=[
             {
@@ -8014,8 +8014,10 @@ async def test_react_pattern_resume_binds_original_task_to_store_memory() -> Non
 
     assert resumed["success"] is True
     assert len(memory_store.added) == 1
-    # The store_memory tool is bound to the original task, not the resume turn.
-    assert memory_store.added[0].metadata["task"] == "Ask, then calculate"
+    # Legacy state without memory_input_text re-derives it from the original
+    # request, not the resume turn.
+    assert resumed_pattern.memory_input_text == "Ask, then calculate"
+    assert "task" not in memory_store.added[0].metadata
 
 
 @pytest.mark.asyncio
@@ -8913,7 +8915,7 @@ async def test_react_pattern_exposes_store_memory_tool_with_memory_store() -> No
 
 
 @pytest.mark.asyncio
-async def test_react_update_memory_uses_clean_task_metadata() -> None:
+async def test_react_update_memory_keeps_request_text_out_of_metadata() -> None:
     llm = FakeLLM(
         responses=[
             {
@@ -8958,8 +8960,7 @@ async def test_react_update_memory_uses_clean_task_metadata() -> None:
 
     assert result["success"] is True
     assert len(memory_store.updated) == 1
-    assert memory_store.updated[0].metadata["updated_by_task"] == typed
-    assert augmented not in memory_store.updated[0].metadata.values()
+    assert memory_store.updated[0].metadata == {"source": "test"}
 
 
 @pytest.mark.asyncio
