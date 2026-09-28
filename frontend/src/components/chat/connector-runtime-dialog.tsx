@@ -378,6 +378,16 @@ function noticeText(
 // report still has something this dialog can fill. A held first message was
 // never sent, so its two lines say that whatever the report: fill in and send
 // while something is fillable, otherwise send or leave it unsent.
+// How a flow ends when its route gate finds the request off its pages: a
+// dialog the user never saw closes as not-shown, which releases whatever it
+// holds; one they saw was left by their own navigation, the same ending the
+// leave effect gives it (left-host).
+function offHostEnding(wasVisible: boolean): Finish {
+  return wasVisible
+    ? { tell: { silent: "user-left" }, event: null, close: "left-host" }
+    : { tell: { silent: "never-shown" }, event: null, close: "not-shown" }
+}
+
 function descriptionKey(
   kind: DialogOutcome["kind"],
   trigger: ConnectorRuntimeDialogTrigger,
@@ -517,9 +527,12 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   // the user is free to navigate away from a host page while this read is in
   // flight. Both gates check the pages the request's trigger may show on
   // (isDialogHostPathFor), and whether a first read shows at all depends on
-  // the trigger too (opensOnFirstRead). A first gate that leaves before it
-  // was ever visible closes as not-shown, which releases its held message:
-  // it goes out exactly as it did before first gates existed.
+  // the trigger too (opensOnFirstRead). Both gates end the flow through
+  // offHostEnding: a first gate that leaves before it was ever visible closes
+  // as not-shown, which releases its held message -- it goes out exactly as
+  // it did before first gates existed -- and one that was visible closes as
+  // left-host, which clears it, whether the leave effect below or one of
+  // these gates sees the new path first.
   //
   // `visible` is read at the moment this effect starts, which is exactly
   // right here: nothing moves the dialog back from shown to hidden, so if
@@ -541,7 +554,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   // that never reach this effect at all.
   useEffect(() => {
     if (!isDialogHostPathFor(requestRef.current.trigger, pathnameRef.current)) {
-      finish({ tell: { silent: visible ? "user-left" : "never-shown" }, event: null, close: "not-shown" })
+      finish(offHostEnding(visible))
       return
     }
     const wasVisible = visible
@@ -574,7 +587,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       }
       if (!isDialogHostPathFor(requestRef.current.trigger, pathnameRef.current)) {
         dispatch(kept)
-        finish({ tell: { silent: wasVisible ? "user-left" : "never-shown" }, event: null, close: "not-shown" })
+        finish(offHostEnding(wasVisible))
         return
       }
       const outcome = resolveOutcomeFor(result.report, request.trigger)

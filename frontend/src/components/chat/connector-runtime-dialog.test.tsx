@@ -4602,6 +4602,28 @@ describe("a first gate starts from its own first read", () => {
   })
 })
 
+// A route gate that finds a request off its pages ends it the way the leave
+// effect would once the dialog was seen: left-host, not not-shown.
+describe("a route gate closes a dialog the user saw as left-host", () => {
+  it("closes as left-host when a retarget lands in the same render as a move off the host pages", async () => {
+    const fillable = () => ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ]))
+    fetchMock.mockResolvedValue(fillable())
+    renderHarness()
+    await openForTask()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    const closeSpy = vi.spyOn(latestActions, "close")
+    await act(async () => {
+      pathnameRef.current = "/settings"
+      latestActions.openForTask(1)
+    })
+    await waitFor(() => expect(latestState.request).toBeNull())
+    expect(closeSpy.mock.calls.length).toBeGreaterThan(0)
+    expect(closeSpy.mock.calls.every(call => call[0] === "left-host")).toBe(true)
+  })
+})
+
 describe("the footer retry repeats save and send", () => {
   it("releases the message when a retried save lands met", async () => {
     fetchMock.mockResolvedValueOnce(gateFillable())
