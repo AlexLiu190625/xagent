@@ -362,9 +362,9 @@ const request = (
   seq: number,
   resendPayload: ConnectorRuntimeResendPayload | null = null,
   trigger: ConnectorRuntimeDialogRequest["trigger"] = "turn_failure",
-): ConnectorRuntimeDialogRequest => ({ taskId, seq, resendPayload, trigger })
+): ConnectorRuntimeDialogRequest => ({ taskId, seq, resendPayload, trigger, gateId: null })
 const state = (overrides: Partial<ConnectorRuntimeDialogState> = {}): ConnectorRuntimeDialogState => (
-  { seq: 4, request: null, payload: null, pending: [], dismissedCheck: null, ...overrides }
+  { seq: 4, request: null, payload: null, pending: [], dismissedCheck: null, gates: [], ...overrides }
 )
 const open = (taskId: number): RequestInput => ({ type: "open", taskId, trigger: "turn_failure" })
 const closeAs = (outcome: ConnectorRuntimeDialogCloseOutcome, taskId = 1): RequestInput => (

@@ -73,8 +73,8 @@ export interface ConnectorRuntimeDialogRequest {
   // and a first gate's message stays with the create path holding it.
   resendPayload: ConnectorRuntimeResendPayload | null
   trigger: ConnectorRuntimeDialogTrigger
-  // Present exactly when trigger is "first_gate": the message it holds.
-  gateId?: number
+  // Non-null exactly when trigger is "first_gate": the message it holds.
+  gateId: number | null
 }
 
 // How a held first message ends. `released`: the dialog let it go (nothing to
@@ -93,8 +93,8 @@ export interface ConnectorRuntimeDialogState {
   pending: ConnectorRuntimePendingDelivery[]
   // Whose dialog the user closed this view (see transitionRequest).
   dismissedCheck: number | null
-  // Written only by transitionRequest's accountGates step; absent means none.
-  gates?: readonly HeldGate[]
+  // Written only by transitionRequest (accountGates, gates-drained).
+  gates: readonly HeldGate[]
 }
 
 export interface ConnectorRuntimeDialogActions {
@@ -212,9 +212,9 @@ export type RequestInput =
 // here may have a side effect: a decision is recorded, and handed over later.
 export function transitionRequest(prev: ConnectorRuntimeDialogState, input: RequestInput): ConnectorRuntimeDialogState {
   if (input.type !== "gates-drained") return accountGates(prev, moveRequest(prev, input), input)
-  const gates = prev.gates?.filter(g => !input.ids.includes(g.id))
+  const gates = prev.gates.filter(g => !input.ids.includes(g.id))
   // Keeps the request and payload objects, so no subscriber re-renders.
-  return gates === undefined || gates.length === prev.gates?.length ? prev : { ...prev, gates }
+  return gates.length === prev.gates.length ? prev : { ...prev, gates }
 }
 
 const CLOSE_DECISIONS: Record<ConnectorRuntimeDialogCloseOutcome, FirstGateDecision> = {
@@ -222,19 +222,19 @@ const CLOSE_DECISIONS: Record<ConnectorRuntimeDialogCloseOutcome, FirstGateDecis
 }
 
 // Whatever step takes a first gate's request away records its decision in that
-// same step, so no input can drop a held message unanswered. moveRequest never
-// writes `gates`: they are carried over from `prev`, even past a branch that
-// builds its next state from scratch.
+// same step, so no input can drop a held message unanswered. Whatever `gates`
+// moveRequest returns is ignored: they are carried over from `prev`, even past
+// a branch that builds its next state from scratch.
 function accountGates(prev: ConnectorRuntimeDialogState, next: ConnectorRuntimeDialogState, input: RequestInput): ConnectorRuntimeDialogState {
-  const before = prev.request?.gateId
-  const after = next.request?.gateId
+  const before = prev.request?.gateId ?? null
+  const after = next.request?.gateId ?? null
   if (before === after) return next.gates === prev.gates ? next : { ...next, gates: prev.gates }
-  let gates = prev.gates ?? []
-  if (before !== undefined) {
+  let gates = prev.gates
+  if (before !== null) {
     const decision = input.type === "close" ? CLOSE_DECISIONS[input.outcome] : "cleared"
     gates = gates.map(g => (g.id === before && g.decision === null ? { ...g, decision } : g))
   }
-  if (after !== undefined) gates = [...gates, { id: after, decision: null }]
+  if (after !== null) gates = [...gates, { id: after, decision: null }]
   return { ...next, gates }
 }
 
@@ -242,7 +242,7 @@ function accountGates(prev: ConnectorRuntimeDialogState, next: ConnectorRuntimeD
 // a backstop for a write that bypassed accountGates, "cleared" for an entry
 // still held by a request that is not the committed one (a hang made visible).
 export function gatesToSettle(state: ConnectorRuntimeDialogState): Array<{ id: number; decision: FirstGateDecision }> {
-  return (state.gates ?? []).flatMap(g => g.decision !== null ? [{ id: g.id, decision: g.decision }]
+  return state.gates.flatMap(g => g.decision !== null ? [{ id: g.id, decision: g.decision }]
     : g.id !== state.request?.gateId ? [{ id: g.id, decision: "cleared" as const }] : [])
 }
 
@@ -264,7 +264,7 @@ function moveRequest(prev: ConnectorRuntimeDialogState, input: Exclude<RequestIn
           || (cause === "opened" ? base.payload?.taskId === taskId : base.dismissedCheck === taskId)
         ) return base
         const seq = base.seq + 1
-        return { ...base, seq, request: { taskId, seq, resendPayload: null, trigger: "session_open" } }
+        return { ...base, seq, request: { taskId, seq, resendPayload: null, trigger: "session_open", gateId: null } }
       }
       if (input.trigger === "first_gate") {
         // The held message has no ticket or stash entry; this touches neither.
@@ -321,10 +321,12 @@ function moveRequest(prev: ConnectorRuntimeDialogState, input: Exclude<RequestIn
           seq,
           resendPayload: ambiguous ? (kept ?? null) : (staged ?? stashed ?? kept),
           trigger: "turn_failure",
+          gateId: null,
         },
         payload: stashed ? null : prev.payload,
         pending: prev.pending.filter(p => p.taskId !== taskId),
         dismissedCheck: prev.dismissedCheck === taskId ? null : prev.dismissedCheck,
+        gates: prev.gates,
       }
     }
     case "close": {
