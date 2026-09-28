@@ -2962,6 +2962,67 @@ def test_missing_task_prepare_reconciles_a_commit_acknowledgement_failure(
     )
 
 
+def test_prepare_task_message_omits_kb_instruction_for_agent_builder_agents(
+    db_session,
+    tmp_path,
+) -> None:
+    """Task-path agents no longer mount the KB authoring tools (#2219).
+
+    A saved agent carrying the ``agent-builder`` skill used to get a system
+    prompt ordering ``create_knowledge_base_from_file`` for every upload.
+    That tool is only mounted by the builder chat now, so the task path must
+    not name it anywhere the model reads.
+    """
+    from xagent.web.models.agent import Agent
+
+    owner = _user(db_session, "builder-skill-owner")
+    agent_row = Agent(
+        user_id=int(owner.id),
+        name="builder-skill-agent",
+        skills=["agent-builder"],
+    )
+    db_session.add(agent_row)
+    db_session.commit()
+    db_session.refresh(agent_row)
+    task = _task(db_session, int(owner.id))
+    task.agent_id = int(agent_row.id)
+    db_session.commit()
+    upload_path = tmp_path / "faq.txt"
+    upload_path.write_text("faq")
+    db_session.add(
+        UploadedFile(
+            file_id="builder-skill-file",
+            user_id=int(owner.id),
+            task_id=None,
+            filename="faq.txt",
+            storage_path=str(upload_path),
+            mime_type="text/plain",
+            file_size=3,
+        )
+    )
+    db_session.commit()
+
+    preparation = command_execution_service._prepare_task_message_sync(
+        requested_task_id=int(task.id),
+        actor_user_id=int(owner.id),
+        actor_is_admin=False,
+        user_message="build a knowledge base from this",
+        raw_context={},
+        raw_files=[{"file_id": "builder-skill-file"}],
+        client_message_id=None,
+        turn_id="builder-skill-turn",
+        durable_attempt_count=1,
+        durable_target_run_id=None,
+        pause_accepted=False,
+    )
+
+    system_prompt = preparation.execution_context["system_prompt"]
+    assert "## UPLOADED FILES" in system_prompt
+    assert "create_knowledge_base_from_file" not in system_prompt
+    assert "builder-skill-file" in preparation.user_message_for_llm
+    assert "create_knowledge_base_from_file" not in preparation.user_message_for_llm
+
+
 def test_missing_task_prepare_keeps_an_absent_commit_outcome_unknown(
     db_session,
     monkeypatch: pytest.MonkeyPatch,

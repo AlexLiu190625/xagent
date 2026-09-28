@@ -182,7 +182,6 @@ class ToolRegistry:
                 browser_tools,
                 current_time_tool,
                 custom_api_factory,
-                file_ingestion_tool,
                 image_tool,
                 knowledge_tools,
                 mcp_tools,
@@ -195,7 +194,6 @@ class ToolRegistry:
                 translate_json,
                 video_tool,
                 vision_tool,
-                web_ingestion_tool,
                 workspace_file_tool,
             )
 

@@ -915,16 +915,10 @@ class _TaskMessagePreparation:
     uses_live_control: bool
 
 
-def _agent_builder_skill_enabled(skills: Any) -> bool:
-    if isinstance(skills, list):
-        return any(skill == "agent-builder" for skill in skills)
-    return isinstance(skills, str) and "agent-builder" in skills
-
-
 def _load_task_command_routing_snapshot(
     db: Session,
     task: Task,
-) -> tuple[_TaskCommandRoutingSnapshot, bool]:
+) -> _TaskCommandRoutingSnapshot:
     """Project one authorized Task row without leaking ORM state."""
 
     from ..models.agent import Agent
@@ -932,14 +926,12 @@ def _load_task_command_routing_snapshot(
     agent_name: str | None = None
     agent_logo_url: str | None = None
     agent_execution_mode: str | None = None
-    agent_skills: Any = None
     if task.agent_id is not None:
         agent_fields = (
             db.query(
                 Agent.name,
                 Agent.logo_url,
                 Agent.execution_mode,
-                Agent.skills,
             )
             .filter(Agent.id == task.agent_id)
             .first()
@@ -952,7 +944,6 @@ def _load_task_command_routing_snapshot(
             agent_execution_mode = (
                 str(agent_fields[2]) if agent_fields[2] is not None else None
             )
-            agent_skills = deepcopy(agent_fields[3])
 
     (
         model_id,
@@ -971,53 +962,50 @@ def _load_task_command_routing_snapshot(
 
     created_at = cast(datetime | None, task.created_at)
     status = cast(TaskStatus, task.status)
-    return (
-        _TaskCommandRoutingSnapshot(
-            task_id=int(task.id),
-            task_owner_user_id=int(task.user_id),
-            task_source=str(task.source) if task.source is not None else None,
-            status=status,
-            control_state=_task_control_state_value(task),
-            run_id=_task_run_id(task),
-            state_version=int(task.state_version or 0),
-            task_lease=_task_lease_snapshot(task),
-            task_input=str(task.input or ""),
-            task_info={
-                "id": int(task.id),
-                "title": task.title,
-                "description": task.description,
-                "status": status.value,
-                "model_id": model_id,
-                "small_fast_model_id": small_fast_model_id,
-                "visual_model_id": visual_model_id,
-                "compact_model_id": compact_model_id,
-                "model_name": task.model_name,
-                "small_fast_model_name": task.small_fast_model_name,
-                "visual_model_name": task.visual_model_name,
-                "compact_model_name": task.compact_model_name,
-                "execution_mode": task.execution_mode,
-                "agent_id": task.agent_id,
-                "agent_name": agent_name,
-                "agent_logo_url": agent_logo_url,
-                "runtime_extension_bindings": list(
-                    task_extension_bindings_from_agent_config(task.agent_config)
-                ),
-                "is_dag": (
-                    agent_execution_mode == "think"
-                    if agent_execution_mode is not None
-                    else None
-                ),
-                "created_at": (
-                    safe_timestamp_to_unix(task.created_at) if task.created_at else None
-                ),
-                "updated_at": (
-                    safe_timestamp_to_unix(task.updated_at) if task.updated_at else None
-                ),
-            },
-            task_context=task_context,
-            created_at=created_at,
-        ),
-        _agent_builder_skill_enabled(agent_skills),
+    return _TaskCommandRoutingSnapshot(
+        task_id=int(task.id),
+        task_owner_user_id=int(task.user_id),
+        task_source=str(task.source) if task.source is not None else None,
+        status=status,
+        control_state=_task_control_state_value(task),
+        run_id=_task_run_id(task),
+        state_version=int(task.state_version or 0),
+        task_lease=_task_lease_snapshot(task),
+        task_input=str(task.input or ""),
+        task_info={
+            "id": int(task.id),
+            "title": task.title,
+            "description": task.description,
+            "status": status.value,
+            "model_id": model_id,
+            "small_fast_model_id": small_fast_model_id,
+            "visual_model_id": visual_model_id,
+            "compact_model_id": compact_model_id,
+            "model_name": task.model_name,
+            "small_fast_model_name": task.small_fast_model_name,
+            "visual_model_name": task.visual_model_name,
+            "compact_model_name": task.compact_model_name,
+            "execution_mode": task.execution_mode,
+            "agent_id": task.agent_id,
+            "agent_name": agent_name,
+            "agent_logo_url": agent_logo_url,
+            "runtime_extension_bindings": list(
+                task_extension_bindings_from_agent_config(task.agent_config)
+            ),
+            "is_dag": (
+                agent_execution_mode == "think"
+                if agent_execution_mode is not None
+                else None
+            ),
+            "created_at": (
+                safe_timestamp_to_unix(task.created_at) if task.created_at else None
+            ),
+            "updated_at": (
+                safe_timestamp_to_unix(task.updated_at) if task.updated_at else None
+            ),
+        },
+        task_context=task_context,
+        created_at=created_at,
     )
 
 
@@ -1044,8 +1032,7 @@ def _load_task_command_routing_snapshot_sync(
         )
         if task is None:
             return None
-        routing, _is_agent_builder = _load_task_command_routing_snapshot(db, task)
-        return routing
+        return _load_task_command_routing_snapshot(db, task)
 
 
 def _recover_recent_task_file_refs(
@@ -1140,14 +1127,13 @@ def _prepare_task_message_sync(
 
         routing: _TaskCommandRoutingSnapshot | None = None
         if task is not None:
-            routing, is_agent_builder = _load_task_command_routing_snapshot(db, task)
+            routing = _load_task_command_routing_snapshot(db, task)
             file_owner_user_id = routing.task_owner_user_id
             file_task_id: int | None = routing.task_id
         else:
             # A missing task has no persisted execution scope or binding yet.
             # Resolve and materialize its unbound uploads while this Session is
             # still read-only; only then create and claim the task atomically.
-            is_agent_builder = False
             file_owner_user_id = actor_user_id
             file_task_id = None
         logger.info("📁 Files used for execution: %s", len(files))
@@ -1194,46 +1180,26 @@ def _prepare_task_message_sync(
             db.add(task)
             db.flush()
             assert task is not None
-            routing, is_agent_builder = _load_task_command_routing_snapshot(db, task)
+            routing = _load_task_command_routing_snapshot(db, task)
 
         assert routing is not None
-        uploaded_files_context = _build_uploaded_files_context(
-            file_info_list,
-            is_agent_builder=is_agent_builder,
-        )
+        uploaded_files_context = _build_uploaded_files_context(file_info_list)
         if file_info_list:
             uploaded_file_paths = [
                 str(file_info["path"]) for file_info in file_info_list
             ]
             execution_context["uploaded_files"] = uploaded_file_paths
             execution_context["file_info"] = deepcopy(file_info_list)
-            file_ids = [str(file_info["file_id"]) for file_info in file_info_list]
             file_names = [file_info["name"] for file_info in file_info_list]
-            file_id_list_str = ", ".join(f'"{file_id}"' for file_id in file_ids)
             file_prompt = (
                 "## UPLOADED FILES\n"
                 f"The user has uploaded {len(file_info_list)} file(s): "
                 f"{file_names}\n\n"
                 f"{FILE_REF_MODEL_INSTRUCTIONS}\n\n"
+                "These files have been successfully uploaded to the workspace "
+                "and are ready for processing.\nYou can use standard workspace "
+                "tools to read, analyze, or process them."
             )
-            if is_agent_builder:
-                file_prompt += (
-                    "Use these exact file_ids (UUIDs) with "
-                    "`create_knowledge_base_from_file`:\n"
-                    f"  file_ids = [{file_id_list_str}]\n\n"
-                    "IMPORTANT: The file_ids above are UUIDs (e.g. "
-                    "'5d983e39-a83b-...'). Do NOT use file paths as file_ids. "
-                    "Call `create_knowledge_base_from_file` with the file_ids "
-                    "listed above, then create or update the agent with the "
-                    "returned collection_name. Do NOT generate a 'wait for "
-                    "upload' step — the files are already uploaded."
-                )
-            else:
-                file_prompt += (
-                    "These files have been successfully uploaded to the workspace "
-                    "and are ready for processing.\nYou can use standard workspace "
-                    "tools to read, analyze, or process them."
-                )
             existing_prompt = execution_context.get("system_prompt")
             execution_context["system_prompt"] = (
                 f"{existing_prompt}\n\n{file_prompt}"
@@ -1282,10 +1248,7 @@ def _prepare_task_message_sync(
             # task_info event reflects the committed RUNNING lease.
             db.expire(task)
             db.refresh(task)
-            routing, _is_agent_builder = _load_task_command_routing_snapshot(
-                db,
-                task,
-            )
+            routing = _load_task_command_routing_snapshot(db, task)
             try:
                 db.flush()
                 db.commit()

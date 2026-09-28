@@ -335,9 +335,7 @@ def bind_turn_files_no_commit(
     return [file_id for file_id in ids if file_id not in bound]
 
 
-def build_uploaded_files_context(
-    file_info_list: List[Dict[str, Any]], *, is_agent_builder: bool = False
-) -> str:
+def build_uploaded_files_context(file_info_list: List[Dict[str, Any]]) -> str:
     """Build stable LLM context for files already uploaded for this turn."""
     if not file_info_list:
         return ""
@@ -364,16 +362,6 @@ def build_uploaded_files_context(
         "",
         FILE_REF_MODEL_INSTRUCTIONS,
     ]
-    if is_agent_builder:
-        joined_file_ids = ", ".join(f'"{file_id}"' for file_id in file_ids)
-        lines.extend(
-            [
-                "",
-                "For knowledge-base creation, call `create_knowledge_base_from_file` with:",
-                f"  file_ids = [{joined_file_ids}]",
-                "Do NOT ask the user to upload again unless these file_ids fail.",
-            ]
-        )
     return "\n".join(lines)
 
 
