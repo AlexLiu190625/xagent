@@ -221,8 +221,14 @@ def _finalize_a2a_cancel_sync(
                 Task.runner_id.is_(None), Task.lease_expires_at.is_(None)
             )
 
+        # ``task`` is already in the identity map, so RETURNING hands back that
+        # same object. Without populate_existing its loaded attributes keep
+        # their pre-cancel values and the response would omit the cancel.
         updated = db.execute(
-            statement.returning(Task).execution_options(synchronize_session=False)
+            statement.returning(Task).execution_options(
+                synchronize_session=False,
+                populate_existing=True,
+            )
         ).scalar_one_or_none()
         if updated is None:
             db.rollback()
