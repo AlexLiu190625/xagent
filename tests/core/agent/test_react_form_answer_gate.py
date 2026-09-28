@@ -1,101 +1,62 @@
-"""Tests for the form-answer-continuation model gate.
+"""Tests for the form-answer-continuation global switch.
 
-``form_answer_continuation_enabled`` decides, once per LLM call, whether the
-form-answer-continuation text (see ``ExecutionContext.get_messages_for_llm``)
-may render for a given LLM. The gate is an exact, case-insensitive match
-against an operator-set list (``get_form_answer_continuation_models``); no
-model name lives in this repo, and the default (unset env) list is empty.
+``_form_answer_decision`` applies the form-answer-continuation text (see
+``ExecutionContext.get_messages_for_llm``) only while one global switch,
+``get_form_answer_continuation_enabled``, is on. The switch covers every
+model and is on by default: unset means on, and any set value other than
+1/true/yes/on (case-insensitive, whitespace ignored) means off, including an
+empty value. The getter's own parsing is pinned in tests/core/test_config.py;
+these rows pin that the decision follows it.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from xagent.config import FORM_ANSWER_CONTINUATION_MODELS
-from xagent.core.agent.pattern.react.react import form_answer_continuation_enabled
+from xagent.config import FORM_ANSWER_CONTINUATION_ENABLED
+from xagent.core.agent import ExecutionContext
+from xagent.core.agent.pattern.react.react import (
+    FormAnswerDecision,
+    _form_answer_decision,
+)
 
 
-class _PlainLLM:
-    """An LLM with no ``concrete_model_name`` attribute at all.
-
-    This is the shape of a directly-configured (non-router) BaseLLM, which
-    only implements the abstract ``model_name`` property.
-    """
-
-    def __init__(self, model_name: str) -> None:
-        self.model_name = model_name
-
-
-class _RoutedLLM:
-    """An LLM exposing both the routing id and the downstream's own name."""
-
-    def __init__(self, *, model_name: str, concrete_model_name: str | None) -> None:
-        self.model_name = model_name
-        self.concrete_model_name = concrete_model_name
+def _context_with_form_answer() -> ExecutionContext:
+    context = ExecutionContext()
+    context.add_user_message("Do the thing")
+    context.add_user_message(
+        "Morning shift",
+        metadata={
+            "response_to_waiting_for_user": {
+                "question": "What is the shift name?",
+                "message_type": "question",
+                "form": True,
+            }
+        },
+    )
+    return context
 
 
 @pytest.mark.parametrize(
-    ("env_value", "llm", "expected"),
+    ("env_value", "applied"),
     [
-        pytest.param("some/model", None, False, id="llm-none"),
-        pytest.param(None, _PlainLLM("some/model"), False, id="unset-env"),
-        pytest.param("some/model", _PlainLLM("some/model"), True, id="exact-match"),
-        pytest.param("Some/Model", _PlainLLM("some/MODEL"), True, id="case-different"),
-        pytest.param(
-            "some/model",
-            _PlainLLM("some/model-extended"),
-            False,
-            id="substring-suffix",
-        ),
-        pytest.param(
-            "some/model",
-            _PlainLLM("prefix-some/model"),
-            False,
-            id="substring-prefix",
-        ),
-        pytest.param(
-            "some/model", _PlainLLM("some/mode"), False, id="substring-shorter"
-        ),
-        pytest.param("some/model", _PlainLLM(""), False, id="empty-name"),
-        pytest.param(
-            "concrete/name",
-            _RoutedLLM(model_name="auto", concrete_model_name="concrete/name"),
-            True,
-            # The routing id ("auto") is never what an operator lists; the
-            # downstream client's own concrete name is.
-            id="routed-concrete-name-listed",
-        ),
-        pytest.param(
-            "auto",
-            _RoutedLLM(model_name="auto", concrete_model_name="concrete/name"),
-            False,
-            # The routing id happens to be listed, but the concrete name
-            # (present and non-empty) takes priority and is not listed --
-            # must stay disabled, not fall back to the routing id.
-            id="routed-only-routing-id-listed",
-        ),
-        pytest.param(
-            "plain/model",
-            _RoutedLLM(model_name="plain/model", concrete_model_name=None),
-            True,
-            id="concrete-name-none-falls-back-to-model-name",
-        ),
-        pytest.param(
-            "plain/model",
-            _RoutedLLM(model_name="plain/model", concrete_model_name=""),
-            True,
-            id="concrete-name-empty-falls-back-to-model-name",
-        ),
+        pytest.param(None, True, id="unset-is-on"),
+        pytest.param("true", True, id="true"),
+        pytest.param(" TRUE ", True, id="true-padded-uppercase"),
+        pytest.param("false", False, id="false"),
+        pytest.param("0", False, id="zero"),
+        pytest.param("", False, id="empty-is-off"),
     ],
 )
-def test_gate(
-    monkeypatch: pytest.MonkeyPatch,
-    env_value: str | None,
-    llm: object | None,
-    expected: bool,
+def test_switch_decides_whether_the_text_applies(
+    monkeypatch: pytest.MonkeyPatch, env_value: str | None, applied: bool
 ) -> None:
     if env_value is None:
-        monkeypatch.delenv(FORM_ANSWER_CONTINUATION_MODELS, raising=False)
+        monkeypatch.delenv(FORM_ANSWER_CONTINUATION_ENABLED, raising=False)
     else:
-        monkeypatch.setenv(FORM_ANSWER_CONTINUATION_MODELS, env_value)
-    assert form_answer_continuation_enabled(llm) is expected
+        monkeypatch.setenv(FORM_ANSWER_CONTINUATION_ENABLED, env_value)
+    decision = _form_answer_decision(
+        _context_with_form_answer(), force_final_answer=False
+    )
+    # The turn key is recorded whether or not the switch is on.
+    assert decision == FormAnswerDecision(turn=True, applied=applied)

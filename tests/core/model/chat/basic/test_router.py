@@ -14,7 +14,6 @@ import httpx
 import openai
 import pytest
 
-from xagent.core.agent.runtime import resolved_llm_metadata
 from xagent.core.context_ref import CONTEXT_REFS_KEY, ContextReference
 from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.core.model.chat.basic.openrouter import OpenRouterLLM
@@ -135,52 +134,6 @@ async def test_prepare_for_call_reuses_route_and_exposes_profile_context_window(
     assert prepared.context_window == 1_048_576
     assert await prepared.chat([{"role": "user", "content": "continue"}]) == "ok"
     assert selected == ["make a podcast"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("downstream_model_name", "expected_concrete_model_name"),
-    [
-        ("z-ai/glm-5.2", "z-ai/glm-5.2"),
-        ("", None),
-        (None, None),
-        (123, None),
-    ],
-    ids=["usable-name", "empty-name", "none-name", "non-str-name"],
-)
-async def test_concrete_model_name_reflects_the_downstream_s_own_name(
-    monkeypatch, downstream_model_name, expected_concrete_model_name
-):
-    # Downstream's own model_name may differ from the routing profile id
-    # xrouter selected ("deepseek/deepseek-v4-flash"): callers that need the
-    # spelling actually sent upstream must read concrete_model_name, not
-    # model_name -- and get None when the downstream's name is not a usable
-    # string. model_name (the routing id) and the selected_model trace field
-    # are unaffected either way.
-    class _Downstream(_ScriptedChatLLM):
-        @property
-        def model_name(self):  # type: ignore[override]
-            return downstream_model_name
-
-    downstream = _Downstream([])
-    router = RouterLLM(downstream_resolver=lambda _model_id: downstream)
-
-    async def select_model(prompt: str) -> str:
-        return "deepseek/deepseek-v4-flash"
-
-    monkeypatch.setattr(router, "_select_model", select_model)
-    monkeypatch.setattr(router, "_profile_context_window", lambda _model_id: None)
-
-    prepared = await router.prepare_for_call(
-        [{"role": "user", "content": "make a podcast"}]
-    )
-
-    assert prepared.concrete_model_name == expected_concrete_model_name
-    assert prepared.model_name == "deepseek/deepseek-v4-flash"
-    assert (
-        resolved_llm_metadata(prepared)["selected_model"]
-        == "deepseek/deepseek-v4-flash"
-    )
 
 
 @pytest.mark.asyncio

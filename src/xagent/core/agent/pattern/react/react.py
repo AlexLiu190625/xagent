@@ -66,7 +66,7 @@ from datetime import timezone
 from enum import Enum
 from typing import Any, Callable, cast
 
-from .....config import get_form_answer_continuation_models
+from .....config import get_form_answer_continuation_enabled
 from ....context_ref import CONTEXT_REFS_KEY, SUPERSEDES_SCOPE_KEY
 from ....file_ref import (
     WORKSPACE_OUTPUT_FILES_TOOL_NAME,
@@ -562,26 +562,6 @@ def _is_answerable(interaction: Any) -> bool:
 _NON_FORM_ANSWERABLE_TYPES = frozenset({"confirm", "file_upload"})
 
 
-def form_answer_continuation_enabled(llm: Any) -> bool:
-    """Whether the form-answer-continuation text may render for this LLM.
-
-    Gated by an operator-set, exact and case-insensitive model-name list
-    (``get_form_answer_continuation_models``; empty by default). When ``llm``
-    is a routed call, the downstream client's own concrete model name is
-    matched in preference to the routing profile id, because the profile id
-    (e.g. an xrouter config name) is never the spelling an operator would
-    list. ``llm is None`` is always disabled.
-    """
-    if llm is None:
-        return False
-    name = getattr(llm, "concrete_model_name", None)
-    if not (isinstance(name, str) and name):
-        name = getattr(llm, "model_name", None)
-    if not (isinstance(name, str) and name):
-        return False
-    return name.strip().lower() in get_form_answer_continuation_models()
-
-
 @dataclass(frozen=True)
 class FormAnswerDecision:
     """Whether this one LLM call is a form-answer turn, and whether the
@@ -595,14 +575,13 @@ class FormAnswerDecision:
     """
 
     # Whether the latest visible user message answers a model-authored form,
-    # independent of whether the gate lets the text render (recorded on
-    # every main and protocol-retry call, including forced ones and unlisted
-    # models, so an operator can see how often this shape occurs before
-    # enabling anything).
+    # independent of whether the text is applied (recorded on every main and
+    # protocol-retry call, including forced ones and with the switch off, so
+    # how often this shape occurs stays visible either way).
     turn: bool
     # Whether the form-answer-continuation text was actually applied to this
-    # call: turn, plus a renderable target, an available llm, an unforced
-    # turn, and that llm being on the operator's list.
+    # call: turn, plus a renderable target, an unforced turn, and the global
+    # switch (``get_form_answer_continuation_enabled``) being on.
     applied: bool
 
     def trace_metadata(self) -> dict[str, bool]:
@@ -615,19 +594,17 @@ class FormAnswerDecision:
 
 
 def _form_answer_decision(
-    context: Any, llm: Any, *, force_final_answer: bool
+    context: Any, *, force_final_answer: bool
 ) -> FormAnswerDecision:
     """Shared by the main loop and the protocol retry. The iteration-limit
     delivery is always forced and passes False instead of calling this. A
     forced turn cannot call ``ask_user_question`` again, so it never
-    applies, and ``llm`` is the resolved call, not the pre-routing virtual
-    model."""
+    applies."""
     turn = context.latest_form_answer_message() is not None
     applied = (
         context.form_answer_continuation_target() is not None
-        and llm is not None
         and not force_final_answer
-        and form_answer_continuation_enabled(llm)
+        and get_form_answer_continuation_enabled()
     )
     return FormAnswerDecision(turn=turn, applied=applied)
 
@@ -1065,9 +1042,9 @@ class ReActPattern(AgentPattern):
             # Computed once, after compaction (compaction can change which
             # message is the latest visible user message), at the site that
             # builds this call's real final messages -- not at the routing
-            # build above, which has no resolved llm yet.
+            # build above, whose messages are only used to pick the model.
             form_answer_decision = _form_answer_decision(
-                context, call_llm, force_final_answer=force_final_answer_now
+                context, force_final_answer=force_final_answer_now
             )
             llm_metadata.update(form_answer_decision.trace_metadata())
             messages = self._messages_for_llm(
@@ -1879,7 +1856,7 @@ class ReActPattern(AgentPattern):
         # computes its own decision with its own force flag, by the same
         # shared formula.
         form_answer_decision = _form_answer_decision(
-            context, llm, force_final_answer=force_final_answer
+            context, force_final_answer=force_final_answer
         )
         messages = self._messages_for_llm(
             context,
@@ -4138,8 +4115,8 @@ class ReActPattern(AgentPattern):
                 "task_text": self.task_text,
                 "message_count": len(getattr(context, "messages", [])),
                 # A form, for the form-answer-continuation text (react.py's
-                # form_answer_continuation_enabled / execution.py's readers),
-                # is the model's own question having at least one field whose
+                # _form_answer_decision / execution.py's readers), is the
+                # model's own question having at least one field whose
                 # answer is actual data rather than a yes/no on the model's
                 # own proposal (confirm) or a file (file_upload). Computed
                 # from the model-authored, pre-append list -- deduplicated_interactions,

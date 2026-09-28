@@ -4,12 +4,12 @@ text renders (``form_answer_continuation=decision.applied``) and what trace
 keys are recorded for that same call (``decision.trace_metadata()``).
 
 The unit-level table below pins the formula directly against
-``ExecutionContext``/fake LLMs. The integration tests further down drive a
-real ``ReActPattern.run()`` end to end -- the routing build, the main
-call-build site, the iteration-limit delivery, a compaction that removes the
-answer before the decision runs, and the protocol-retry site -- to confirm
-the wiring (not just the formula) puts matching trace keys and message text
-on the same call, and puts neither on any other call.
+``ExecutionContext``. The integration tests further down drive a real
+``ReActPattern.run()`` end to end -- the routing build, the main call-build
+site, the iteration-limit delivery, a compaction that removes the answer
+before the decision runs, and the protocol-retry site -- to confirm the
+wiring (not just the formula) puts matching trace keys and message text on
+the same call, and puts neither on any other call.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 
-from xagent.config import FORM_ANSWER_CONTINUATION_MODELS
+from xagent.config import FORM_ANSWER_CONTINUATION_ENABLED
 from xagent.core.agent import ExecutionContext, PatternRuntime, ReActPattern
 from xagent.core.agent.context.execution import (
     FORM_ANSWER_CONTINUATION_INSTRUCTION,
@@ -33,6 +33,13 @@ from xagent.core.model.chat.exceptions import LLMToolProtocolError
 from xagent.core.model.chat.types import ChunkType, StreamChunk
 
 from .test_react import FakeTool
+
+
+@pytest.fixture(autouse=True)
+def _switch_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test starts from the default (switch unset, so on); a test that
+    needs it off sets it explicitly."""
+    monkeypatch.delenv(FORM_ANSWER_CONTINUATION_ENABLED, raising=False)
 
 
 def _form_marker() -> dict[str, object]:
@@ -74,11 +81,6 @@ def _empty_task_context() -> ExecutionContext:
     return context
 
 
-class _NamedLLM:
-    def __init__(self, model_name: str) -> None:
-        self.model_name = model_name
-
-
 # ---------------------------------------------------------------------------
 # trace_metadata: the dict shape alone
 # ---------------------------------------------------------------------------
@@ -104,44 +106,55 @@ def test_trace_metadata_shape(
 
 
 # ---------------------------------------------------------------------------
-# _form_answer_decision: the formula. Everything gate-specific (llm is None,
-# unlisted model, no usable name, a routed call's concrete-vs-routing-id
-# preference) is pinned once, at the gate itself
-# (test_react_form_answer_gate.py) and again by the unlisted-model row of the
-# main-path integration test below -- not duplicated here.
+# _form_answer_decision: the formula. How the switch's environment value is
+# parsed is pinned at the getter (tests/core/test_config.py) and its effect
+# on the decision in test_react_form_answer_gate.py; only "on" (unset) and one
+# "off" row appear here.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    ("build_context", "forced", "expected"),
+    ("build_context", "forced", "switch", "expected"),
     [
         pytest.param(
             _context_with_form_answer,
             False,
+            None,
             FormAnswerDecision(turn=True, applied=True),
             id="everything-lines-up",
         ),
         pytest.param(
             _context_with_form_answer,
             True,
+            None,
             FormAnswerDecision(turn=True, applied=False),
             id="forced",
         ),
         pytest.param(
+            _context_with_form_answer,
+            False,
+            "false",
+            FormAnswerDecision(turn=True, applied=False),
+            id="switch-off",
+        ),
+        pytest.param(
             _context_without_form_answer,
             False,
+            None,
             FormAnswerDecision(turn=False, applied=False),
             id="no-form-answer",
         ),
         pytest.param(
             _dag_step_context,
             False,
+            None,
             FormAnswerDecision(turn=True, applied=False),
             id="dag-step",
         ),
         pytest.param(
             _empty_task_context,
             False,
+            None,
             FormAnswerDecision(turn=True, applied=False),
             id="empty-task",
         ),
@@ -150,16 +163,16 @@ def test_trace_metadata_shape(
 def test_decision_formula(
     build_context: Any,
     forced: bool,
+    switch: str | None,
     expected: FormAnswerDecision,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The dag-step and empty-task rows pin that ``applied`` reads the
     target, not the turn: ``turn`` does not consult either condition (it is
     still True), while ``applied`` requires the target and is suppressed."""
-    monkeypatch.setenv(FORM_ANSWER_CONTINUATION_MODELS, "listed/model")
-    decision = _form_answer_decision(
-        build_context(), _NamedLLM("listed/model"), force_final_answer=forced
-    )
+    if switch is not None:
+        monkeypatch.setenv(FORM_ANSWER_CONTINUATION_ENABLED, switch)
+    decision = _form_answer_decision(build_context(), force_final_answer=forced)
     assert decision == expected
 
 
@@ -211,7 +224,7 @@ def _final_answer_call(answer: str, *, outcome: str = "completed") -> dict[str, 
 
 
 class _NamedFakeLLM:
-    """A non-streaming FakeLLM carrying a ``model_name`` for the gate.
+    """A non-streaming FakeLLM with a ``model_name``.
 
     Implements ``prepare_for_call`` (returning itself) so every test using it
     also exercises -- and can assert on -- the routing-input messages a
@@ -222,7 +235,7 @@ class _NamedFakeLLM:
         self,
         responses: list[Any],
         *,
-        model_name: str,
+        model_name: str = "fake/model",
         context_window: int | None = None,
     ) -> None:
         self.responses = responses
@@ -246,8 +259,7 @@ class _NamedFakeLLM:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     (
-        "model_name",
-        "env_value",
+        "switch",
         "build_context",
         "force_first_turn",
         "expected_keys",
@@ -255,8 +267,7 @@ class _NamedFakeLLM:
     ),
     [
         pytest.param(
-            "listed/model",
-            "listed/model",
+            None,
             _context_with_form_answer,
             False,
             {"form_answer_turn": True, "form_answer_continuation": True},
@@ -264,17 +275,15 @@ class _NamedFakeLLM:
             id="applied",
         ),
         pytest.param(
-            "unlisted/model",
-            None,
+            "false",
             _context_with_form_answer,
             False,
             {"form_answer_turn": True},
             False,
-            id="unlisted-model",
+            id="switch-off",
         ),
         pytest.param(
-            "listed/model",
-            "listed/model",
+            None,
             _context_without_form_answer,
             False,
             {},
@@ -282,8 +291,7 @@ class _NamedFakeLLM:
             id="no-form-answer",
         ),
         pytest.param(
-            "listed/model",
-            "listed/model",
+            None,
             _context_with_form_answer,
             True,
             {"form_answer_turn": True},
@@ -294,18 +302,15 @@ class _NamedFakeLLM:
 )
 async def test_main_path_keys_and_text_come_from_one_decision(
     monkeypatch: pytest.MonkeyPatch,
-    model_name: str,
-    env_value: str | None,
+    switch: str | None,
     build_context: Any,
     force_first_turn: bool,
     expected_keys: dict[str, bool],
     expect_text: bool,
 ) -> None:
-    if env_value is None:
-        monkeypatch.delenv(FORM_ANSWER_CONTINUATION_MODELS, raising=False)
-    else:
-        monkeypatch.setenv(FORM_ANSWER_CONTINUATION_MODELS, env_value)
-    llm = _NamedFakeLLM([_final_answer_call("Booked.")], model_name=model_name)
+    if switch is not None:
+        monkeypatch.setenv(FORM_ANSWER_CONTINUATION_ENABLED, switch)
+    llm = _NamedFakeLLM([_final_answer_call("Booked.")])
     context = build_context()
     tracer = _CaptureTracer()
     runtime = PatternRuntime(execution_id="exec-decision-main", tracer=tracer)
@@ -341,13 +346,10 @@ async def test_main_path_keys_and_text_come_from_one_decision(
 
 
 @pytest.mark.asyncio
-async def test_iteration_limit_build_passes_false_even_with_a_form_answer(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_iteration_limit_build_passes_false_even_with_a_form_answer() -> None:
     """The iteration-limit delivery is always forced and never computes a
     decision at all (react.py passes the parameter's default, False); prove
     it does not render the text even when the context otherwise qualifies."""
-    monkeypatch.setenv(FORM_ANSWER_CONTINUATION_MODELS, "listed/model")
     context = _context_with_form_answer()
     tool = FakeTool()
     llm = _NamedFakeLLM(
@@ -368,7 +370,6 @@ async def test_iteration_limit_build_passes_false_even_with_a_form_answer(
                 "2+2 = 4. The remaining work was not run.", outcome="partial"
             ),
         ],
-        model_name="listed/model",
     )
     pattern = ReActPattern(max_iterations=1)
 
@@ -385,9 +386,7 @@ async def test_iteration_limit_build_passes_false_even_with_a_form_answer(
 
 
 @pytest.mark.asyncio
-async def test_decision_reflects_state_after_compaction_removes_the_answer(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_decision_reflects_state_after_compaction_removes_the_answer() -> None:
     """The decision is computed after ``compact_context_if_needed`` runs, not
     before: when compaction removes the answer message, the real call must
     see turn=False and applied=False, not the stale pre-compaction state. A
@@ -395,7 +394,6 @@ async def test_decision_reflects_state_after_compaction_removes_the_answer(
     unusable forces the truncate fallback (``_drop_oldest_messages``) to drop
     every message, including the answer.
     """
-    monkeypatch.setenv(FORM_ANSWER_CONTINUATION_MODELS, "listed/model")
     context = _context_with_form_answer()
     context.compact_config.threshold = 1
     context.compact_config.max_messages = 0
@@ -404,7 +402,6 @@ async def test_decision_reflects_state_after_compaction_removes_the_answer(
             {"content": ""},  # compaction's own summarization call: unusable
             _final_answer_call("Done."),
         ],
-        model_name="listed/model",
         context_window=32_000,
     )
     tracer = _CaptureTracer()
@@ -429,31 +426,9 @@ async def test_decision_reflects_state_after_compaction_removes_the_answer(
     assert FORM_ANSWER_CONTINUATION_INSTRUCTION not in sent_messages[0]["content"]
 
 
-class _RetryTriggeringLLM:
-    """Fails the tool protocol on the very first turn, forcing
-    ``_retry_tool_protocol_response`` to build and send the retry turn."""
-
-    def __init__(self, model_name: str) -> None:
-        self.model_name = model_name
-        self.stream_calls: list[dict[str, Any]] = []
-
-    async def chat(self, **kwargs: Any) -> Any:
-        raise AssertionError("expected the streaming path")
-
-    async def stream_chat(self, **kwargs: Any):
-        self.stream_calls.append(kwargs)
-        if len(self.stream_calls) == 1:
-            raise LLMToolProtocolError(
-                provider="deepseek",
-                code="malformed_tool_arguments",
-                message="malformed arguments",
-                details={
-                    "original_arguments_preview": '{"answer":',
-                    "original_arguments_length": 10,
-                    "repair_status": "skipped_incomplete",
-                },
-            )
-        yield StreamChunk(
+def _final_answer_stream_chunks(answer: str) -> list[StreamChunk]:
+    return [
+        StreamChunk(
             type=ChunkType.TOOL_CALL,
             tool_calls=[
                 {
@@ -463,23 +438,55 @@ class _RetryTriggeringLLM:
                         "arguments": json.dumps(
                             {
                                 "response_language": "English",
-                                "answer": "Booked after retry.",
+                                "answer": answer,
                                 "outcome": "completed",
                             }
                         ),
                     },
                 }
             ],
-        )
-        yield StreamChunk(type=ChunkType.END)
+        ),
+        StreamChunk(type=ChunkType.END),
+    ]
+
+
+class _RetryTriggeringLLM:
+    """Fails the tool protocol on the very first turn with ``first_error``,
+    forcing ``_retry_tool_protocol_response`` to build and send the retry
+    turn, which answers."""
+
+    def __init__(self, first_error: LLMToolProtocolError) -> None:
+        self.model_name = "fake/model"
+        self.first_error = first_error
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("expected the streaming path")
+
+    async def stream_chat(self, **kwargs: Any):
+        self.stream_calls.append(kwargs)
+        if len(self.stream_calls) == 1:
+            raise self.first_error
+        for chunk in _final_answer_stream_chunks("Booked after retry."):
+            yield chunk
+
+
+def _malformed_arguments_error() -> LLMToolProtocolError:
+    return LLMToolProtocolError(
+        provider="deepseek",
+        code="malformed_tool_arguments",
+        message="malformed arguments",
+        details={
+            "original_arguments_preview": '{"answer":',
+            "original_arguments_length": 10,
+            "repair_status": "skipped_incomplete",
+        },
+    )
 
 
 @pytest.mark.asyncio
-async def test_retry_path_carries_matching_keys_and_text_when_applied(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv(FORM_ANSWER_CONTINUATION_MODELS, "listed/model")
-    llm = _RetryTriggeringLLM(model_name="listed/model")
+async def test_retry_path_carries_matching_keys_and_text_when_applied() -> None:
+    llm = _RetryTriggeringLLM(_malformed_arguments_error())
     context = _context_with_form_answer()
     tracer = _CaptureTracer()
     runtime = PatternRuntime(execution_id="exec-decision-retry", tracer=tracer)

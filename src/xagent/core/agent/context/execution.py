@@ -585,9 +585,9 @@ def context_checkpoint_gate(context: ExecutionContext) -> _ContextCheckpointGate
 
 # The two form-answer-continuation texts (see ``get_messages_for_llm``'s
 # ``form_answer_continuation`` parameter). Both are inert prose gated behind
-# an operator-set model list (react.py's ``form_answer_continuation_enabled``)
-# and a per-call decision (``ReActPattern``'s ``FormAnswerDecision``); neither
-# constant is ever rendered on its own account.
+# one global switch (``get_form_answer_continuation_enabled``) and a per-call
+# decision (``ReActPattern``'s ``FormAnswerDecision``); neither constant is
+# ever rendered on its own account.
 #
 # A trailing "\n\n" lets this slot directly between the task text's own
 # "\n\n" and "Conversation focus rules: ..." in ``_system_context`` without a
