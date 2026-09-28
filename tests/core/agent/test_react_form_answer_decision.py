@@ -7,9 +7,10 @@ The unit-level table below pins the formula directly against
 ``ExecutionContext``. The integration tests further down drive a real
 ``ReActPattern.run()`` end to end -- the routing build, the main call-build
 site, the iteration-limit delivery, a compaction that removes the answer
-before the decision runs, and the protocol-retry site -- to confirm the
-wiring (not just the formula) puts matching trace keys and message text on
-the same call, and puts neither on any other call.
+before the decision runs, an LLM-summary compaction that keeps it, and the
+protocol-retry site -- to confirm the wiring (not just the formula) puts
+matching trace keys and message text on the same call, and puts neither on
+any other call.
 """
 
 from __future__ import annotations
@@ -393,6 +394,17 @@ async def test_iteration_limit_build_never_applies_even_with_a_form_answer() -> 
     assert result["termination_reason"] == "max_iterations"
     delivery_messages = llm.calls[-1]["messages"]
     assert FORM_ANSWER_CONTINUATION_INSTRUCTION not in delivery_messages[0]["content"]
+    # The answer message is followed by the work turn's assistant call and
+    # tool result here, so find it by its content rather than by position.
+    answer_messages = [
+        message
+        for message in delivery_messages
+        if str(message.get("content") or "").endswith(
+            "Execution-enriched message content follows:\nMorning shift"
+        )
+    ]
+    assert len(answer_messages) == 1
+    assert FORM_ANSWER_FRAMING not in answer_messages[0]["content"]
 
 
 @pytest.mark.asyncio
@@ -434,6 +446,51 @@ async def test_decision_reflects_state_after_compaction_removes_the_answer() -> 
     sent_messages = llm.calls[-1]["messages"]
     assert [message["role"] for message in sent_messages] == ["system"]
     assert FORM_ANSWER_CONTINUATION_INSTRUCTION not in sent_messages[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_text_still_applies_after_llm_summary_compaction() -> None:
+    """The production compaction path (``compact_with_llm_response``) replaces
+    the history with a summary and re-appends the latest visible user message
+    -- the same object, which rendering matches with ``is``. When that message
+    is the form answer, the real call built after compaction must still carry
+    both texts, and the framing must land on that re-appended answer."""
+    context = _context_with_form_answer()
+    answer_message = context.messages[-1]
+    context.compact_config.threshold = 1
+    llm = _NamedFakeLLM(
+        [
+            # compaction's own summarization call: a usable summary
+            {"content": "The user asked to do the thing and was asked for a shift."},
+            _final_answer_call("Done."),
+        ],
+        context_window=32_000,
+    )
+    tracer = _CaptureTracer()
+    runtime = PatternRuntime(
+        execution_id="exec-decision-summary-compaction", tracer=tracer
+    )
+    pattern = ReActPattern(max_iterations=2)
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    # The summary replaced the history and kept the answer object itself.
+    assert context.messages[0].metadata.get("compacted_context") is True
+    assert context.messages[1] is answer_message
+    real_turn_events = [
+        event for event in tracer.llm_start_events() if "purpose" not in event
+    ]
+    assert len(real_turn_events) == 1
+    assert real_turn_events[0]["form_answer_turn"] is True
+    assert real_turn_events[0]["form_answer_continuation"] is True
+    sent_messages = llm.calls[-1]["messages"]
+    assert "Compacted conversation summary:" in "".join(
+        str(message.get("content") or "") for message in sent_messages
+    )
+    assert FORM_ANSWER_CONTINUATION_INSTRUCTION in sent_messages[0]["content"]
+    assert FORM_ANSWER_FRAMING in sent_messages[-1]["content"]
+    assert str(sent_messages[-1]["content"]).endswith("Morning shift")
 
 
 def _final_answer_stream_chunks(answer: str) -> list[StreamChunk]:
@@ -494,6 +551,14 @@ def _malformed_arguments_error() -> LLMToolProtocolError:
     )
 
 
+def _unavailable_tool_error() -> LLMToolProtocolError:
+    return LLMToolProtocolError(
+        provider="deepseek",
+        code="unavailable_tool_call",
+        message="DeepSeek returned unavailable tool call 'calculator'.",
+    )
+
+
 @pytest.mark.asyncio
 async def test_retry_path_carries_matching_keys_and_text_when_applied() -> None:
     llm = _RetryTriggeringLLM(_malformed_arguments_error())
@@ -516,3 +581,62 @@ async def test_retry_path_carries_matching_keys_and_text_when_applied() -> None:
     system_content = retry_messages[0]["content"]
     assert FORM_ANSWER_CONTINUATION_INSTRUCTION in system_content
     assert FORM_ANSWER_FRAMING in retry_messages[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_forced_main_call_then_unforced_retry_applies_only_on_the_retry() -> None:
+    """A forced main call that the provider refuses as an unavailable tool
+    call is retried unforced with the full tool set restored (react.py's
+    ``restore_full_tool_set``). The retry makes its own decision with its own
+    force flag, so the main call records only the turn key and carries no
+    text, while the retry records both keys and carries both texts."""
+    llm = _RetryTriggeringLLM(_unavailable_tool_error())
+    context = _context_with_form_answer()
+    tracer = _CaptureTracer()
+    runtime = PatternRuntime(execution_id="exec-decision-forced-retry", tracer=tracer)
+    pattern = ReActPattern(max_iterations=2)
+    pattern.force_final_answer_next = True
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    llm_events = tracer.llm_start_events()
+    assert len(llm_events) == 2
+    main_event, retry_event = llm_events
+    assert main_event["form_answer_turn"] is True
+    assert "form_answer_continuation" not in main_event
+    assert retry_event["recovery_reason"] == "unavailable_tool_call"
+    assert retry_event["form_answer_turn"] is True
+    assert retry_event["form_answer_continuation"] is True
+
+    main_messages = llm.stream_calls[0]["messages"]
+    assert FORM_ANSWER_CONTINUATION_INSTRUCTION not in main_messages[0]["content"]
+    assert FORM_ANSWER_FRAMING not in main_messages[-1]["content"]
+    retry_messages = llm.stream_calls[1]["messages"]
+    assert FORM_ANSWER_CONTINUATION_INSTRUCTION in retry_messages[0]["content"]
+    assert FORM_ANSWER_FRAMING in retry_messages[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_retry_path_records_only_the_turn_key_when_not_applied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(FORM_ANSWER_CONTINUATION_ENABLED, "false")
+    llm = _RetryTriggeringLLM(_malformed_arguments_error())
+    context = _context_with_form_answer()
+    tracer = _CaptureTracer()
+    runtime = PatternRuntime(execution_id="exec-decision-retry-off", tracer=tracer)
+    pattern = ReActPattern(max_iterations=2)
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    llm_events = tracer.llm_start_events()
+    assert len(llm_events) == 2
+    retry_event = llm_events[1]
+    assert retry_event["form_answer_turn"] is True
+    assert "form_answer_continuation" not in retry_event
+
+    retry_messages = llm.stream_calls[1]["messages"]
+    assert FORM_ANSWER_CONTINUATION_INSTRUCTION not in retry_messages[0]["content"]
+    assert FORM_ANSWER_FRAMING not in retry_messages[-1]["content"]

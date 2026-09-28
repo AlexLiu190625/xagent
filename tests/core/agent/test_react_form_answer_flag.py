@@ -94,6 +94,91 @@ async def _run_ask_user_question(arguments: dict[str, Any]) -> ReActPattern:
             id="file-upload-only",
         ),
         pytest.param(
+            [
+                {
+                    "type": "select_one",
+                    "field": "city",
+                    "label": "City",
+                    "options": [
+                        {"label": "Sydney", "value": "sydney"},
+                        {"label": "Perth", "value": "perth"},
+                    ],
+                }
+            ],
+            True,
+            id="select-one-with-options",
+        ),
+        pytest.param(
+            # Intended: the rule excludes only confirm and file_upload by
+            # type, so a select_one that happens to offer Yes/No is a form.
+            [
+                {
+                    "type": "select_one",
+                    "field": "proceed",
+                    "label": "Proceed?",
+                    "options": [
+                        {"label": "Yes", "value": "yes"},
+                        {"label": "No", "value": "no"},
+                    ],
+                }
+            ],
+            True,
+            id="select-one-yes-no-options",
+        ),
+        pytest.param(
+            [
+                {
+                    "type": "select_multiple",
+                    "field": "days",
+                    "label": "Days",
+                    "options": [
+                        {"label": "Monday", "value": "mon"},
+                        {"label": "Tuesday", "value": "tue"},
+                    ],
+                }
+            ],
+            True,
+            id="select-multiple",
+        ),
+        pytest.param(
+            [{"type": "number_input", "field": "hours", "label": "Hours"}],
+            True,
+            id="number-input",
+        ),
+        pytest.param(
+            # Intended: a pick among the model's own proposed actions is
+            # still a form under the rule (only confirm and file_upload are
+            # excluded).
+            [
+                {
+                    "type": "action_cards",
+                    "field": "plan",
+                    "label": "Pick a plan",
+                    "options": [
+                        {"label": "Plan A", "value": "a"},
+                        {"label": "Plan B", "value": "b"},
+                    ],
+                }
+            ],
+            True,
+            id="action-cards",
+        ),
+        pytest.param(
+            # "boolean" is an alias that normalizes to confirm before the flag
+            # is computed, so it is excluded like confirm.
+            [{"type": "boolean", "field": "ok", "label": "Proceed?"}],
+            False,
+            id="boolean-alias-is-confirm",
+        ),
+        pytest.param(
+            [
+                {"type": "confirm", "field": "ok", "label": "Proceed?"},
+                {"type": "file_upload", "field": "doc", "label": "Upload"},
+            ],
+            False,
+            id="confirm-plus-file-upload",
+        ),
+        pytest.param(
             # The engine appends a default text_input in _send_waiting_message,
             # but the flag is computed from the model-authored list
             # beforehand, which was empty.
