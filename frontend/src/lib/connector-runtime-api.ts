@@ -641,7 +641,10 @@ export function isConnectorRuntimeDialogHostPath(pathname: string | null): boole
 }
 
 // The new-conversation page and an agent's chat page: where a first gate's
-// create response can land. Only a first gate adds them.
+// create response can land. Only a first gate adds them. The home page and
+// the build list start conversations too, but they create the task without
+// an agent_id, and the server reports a task with no agent as met, so
+// shouldHoldFirstMessage never holds a message started there.
 export const FIRST_GATE_EXTRA_HOST_PATTERNS = [/^\/task\/?$/, /^\/agent\/[^/]+\/?$/] as const
 
 // The one route check the dialog runs, for the trigger of the request it shows.
