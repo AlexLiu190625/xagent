@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, cast
+from typing import Any, Dict, List, NoReturn, Optional, Sequence, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -56,6 +56,7 @@ from ..services.connector_runtime import (
     build_task_runtime_requirements,
     resolve_agent_runtime_requirements,
 )
+from ..services.expired_tasks import find_expired_task
 from ..services.hot_path_cache import (
     cache_get,
     cache_set,
@@ -98,6 +99,7 @@ from ..services.task_workspace_cleanup import (
 )
 from ..services.workforce_runtime import resolve_workforce_task_runtime
 from ..utils.db_timezone import format_datetime_for_api, safe_timestamp_to_unix
+from .expired_task_errors import task_expired_http_error
 
 logger = logging.getLogger(__name__)
 
@@ -1032,6 +1034,26 @@ async def get_tasks(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _raise_task_expired_or_not_found(db: Session, user: User, task_id: int) -> NoReturn:
+    """Raise for a task ``GET`` that found no live row for ``task_id``.
+
+    ``410 task_expired`` to the same callers the live query above would have
+    served the task to -- an admin, or its owner (#2565) -- since a tombstone
+    is what is left of a task retention purged. Anyone else keeps the plain
+    ``404``, so the answer cannot be used to probe for other users' ids.
+    Shared by ``GET /task/{id}`` and ``GET /task/{id}/status``, which apply
+    the same owner-or-admin scope to the live task.
+    """
+    tombstone = find_expired_task(db, task_id)
+    if tombstone is not None and (
+        bool(user.is_admin) or int(tombstone.user_id) == int(user.id)
+    ):
+        raise task_expired_http_error(
+            tombstone, message="Task expired under the retention policy"
+        )
+    raise HTTPException(status_code=404, detail="Task not found")
+
+
 @chat_router.get("/task/{task_id}")
 async def get_task(
     task_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)
@@ -1050,7 +1072,7 @@ async def get_task(
                     .first()
                 )
             if not task:
-                raise HTTPException(status_code=404, detail="Task not found")
+                _raise_task_expired_or_not_found(db, user, task_id)
 
             cache_key = web_task_detail_key(task_id)
             task_updated_at = cache_version_token(task.updated_at)
@@ -1212,7 +1234,7 @@ async def get_task_status(
                     .first()
                 )
             if not task:
-                raise HTTPException(status_code=404, detail="Task not found")
+                _raise_task_expired_or_not_found(db, user, task_id)
 
             cache_key = web_task_status_key(task_id)
             task_updated_at = cache_version_token(task.updated_at)
@@ -1335,6 +1357,10 @@ async def update_task(
             )
 
         if not task:
+            # Stays a plain 404, unlike the GET route's 410 task_expired: an
+            # expired task is never listed, so the UI has no title field open
+            # on one to submit this from, and disclosing the expiry here would gain
+            # a caller nothing they could not already learn from GET (#2565).
             raise HTTPException(status_code=404, detail="Task not found")
 
         task.title = title
@@ -1647,6 +1673,10 @@ async def delete_task(
             is_admin=is_admin,
         )
         if task_snapshot is None:
+            # Stays a plain 404, unlike the GET route's 410 task_expired: an
+            # expired task is never listed, so the UI never offers a delete
+            # control for one, and a 410 here would gain a caller nothing
+            # beyond what GET already discloses (#2565).
             raise HTTPException(status_code=404, detail="Task not found")
         task_title, task_user_id, task_source, bound_extensions = task_snapshot
         runtime_context = agent_runtime_service._task_runtime_context(

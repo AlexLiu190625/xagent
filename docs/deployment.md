@@ -517,3 +517,20 @@ A client that does not know the new code still sees a 4xx for the REST routes an
 - No migration and no configuration.
 - Responses cached by the steps cache before this change are still served for tasks the retention policy never touched. The first read of a trace-expired task after the upgrade re-reads and re-caches it.
 - Rolling back makes the API answer `404 task_not_found` again for expired tasks and drops the two `/steps` fields.
+
+## 2026-09-28 — Internal surfaces report expired tasks
+
+The web UI and internal API now read the expired-task records above (#2565), the same way the `/v1` API already does. No deployment configures a retention period yet, so no tombstone exists and this change is inert until one does.
+
+### Client-visible changes
+
+- `GET /api/conversation-logs/{id}` answers **`410`** with `detail: {code: "task_expired", message, task_id, expired_at}` for a task the retention policy expired that was a hidden, external-source conversation (not MCP channel-plumbing) the calling user could have seen live — their own, or any such log for an admin. `GET /api/chat/task/{id}` and `GET /api/chat/task/{id}/status` answer the same `410` for a task the caller could have seen live regardless of source or visibility — their own task, or any task for an admin. Anyone else keeps the same `404` a task that never existed gets, so the answer cannot be used to probe which ids retention expired. Webhook trigger conversation logs are included on the Conversation Logs route; scheduled and Gmail trigger ones are not, since Conversation Logs never served those live either. `PUT /api/chat/task/{id}` and `DELETE /api/chat/task/{id}` are unchanged and keep answering plain `404`: an expired task is never listed, so the UI has no rename or delete control open on one to call either from.
+- Conversation Logs detail gains `trace_events_expired_at`, alongside the existing `trace_events`.
+- The trigger-run and workforce-run APIs gain `task_expired_at`; `status` is unchanged. Fixing that field's serialization to go through the same UTC-aware formatter as the rest of the API means every trigger-run and workforce-run timestamp field (`created_at`, `updated_at`, `started_at`, `finished_at`, `next_run_at`, `last_run_at`, `completed_at`, and now `task_expired_at`) now always carries an explicit UTC offset (`+00:00`) on SQLite; PostgreSQL's output is unchanged, since it was already tz-aware.
+- The web UI shows "Conversation expired on {date}" in run history where it showed a dash or "Conversation unavailable" for a run whose task is gone, and an expiry or trace-removed note on the Conversation Logs page.
+- Lists are unchanged: an expired task is simply absent from them, its source counts and agent filter options included.
+
+### Deployment impact
+
+- No migration and no configuration.
+- Rolling back returns the previous `404` for these routes and drops `trace_events_expired_at` and `task_expired_at`.
