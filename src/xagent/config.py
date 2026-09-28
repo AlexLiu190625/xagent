@@ -247,6 +247,7 @@ OIDC_EXCHANGE_TTL_SECONDS = "XAGENT_OIDC_EXCHANGE_TTL_SECONDS"
 SESSION_SECRET = "XAGENT_SESSION_SECRET"
 OPENROUTER_OFFICIAL_PROVIDERS_ONLY = "XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY"
 XROUTER_EXCLUDED_MODELS = "XAGENT_XROUTER_EXCLUDED_MODELS"
+FORM_ANSWER_CONTINUATION_ENABLED = "XAGENT_FORM_ANSWER_CONTINUATION_ENABLED"
 MCP_OAUTH_ALLOW_PRIVATE_HOSTS = "XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS"
 MCP_OAUTH_PROXY_URL = "XAGENT_MCP_OAUTH_PROXY_URL"
 TOBY_PERSONAL_STDIO_ENABLED = "XAGENT_TOBY_PERSONAL_STDIO_ENABLED"
@@ -721,6 +722,17 @@ def get_xrouter_excluded_models() -> tuple[str, ...]:
     return tuple(
         dict.fromkeys(item.strip() for item in value.split(",") if item.strip())
     )
+
+
+def get_form_answer_continuation_enabled() -> bool:
+    """Return whether the form-answer continuation text may be applied.
+
+    One switch for every model, on by default. Unset means on; any set value
+    other than ``1``, ``true``, ``yes`` or ``on`` (case-insensitive, surrounding
+    whitespace ignored) means off, including an empty value. Read on every
+    call (not cached).
+    """
+    return _get_bool_env(FORM_ANSWER_CONTINUATION_ENABLED, True)
 
 
 def get_mcp_oauth_allow_private_hosts() -> bool:

@@ -69,6 +69,7 @@ from .enrichment import (
     IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
     MEMORY_CONTEXT_METADATA_KEY,
     SKILL_CONTEXT_METADATA_KEY,
+    TopLevelUserRequest,
     latest_pending_user_response,
     pending_user_response,
     pending_user_response_lifecycle,
@@ -596,6 +597,34 @@ def context_checkpoint_gate(context: ExecutionContext) -> _ContextCheckpointGate
     return cast(_ContextCheckpointGate, gate)
 
 
+# The two form-answer-continuation texts (see ``get_messages_for_llm``'s
+# ``form_answer_continuation`` parameter). Both are inert prose gated behind
+# one global switch (``get_form_answer_continuation_enabled``) and a per-call
+# decision (``ReActPattern``'s ``FormAnswerDecision``); neither constant is
+# ever rendered on its own account.
+#
+# The framing only says what the message is. Whether to continue, change or
+# cancel the request is left to the system instruction, because the message
+# the framing lands on can be any typed reply, not only a filled-in form.
+#
+# A trailing "\n\n" lets this slot directly between the task text's own
+# "\n\n" and "Conversation focus rules: ..." in ``_system_context`` without a
+# separate blank-line rule when the flag is off (the empty string inserts
+# nothing).
+FORM_ANSWER_CONTINUATION_INSTRUCTION = (
+    "The latest user message answers the form you asked for. Use those "
+    "answers to continue the current user request. Do not ask again for "
+    "information those answers already provide; if something required is "
+    "still missing or unusable, ask only for that. If the answers change or "
+    "cancel the request, follow the answers. This does not replace any "
+    "confirmation or approval your instructions require before an action. "
+    "Approving one proposal does not approve a changed or different "
+    "action.\n\n"
+)
+
+FORM_ANSWER_FRAMING = "It replies to the form you asked for. "
+
+
 @dataclass
 class ExecutionContext:
     """Execution state plus pluggable runtime components."""
@@ -1096,13 +1125,24 @@ class ExecutionContext:
         self,
         include_system: bool = True,
         max_tokens: int | None = None,
+        *,
+        form_answer_continuation: bool = False,
     ) -> list[dict[str, Any]]:
+        # Computed once per call (not once per candidate message, and not
+        # again inside ``_system_context``): the system-context instruction
+        # and the answer-message framing both key off this single object, so
+        # a decision made here can only ever line up with itself.
+        form_answer_target = (
+            self.form_answer_continuation_target() if form_answer_continuation else None
+        )
         messages: list[dict[str, Any]] = []
         system_parts: list[str] = []
         if include_system and self.system_prompt:
             system_parts.append(self.system_prompt)
         if include_system:
-            system_parts.append(self._system_context())
+            system_parts.append(
+                self._system_context(form_answer_continuation_target=form_answer_target)
+            )
 
         visible_messages = [message for message in self.messages if not message.hidden]
         if max_tokens:
@@ -1123,6 +1163,9 @@ class ExecutionContext:
                 provider_state = message.metadata.get("_xagent_provider_state")
                 if isinstance(provider_state, dict):
                     message_dict["_xagent_provider_state"] = provider_state
+            form_answer_framing = (
+                FORM_ANSWER_FRAMING if message is form_answer_target else ""
+            )
             waiting_response = pending_user_response(message)
             if waiting_response is not None:
                 if message is latest_pending_message:
@@ -1138,6 +1181,7 @@ class ExecutionContext:
                 message_dict["content"] = (
                     "This user message is the answer to a pending agent question "
                     "and is the primary response, not an independent task. "
+                    f"{form_answer_framing}"
                     f"{framing}\nExecution-enriched message content follows:\n"
                     f"{str(message_dict.get('content') or '')}"
                 )
@@ -1145,7 +1189,9 @@ class ExecutionContext:
                 message_dict["content"] = (
                     "This user message is the primary response in a waiting lifecycle "
                     "whose question text is unavailable or blank, not an independent "
-                    "task. Execution-enriched message content follows:\n"
+                    "task. "
+                    f"{form_answer_framing}"
+                    "Execution-enriched message content follows:\n"
                     f"{str(message_dict.get('content') or '')}"
                 )
             if include_system and message_dict.get("role") == "system":
@@ -1251,22 +1297,30 @@ class ExecutionContext:
             return request.language_text
         return request.execution_text
 
-    def _system_context(self) -> str:
+    def _system_context(
+        self, *, form_answer_continuation_target: Message | None = None
+    ) -> str:
         parts = [self._current_time_context(), FILE_REF_MODEL_INSTRUCTIONS]
         dag_step_id = self.metadata.get("dag_step_id")
         request = top_level_user_request(self)
         current_task = request.execution_text
         pending_response = latest_pending_user_response(self)
         output_language = effective_output_language(self)
-        if current_task and not dag_step_id:
+        if self._renders_current_request_block(request):
             language_directives = render_root_request_language_harness(
                 request,
                 pending_response,
                 output_language,
             )
+            form_answer_instruction = (
+                FORM_ANSWER_CONTINUATION_INSTRUCTION
+                if form_answer_continuation_target is not None
+                else ""
+            )
             parts.append(
                 "Current user request:\n"
                 f"{current_task}\n\n"
+                f"{form_answer_instruction}"
                 "Conversation focus rules: answer the current user request above. "
                 "Earlier user and assistant messages are context only; use them to "
                 "resolve references and preserve continuity, but do not re-answer "
@@ -2374,6 +2428,49 @@ class ExecutionContext:
                 continue
             return message
         return None
+
+    def latest_form_answer_message(self) -> Message | None:
+        """The latest visible user message, iff it answers a model-authored
+        form (``waiting_for_user_request["form"] is True`` when the answer
+        was recorded; see react.py's ask_user_question branch and
+        ``pending_user_response_marker``).
+
+        Deliberately the *latest* visible user message only, not the latest
+        one that happens to carry a form marker: an independent message typed
+        after the answer must turn this off, not fall back to an older
+        answer.
+        """
+        message = self._latest_visible_user_message()
+        if message is None:
+            return None
+        metadata = message.metadata
+        if not isinstance(metadata, dict):
+            return None
+        marker = metadata.get("response_to_waiting_for_user")
+        if not isinstance(marker, dict):
+            return None
+        return message if marker.get("form") is True else None
+
+    def _renders_current_request_block(self, request: TopLevelUserRequest) -> bool:
+        """Whether ``_system_context`` renders its "Current user request"
+        block for ``request`` (the context's ``top_level_user_request``): the
+        request text is non-empty and this is not a DAG step (a DAG step
+        builds its own step context instead).
+
+        The one place this condition lives: ``_system_context`` uses it to
+        decide whether to render the block, and
+        ``form_answer_continuation_target`` uses it so the instruction that
+        goes inside that block is only ever targeted when the block exists.
+        """
+        return bool(request.execution_text) and not self.metadata.get("dag_step_id")
+
+    def form_answer_continuation_target(self) -> Message | None:
+        """``latest_form_answer_message()``, but only when
+        ``_system_context`` renders its "Current user request" block
+        (``_renders_current_request_block``); otherwise None."""
+        if not self._renders_current_request_block(top_level_user_request(self)):
+            return None
+        return self.latest_form_answer_message()
 
     def _build_llm_compact_prompt(
         self,

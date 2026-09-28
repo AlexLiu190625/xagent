@@ -47,6 +47,7 @@ from xagent.config import (
     FILE_STORAGE_STARTUP_SYNC_ENABLED,
     FILE_STORAGE_URI,
     FILE_STREAM_TICKET_TTL_SECONDS,
+    FORM_ANSWER_CONTINUATION_ENABLED,
     FRONTEND_DIST_DIR,
     GMAIL_PUBSUB_PROJECT_ID,
     GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT,
@@ -157,6 +158,7 @@ from xagent.config import (
     get_file_storage_startup_sync_enabled,
     get_file_storage_uri,
     get_file_stream_ticket_ttl_seconds,
+    get_form_answer_continuation_enabled,
     get_frontend_dist_dir,
     get_gmail_pubsub_project_id,
     get_gmail_pubsub_push_service_account,
@@ -634,6 +636,33 @@ class TestOpenRouterConfig:
         assert get_xrouter_excluded_models() == (
             "z-ai/glm-5.3-flash",
             "openai/gpt-5.6-luna",
+        )
+
+
+class TestFormAnswerContinuationConfig:
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            pytest.param(None, True, id="unset-is-on"),
+            pytest.param("true", True, id="true"),
+            pytest.param(" TRUE ", True, id="true-padded-uppercase"),
+            pytest.param("1", True, id="one"),
+            pytest.param("false", False, id="false"),
+            pytest.param("0", False, id="zero"),
+            pytest.param("", False, id="empty-is-off"),
+        ],
+    )
+    def test_env_table(self, monkeypatch, value, expected):
+        if value is None:
+            monkeypatch.delenv(FORM_ANSWER_CONTINUATION_ENABLED, raising=False)
+        else:
+            monkeypatch.setenv(FORM_ANSWER_CONTINUATION_ENABLED, value)
+        assert get_form_answer_continuation_enabled() is expected
+
+    def test_env_var_name_constant(self):
+        assert (
+            FORM_ANSWER_CONTINUATION_ENABLED
+            == "XAGENT_FORM_ANSWER_CONTINUATION_ENABLED"
         )
 
 

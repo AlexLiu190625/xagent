@@ -66,6 +66,7 @@ from datetime import timezone
 from enum import Enum
 from typing import Any, Callable, cast
 
+from .....config import get_form_answer_continuation_enabled
 from ....context_ref import CONTEXT_REFS_KEY, SUPERSEDES_SCOPE_KEY
 from ....file_ref import (
     WORKSPACE_OUTPUT_FILES_TOOL_NAME,
@@ -556,6 +557,62 @@ def _is_answerable(interaction: Any) -> bool:
     return not lacks_required_options(interaction)
 
 
+# The rule this implements: a model-authored ask_user_question is a form when
+# at least one of its answerable fields (see ``_is_answerable``) has a type
+# other than confirm or file_upload. Every other answerable type counts,
+# including a select_one whose options are just "Yes" and "No" and
+# action_cards; only the two types below are excluded. ``boolean`` is not
+# listed because it normalizes to confirm before this check runs.
+_NON_FORM_ANSWERABLE_TYPES = frozenset({"confirm", "file_upload"})
+
+
+@dataclass(frozen=True)
+class FormAnswerDecision:
+    """Whether this one LLM call is a form-answer turn, and whether the
+    form-answer-continuation text is applied to it.
+
+    Computed exactly once per call, at the site that builds that call's final
+    messages, so the same object both selects what ``get_messages_for_llm``
+    renders (via ``_messages_for_llm(..., form_answer_continuation=...)``)
+    and what ``trace_metadata`` reports for it -- the two can never disagree
+    about the same call.
+    """
+
+    # Whether this call could carry the text at all: the latest visible user
+    # message answers a model-authored form and the context renders a
+    # "Current user request" block (``form_answer_continuation_target``).
+    # Recorded on every main and protocol-retry call where that holds,
+    # including forced ones and with the switch off, so how often this shape
+    # occurs stays visible either way. A DAG step or a context with no
+    # current request records nothing.
+    turn: bool
+    # Whether the form-answer-continuation text was actually applied to this
+    # call: turn, plus an unforced turn and the global switch
+    # (``get_form_answer_continuation_enabled``) being on.
+    applied: bool
+
+    def trace_metadata(self) -> dict[str, bool]:
+        metadata: dict[str, bool] = {}
+        if self.turn:
+            metadata["form_answer_turn"] = True
+        if self.applied:
+            metadata["form_answer_continuation"] = True
+        return metadata
+
+
+def _form_answer_decision(
+    context: Any, *, force_final_answer: bool
+) -> FormAnswerDecision:
+    """Shared by the main loop and the protocol retry. The iteration-limit
+    delivery does not call this and does not pass ``form_answer_continuation``
+    to ``_messages_for_llm``, so it relies on that parameter's default
+    (False). A forced turn cannot call ``ask_user_question`` again, so it
+    never applies."""
+    turn = context.form_answer_continuation_target() is not None
+    applied = turn and not force_final_answer and get_form_answer_continuation_enabled()
+    return FormAnswerDecision(turn=turn, applied=applied)
+
+
 def _unavailable_tool_call_names(
     protocol_error: dict[str, Any],
 ) -> frozenset[str] | None:
@@ -988,11 +1045,20 @@ class ReActPattern(AgentPattern):
                 )
                 note_compaction_evidence_loss(context, compact_result)
 
+            # Computed once, after compaction (compaction can change which
+            # message is the latest visible user message), at the site that
+            # builds this call's real final messages -- not at the routing
+            # build above, whose messages are only used to pick the model.
+            form_answer_decision = _form_answer_decision(
+                context, force_final_answer=force_final_answer_now
+            )
+            llm_metadata.update(form_answer_decision.trace_metadata())
             messages = self._messages_for_llm(
                 context,
                 has_tools=bool(tool_schemas),
                 force_final_answer=force_final_answer_now,
                 tool_names=self._schema_tool_names(tool_schemas),
+                form_answer_continuation=form_answer_decision.applied,
             )
             await runtime.checkpoint("before_llm", context=context, pattern=self)
             await runtime.on_llm_start(
@@ -1562,8 +1628,13 @@ class ReActPattern(AgentPattern):
         has_tools: bool,
         force_final_answer: bool = False,
         tool_names: list[str] | None = None,
+        form_answer_continuation: bool = False,
     ) -> list[dict[str, Any]]:
-        messages = list(context.get_messages_for_llm())
+        messages = list(
+            context.get_messages_for_llm(
+                form_answer_continuation=form_answer_continuation
+            )
+        )
         if force_final_answer:
             # One body with switched phrases: hand-written duplicates would
             # drift, and the weaker copy lands on the turn that invents a
@@ -1791,11 +1862,19 @@ class ReActPattern(AgentPattern):
             tools = self._forced_answer_tool_schemas(tool_schemas)
         else:
             tools = [self._final_answer_tool_schema()]
+        # The retry can run unforced where the main call was forced
+        # (unavailable-tool recovery restores the full tool set), so it
+        # computes its own decision with its own force flag, by the same
+        # shared formula.
+        form_answer_decision = _form_answer_decision(
+            context, force_final_answer=force_final_answer
+        )
         messages = self._messages_for_llm(
             context,
             has_tools=True,
             force_final_answer=force_final_answer,
             tool_names=self._schema_tool_names(tools),
+            form_answer_continuation=form_answer_decision.applied,
         )
         if recovery_reason == "unavailable_tool_call":
             retry_instruction = (
@@ -1885,6 +1964,7 @@ class ReActPattern(AgentPattern):
         }
         if recovery_reason:
             metadata["recovery_reason"] = recovery_reason
+        metadata.update(form_answer_decision.trace_metadata())
         await runtime.checkpoint(
             retry_phase,
             context=context,
@@ -4045,6 +4125,24 @@ class ReActPattern(AgentPattern):
                 "interactions": interactions,
                 "task_text": self.task_text,
                 "message_count": len(getattr(context, "messages", [])),
+                # A form, for the form-answer-continuation text (react.py's
+                # _form_answer_decision / execution.py's readers), is the
+                # model's own question having at least one answerable field
+                # whose type is neither confirm nor file_upload (the rule
+                # stated at _NON_FORM_ANSWERABLE_TYPES). Computed
+                # from the model-authored, pre-append list -- deduplicated_interactions,
+                # not the ``interactions`` _send_waiting_message may have
+                # appended a default field to -- so an engine-appended
+                # placeholder field never manufactures a form on its own,
+                # and only this branch (ask_user_question) ever writes this
+                # key: send_message(expect_response=True) and a tool's own
+                # waiting request have no model-authored interactions to
+                # judge in the first place.
+                "form": any(
+                    _is_answerable(interaction)
+                    and interaction.get("type") not in _NON_FORM_ANSWERABLE_TYPES
+                    for interaction in deduplicated_interactions
+                ),
             }
             return {
                 "success": False,
