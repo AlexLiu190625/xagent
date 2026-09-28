@@ -267,14 +267,35 @@ def test_pause_fence_without_a_local_holder_defers(db_session) -> None:
     assert _row(db_session, int(task.id)).state_version == 3
 
 
-def test_pause_fence_still_reports_a_settled_run_as_finished(db_session) -> None:
+@pytest.mark.parametrize(
+    ("status", "control_state", "outcome"),
+    [
+        # The interrupted run paused itself: the pause took effect.
+        (
+            TaskStatus.PAUSED,
+            TaskControlState.PAUSED,
+            commands.PauseWriteOutcome.RUN_ALREADY_PAUSED,
+        ),
+        (
+            TaskStatus.COMPLETED,
+            TaskControlState.COMPLETED,
+            commands.PauseWriteOutcome.NOT_APPLIED,
+        ),
+    ],
+    ids=["paused", "completed"],
+)
+def test_pause_fence_does_not_defer_a_settled_run(
+    db_session, status, control_state, outcome
+) -> None:
+    """A settled run is not another live owner, so the pause is not deferred."""
+
     task = _leased_task(db_session)
     task.lease_attempt_id = "own-attempt"
-    task.status = TaskStatus.PAUSED
-    task.control_state = TaskControlState.PAUSED.value
+    task.status = status
+    task.control_state = control_state.value
     db_session.commit()
 
-    applied = commands._apply_pause_requested_isolated(
+    result = commands._apply_pause_requested_isolated(
         int(task.id),
         expected_run_id=str(task.run_id),
         owner_leases=(
@@ -282,7 +303,8 @@ def test_pause_fence_still_reports_a_settled_run_as_finished(db_session) -> None
         ),
     )
 
-    assert applied is False
+    assert result is outcome
+    assert _row(db_session, int(task.id)).state_version == 3
 
 
 @pytest.mark.parametrize(

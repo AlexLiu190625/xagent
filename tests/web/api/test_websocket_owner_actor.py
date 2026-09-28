@@ -3399,6 +3399,66 @@ async def test_durable_pause_propagates_stale_run_error(db_session) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("settled_status", "applied"),
+    [
+        # The interrupted run paused itself before the fenced write ran.
+        (TaskStatus.PAUSED, True),
+        # The run really ended; the pause did not take effect.
+        (TaskStatus.FAILED, False),
+    ],
+)
+async def test_durable_pause_after_run_settles_before_fenced_write(
+    db_session, settled_status: TaskStatus, applied: bool
+) -> None:
+    owner = _user(db_session, "owner")
+    task = _task(db_session, owner.id)
+    task.run_id = "run-a"
+    db_session.commit()
+    task_id = int(task.id)
+    _captured, agent, mgr, ws_manager = _patched_manager_and_agent()
+
+    async def interrupt_and_settle():
+        # The interrupt reaches the run, which settles before the fenced
+        # write, so the real RUNNING-only UPDATE matches no row.
+        row = db_session.get(Task, task_id)
+        row.status = settled_status
+        db_session.commit()
+        return {"status": "paused"}
+
+    agent.pause_execution = AsyncMock(side_effect=interrupt_and_settle)
+    message_data = {"user": owner, "_durable_ack_sent": True}
+    with (
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=mgr,
+        ),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch(
+            "xagent.web.services.task_command_execution.publish_task_event",
+            new=AsyncMock(),
+        ) as published,
+    ):
+        await pause_task(_make_command_reply(MagicMock()), task_id, message_data)
+
+    agent.pause_execution.assert_awaited_once()
+    # Nothing is left pending: the run has already ended, so a marker would
+    # hold back messages on a later resumed run.
+    assert not task_execution_service._is_task_pause_accepted(task_id)
+    assert not [
+        call
+        for call in published.await_args_list
+        if call.args[0].get("type") == "task_pause_requested"
+    ]
+    if applied:
+        assert "_durable_command_error" not in message_data
+    else:
+        assert message_data["_durable_command_error"] == (
+            "Task finished before the pause request was applied"
+        )
+
+
+@pytest.mark.asyncio
 async def test_durable_resume_propagates_stale_run_error(db_session) -> None:
     owner = _user(db_session, "owner")
     task = _task(db_session, owner.id, status=TaskStatus.PAUSED)

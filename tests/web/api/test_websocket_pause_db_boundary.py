@@ -83,13 +83,13 @@ async def test_pause_handler_keeps_database_work_off_the_event_loop(
         *,
         expected_run_id: str | None,
         owner_leases: tuple[object, ...],
-    ) -> bool:
+    ) -> command_execution_service.PauseWriteOutcome:
         worker_threads["finalize"] = threading.get_ident()
         assert resolved_task_id == task_id
         assert expected_run_id == "run-1"
         # No heartbeat or coordinator holds this mocked run.
         assert owner_leases == ()
-        return True
+        return command_execution_service.PauseWriteOutcome.APPLIED
 
     def forbidden_event_loop_db() -> object:
         raise AssertionError("pause handler opened a request Session on the event loop")
@@ -190,7 +190,7 @@ async def test_pause_survives_a_scope_authority_mismatch(
     monkeypatch.setattr(
         command_execution_service,
         "_apply_pause_requested_isolated",
-        lambda *a, **k: True,
+        lambda *a, **k: command_execution_service.PauseWriteOutcome.APPLIED,
         raising=False,
     )
     monkeypatch.setattr(
@@ -264,7 +264,7 @@ def test_pause_transition_updates_only_the_expected_running_run(
 
     db_session.expire_all()
     stored = db_session.query(Task).filter(Task.id == int(task.id)).one()
-    assert applied is True
+    assert applied is command_execution_service.PauseWriteOutcome.APPLIED
     assert stored.status == TaskStatus.RUNNING
     assert stored.run_id == "run-1"
     assert stored.control_state == TaskControlState.PAUSE_REQUESTED.value
@@ -304,7 +304,29 @@ def test_pause_transition_leaves_a_terminal_task_unchanged(
 
     db_session.expire_all()
     stored = db_session.query(Task).filter(Task.id == int(task.id)).one()
-    assert applied is False
+    assert applied is command_execution_service.PauseWriteOutcome.NOT_APPLIED
     assert stored.status == TaskStatus.COMPLETED
     assert stored.control_state == TaskControlState.COMPLETED.value
+    assert stored.state_version == 3
+
+
+def test_pause_transition_reports_a_run_that_already_paused(
+    db_session: Session,
+) -> None:
+    task = _running_task(db_session)
+    setattr(task, "status", TaskStatus.PAUSED)
+    setattr(task, "control_state", TaskControlState.PAUSED.value)
+    db_session.commit()
+
+    outcome = command_execution_service._apply_pause_requested_isolated(
+        int(task.id),
+        expected_run_id="run-1",
+        owner_leases=(_owner_lease(task),),
+    )
+
+    db_session.expire_all()
+    stored = db_session.query(Task).filter(Task.id == int(task.id)).one()
+    assert outcome is command_execution_service.PauseWriteOutcome.RUN_ALREADY_PAUSED
+    assert stored.status == TaskStatus.PAUSED
+    assert stored.control_state == TaskControlState.PAUSED.value
     assert stored.state_version == 3

@@ -3156,12 +3156,21 @@ async def handle_task_message(
         raise
 
 
+class PauseWriteOutcome(enum.Enum):
+    """Result of recording PAUSE_REQUESTED for one targeted run."""
+
+    APPLIED = "applied"
+    # The interrupted run settled PAUSED before the fenced write ran.
+    RUN_ALREADY_PAUSED = "run_already_paused"
+    NOT_APPLIED = "not_applied"
+
+
 def _apply_pause_requested_isolated(
     task_id: int,
     *,
     expected_run_id: str | None,
     owner_leases: Sequence[TaskLease],
-) -> bool:
+) -> PauseWriteOutcome:
     """Persist PAUSE_REQUESTED for the exact RUNNING run in a short Session.
 
     ``owner_leases`` are the acquisitions this process holds for the run
@@ -3176,6 +3185,10 @@ def _apply_pause_requested_isolated(
 
     A legacy RUNNING row with no run id is left unfenced: every acquisition
     assigns a run id, so ``run_id IS NULL`` already excludes any leased owner.
+
+    A miss on a row already PAUSED on ``expected_run_id`` is reported as
+    ``RUN_ALREADY_PAUSED``, read in the same Session as the write: the run
+    settled on its own after the caller interrupted it.
     """
 
     SessionLocal = get_session_local()
@@ -3206,7 +3219,7 @@ def _apply_pause_requested_isolated(
         )
         if int(getattr(result, "rowcount", 0) or 0) == 1:
             db.commit()
-            return True
+            return PauseWriteOutcome.APPLIED
 
         current = db.query(Task.run_id, Task.status).filter(Task.id == task_id).first()
         if current is not None:
@@ -3226,7 +3239,9 @@ def _apply_pause_requested_isolated(
                 raise ClientVisibleTaskCommandDeferred(
                     "Pause command is waiting for the active task lease owner"
                 )
-        return False
+            if expected_run_id is not None and current[1] == TaskStatus.PAUSED:
+                return PauseWriteOutcome.RUN_ALREADY_PAUSED
+        return PauseWriteOutcome.NOT_APPLIED
 
 
 def _pause_retry_found_its_run_paused(
@@ -3389,14 +3404,26 @@ async def pause_task(reply: CommandReply, task_id: int, message_data: dict) -> N
                 logger.warning("%s for task %s", pause_failure, task_id)
                 return
             logger.info("Agent pause_execution completed")
-            pause_applied = await run_db_io_cancellation_safe(
+            pause_write = await run_db_io_cancellation_safe(
                 lambda: _apply_pause_requested_isolated(
                     task_id,
                     expected_run_id=expected_run_id,
                     owner_leases=owner_leases,
                 )
             )
-            if not pause_applied:
+            if pause_write is PauseWriteOutcome.RUN_ALREADY_PAUSED:
+                # The interrupt above reached the live run, and the run settled
+                # PAUSED before the fenced write ran, so the write found no
+                # RUNNING row. The pause took effect; that settlement already
+                # published the durable PAUSED ``task_info``.
+                logger.info(
+                    "Task %s run %s paused before its pause request was "
+                    "recorded; pause command settles as applied",
+                    task_id,
+                    expected_run_id,
+                )
+                return
+            if pause_write is not PauseWriteOutcome.APPLIED:
                 message_data["_durable_command_error"] = (
                     "Task finished before the pause request was applied"
                 )
