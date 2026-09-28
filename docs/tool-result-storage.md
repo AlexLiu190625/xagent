@@ -65,10 +65,11 @@ whose bytes no longer match the digest in its name, is reported as
 unavailable.
 
 The reply goes through the same output filter as every other tool and is
-never stored again. For any positive limit the text of one reply is never
-longer than the output limit, so the filter does not cut it, and advancing
-`offset` by the number in the tool description continues exactly where the
-previous reply ended.
+never stored again. For any positive limit the text of one reply, in `output`
+or `content_preview`, is never longer than the output limit, so the filter
+does not cut it, and advancing `offset` by the number in the tool description
+continues exactly where the previous reply ended. The other fields of a reply
+can still be cut; see Known limitations.
 
 ## Settings and limits
 
@@ -83,3 +84,10 @@ previous reply ended.
 
 - Only dict results are stored. A tool that returns a plain string or a list
   is truncated as before.
+- The output filter still cuts the short string fields of a `read_tool_result`
+  preview when the output limit is shorter than the field: `instruction` (160
+  characters) under a limit below 160, and `relative_path` (at most 130
+  characters) under a limit below its own length.
+- A listing page holds up to `SPILL_MAX_FILES_PER_RUN` (64) entries, and the
+  output filter also caps every list at `XAGENT_TOOL_MAX_FIELD_COUNT` items. A
+  deployment that sets that count below 64 gets a truncated listing.
