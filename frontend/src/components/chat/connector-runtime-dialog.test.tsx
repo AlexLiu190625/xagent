@@ -4333,6 +4333,11 @@ const gateFillable = () => ok(report(false, [
 const gateSecretsOnly = () => ok(report(false, [
   connector(REF_A, "A", [input({ section: "secrets", key: "api_key", type: "string", required: true })]),
 ]))
+// Still fillable by resolveDialogOutcome, but the server rejects any value
+// saved under this name, so a first gate has nothing it can save.
+const gateBadNameOnly = () => ok(report(false, [
+  connector(REF_A, "A", [input({ section: "context", key: "bad key", type: "string", required: true })]),
+]))
 async function holdFirstMessage(taskId = 1): Promise<string[]> {
   const seen: string[] = []
   await act(async () => { void latestActions.openFirstGate(taskId)?.then(d => { seen.push(d) }) })
@@ -4368,6 +4373,7 @@ describe("a first gate shows only while something can be filled, and only where 
     ["met", () => ok(report(true, []))],
     ["unsupported_only", gateSecretsOnly],
     ["nothing_fillable", () => ok(report(false, []))],
+    ["only a required key it can never save", gateBadNameOnly],
     ["a failed read", () => ({ ok: false, kind: "http", status: 500 })],
   ] as const)("stays hidden and releases the message on %s", async (_name, result) => {
     vi.spyOn(console, "warn").mockImplementation(() => {})
@@ -4452,6 +4458,7 @@ describe("save and send lets the message go once nothing is left to fill", () =>
     ["met", () => ok(report(true, [])), []],
     ["unsupported_only", gateSecretsOnly, [["connectorRuntime.onlyUnsupportedRemaining:{\"keys\":\"api_key\"}"]]],
     ["nothing_fillable", () => ok(report(false, [])), []],
+    ["only a required key it can never save", gateBadNameOnly, []],
   ] as const)("releases it when the save lands %s", async (_name, landed, toasts) => {
     const { seen, closeSpy } = await shownGate()
     submitMock.mockResolvedValueOnce(landed())
@@ -4528,6 +4535,7 @@ describe("a visible first gate never sends on its own", () => {
     ["met", () => ok(report(true, []))],
     ["unsupported_only", gateSecretsOnly],
     ["nothing_fillable", () => ok(report(false, []))],
+    ["only a required key it can never save", gateBadNameOnly],
   ] as const)("offers send message instead of closing when it re-reads %s", async (_name, reread) => {
     const { seen, closeSpy } = await shownGateThatReReads(reread)
     expect(screen.getByRole("dialog")).toBeInTheDocument()

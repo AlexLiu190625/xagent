@@ -20,6 +20,7 @@ import {
   resolveDialogActions,
   resolveDialogOutcome,
   resolveFirstGateActions,
+  resolveOutcomeFor,
   type ConnectorRuntimeConnector,
   type ConnectorRuntimeDialogAction,
   type ConnectorRuntimeDialogTrigger,
@@ -148,7 +149,8 @@ export interface GateFacts {
   drafts: Readonly<Record<string, string>>
   invalidDraftKeys: ReadonlyMap<string, InvalidObjectDraftReason>
   request: { seq: number; resendPayload: { clientMessageId: string } | null }
-  // Why the request was opened; picks the button set, nothing else.
+  // Why the request was opened; picks how the report reads
+  // (resolveOutcomeFor) and the button set, nothing else.
   trigger: ConnectorRuntimeDialogTrigger
 }
 
@@ -230,7 +232,7 @@ export function deriveGates(facts: GateFacts): Gates {
   // disagree with the two facts it is made of.
   const readFailed = !reading && reportIsStale
 
-  const outcome: DialogOutcome | null = facts.report ? resolveDialogOutcome(facts.report) : null
+  const outcome: DialogOutcome | null = facts.report ? resolveOutcomeFor(facts.report, facts.trigger) : null
   const submitItems = facts.report ? buildSubmitItems(facts.report, facts.drafts) : []
   // Only a mark on a row the current report still renders an editable
   // control for may gate submission. A key a refreshed report reports
@@ -316,7 +318,7 @@ export function deriveGates(facts: GateFacts): Gates {
 /**
  * What the dialog is doing. Deliberately not what the report on screen says:
  * a same-task re-read can install a report of another tier under any phase,
- * so rendering reads the phase and `resolveDialogOutcome(view.report)` as two
+ * so rendering reads the phase and `resolveOutcomeFor(view.report, trigger)` as two
  * separate things rather than one flattened list of combinations.
  *
  * `saving` covers the save POST (`post`) and the re-read a rejected save asks

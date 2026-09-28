@@ -58,6 +58,7 @@ import {
   isDialogHostPathFor,
   isSubmittableObjectValue,
   resolveDialogOutcome,
+  resolveOutcomeFor,
   submitTaskConnectorRuntimeValues,
   type ConnectorRuntimeConnector,
   type ConnectorRuntimeDialogTrigger,
@@ -570,7 +571,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
         finish({ tell: { silent: wasVisible ? "user-left" : "never-shown" }, event: null, close: "not-shown" })
         return
       }
-      const outcome = resolveDialogOutcome(result.report)
+      const outcome = resolveOutcomeFor(result.report, request.trigger)
       // A report the user has never seen and this request's trigger does
       // not open on (see opensOnFirstRead) is the one case where nothing is
       // installed at all: there is no dialog to keep open and nothing for it
@@ -858,7 +859,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       return
     }
 
-    const newOutcome = resolveDialogOutcome(result.report)
+    const newOutcome = resolveOutcomeFor(result.report, request.trigger)
     // Only a met report can carry the resend the primary button promised --
     // see canResendReport, which handleRetryResend asks too, so the two
     // entry points cannot disagree about the same snapshot. Because the

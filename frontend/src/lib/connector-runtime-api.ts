@@ -722,17 +722,43 @@ export type ConnectorRuntimeDialogTrigger = "turn_failure" | "session_open" | "f
 export type ConnectorRuntimeDialogAction = "saveAndResend" | "saveOnly" | "acknowledge" | "saveAndSend" | "sendHeld"
 
 /**
+ * How a request opened for `trigger` reads a report: the dialog's first read,
+ * its save and its render all ask this. A first gate holds a message the user
+ * has not sent yet, so for it "fillable" means a missing required context key
+ * this dialog can actually save. A key whose name the server rejects
+ * (isAcceptedRuntimeKeyName) cannot be saved from anywhere -- the write fails
+ * with keyNameRejected -- so a first gate counts it with the inputs it cannot
+ * fill: without an acceptable one left, the report reads as unsupported_only
+ * (secrets still missing) or nothing_fillable, and the message goes out to
+ * fail at the per-turn check as it does today, instead of waiting behind a
+ * dialog that can never send it. Every other trigger reads
+ * resolveDialogOutcome unchanged.
+ */
+export function resolveOutcomeFor(report: ConnectorRuntimeReport, trigger: ConnectorRuntimeDialogTrigger): DialogOutcome {
+  const outcome = resolveDialogOutcome(report)
+  if (trigger !== "first_gate" || outcome.kind !== "fillable") return outcome
+  const savable = report.connectors.some(connector => connector.inputs.some(input => (
+    input.required && !input.satisfied && input.section === "context" && isAcceptedRuntimeKeyName(input.key)
+  )))
+  if (savable) return outcome
+  return outcome.blocking.length > 0 ? { kind: "unsupported_only", blocking: outcome.blocking } : { kind: "nothing_fillable" }
+}
+
+/**
  * Whether a web-chat create response asks for the first message to be held
- * until the task's missing runtime inputs are filled. Reads the create
- * response's report only for this decision: that report is computed from the
- * agent before the task exists (every key reads unsatisfied), so what the
- * dialog shows always comes from the per-task read. Anything that does not
- * parse -- null on the public and share create paths, a missing field, a
- * malformed body -- answers "do not hold", the behavior before this check.
+ * until the task's missing runtime inputs are filled: the same reading a
+ * first gate gives every later report (resolveOutcomeFor), so the message is
+ * held only while there is something the user can save here. Reads the
+ * create response's report only for this decision: that report is computed
+ * from the agent before the task exists (every key reads unsatisfied), so
+ * what the dialog shows always comes from the per-task read. Anything that
+ * does not parse -- null on the public and share create paths, a missing
+ * field, a malformed body -- answers "do not hold", the behavior before this
+ * check.
  */
 export function shouldHoldFirstMessage(value: unknown): boolean {
   const report = readConnectorRuntimeReport(value)
-  return report !== null && resolveDialogOutcome(report).kind === "fillable"
+  return report !== null && resolveOutcomeFor(report, "first_gate").kind === "fillable"
 }
 
 // The one sentence a create path shows when its held first message was
@@ -911,9 +937,11 @@ export function isSubmitEnabled(items: ConnectorRuntimeSubmitItem[], hasInvalidO
 }
 
 // Mirrors core/tools/adapters/vibe/connector_runtime.py's
-// validate_runtime_source_key exactly, for a hint only: it never
-// participates in submission gating, and a server-side rename of the
-// accepted character set would require updating this constant to match.
+// validate_runtime_source_key exactly. It never participates in submission
+// gating: it drives the row hint, and whether a first gate counts a required
+// context key as something the user can still fill (resolveOutcomeFor). A
+// server-side rename of the accepted character set would require updating
+// this constant to match.
 const ACCEPTED_RUNTIME_KEY_NAME_RE = /^[A-Za-z0-9_-]+$/
 
 export function isAcceptedRuntimeKeyName(key: string): boolean {

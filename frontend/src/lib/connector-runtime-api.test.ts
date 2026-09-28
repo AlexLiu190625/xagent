@@ -23,6 +23,7 @@ import {
   resolveDialogActions,
   resolveDialogOutcome,
   resolveFirstGateActions,
+  resolveOutcomeFor,
   shouldHoldFirstMessage,
   submitTaskConnectorRuntimeValues,
   type ConnectorRuntimeConnector,
@@ -1068,6 +1069,8 @@ describe("holds the first message only while something can be filled", () => {
   const context = input({ section: "context", key: "k", type: "string", required: true })
   const secret = input({ section: "secrets", key: "s", type: "string", required: true })
   const badKeyOnly = input({ section: "secrets", key: "bad key", type: "string" })
+  // Required, and no value can ever be saved under this name.
+  const badContext = input({ section: "context", key: "bad key", type: "string", required: true })
   it.each([
     ["null (public and share create paths)", false, null],
     ["a body that is not a report", false, {}],
@@ -1075,9 +1078,39 @@ describe("holds the first message only while something can be filled", () => {
     ["context missing", true, report(false, [connector(REF_A, "A", [context])])],
     ["context and a secret missing", true, report(false, [connector(REF_A, "A", [context, secret])])],
     ["only a secret missing", false, report(false, [connector(REF_A, "A", [secret])])],
-    ["only an invalid key name", false, report(false, [connector(REF_A, "A", [badKeyOnly])])],
+    ["only an optional key with an invalid name", false, report(false, [connector(REF_A, "A", [badKeyOnly])])],
+    ["only a required context key with an invalid name", false, report(false, [connector(REF_A, "A", [badContext])])],
+    ["a required context key with an invalid name and a secret", false,
+      report(false, [connector(REF_A, "A", [badContext, secret])])],
+    ["a required context key with an invalid name next to a valid one", true,
+      report(false, [connector(REF_A, "A", [badContext, context])])],
   ] as const)("%s -> holds: %s", (_name, holds, value) => {
     expect(shouldHoldFirstMessage(value)).toBe(holds)
+  })
+})
+
+// A first gate reads a required context key it can never save as something
+// it cannot fill; every other request reads the report as before.
+describe("reads a report for the request that asks", () => {
+  const context = input({ section: "context", key: "k", type: "string", required: true })
+  const secret = input({ section: "secrets", key: "s", type: "string", required: true })
+  const badContext = input({ section: "context", key: "bad key", type: "string", required: true })
+  const blockingSecret = [{ connectorRef: REF_A, key: "s" }]
+  it.each([
+    ["only a bad-name key", [badContext], { kind: "nothing_fillable" }, { kind: "fillable", blocking: [] }],
+    ["a bad-name key and a secret", [badContext, secret],
+      { kind: "unsupported_only", blocking: blockingSecret }, { kind: "fillable", blocking: blockingSecret }],
+    ["a bad-name key next to a valid one", [badContext, context],
+      { kind: "fillable", blocking: [] }, { kind: "fillable", blocking: [] }],
+    ["only a secret", [secret], { kind: "unsupported_only", blocking: blockingSecret },
+      { kind: "unsupported_only", blocking: blockingSecret }],
+  ] as const)("%s", (_name, inputs, firstGate, other) => {
+    const value = report(false, [connector(REF_A, "A", [...inputs])])
+    expect(resolveOutcomeFor(value, "first_gate")).toEqual(firstGate)
+    for (const trigger of ["turn_failure", "session_open"] as const) {
+      expect(resolveOutcomeFor(value, trigger)).toEqual(other)
+      expect(resolveOutcomeFor(value, trigger)).toEqual(resolveDialogOutcome(value))
+    }
   })
 })
 
