@@ -151,7 +151,7 @@ def test_an_old_writer_after_the_backfill_does_not_get_the_task_purged(
             conversation_days=CONVERSATION_DAYS,
             trace_days=TRACE_DAYS,
         )
-    assert action is RetentionPurgeAction.SKIPPED_BUSY
+    assert action is RetentionPurgeAction.SKIPPED_NOT_DUE
 
     with sessions() as db:
         assert (

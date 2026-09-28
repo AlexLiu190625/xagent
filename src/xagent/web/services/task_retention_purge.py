@@ -106,7 +106,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from sqlalchemy import and_, delete, exists, or_, select, update
+from sqlalchemy import ColumnElement, and_, delete, exists, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from ...config import (
@@ -140,6 +140,12 @@ from .task_retention import (
     retention_expiry_condition,
     retention_quiescent_condition,
 )
+from .task_retention_overrides import (
+    RetentionOverrideSnapshot,
+    RetentionPeriods,
+    load_retention_overrides,
+    resolve_task_retention_periods,
+)
 from .task_runtime import task_extension_bindings_from_agent_config
 from .task_workspace_cleanup import capture_workspace_cleanup_target_best_effort
 
@@ -165,9 +171,18 @@ class RetentionPurgeAction(enum.Enum):
     PURGED_CONVERSATION = "purged_conversation"
     PURGED_TRACES = "purged_traces"
     #: The predicate refused it: live status, live lease, or a command owed
-    #: execution. Expected and uninteresting -- a task can become busy between
-    #: the batch scan and its own assessment.
+    #: execution -- or the row was gone or locked by then, or it has no anchor
+    #: to measure from. Expected and uninteresting -- a task can become busy
+    #: between the batch scan and its own assessment.
     SKIPPED_BUSY = "skipped_busy"
+    #: Quiescent, but its period has not elapsed under the lock: its newest
+    #: message is later than its stored anchor (#2580), or its team's period
+    #: changed between the scan and the lock (#2600).
+    SKIPPED_NOT_DUE = "skipped_not_due"
+    #: Its team's override could not be resolved or was unusable, so no period
+    #: is known to have elapsed (#2600). Kept, never measured against the
+    #: global period instead.
+    SKIPPED_OVERRIDE_UNRESOLVED = "skipped_override_unresolved"
     #: Trace expiry only: the task still holds an ``active`` interaction row,
     #: whose anchor the trace delete would try to NULL against
     #: ``ck_task_interaction_requests_active_anchor``.
@@ -197,6 +212,8 @@ class RetentionPurgeReport:
     purged_conversations: int = 0
     purged_traces: int = 0
     skipped_busy: int = 0
+    skipped_not_due: int = 0
+    skipped_override_unresolved: int = 0
     skipped_active_interaction: int = 0
     nothing_to_purge: int = 0
     failed: int = 0
@@ -236,6 +253,10 @@ class RetentionPurgeReport:
             + int(action is RetentionPurgeAction.PURGED_TRACES),
             skipped_busy=self.skipped_busy
             + int(action is RetentionPurgeAction.SKIPPED_BUSY),
+            skipped_not_due=self.skipped_not_due
+            + int(action is RetentionPurgeAction.SKIPPED_NOT_DUE),
+            skipped_override_unresolved=self.skipped_override_unresolved
+            + int(action is RetentionPurgeAction.SKIPPED_OVERRIDE_UNRESOLVED),
             skipped_active_interaction=self.skipped_active_interaction
             + int(action is RetentionPurgeAction.SKIPPED_ACTIVE_INTERACTION),
             nothing_to_purge=self.nothing_to_purge
@@ -258,6 +279,8 @@ class RetentionPurgeReport:
             f"purged_conversations={self.purged_conversations} "
             f"purged_traces={self.purged_traces} "
             f"skipped_busy={self.skipped_busy} "
+            f"skipped_not_due={self.skipped_not_due} "
+            f"skipped_override_unresolved={self.skipped_override_unresolved} "
             f"skipped_active_interaction={self.skipped_active_interaction} "
             f"nothing_to_purge={self.nothing_to_purge} "
             f"failed={self.failed} "
@@ -288,6 +311,7 @@ def select_purge_candidates(
     trace_days: int | None,
     limit: int,
     after_task_id: int = 0,
+    overrides: RetentionOverrideSnapshot | None = None,
 ) -> list[int]:
     """Up to ``limit`` task ids that some path would expire, lowest id first.
 
@@ -325,20 +349,32 @@ def select_purge_candidates(
     what that diagnostic reports, and it cannot be applied to both legs
     anyway. ``ix_trace_events_task_id_event_type`` makes it a leading-column
     lookup.
+
+    ``overrides`` applies per-team periods (#2600) by partitioning this
+    condition by user; omitted, the scan uses the two periods alone.
     """
-    conversation_due = retention_expiry_condition(now=now, days=conversation_days)
-    trace_due = and_(
-        retention_expiry_condition(now=now, days=trace_days),
-        exists(select(1).where(TraceEvent.task_id == Task.id)),
-    )
+
+    def due(periods: RetentionPeriods) -> ColumnElement[bool]:
+        return or_(
+            retention_expiry_condition(now=now, days=periods.conversation_days),
+            and_(
+                retention_expiry_condition(now=now, days=periods.trace_days),
+                exists(select(1).where(TraceEvent.task_id == Task.id)),
+            ),
+        )
+
     if conversation_days is None and trace_days is None:
         return []
+    defaults = RetentionPeriods(conversation_days, trace_days)
+    snapshot = overrides or RetentionOverrideSnapshot(defaults=defaults)
+    if snapshot.defaults != defaults:
+        raise ValueError("overrides were resolved against different periods")
     rows = db.execute(
         select(Task.id)
         .where(
             Task.id > after_task_id,
             retention_quiescent_condition(now=now),
-            or_(conversation_due, trace_due),
+            snapshot.scan_condition(Task.user_id, due),
         )
         .order_by(Task.id.asc())
         .limit(limit)
@@ -517,7 +553,12 @@ def purge_task(
     trace_days: int | None,
     dry_run: bool = False,
 ) -> RetentionPurgeAction:
-    """Assess one task under a lock and expire what its disposition allows."""
+    """Assess one task under a lock and expire what its disposition allows.
+
+    ``conversation_days`` and ``trace_days`` are the deployment's periods. With
+    a retention override resolver registered, the task's team may replace
+    them (see ``task_retention_overrides``).
+    """
     action, _owed = _purge_task(
         db,
         task_id,
@@ -561,7 +602,9 @@ def _purge_task(
 
     "No release call" is narrower than "no external call": recording resolves
     the task's execution scope, which runs any registered scope resolver under
-    the lock (see :func:`_conversation_cleanup_owed`).
+    the lock (see :func:`_conversation_cleanup_owed`). A registered retention
+    override resolver also runs in this transaction, just before the lock, to
+    read the task's own periods.
 
     Every exit rolls back or commits, so the ``FOR UPDATE`` the assessment
     took is never held past this call -- a sweep that left one open per task
@@ -569,14 +612,23 @@ def _purge_task(
     """
     committed = False
     try:
+        # Per task, inside this transaction: a team's period can change after
+        # the scan read it, and this is the read that decides (#2600).
+        periods = resolve_task_retention_periods(
+            db, task_id, RetentionPeriods(conversation_days, trace_days)
+        )
+        if periods is None:
+            return RetentionPurgeAction.SKIPPED_OVERRIDE_UNRESOLVED, 0
         assessment = assess_task_retention(
             db,
             task_id,
             now=now,
-            conversation_days=conversation_days,
-            trace_days=trace_days,
+            conversation_days=periods.conversation_days,
+            trace_days=periods.trace_days,
         )
         if assessment.disposition is RetentionDisposition.NOT_ELIGIBLE:
+            if assessment.quiescent and assessment.anchor is not None:
+                return RetentionPurgeAction.SKIPPED_NOT_DUE, 0
             return RetentionPurgeAction.SKIPPED_BUSY, 0
 
         if assessment.disposition is RetentionDisposition.CONVERSATION_EXPIRED:
@@ -608,7 +660,7 @@ def _purge_task(
         committed = True
         return action, len(owed)
     finally:
-        # Covers every exit -- the two skips, the dry run, the purge (both
+        # Covers every exit -- the skips, the dry run, the purge (both
         # branches converge on one return) and any exception -- because
         # each one either committed or must not.
         # Written as a flag rather than as a rollback before each ``return``
@@ -642,7 +694,10 @@ def run_retention_purge_batch(
     retention setting is read once, by the loop: they cannot change within a
     process (see the retention section of ``config.py``), and re-reading them
     per batch meant an unusable value logged its warning every few seconds
-    while a backlog drained.
+    while a backlog drained. Per-team overrides are the exception: they can
+    change at run time, so this batch reads them once for its scan and each
+    task reads them again (``task_retention_overrides``). If that read fails,
+    the batch selects nothing.
 
     Configuration is read per batch rather than captured at import. That is
     not the same as being changeable at run time, and this module used to
@@ -677,13 +732,23 @@ def run_retention_purge_batch(
 
     with session_factory() as db:
         ensure_retention_purge_supported(db)
-        candidates = select_purge_candidates(
-            db,
-            now=now,
-            conversation_days=conversation_days,
-            trace_days=trace_days,
-            limit=limit,
-            after_task_id=after_task_id,
+        overrides = load_retention_overrides(
+            db, RetentionPeriods(conversation_days, trace_days)
+        )
+        # A failed resolver selects nothing: without it, no task's period is
+        # known, and the global one would expire an extending team early.
+        candidates = (
+            []
+            if overrides is None
+            else select_purge_candidates(
+                db,
+                now=now,
+                conversation_days=conversation_days,
+                trace_days=trace_days,
+                limit=limit,
+                after_task_id=after_task_id,
+                overrides=overrides,
+            )
         )
 
     report = RetentionPurgeReport(eligible=len(candidates), dry_run=dry_run)
@@ -729,6 +794,16 @@ def run_retention_purge_batch(
         # task commits its own transaction, so an exception escaping this loop
         # would otherwise discard the record of deletions that did happen.
         logger.info(report.audit_line())
+        # One line per batch, not per task: the per-task override reads log
+        # their cause at DEBUG, and a resolver that fails only on those reads
+        # would otherwise never reach WARNING at all (#2600).
+        if report.skipped_override_unresolved:
+            logger.warning(
+                "retention purge kept %d task(s) whose team retention period "
+                "could not be resolved or was unusable; the cause is logged "
+                "at DEBUG by xagent.web.services.task_retention_overrides",
+                report.skipped_override_unresolved,
+            )
     return report
 
 

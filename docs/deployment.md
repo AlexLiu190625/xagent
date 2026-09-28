@@ -400,7 +400,7 @@ The purge that acts on the retention predicate. It starts only when a retention 
 
 The job is gated on `XAGENT_CONVERSATION_RETENTION_DAYS` / `XAGENT_TRACE_RETENTION_DAYS` (see `example.env`), and it refuses to start on anything but PostgreSQL — the row lock its eligibility check depends on is compiled away on SQLite, so an assessment there is not a deletion licence. The refusal is logged once and the loop exits; it is not retried, because configuration cannot change under a running process.
 
-**Every retention setting takes effect at process start, and only there.** `.env` is read once and nothing mutates the environment afterwards, so changing a period, the dry-run flag or the kill switch requires a restart. The kill switch exists so that stopping expiry does not mean editing the periods — not so that a running sweep can be halted from outside.
+**Every retention setting takes effect at process start, and only there.** Per-team overrides, when a deployment layer registers them, are the one exception (see the 2026-09-28 entry). `.env` is read once and nothing mutates the environment afterwards, so changing a period, the dry-run flag or the kill switch requires a restart. The kill switch exists so that stopping expiry does not mean editing the periods — not so that a running sweep can be halted from outside.
 
 Before setting a period anywhere, work through the enablement gate on the retention tracking issue.
 
@@ -420,7 +420,7 @@ WHERE contype = 'f'
   AND confrelid = 'tasks'::regclass;
 ```
 
-A stale anchor still affects `xagent retention preview` and the purge's candidate scan, which read the stored value only. Both can treat such a task as older than the purge will: the preview over-counts, never under-counts, and the scan hands the purge a candidate it then keeps (`skipped_busy`) or expires only the trace of (`purged_traces`), where the stored anchor alone would have expired the whole conversation. Because the stored anchor is not repaired, the scan keeps selecting such a task on every sweep: it goes on reporting `skipped_busy`, or `nothing_to_purge` once its trace is gone, until its newest message itself passes the conversation period.
+A stale anchor still affects `xagent retention preview` and the purge's candidate scan, which read the stored value only. Both can treat such a task as older than the purge will: the preview over-counts, never under-counts, and the scan hands the purge a candidate it then keeps (`skipped_not_due`) or expires only the trace of (`purged_traces`), where the stored anchor alone would have expired the whole conversation. Because the stored anchor is not repaired, the scan keeps selecting such a task on every sweep: it goes on reporting `skipped_not_due`, or `nothing_to_purge` once its trace is gone, until its newest message itself passes the conversation period.
 
 Recommended first run: set the period together with `XAGENT_RETENTION_DRY_RUN=true`, restart, read the audit line, and only then clear the dry-run flag and restart again. A value the parser does not recognise resolves to a dry run rather than a deletion, but do not rely on that instead of checking the log line.
 
@@ -432,9 +432,9 @@ What it costs is duplicated scanning, which is why there is no advisory lock her
 
 ### Verification and monitoring
 
-`xagent retention preview --days N` reports what a period would expire without touching anything. Once the job runs, each *batch* logs one line beginning `retention purge` — a sweep that drains a backlog logs one per page, not one in total — counting `scanned`, `purged_conversations`, `purged_traces`, `skipped_busy`, `skipped_active_interaction`, `nothing_to_purge`, `failed` and `cleanup_owed`.
+`xagent retention preview --days N` reports what a period would expire without touching anything. Once the job runs, each *batch* logs one line beginning `retention purge` — a sweep that drains a backlog logs one per page, not one in total — counting `scanned`, `purged_conversations`, `purged_traces`, `skipped_busy`, `skipped_not_due`, `skipped_override_unresolved`, `skipped_active_interaction`, `nothing_to_purge`, `failed` and `cleanup_owed`.
 
-`scanned` is how many candidates the batch selected, not how many proved expirable — the locked assessment can still refuse any of them. `skipped_busy` covers every such refusal, which is usually a task that is genuinely not quiescent but also includes a row that vanished between the scan and the lock (normal with more than one replica), a task whose newest message is more recent than its stored anchor, and a task with no anchor at all. `nothing_to_purge` is a trace-expiry candidate whose trace was already gone by the time the lock was taken — either removed between the scan and the lock, or, for a task whose stored anchor lags its newest message, removed by an earlier sweep. `failed` is a task whose own purge raised: it is logged with its id and traceback, the sweep carries on, and the task is retried on the next pass.
+`scanned` is how many candidates the batch selected, not how many proved expirable — the locked assessment can still refuse any of them. `skipped_busy` is a refusal because the task is not quiescent, which also includes a row that vanished between the scan and the lock (normal with more than one replica) and a task with no anchor at all. `skipped_not_due` is a quiescent task whose period has not elapsed under the lock: its newest message is more recent than its stored anchor, or its team's period changed after the scan. `skipped_override_unresolved` is a task whose team's period could not be resolved (see the 2026-09-28 entry). `nothing_to_purge` is a trace-expiry candidate whose trace was already gone by the time the lock was taken — either removed between the scan and the lock, or, for a task whose stored anchor lags its newest message, removed by an earlier sweep. `failed` is a task whose own purge raised: it is logged with its id and traceback, the sweep carries on, and the task is retried on the next pass.
 
 Those field names deliberately differ from the ones sketched on the tracking issue (`eligible / deleted / skipped-busy / external-pending`): `deleted` is split because the two paths delete different things and an operator needs to know which ran, `skipped_active_interaction` names the one refusal that is permanent rather than transient, and `external-pending` became `cleanup_owed`: the external cleanup of the conversations the batch expired, which the job records for the cleanup retry driver rather than performs (see the 2026-09-25 entry below).
 
@@ -534,3 +534,32 @@ The web UI and internal API now read the expired-task records above (#2565), the
 
 - No migration and no configuration.
 - Rolling back returns the previous `404` for these routes and drops `trace_events_expired_at` and `task_expired_at`.
+
+## 2026-09-28 — Per-team retention period overrides
+
+The two retention variables are deployment-wide. A deployment layer that lets a team shorten or extend them (shortening on every plan, extension up to two years) now has a hook for it. Nothing in this repository registers one: unregistered, the purge uses the two variables alone and runs the same scan.
+
+### Deployment impact
+
+- No migration, no index, no new environment variable.
+- The purge's audit line gains `skipped_not_due` and `skipped_override_unresolved`. `skipped_not_due` applies with no resolver registered too: a quiescent task whose period has not elapsed under the lock — for example one whose newest message is more recent than its stored anchor — used to be counted as `skipped_busy`. Alerts or dashboards keyed on `skipped_busy` will see it drop by that amount.
+
+### The resolver contract
+
+A deployment layer registers a resolver with `xagent.web.services.task_retention_overrides.set_retention_override_resolver`. It maps each `user_id` whose team has an override to its conversation and trace periods, either of which may be left to inherit the deployment's value.
+
+- An override may set 1 to 730 days. Any other value, including `None`, is refused rather than clamped, and that user's tasks are kept. An unusable value refuses the user even on a leg the deployment left off.
+- A resolver that raises, returns something that is not a mapping, or returns a non-`int` user id keeps everything: the batch selects nothing, and a task already selected is counted as `skipped_override_unresolved`. A single user's value that is not a `RetentionOverride` (or an override with an unusable period) refuses only that user, and the batch proceeds for everyone else. Nothing falls back to the global periods, which would expire a team that extended its period early.
+- An override never enables a leg the deployment left off, and never starts a purge the variables leave disabled.
+- An inherited trace period follows the team's conversation period when the deployment's trace period equals its conversation period — which is what leaving `XAGENT_TRACE_RETENTION_DAYS` unset produces, but also what an operator gets by setting it explicitly equal to the conversation period. Either way, a team extending its conversation period also extends its trace period past the value the operator set. A team shortening its conversation shortens the trace with it, which deletes nothing earlier: conversation expiry removes the whole task, traces included, at that point anyway. Otherwise the trace period stays the deployment's own.
+- Overrides are read once per batch for the scan and again per task inside the task's own transaction, just before its row is locked, so a settings change committed before then applies to that task. The resolver therefore runs inside the purge's transaction and must be a read with no side effects, dry run included.
+
+### Verification and monitoring
+
+- A failed resolver read shows in the audit line only as `scanned=0`, which is indistinguishable from an idle batch. The warning `retention override resolver failed` in the log is the signal, and the cursor restarts from the top of the table on the next sweep.
+- Refused users are logged once per batch with up to 20 of their ids. A non-zero `skipped_override_unresolved` is also logged as one WARNING per batch (`retention purge kept N task(s) ...`). It has two possible sources: the resolver failing on the per-task reads (the traceback for each task is logged at DEBUG by `xagent.web.services.task_retention_overrides`), or a user whose value became unusable after the scan.
+- `xagent retention preview` still counts against the global periods only; it does not apply overrides.
+
+### Rollback
+
+Unregister the resolver (or stop registering it) and restart: the purge returns to the two variables alone. Rows already expired under a team's shorter period are not restored.

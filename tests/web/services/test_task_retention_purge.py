@@ -521,7 +521,7 @@ def test_a_task_younger_than_both_periods_is_not_purged(sessions) -> None:
     with sessions() as db:
         task_id = _seed_full_task(db, username="y1", anchor=_age(10))
 
-    assert _purge(sessions, task_id) is RetentionPurgeAction.SKIPPED_BUSY
+    assert _purge(sessions, task_id) is RetentionPurgeAction.SKIPPED_NOT_DUE
 
     with sessions() as db:
         assert _counts(db, task_id)["trace_events"] == 1
@@ -533,7 +533,7 @@ def test_unlimited_retention_purges_nothing(sessions) -> None:
 
     action = _purge(sessions, task_id, conversation_days=None, trace_days=None)
 
-    assert action is RetentionPurgeAction.SKIPPED_BUSY
+    assert action is RetentionPurgeAction.SKIPPED_NOT_DUE
     with sessions() as db:
         assert _counts(db, task_id)["tasks"] == 1
 
@@ -1033,6 +1033,8 @@ def test_every_action_increments_exactly_one_counter() -> None:
                 "purged_conversations",
                 "purged_traces",
                 "skipped_busy",
+                "skipped_not_due",
+                "skipped_override_unresolved",
                 "skipped_active_interaction",
                 "nothing_to_purge",
                 "failed",
