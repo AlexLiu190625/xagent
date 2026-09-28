@@ -1212,6 +1212,29 @@ async def test_tail_checkpoint_failure_keeps_the_result(durable, caplog):
 
 
 @pytest.mark.asyncio
+async def test_tail_fact_failure_aborts_completion(durable, monkeypatch):
+    from xagent.core.agent.checkpoint import ExecutionEventPersistenceError
+
+    runner, store = durable
+    runner.agent.patterns = [_AnsweringPattern()]
+    on_run_end = AsyncMock()
+    runner.callbacks = [SimpleNamespace(on_run_end=on_run_end)]
+    checkpoint = store.checkpoint
+
+    async def fail_tail(**payload):
+        if payload["label"] == "run_end_tail":
+            raise ExecutionEventPersistenceError("fact write failed")
+        await checkpoint(**payload)
+
+    monkeypatch.setattr(store, "checkpoint", fail_tail)
+    with pytest.raises(ExecutionEventPersistenceError, match="fact write failed"):
+        await runner.run("m1", execution_id="tail-fact-fails")
+    on_run_end.assert_not_awaited()
+    assert store.writes == ["step"]
+    assert runner.context_manager.get_context("tail-fact-fails") is None
+
+
+@pytest.mark.asyncio
 async def test_waiting_result_is_not_tail_persisted_so_resume_keeps_waiting(durable):
     from xagent.core.agent import ReActPattern
 

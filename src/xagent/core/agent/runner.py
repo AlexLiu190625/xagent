@@ -29,6 +29,7 @@ from .attachments import build_image_context_references
 from .checkpoint import (
     CheckpointCorruptError,
     CheckpointPersistenceError,
+    ExecutionEventPersistenceError,
     can_read_checkpoints,
     read_latest_checkpoint_payload,
 )
@@ -1929,6 +1930,8 @@ class AgentRunner:
         if result.get("success") is True:
             try:
                 await runtime.checkpoint_context_tail("run_end_tail", context=context)
+            except ExecutionEventPersistenceError:
+                raise
             except Exception:
                 logger.warning(
                     "Final context checkpoint failed for %s; the result stands",

@@ -236,6 +236,16 @@ def _finalize_a2a_cancel_sync(
                 f"task {task_id} changed while finalizing cancel target "
                 f"{expected_run_id}/{expected_state_version}"
             )
+        if direct_cancel:
+            from .task_execution_event_writer import stage_result_fact_no_commit
+
+            # A locally settled execution already recorded its own result.
+            # Direct cancellation owns this transition and its result fact.
+            stage_result_fact_no_commit(
+                db,
+                updated,
+                {"status": "cancelled", "error": updated.error_message},
+            )
         snapshot = A2ATaskSnapshot.from_task(updated)
         db.commit()
         return snapshot

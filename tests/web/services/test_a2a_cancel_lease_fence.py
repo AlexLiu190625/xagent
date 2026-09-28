@@ -7,14 +7,16 @@ import pytest
 from xagent.web.models.agent import Agent
 from xagent.web.models.database import get_session_local, init_db
 from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.task_execution_event import TaskExecutionEvent
 from xagent.web.models.user import User
 from xagent.web.services import a2a_task_cancel, task_coordinator_service
 from xagent.web.services.task_execution_controller import StaleTaskRunError
 
 
+@pytest.mark.parametrize("version", [1, 2])
 @pytest.mark.parametrize("fence", ["lock", "update"])
 def test_replaced_attempt_rejects_cancel_and_preserves_task(
-    tmp_path, monkeypatch, fence
+    tmp_path, monkeypatch, fence, version
 ):
     monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
     init_db(db_url=f"sqlite:///{tmp_path / 'cancel.db'}")
@@ -29,6 +31,7 @@ def test_replaced_attempt_rejects_cancel_and_preserves_task(
             user_id=user.id,
             agent_id=agent.id,
             source="a2a",
+            conversation_storage_version=version,
             title="Cancel",
             status=TaskStatus.PAUSED,
             control_state="paused",
@@ -69,6 +72,7 @@ def test_replaced_attempt_rejects_cancel_and_preserves_task(
         assert task.lease_attempt_id == "replacement-attempt"
         assert task.state_version == version
         assert task.output == "retained output"
+        assert db.query(TaskExecutionEvent).count() == 0
 
 
 @pytest.mark.parametrize("path", ["direct", "settled_local_cancel"])

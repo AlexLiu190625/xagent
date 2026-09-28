@@ -141,19 +141,60 @@ def reconcile_orphaned_pending_deliveries_no_commit(
     running, is left alone.
     """
 
+    from .task_execution_event_store import lock_task_execution_events_no_commit
+    from .task_execution_event_writer import stage_delivery_fact_no_commit
+
+    # Match the event writers' task-before-chat lock order. Recheck orphan
+    # eligibility in the UPDATE after waiting for any in-flight task writer.
+    event_tasks = list(
+        db.scalars(
+            select(Task.id)
+            .where(
+                Task.conversation_storage_version == 2,
+                Task.id.in_(
+                    select(TaskChatMessage.task_id).where(
+                        *_orphaned_pending_delivery_predicates(
+                            now=now,
+                            task_id=task_id,
+                            created_before=created_before,
+                        )
+                    )
+                ),
+            )
+            .order_by(Task.id)
+        )
+    )
+    for event_task_id in event_tasks:
+        lock_task_execution_events_no_commit(db, event_task_id)
     result = db.execute(
         update(TaskChatMessage)
         .where(
+            or_(
+                TaskChatMessage.task_id.in_(event_tasks),
+                TaskChatMessage.task_id.in_(
+                    select(Task.id).where(Task.conversation_storage_version == 1)
+                ),
+            ),
             *_orphaned_pending_delivery_predicates(
                 now=now,
                 task_id=task_id,
                 created_before=created_before,
-            )
+            ),
         )
         .values(delivery_status=DELIVERY_DISPATCHED)
+        .returning(TaskChatMessage.task_id, TaskChatMessage.turn_id)
         .execution_options(synchronize_session=False)
     )
-    return int(getattr(result, "rowcount", 0) or 0)
+    changed = result.all()
+    for changed_task_id, turn_id in changed:
+        if changed_task_id in event_tasks and turn_id:
+            stage_delivery_fact_no_commit(
+                db,
+                task_id=changed_task_id,
+                turn_id=turn_id,
+                status=DELIVERY_DISPATCHED,
+            )
+    return len(changed)
 
 
 def reconcile_orphaned_pending_deliveries_isolated(*, batch_size: int) -> int:
@@ -260,6 +301,9 @@ def recover_task_lease_candidate_no_commit(
         )
     db.expire_all()
     task = db.query(Task).filter(Task.id == candidate.task_id).one()
+    from .task_execution_event_writer import stage_result_fact_no_commit
+
+    stage_result_fact_no_commit(db, task, {"error": task_error})
     sync_workforce_run_status(db, task, next_status)
     sync_trigger_run_status(
         db,

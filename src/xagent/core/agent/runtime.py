@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Callable
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from ...config import COMPACT_THRESHOLD_DEFAULT
 from ..agent.trace import (
@@ -36,7 +37,11 @@ from ..tools.user_interaction import (
     WAITING_FOR_USER_STATUS,
     tool_result_waits_for_user,
 )
-from .checkpoint import CheckpointPersistenceError, TraceCheckpointStore
+from .checkpoint import (
+    CheckpointPersistenceError,
+    ExecutionEventPersistenceError,
+    TraceCheckpointStore,
+)
 from .context.execution import (
     COMPACT_SUMMARY_FALLBACK_BUDGETS,
     COMPACT_THRESHOLD_SOURCE_DEFAULT,
@@ -991,14 +996,32 @@ class PatternRuntime:
             "visible": visible,
             "metadata": outbound_metadata,
         }
-        if expect_response or message_type == "question":
+        sources = outbound_metadata.get("tool_calls") or [outbound_metadata]
+        attempts = [source.get("tool_attempt_id") for source in sources]
+        if all(attempts):
+            # One direct message per control attempt; aggregated questions are
+            # a distinct effect of an ordered set of tool attempts. Neither
+            # current run/step nor message text defines occurrence identity.
+            purpose = (
+                "tool-question" if "tool_calls" in outbound_metadata else "tool-message"
+            )
+            payload["event_id"] = str(
+                uuid5(NAMESPACE_URL, json.dumps([purpose, attempts]))
+            )
+        elif expect_response or message_type == "question":
             payload["event_id"] = str(uuid4())
         if step_id:
             payload["step_id"] = str(step_id)
         self.outbound_messages.append(payload)
 
         if self.outbound_message_handler is not None:
-            await self._maybe_await(self.outbound_message_handler(payload))
+            committed = self.outbound_message_handler(payload)
+            if inspect.isawaitable(committed):
+                committed = await committed
+            if all(attempts) and isinstance(committed, dict):
+                # A replay returns the original committed message, including
+                # its source attribution, for waiting-state reconstruction.
+                payload.update(committed)
         elif expect_response or message_type == "question":
             # A dropped question parks the run waiting for a reply that can
             # never arrive, so this is worth a warning.
@@ -1152,6 +1175,11 @@ class PatternRuntime:
             "tool_name": tool_call.get("name"),
             "tool_params": tool_call.get("args", {}),
             "tool_call_id": tool_call.get("id"),
+            **{
+                key: tool_call[key]
+                for key in ("assistant_message_id", "tool_attempt_id")
+                if key in tool_call
+            },
         }
         assistant_content = tool_call.get("assistant_content")
         if isinstance(assistant_content, str) and assistant_content.strip():
@@ -1185,6 +1213,11 @@ class PatternRuntime:
                 "tool_name": tool_call.get("name"),
                 "tool_params": tool_call.get("args", {}),
                 "tool_call_id": tool_call.get("id"),
+                **{
+                    key: tool_call[key]
+                    for key in ("assistant_message_id", "tool_attempt_id")
+                    if key in tool_call
+                },
                 "result": result,
                 "success": False,
                 "status": WAITING_FOR_USER_STATUS,
@@ -1222,6 +1255,11 @@ class PatternRuntime:
             "tool_name": tool_call.get("name"),
             "tool_params": tool_call.get("args", {}),
             "tool_call_id": tool_call.get("id"),
+            **{
+                key: tool_call[key]
+                for key in ("assistant_message_id", "tool_attempt_id")
+                if key in tool_call
+            },
             "result": result,
             "success": True,
         }
@@ -1252,6 +1290,11 @@ class PatternRuntime:
             "error_message": str(error),
             "tool_name": tool_call.get("name"),
             "tool_call_id": tool_call.get("id"),
+            **{
+                key: tool_call[key]
+                for key in ("assistant_message_id", "tool_attempt_id")
+                if key in tool_call
+            },
         }
         if result is not None:
             data["result"] = result
@@ -1289,6 +1332,11 @@ class PatternRuntime:
             "tool_name": tool_call.get("name"),
             "tool_params": tool_call.get("args", {}),
             "tool_call_id": tool_call.get("id"),
+            **{
+                key: tool_call[key]
+                for key in ("assistant_message_id", "tool_attempt_id")
+                if key in tool_call
+            },
             "success": False,
             "interrupted": True,
             "interrupt_reason": cancellation_reason,
@@ -1715,7 +1763,7 @@ class PatternRuntime:
                                 "llm_summary_unusable": True,
                                 **request_metadata,
                             }
-                    except LLMCallInterrupted:
+                    except (LLMCallInterrupted, ExecutionEventPersistenceError):
                         raise
                     except Exception as exc:  # noqa: BLE001
                         await self.on_llm_error(
@@ -2018,7 +2066,11 @@ class PatternRuntime:
         # truncates bulky content (messages, response, tool_calls, ...).
         # Non-LLM categories (TOOL / DAG / REACT / COMPACT / GENERAL)
         # pass through unchanged.
-        if data and getattr(event_type, "category", None) == TraceCategory.LLM:
+        if (
+            data
+            and getattr(event_type, "category", None) == TraceCategory.LLM
+            and getattr(self.tracer, "records_execution_events", False) is not True
+        ):
             data = normalize_llm_trace_payload(data)
         try:
             await self._maybe_await(
@@ -2029,6 +2081,8 @@ class PatternRuntime:
                     data=data or {},
                 )
             )
+        except ExecutionEventPersistenceError:
+            raise
         except Exception:
             # UI trace events are best-effort; checkpoint persistence remains strict.
             return

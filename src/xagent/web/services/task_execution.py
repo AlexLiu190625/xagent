@@ -31,6 +31,7 @@ names must keep it importable from this module.
 
 import asyncio
 import enum
+import json
 import logging
 import re
 import shutil
@@ -86,6 +87,7 @@ from ..models.task import Task, TaskStatus, task_status_predicate
 from ..models.uploaded_file import UploadedFile
 from .llm_utils import AutoModelUnavailableError
 from .task_events import DeliveryNotifier, publish_task_event
+from .task_execution_event_writer import stage_result_fact_no_commit
 from .task_lease_service import (
     lock_task_lease_for_settlement_no_commit,
     lock_task_lease_no_commit,
@@ -422,7 +424,11 @@ def _terminal_task_error_payload(
 ) -> dict[str, Any] | None:
     SessionLocal = get_session_local()
     db = SessionLocal()
+    canonical = False
     try:
+        from .task_execution_event_writer import uses_execution_events
+
+        canonical = uses_execution_events(db, task_id)
         failed_control_state = TaskControlState.FAILED.value
         current_version = func.coalesce(Task.state_version, 0)
         statement = (
@@ -495,10 +501,15 @@ def _terminal_task_error_payload(
                         message_type=TASK_FAILURE_MESSAGE_TYPE,
                     )
                 except Exception:
+                    if task.conversation_storage_version == 2:
+                        raise
                     logger.warning(
                         "Failed to persist terminal error chat message",
                         exc_info=True,
                     )
+            if canonical:
+                db.refresh(task)
+                stage_result_fact_no_commit(db, task, {"error": message})
             db.commit()
         return _task_error_payload(
             db,
@@ -506,8 +517,14 @@ def _terminal_task_error_payload(
             CLIENT_SAFE_TASK_FAILURE,
             event_type=event_type,
         )
-    except Exception:
+    except Exception as exc:
         db.rollback()
+        if canonical:
+            from ...core.agent.checkpoint import ExecutionEventPersistenceError
+
+            raise ExecutionEventPersistenceError(
+                "Terminal failure event commit failed"
+            ) from exc
         logger.warning("Failed to persist terminal task error", exc_info=True)
         return {
             "type": event_type,
@@ -549,7 +566,7 @@ def create_final_answer_stream_event(
     data: Dict[str, Any],
     timestamp: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Create non-persistent final-answer UI stream events."""
+    """Create final-answer UI stream envelopes without changing their protocol."""
 
     payload = dict(data)
     payload.pop("type", None)
@@ -577,17 +594,66 @@ def _stream_timestamp(timestamp: Optional[Any] = None) -> float:
     return float(timestamp)
 
 
-def _persist_agent_outbound_event(task_id: int, event: Dict[str, Any]) -> None:
+def _outbound_message_business_payload(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Compare a message effect without attributing a replay to its new run."""
+    metadata = dict(data.get("metadata") or {})
+    for key in ("step_id", "dag_step_id", "turn_id"):
+        metadata.pop(key, None)
+    if "tool_calls" in metadata:
+        metadata["tool_calls"] = [
+            {
+                key: value
+                for key, value in source.items()
+                if key not in {"step_id", "dag_step_id", "turn_id"}
+            }
+            for source in metadata["tool_calls"]
+        ]
+    return {
+        "message": data.get("message"),
+        "message_type": data.get("message_type"),
+        "expect_response": data.get("expect_response"),
+        "visible": data.get("visible"),
+        "metadata": metadata,
+    }
+
+
+def _persist_agent_outbound_event(
+    task_id: int, event: Dict[str, Any], *, authoritative: bool = False
+) -> None:
     """Persist agent outbound events and durable waiting prompts."""
 
     from ..models.task import Task as DatabaseTask
     from ..models.task import TraceEvent as DatabaseTraceEvent
-    from .chat_history_service import persist_assistant_message
+    from .chat_history_service import persist_assistant_message_no_commit
 
+    execution_event_id: str | None = None
     db_gen = get_db()
     db = next(db_gen)
     try:
+        from .task_lease_service import current_task_lease
+
+        lease = current_task_lease()
+        if authoritative and event.get("type") == "final_answer_delta":
+            # Chunks are ephemeral; complete answers and stream boundaries are
+            # durable. Check ownership without serializing every chunk against
+            # fact writers. Publication already occurs outside the transaction.
+            if lease is not None and (
+                lease.task_id != task_id
+                or db.query(DatabaseTask.id)
+                .filter(
+                    DatabaseTask.id == task_id,
+                    DatabaseTask.runner_id == lease.runner_id,
+                    DatabaseTask.run_id == lease.run_id,
+                    task_lease_attempt_predicate(lease),
+                )
+                .first()
+                is None
+            ):
+                raise TaskLeaseLostError("Outbound event producer lost its task lease")
+            return
         event_data = event.get("data")
+        if authoritative and event_data is None:
+            event_data = dict(event)
         data: Dict[str, Any] = cast(
             Dict[str, Any], event_data if isinstance(event_data, dict) else {}
         )
@@ -613,14 +679,103 @@ def _persist_agent_outbound_event(task_id: int, event: Dict[str, Any]) -> None:
             parent_event_id=None,
             data=data,
         )
-        from .task_lease_service import current_task_lease
-
-        lease = current_task_lease()
         if lease is not None and (
             lease.task_id != task_id or not lock_task_lease_no_commit(db, lease)
         ):
             raise TaskLeaseLostError("Outbound event producer lost its task lease")
-        db.add(trace_event)
+        if authoritative:
+            from ..models.task_execution_event import TaskExecutionEvent
+            from .task_execution_event_store import (
+                ExecutionEventConflict,
+                lock_task_execution_events_no_commit,
+            )
+            from .task_execution_event_writer import append_fact_no_commit
+
+            lock_task_execution_events_no_commit(db, task_id)
+            task = db.get(DatabaseTask, task_id)
+            assert task is not None
+            metadata = data.get("metadata") or {}
+            sources = metadata.get("tool_calls") or [metadata]
+            if all(source.get("tool_attempt_id") for source in sources):
+                existing = (
+                    db.query(TaskExecutionEvent)
+                    .filter(
+                        TaskExecutionEvent.task_id == task_id,
+                        TaskExecutionEvent.scope_id == "root",
+                        TaskExecutionEvent.idempotency_key
+                        == f"outbound:{trace_event.event_id}",
+                    )
+                    .first()
+                )
+                if existing is not None:
+                    original_payload = cast(Dict[str, Any], existing.payload)
+                    if existing.kind != trace_event.event_type or (
+                        json.dumps(
+                            _outbound_message_business_payload(
+                                original_payload["data"]
+                            ),
+                            sort_keys=True,
+                        )
+                        != json.dumps(
+                            _outbound_message_business_payload(data), sort_keys=True
+                        )
+                    ):
+                        raise ExecutionEventConflict(
+                            "Tool message identity identifies a different message"
+                        )
+                    # The fact and its projections committed together. Reuse
+                    # the envelope, but permit retransmission after a crash
+                    # between commit and broadcast. Do not execute a new send.
+                    event.clear()
+                    event.update(
+                        create_stream_event(
+                            str(existing.kind),
+                            task_id,
+                            original_payload["data"],
+                            timestamp=existing.occurred_at,
+                            event_id=original_payload["protocol_event_id"],
+                        )
+                    )
+                    db.commit()
+                    return
+            fact = append_fact_no_commit(
+                db,
+                task_id=task_id,
+                kind=str(trace_event.event_type),
+                key=f"outbound:{trace_event.event_id}",
+                run_id=cast(str | None, task.run_id),
+                assistant_message_id=metadata.get("assistant_message_id"),
+                tool_attempt_id=metadata.get("tool_attempt_id"),
+                payload={"data": data, "protocol_event_id": trace_event.event_id},
+                occurred_at=event_time,
+            )
+            setattr(trace_event, "data", fact.payload["data"])
+            if trace_event.event_type.startswith("final_answer_"):
+                db.commit()
+                return
+            execution_event_id = cast(str, fact.event_id)
+            data = cast(Dict[str, Any], fact.payload)["data"]
+            setattr(trace_event, "timestamp", fact.occurred_at)
+            # Protocol replay retains the original envelope as well as the
+            # same chat projection. The task lock serializes both lookups.
+            event.update(
+                create_stream_event(
+                    str(fact.kind),
+                    task_id,
+                    data,
+                    timestamp=fact.occurred_at,
+                    event_id=cast(Dict[str, Any], fact.payload)["protocol_event_id"],
+                )
+            )
+        if not authoritative or not (
+            db.query(DatabaseTraceEvent.id)
+            .filter(
+                DatabaseTraceEvent.task_id == task_id,
+                DatabaseTraceEvent.event_id == trace_event.event_id,
+            )
+            .first()
+        ):
+            db.add(trace_event)
 
         if bool(data.get("expect_response")):
             task = db.query(DatabaseTask).filter(DatabaseTask.id == task_id).first()
@@ -634,7 +789,7 @@ def _persist_agent_outbound_event(task_id: int, event: Dict[str, Any]) -> None:
                     and isinstance(metadata.get("interactions"), list)
                     else None
                 )
-                persist_assistant_message(
+                persist_assistant_message_no_commit(
                     db,
                     task_id=task_id,
                     user_id=task_user_id,
@@ -642,11 +797,18 @@ def _persist_agent_outbound_event(task_id: int, event: Dict[str, Any]) -> None:
                     message_type="question",
                     interactions=interactions,
                     source_event_id=str(trace_event.event_id),
+                    execution_event_id=execution_event_id,
                 )
 
         db.commit()
     except Exception as exc:
         db.rollback()
+        if authoritative:
+            from ...core.agent.checkpoint import ExecutionEventPersistenceError
+
+            raise ExecutionEventPersistenceError(
+                "Outbound event commit failed"
+            ) from exc
         if isinstance(exc, TaskLeaseLostError):
             raise
         logger.exception(
@@ -684,10 +846,10 @@ def _reconcile_streamed_final_answer(task_id: int, content: str) -> str:
         db.close()
 
 
-def make_agent_outbound_handler(task_id: int) -> Any:
+def make_agent_outbound_handler(task_id: int, *, authoritative: bool = False) -> Any:
     """Create a web bridge for agent agent-to-user messages."""
 
-    async def handle_outbound_message(payload: Dict[str, Any]) -> None:
+    async def handle_outbound_message(payload: Dict[str, Any]) -> Dict[str, Any] | None:
         payload_type = str(payload.get("type") or "")
         if payload_type in {
             "final_answer_start",
@@ -704,14 +866,20 @@ def make_agent_outbound_handler(task_id: int) -> Any:
                     task_id,
                     str(payload["content"]),
                 )
-            await publish_task_event(
-                create_final_answer_stream_event(payload_type, task_id, dict(payload)),
-                task_id,
+            final_answer_event = create_final_answer_stream_event(
+                payload_type, task_id, dict(payload)
             )
-            return
+            if authoritative:
+                await run_db_io_cancellation_safe(
+                    lambda: _persist_agent_outbound_event(
+                        task_id, final_answer_event, authoritative=True
+                    )
+                )
+            await publish_task_event(final_answer_event, task_id)
+            return None
 
         if payload.get("visible") is False:
-            return
+            return None
 
         event_type = _agent_outbound_event_type(payload)
         event = create_stream_event(
@@ -731,9 +899,12 @@ def make_agent_outbound_handler(task_id: int) -> Any:
             event_id=payload.get("event_id"),
         )
         await run_db_io_cancellation_safe(
-            lambda: _persist_agent_outbound_event(task_id, event)
+            lambda: _persist_agent_outbound_event(
+                task_id, event, authoritative=authoritative
+            )
         )
         await publish_task_event(event, task_id)
+        return cast(Dict[str, Any], event["data"]) if authoritative else None
 
     return handle_outbound_message
 
@@ -1691,6 +1862,7 @@ def _finalize_task_execution_result_isolated(
                     task_updated,
                     task_updated.status,
                 )
+                stage_result_fact_no_commit(finalize_db, task_updated, result)
                 finalize_db.commit()
                 metadata_committed = True
                 terminal_state_committed = True
@@ -1807,11 +1979,13 @@ def _finalize_task_execution_result_isolated(
                     ),
                     content_is_reconciled=True,
                 )
+                stage_result_fact_no_commit(finalize_db, task_updated, result)
                 finalize_db.commit()
                 metadata_committed = True
                 terminal_state_committed = True
 
             if pause_commit_pending and not metadata_committed:
+                stage_result_fact_no_commit(finalize_db, task_updated, result)
                 finalize_db.commit()
                 metadata_committed = True
             broadcast_meta = {
@@ -1963,7 +2137,13 @@ async def execute_task_background(
             )
             if hasattr(agent_service, "set_outbound_message_handler"):
                 agent_service.set_outbound_message_handler(
-                    make_agent_outbound_handler(task_id)
+                    make_agent_outbound_handler(
+                        task_id,
+                        authoritative=getattr(
+                            agent_service.tracer, "records_execution_events", False
+                        )
+                        is True,
+                    )
                 )
             agent_service.set_conversation_history(
                 [dict(message) for message in snapshot.conversation_history],
@@ -2583,6 +2763,7 @@ def _finalize_resumed_task(
             db.rollback()
             finalized["late_result"] = True
             return finalized
+        stage_result_fact_no_commit(db, task, result)
         db.commit()
         metadata_committed = True
         finalized["lease_released"] = True
@@ -3116,7 +3297,13 @@ async def execute_resume_background(
         # that already installed one is harmless.
         if hasattr(agent_service, "set_outbound_message_handler"):
             agent_service.set_outbound_message_handler(
-                make_agent_outbound_handler(task_id)
+                make_agent_outbound_handler(
+                    task_id,
+                    authoritative=getattr(
+                        agent_service.tracer, "records_execution_events", False
+                    )
+                    is True,
+                )
             )
 
         # The task row can become RUNNING before the original AgentRunner has
