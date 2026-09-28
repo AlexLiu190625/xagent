@@ -5,6 +5,7 @@
 // not a general connector client -- it does not know about connection
 // management, only about the two endpoints that read and write a task's
 // missing runtime inputs.
+import type { TranslationKey } from "@/i18n/translations"
 import type { ClientErrorCode } from "@/lib/client-errors"
 import { apiRequest, isJsonRecord, parseApiResponse, type ParsedApiResponse } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
@@ -763,7 +764,7 @@ export function shouldHoldFirstMessage(value: unknown): boolean {
 
 // The one sentence a create path shows when its held first message was
 // cleared by anything other than the user.
-export const FIRST_GATE_CLEARED_MESSAGE_KEY = "connectorRuntime.firstGateCleared" as const
+export const FIRST_GATE_CLEARED_MESSAGE_KEY = "connectorRuntime.firstGateCleared" as const satisfies TranslationKey
 
 /**
  * A first gate's buttons: fill in and send while something is fillable,
