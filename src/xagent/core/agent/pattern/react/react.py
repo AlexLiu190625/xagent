@@ -554,11 +554,12 @@ def _is_answerable(interaction: Any) -> bool:
     return not lacks_required_options(interaction)
 
 
-# Types that do carry an answerable field (see ``_is_answerable``) but whose
-# answer is not "the information the model asked for" in the sense the
-# form-answer-continuation text cares about: a confirm is a yes/no on the
-# model's own proposal, and a file_upload's answer is a file, not data the
-# model can read back to decide what "the request" now means.
+# The rule this implements: a model-authored ask_user_question is a form when
+# at least one of its answerable fields (see ``_is_answerable``) has a type
+# other than confirm or file_upload. Every other answerable type counts,
+# including a select_one whose options are just "Yes" and "No" and
+# action_cards; only the two types below are excluded. ``boolean`` is not
+# listed because it normalizes to confirm before this check runs.
 _NON_FORM_ANSWERABLE_TYPES = frozenset({"confirm", "file_upload"})
 
 
@@ -574,14 +575,17 @@ class FormAnswerDecision:
     about the same call.
     """
 
-    # Whether the latest visible user message answers a model-authored form,
-    # independent of whether the text is applied (recorded on every main and
-    # protocol-retry call, including forced ones and with the switch off, so
-    # how often this shape occurs stays visible either way).
+    # Whether this call could carry the text at all: the latest visible user
+    # message answers a model-authored form and the context renders a
+    # "Current user request" block (``form_answer_continuation_target``).
+    # Recorded on every main and protocol-retry call where that holds,
+    # including forced ones and with the switch off, so how often this shape
+    # occurs stays visible either way. A DAG step or a context with no
+    # current request records nothing.
     turn: bool
     # Whether the form-answer-continuation text was actually applied to this
-    # call: turn, plus a renderable target, an unforced turn, and the global
-    # switch (``get_form_answer_continuation_enabled``) being on.
+    # call: turn, plus an unforced turn and the global switch
+    # (``get_form_answer_continuation_enabled``) being on.
     applied: bool
 
     def trace_metadata(self) -> dict[str, bool]:
@@ -597,15 +601,12 @@ def _form_answer_decision(
     context: Any, *, force_final_answer: bool
 ) -> FormAnswerDecision:
     """Shared by the main loop and the protocol retry. The iteration-limit
-    delivery is always forced and passes False instead of calling this. A
-    forced turn cannot call ``ask_user_question`` again, so it never
-    applies."""
-    turn = context.latest_form_answer_message() is not None
-    applied = (
-        context.form_answer_continuation_target() is not None
-        and not force_final_answer
-        and get_form_answer_continuation_enabled()
-    )
+    delivery does not call this and does not pass ``form_answer_continuation``
+    to ``_messages_for_llm``, so it relies on that parameter's default
+    (False). A forced turn cannot call ``ask_user_question`` again, so it
+    never applies."""
+    turn = context.form_answer_continuation_target() is not None
+    applied = turn and not force_final_answer and get_form_answer_continuation_enabled()
     return FormAnswerDecision(turn=turn, applied=applied)
 
 
@@ -4116,9 +4117,9 @@ class ReActPattern(AgentPattern):
                 "message_count": len(getattr(context, "messages", [])),
                 # A form, for the form-answer-continuation text (react.py's
                 # _form_answer_decision / execution.py's readers), is the
-                # model's own question having at least one field whose
-                # answer is actual data rather than a yes/no on the model's
-                # own proposal (confirm) or a file (file_upload). Computed
+                # model's own question having at least one answerable field
+                # whose type is neither confirm nor file_upload (the rule
+                # stated at _NON_FORM_ANSWERABLE_TYPES). Computed
                 # from the model-authored, pre-append list -- deduplicated_interactions,
                 # not the ``interactions`` _send_waiting_message may have
                 # appended a default field to -- so an engine-appended

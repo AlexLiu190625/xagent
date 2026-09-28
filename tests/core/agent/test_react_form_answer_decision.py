@@ -92,10 +92,9 @@ def _empty_task_context() -> ExecutionContext:
         (False, False, {}),
         (True, False, {"form_answer_turn": True}),
         (True, True, {"form_answer_turn": True, "form_answer_continuation": True}),
-        # Not reachable from _form_answer_decision (applied implies turn,
-        # transitively, through form_answer_continuation_target requiring the
-        # same message latest_form_answer_message finds), but trace_metadata
-        # must not silently invent a turn key it wasn't told about.
+        # Not reachable from _form_answer_decision (applied is computed as
+        # turn and ...), but trace_metadata must not silently invent a turn
+        # key it wasn't told about.
         (False, True, {"form_answer_continuation": True}),
     ],
 )
@@ -148,14 +147,14 @@ def test_trace_metadata_shape(
             _dag_step_context,
             False,
             None,
-            FormAnswerDecision(turn=True, applied=False),
+            FormAnswerDecision(turn=False, applied=False),
             id="dag-step",
         ),
         pytest.param(
             _empty_task_context,
             False,
             None,
-            FormAnswerDecision(turn=True, applied=False),
+            FormAnswerDecision(turn=False, applied=False),
             id="empty-task",
         ),
     ],
@@ -167,9 +166,11 @@ def test_decision_formula(
     expected: FormAnswerDecision,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The dag-step and empty-task rows pin that ``applied`` reads the
-    target, not the turn: ``turn`` does not consult either condition (it is
-    still True), while ``applied`` requires the target and is suppressed."""
+    """The dag-step and empty-task rows pin that ``turn`` reads the target,
+    not just the latest form answer: both contexts do end in a form answer,
+    but neither renders a "Current user request" block, so neither records a
+    trace key. The forced and switch-off rows pin that ``turn`` is still
+    recorded when the text is not applied."""
     if switch is not None:
         monkeypatch.setenv(FORM_ANSWER_CONTINUATION_ENABLED, switch)
     decision = _form_answer_decision(build_context(), force_final_answer=forced)
@@ -298,6 +299,14 @@ class _NamedFakeLLM:
             False,
             id="forced",
         ),
+        pytest.param(
+            None,
+            _dag_step_context,
+            False,
+            {},
+            False,
+            id="dag-step",
+        ),
     ],
 )
 async def test_main_path_keys_and_text_come_from_one_decision(
@@ -346,10 +355,11 @@ async def test_main_path_keys_and_text_come_from_one_decision(
 
 
 @pytest.mark.asyncio
-async def test_iteration_limit_build_passes_false_even_with_a_form_answer() -> None:
+async def test_iteration_limit_build_never_applies_even_with_a_form_answer() -> None:
     """The iteration-limit delivery is always forced and never computes a
-    decision at all (react.py passes the parameter's default, False); prove
-    it does not render the text even when the context otherwise qualifies."""
+    decision at all (it does not pass ``form_answer_continuation``, so it gets
+    that parameter's default, False); prove it renders neither text even when
+    the context otherwise qualifies and the switch is on."""
     context = _context_with_form_answer()
     tool = FakeTool()
     llm = _NamedFakeLLM(

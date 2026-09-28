@@ -69,6 +69,7 @@ from .enrichment import (
     IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
     MEMORY_CONTEXT_METADATA_KEY,
     SKILL_CONTEXT_METADATA_KEY,
+    TopLevelUserRequest,
     latest_pending_user_response,
     pending_user_response,
     pending_user_response_lifecycle,
@@ -589,6 +590,10 @@ def context_checkpoint_gate(context: ExecutionContext) -> _ContextCheckpointGate
 # decision (``ReActPattern``'s ``FormAnswerDecision``); neither constant is
 # ever rendered on its own account.
 #
+# The framing only says what the message is. Whether to continue, change or
+# cancel the request is left to the system instruction, because the message
+# the framing lands on can be any typed reply, not only a filled-in form.
+#
 # A trailing "\n\n" lets this slot directly between the task text's own
 # "\n\n" and "Conversation focus rules: ..." in ``_system_context`` without a
 # separate blank-line rule when the flag is off (the empty string inserts
@@ -604,9 +609,7 @@ FORM_ANSWER_CONTINUATION_INSTRUCTION = (
     "action.\n\n"
 )
 
-FORM_ANSWER_FRAMING = (
-    "It answers the form you asked for; use it to continue the current user request. "
-)
+FORM_ANSWER_FRAMING = "It replies to the form you asked for. "
 
 
 @dataclass
@@ -1283,7 +1286,7 @@ class ExecutionContext:
         current_task = request.execution_text
         pending_response = latest_pending_user_response(self)
         output_language = effective_output_language(self)
-        if current_task and not dag_step_id:
+        if self._renders_current_request_block(request):
             language_directives = render_root_request_language_harness(
                 request,
                 pending_response,
@@ -2314,14 +2317,24 @@ class ExecutionContext:
             return None
         return message if marker.get("form") is True else None
 
+    def _renders_current_request_block(self, request: TopLevelUserRequest) -> bool:
+        """Whether ``_system_context`` renders its "Current user request"
+        block for ``request`` (the context's ``top_level_user_request``): the
+        request text is non-empty and this is not a DAG step (a DAG step
+        builds its own step context instead).
+
+        The one place this condition lives: ``_system_context`` uses it to
+        decide whether to render the block, and
+        ``form_answer_continuation_target`` uses it so the instruction that
+        goes inside that block is only ever targeted when the block exists.
+        """
+        return bool(request.execution_text) and not self.metadata.get("dag_step_id")
+
     def form_answer_continuation_target(self) -> Message | None:
-        """``latest_form_answer_message()``, restricted to the same condition
-        under which ``_system_context`` renders its "Current user request"
-        block: a non-empty top-level request, and not a DAG step (a DAG step
-        builds its own step context and is not covered)."""
-        if self.metadata.get("dag_step_id"):
-            return None
-        if not top_level_user_request(self).execution_text:
+        """``latest_form_answer_message()``, but only when
+        ``_system_context`` renders its "Current user request" block
+        (``_renders_current_request_block``); otherwise None."""
+        if not self._renders_current_request_block(top_level_user_request(self)):
             return None
         return self.latest_form_answer_message()
 

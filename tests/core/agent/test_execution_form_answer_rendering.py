@@ -44,8 +44,9 @@ def _build_form_answer_context() -> ExecutionContext:
 
 
 def _build_blank_question_context() -> ExecutionContext:
-    # message_type/question blank: pending_user_response (strict) refuses it,
-    # so this exercises the lifecycle branch, not the latest-pending one.
+    # question blank (message_type is still "question"): pending_user_response
+    # (strict) refuses it, so this exercises the lifecycle branch, not the
+    # latest-pending one.
     context = ExecutionContext()
     context.add_user_message("Do the thing")
     context.add_user_message(
@@ -272,10 +273,7 @@ def test_both_texts_are_pinned_literally() -> None:
     would leave them all green. This is the one place the model-facing wording
     is written out in full.
     """
-    assert FORM_ANSWER_FRAMING == (
-        "It answers the form you asked for; use it to continue the current "
-        "user request. "
-    )
+    assert FORM_ANSWER_FRAMING == "It replies to the form you asked for. "
     assert FORM_ANSWER_CONTINUATION_INSTRUCTION == (
         "The latest user message answers the form you asked for. Use those "
         "answers to continue the current user request. Do not ask again for "
