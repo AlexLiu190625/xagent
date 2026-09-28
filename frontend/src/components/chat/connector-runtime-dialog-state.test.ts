@@ -874,5 +874,6 @@ describe("keeps the dialog's phases and events as they were", () => {
       "retry-abandoned", "save-rejected-refreshing", "save-landed-resending", "read-settled", "resend-failed",
       "read-again", "draft-changed", "object-blurred", "save-started", "retry-started", "snapshot-gone",
     ])
+    expect(stateSource).toContain("\nexport type DialogEvent = FinishingEvent | MidEvent | LocalEvent\n")
   })
 })
