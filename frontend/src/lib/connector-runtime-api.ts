@@ -619,6 +619,11 @@ export function reconcileTypeMismatchDisposition(
  * owner-of-the-task check, and narrowing where the dialog appears can only
  * make it appear less, never grant it access it would not otherwise have.
  *
+ * A first gate (a new conversation's held first message) may also show on
+ * the two pages a conversation is started from: its create response lands
+ * while the user is still there, before the navigation to the new
+ * conversation has arrived. See isDialogHostPathFor.
+ *
  * The static-export server (frontend_static.py) maps all three shapes to a
  * page shell -- a trailing slash and the `__shell__` placeholder id both
  * still match, so this holds under either deployment.
@@ -632,6 +637,16 @@ export const CONNECTOR_RUNTIME_DIALOG_HOST_PATTERNS = [
 export function isConnectorRuntimeDialogHostPath(pathname: string | null): boolean {
   if (!pathname) return false
   return CONNECTOR_RUNTIME_DIALOG_HOST_PATTERNS.some(pattern => pattern.test(pathname))
+}
+
+// The new-conversation page and an agent's chat page: where a first gate's
+// create response can land. Only a first gate adds them.
+export const FIRST_GATE_EXTRA_HOST_PATTERNS = [/^\/task\/?$/, /^\/agent\/[^/]+\/?$/] as const
+
+// The one route check the dialog runs, for the trigger of the request it shows.
+export function isDialogHostPathFor(trigger: ConnectorRuntimeDialogTrigger, pathname: string | null): boolean {
+  if (isConnectorRuntimeDialogHostPath(pathname)) return true
+  return trigger === "first_gate" && FIRST_GATE_EXTRA_HOST_PATTERNS.some(pattern => pattern.test(pathname ?? ""))
 }
 
 // The three terminal task_error codes that open the dialog. The other
@@ -704,7 +719,48 @@ export function resolveDialogOutcome(report: ConnectorRuntimeReport): DialogOutc
 // and its provider can both name it without this module importing either.
 export type ConnectorRuntimeDialogTrigger = "turn_failure" | "session_open" | "first_gate"
 
-export type ConnectorRuntimeDialogAction = "saveAndResend" | "saveOnly" | "acknowledge"
+export type ConnectorRuntimeDialogAction = "saveAndResend" | "saveOnly" | "acknowledge" | "saveAndSend" | "sendHeld"
+
+/**
+ * Whether a web-chat create response asks for the first message to be held
+ * until the task's missing runtime inputs are filled. Reads the create
+ * response's report only for this decision: that report is computed from the
+ * agent before the task exists (every key reads unsatisfied), so what the
+ * dialog shows always comes from the per-task read. Anything that does not
+ * parse -- null on the public and share create paths, a missing field, a
+ * malformed body -- answers "do not hold", the behavior before this check.
+ */
+export function shouldHoldFirstMessage(value: unknown): boolean {
+  const report = readConnectorRuntimeReport(value)
+  return report !== null && resolveDialogOutcome(report).kind === "fillable"
+}
+
+// The one sentence a create path shows when its held first message was
+// cleared by anything other than the user.
+export const FIRST_GATE_CLEARED_MESSAGE_KEY = "connectorRuntime.firstGateCleared" as const
+
+/**
+ * A first gate's buttons: fill in and send while something is fillable,
+ * otherwise send the held message as it is. Never "Got it", which closes as
+ * dismissed and would drop a message the user never chose to drop; every
+ * other request uses resolveDialogActions.
+ */
+export function resolveFirstGateActions(outcome: DialogOutcome): ConnectorRuntimeDialogAction[] {
+  switch (outcome.kind) {
+    case "fillable":
+      return ["saveAndSend"]
+    case "met":
+    case "unsupported_only":
+    case "nothing_fillable":
+      return ["sendHeld"]
+    default: {
+      // Same exhaustiveness guard as resolveDialogActions.
+      const unhandled: never = outcome
+      void unhandled
+      return ["sendHeld"]
+    }
+  }
+}
 
 /**
  * The dialog's button set, derived from the outcome and whether this

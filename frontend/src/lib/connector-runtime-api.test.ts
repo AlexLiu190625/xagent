@@ -1,7 +1,10 @@
+import { readFileSync } from "node:fs"
+import path from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import {
   CONNECTOR_RUNTIME_DIALOG_HOST_PATTERNS,
+  FIRST_GATE_EXTRA_HOST_PATTERNS,
   CONNECTOR_RUNTIME_KNOWN_REASONS,
   CONNECTOR_RUNTIME_SECTIONS,
   CONNECTOR_RUNTIME_TYPES,
@@ -12,12 +15,15 @@ import {
   connectorRuntimeInputDraftKey,
   fetchTaskConnectorRuntimeRequirements,
   isConnectorRuntimeDialogHostPath,
+  isDialogHostPathFor,
   isSubmitEnabled,
   isTypeMismatchDispositionStale,
   readConnectorRuntimeReport,
   reconcileTypeMismatchDisposition,
   resolveDialogActions,
   resolveDialogOutcome,
+  resolveFirstGateActions,
+  shouldHoldFirstMessage,
   submitTaskConnectorRuntimeValues,
   type ConnectorRuntimeConnector,
   type ConnectorRuntimeErrorMessageKey,
@@ -1053,5 +1059,59 @@ describe("isConnectorRuntimeDialogHostPath", () => {
     expect(CONNECTOR_RUNTIME_DIALOG_HOST_PATTERNS.every(pattern =>
       ["/task/5", "/workforces/7/run", "/workforces/7"].some(p => pattern.test(p)),
     )).toBe(true)
+  })
+})
+
+// A create response's report decides only whether the first message waits;
+// it holds only while something can be filled in here.
+describe("holds the first message only while something can be filled", () => {
+  const context = input({ section: "context", key: "k", type: "string", required: true })
+  const secret = input({ section: "secrets", key: "s", type: "string", required: true })
+  const badKeyOnly = input({ section: "secrets", key: "bad key", type: "string" })
+  it.each([
+    ["null (public and share create paths)", false, null],
+    ["a body that is not a report", false, {}],
+    ["met", false, report(true, [])],
+    ["context missing", true, report(false, [connector(REF_A, "A", [context])])],
+    ["context and a secret missing", true, report(false, [connector(REF_A, "A", [context, secret])])],
+    ["only a secret missing", false, report(false, [connector(REF_A, "A", [secret])])],
+    ["only an invalid key name", false, report(false, [connector(REF_A, "A", [badKeyOnly])])],
+  ] as const)("%s -> holds: %s", (_name, holds, value) => {
+    expect(shouldHoldFirstMessage(value)).toBe(holds)
+  })
+})
+
+describe("gives a first gate its own buttons and pages", () => {
+  const outcomes: Array<[DialogOutcome, string[]]> = [
+    [{ kind: "fillable", blocking: [] }, ["saveAndSend"]],
+    [{ kind: "met" }, ["sendHeld"]],
+    [{ kind: "unsupported_only", blocking: [] }, ["sendHeld"]],
+    [{ kind: "nothing_fillable" }, ["sendHeld"]],
+  ]
+  it.each(outcomes)("%o -> %o", (outcome, expected) => {
+    expect(resolveFirstGateActions(outcome)).toEqual(expected)
+  })
+
+  // Every trigger against every kind of page: only a first gate adds the two
+  // pages a conversation is started from.
+  const paths = ["/task", "/task/7", "/agent/3", "/workforces/2", "/workforces/2/run", "/settings", null] as const
+  it.each([
+    ["turn_failure", [false, true, false, true, true, false, false]],
+    ["session_open", [false, true, false, true, true, false, false]],
+    ["first_gate", [true, true, true, true, true, false, false]],
+  ] as const)("%s shows on %o", (trigger, expected) => {
+    expect(paths.map(p => isDialogHostPathFor(trigger, p))).toEqual(expected)
+  })
+
+  it("keeps the first gate's two pages out of every other request's set", () => {
+    expect(FIRST_GATE_EXTRA_HOST_PATTERNS).toHaveLength(2)
+    for (const p of ["/task/", "/agent/abc/", "/agent", "/agent/3/edit", "/tasks"]) {
+      expect(isDialogHostPathFor("first_gate", p), p).toBe(p === "/task/" || p === "/agent/abc/")
+    }
+  })
+
+  it("does not import the React context modules it is shared with", () => {
+    const source = readFileSync(path.resolve(__dirname, "./connector-runtime-api.ts"), "utf8")
+    expect(source).not.toMatch(/@\/contexts\//)
   })
 })
