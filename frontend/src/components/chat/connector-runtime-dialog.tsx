@@ -183,7 +183,13 @@ export function ConnectorRuntimeDialog() {
   }, [])
 
   if (!request) return null
-  return <ConnectorRuntimeDialogBody key={request.taskId} request={request} />
+  // One body per task, and per held first message: a first gate is a message
+  // of its own, so opening one mounts a fresh body even over a request for
+  // the same task that is already on screen -- its first read then decides
+  // whether it shows at all (opensOnFirstRead), and any flow the old body
+  // had in flight ends as unmounted. A same-task retarget of the other two
+  // triggers (gateId null) keeps the body, and the draft in it.
+  return <ConnectorRuntimeDialogBody key={`${request.taskId}:${request.gateId ?? ""}`} request={request} />
 }
 
 function findConnector(
@@ -886,7 +892,11 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       const notSent = { notice: { kind: "saved-not-sent" } } as const
       settle(seqAtStart, {
         unmounted: { silent: "sender-says-it" },
-        // Unreachable: a first gate's `seq` does not move while it holds.
+        // Unreachable: this body's request cannot move to a new `seq` while
+        // it is a first gate. A failure frame or session check for its task
+        // leaves the request as it is, and a second first gate for its task
+        // has another gate id, so it mounts a new body (see the key on
+        // ConnectorRuntimeDialogBody) and this save settles as unmounted.
         superseded: { tell: notSent },
         current: newOutcome.kind === "fillable"
           ? { tell: notSent, event: { type: "save-landed", ...landed } }

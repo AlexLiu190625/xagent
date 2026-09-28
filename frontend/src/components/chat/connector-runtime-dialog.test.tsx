@@ -4561,6 +4561,47 @@ describe("a visible first gate never sends on its own", () => {
   })
 })
 
+// A first gate is a message of its own, so it gets a dialog body of its own:
+// whatever was on screen for its task before, its first read decides alone
+// whether it shows.
+describe("a first gate starts from its own first read", () => {
+  it("releases on a met first read even over a session check already on screen", async () => {
+    fetchMock.mockResolvedValueOnce(gateFillable())
+    renderHarness()
+    await act(async () => { latestActions.openSessionCheck(1, "opened") })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    const closeSpy = vi.spyOn(latestActions, "close")
+    fetchMock.mockResolvedValueOnce(ok(report(true, [])))
+    const seen = await holdFirstMessage()
+    await waitFor(() => expect(seen).toEqual(["released"]))
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(closeSpy.mock.calls).toEqual([["not-shown", 1]])
+    expect(screen.queryByText("connectorRuntime.actions.sendHeld")).not.toBeInTheDocument()
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+  })
+
+  it("ends the first gate's save quietly when a second gate for the task replaces it", async () => {
+    fetchMock.mockResolvedValueOnce(gateFillable())
+    renderHarness()
+    const first = await holdFirstMessage()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "v" } })
+    let resolveSave: (value: unknown) => void = () => {}
+    submitMock.mockReturnValueOnce(new Promise((res) => { resolveSave = res }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndSend"))
+    fetchMock.mockResolvedValueOnce(gateFillable())
+    const second = await holdFirstMessage()
+    await waitFor(() => expect(first).toEqual(["cleared"]))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    await act(async () => { resolveSave(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "other", type: "string", required: true })]),
+    ]))) })
+    expect(toastMock).not.toHaveBeenCalled()
+    expect(second).toEqual([])
+    expect(screen.getByLabelText("token")).toHaveValue("")
+  })
+})
+
 describe("the footer retry repeats save and send", () => {
   it("releases the message when a retried save lands met", async () => {
     fetchMock.mockResolvedValueOnce(gateFillable())
