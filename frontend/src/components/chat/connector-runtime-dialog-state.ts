@@ -19,6 +19,8 @@ import {
   reconcileTypeMismatchDisposition,
   resolveDialogActions,
   resolveDialogOutcome,
+  resolveFirstGateActions,
+  resolveOutcomeFor,
   type ConnectorRuntimeConnector,
   type ConnectorRuntimeDialogAction,
   type ConnectorRuntimeDialogTrigger,
@@ -147,6 +149,9 @@ export interface GateFacts {
   drafts: Readonly<Record<string, string>>
   invalidDraftKeys: ReadonlyMap<string, InvalidObjectDraftReason>
   request: { seq: number; resendPayload: { clientMessageId: string } | null }
+  // Why the request was opened; picks how the report reads
+  // (resolveOutcomeFor) and the button set, nothing else.
+  trigger: ConnectorRuntimeDialogTrigger
 }
 
 export interface Gates {
@@ -227,7 +232,7 @@ export function deriveGates(facts: GateFacts): Gates {
   // disagree with the two facts it is made of.
   const readFailed = !reading && reportIsStale
 
-  const outcome: DialogOutcome | null = facts.report ? resolveDialogOutcome(facts.report) : null
+  const outcome: DialogOutcome | null = facts.report ? resolveOutcomeFor(facts.report, facts.trigger) : null
   const submitItems = facts.report ? buildSubmitItems(facts.report, facts.drafts) : []
   // Only a mark on a row the current report still renders an editable
   // control for may gate submission. A key a refreshed report reports
@@ -260,15 +265,17 @@ export function deriveGates(facts: GateFacts): Gates {
   // where the dialog reads it for dismissal.
   const canSubmitNow = canSubmit && !facts.busy && !reportIsStale
   const hasResendPayload = facts.request.resendPayload !== null
-  const actions = outcome ? resolveDialogActions(outcome, hasResendPayload) : []
+  const actions = !outcome ? []
+    : facts.trigger === "first_gate" ? resolveFirstGateActions(outcome) : resolveDialogActions(outcome, hasResendPayload)
   // Whether this shape offers any way to submit. The row renderer asks this
   // instead of listing the outcome kinds that offer none, because that list
   // was one kind short: a `met` report reaches the render whenever one is
   // installed into a dialog that stays open, and an unfilled *optional*
   // context key inside one was still drawn as an editable field with no
   // button able to send it. Derived from the action set, so the rows and
-  // the footer cannot disagree about whether saving is possible.
-  const hasSaveEntryPoint = actions.includes("saveOnly")
+  // the footer cannot disagree about whether saving is possible. A first
+  // gate saves through "save and send" instead of "save only".
+  const hasSaveEntryPoint = actions.includes("saveOnly") || actions.includes("saveAndSend")
   // A met report that reached the render still carries the snapshot of the
   // message that failed, and this shape offers no way to send it: the
   // footer collapses to "Got it", and the save-and-resend button a
@@ -311,7 +318,7 @@ export function deriveGates(facts: GateFacts): Gates {
 /**
  * What the dialog is doing. Deliberately not what the report on screen says:
  * a same-task re-read can install a report of another tier under any phase,
- * so rendering reads the phase and `resolveDialogOutcome(view.report)` as two
+ * so rendering reads the phase and `resolveOutcomeFor(view.report, trigger)` as two
  * separate things rather than one flattened list of combinations.
  *
  * `saving` covers the save POST (`post`) and the re-read a rejected save asks
@@ -347,11 +354,12 @@ export function isBusy(phase: Phase): boolean {
 }
 
 // Whether a first read finding `kind` shows a hidden dialog: after a failed
-// turn, anything short of met; for a check, only what can be filled in here.
+// turn, anything short of met; for a check or a held first message, only
+// what can be filled in here.
 export function opensOnFirstRead(kind: DialogOutcomeKind, trigger: ConnectorRuntimeDialogTrigger): boolean {
   switch (trigger) {
     case "turn_failure": return kind !== "met"
-    case "session_open": return kind === "fillable"
+    case "session_open": case "first_gate": return kind === "fillable"
     default: return assertNever(trigger)
   }
 }
@@ -689,6 +697,8 @@ export type SilenceReason =
   | "never-shown"
   // The user left the pages the dialog lives on.
   | "user-left"
+  // A held first message's own send path (its create path) says how it ends.
+  | "sender-says-it"
   // A defensive exit a rendered frame has already ruled out.
   | "unreachable"
 
@@ -705,6 +715,7 @@ export type Notice =
   | { kind: "save-rejected-elsewhere"; messageKey: ConnectorRuntimeErrorMessageKey }
   | { kind: "resend-not-sent"; disposition: MessageDeliveryDisposition | null }
   | { kind: "resend-already-sent" }
+  | { kind: "saved-not-sent" }
 
 export type Tell = { notice: Notice } | { silent: SilenceReason }
 
@@ -738,8 +749,8 @@ const NO_INVALID_DRAFT_KEYS: ReadonlyMap<string, InvalidObjectDraftReason> = new
  * The flat facts deriveGates reads, taken off the dialog's state. A hidden
  * dialog has no report, nothing in flight and no failure to stand for.
  */
-export function gateFactsOf(state: DialogState, request: GateFacts["request"]): GateFacts {
-  const read = { settledReadKey: state.read.settledKey, readNonce: state.read.nonce, request }
+export function gateFactsOf(state: DialogState, request: GateFacts["request"], trigger: GateFacts["trigger"]): GateFacts {
+  const read = { settledReadKey: state.read.settledKey, readNonce: state.read.nonce, request, trigger }
   if (state.stage === "hidden") {
     return {
       ...read,

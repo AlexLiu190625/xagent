@@ -55,9 +55,10 @@ import {
   connectorRuntimeInputDraftKey,
   fetchTaskConnectorRuntimeRequirements,
   isAcceptedRuntimeKeyName,
-  isConnectorRuntimeDialogHostPath,
+  isDialogHostPathFor,
   isSubmittableObjectValue,
   resolveDialogOutcome,
+  resolveOutcomeFor,
   submitTaskConnectorRuntimeValues,
   type ConnectorRuntimeConnector,
   type ConnectorRuntimeDialogTrigger,
@@ -167,7 +168,7 @@ export function ConnectorRuntimeDialog() {
   // Task-switch cleanup: no cleanup function of its own. Combining this with
   // the unmount effect below into one effect would run the unmount cleanup
   // on every task change too, which would erase a same-render first-gate
-  // snapshot before anything could read it.
+  // request before anything could read it.
   useEffect(() => {
     if (!hasProvider) return
     retainOnlyTask(state.taskId)
@@ -182,7 +183,13 @@ export function ConnectorRuntimeDialog() {
   }, [])
 
   if (!request) return null
-  return <ConnectorRuntimeDialogBody key={request.taskId} request={request} />
+  // One body per task, and per held first message: a first gate is a message
+  // of its own, so opening one mounts a fresh body even over a request for
+  // the same task that is already on screen -- its first read then decides
+  // whether it shows at all (opensOnFirstRead), and any flow the old body
+  // had in flight ends as unmounted. A same-task retarget of the other two
+  // triggers (gateId null) keeps the body, and the draft in it.
+  return <ConnectorRuntimeDialogBody key={`${request.taskId}:${request.gateId ?? ""}`} request={request} />
 }
 
 function findConnector(
@@ -354,6 +361,8 @@ function noticeText(
       return t(sendFailureTextKey(notice.disposition))
     case "resend-already-sent":
       return t("connectorRuntime.resendSupersededSent")
+    case "saved-not-sent":
+      return t("connectorRuntime.savedNotSent")
     default:
       return assertNever(notice)
   }
@@ -366,12 +375,27 @@ function noticeText(
 // already carries the message and its own retry button, and a resend of this
 // very message still on the wire. Short of met, the line says why the dialog
 // is open; a session check asks the user to fill something in only while the
-// report still has something this dialog can fill.
+// report still has something this dialog can fill. A held first message was
+// never sent, so its two lines say that whatever the report: fill in and send
+// while something is fillable, otherwise send or leave it unsent.
+// How a flow ends when its route gate finds the request off its pages: a
+// dialog the user never saw closes as not-shown, which releases whatever it
+// holds; one they saw was left by their own navigation, the same ending the
+// leave effect gives it (left-host).
+function offHostEnding(wasVisible: boolean): Finish {
+  return wasVisible
+    ? { tell: { silent: "user-left" }, event: null, close: "left-host" }
+    : { tell: { silent: "never-shown" }, event: null, close: "not-shown" }
+}
+
 function descriptionKey(
   kind: DialogOutcome["kind"],
   trigger: ConnectorRuntimeDialogTrigger,
   metHoldingSnapshot: boolean,
 ): TranslationKey {
+  if (trigger === "first_gate") {
+    return kind === "fillable" ? "connectorRuntime.firstGateDescription" : "connectorRuntime.firstGateReadyDescription"
+  }
   if (kind === "met") return metHoldingSnapshot ? "connectorRuntime.metNotResent" : "connectorRuntime.metNothingLeft"
   switch (trigger) {
     case "session_open":
@@ -416,7 +440,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   // snapshot -- see doResend, which is the only reader and writer.
   const resendMessageIdRef = useRef<{ forSnapshotId: string, clientMessageId: string } | null>(null)
 
-  const facts = gateFactsOf(state, { seq: request.seq, resendPayload: request.resendPayload })
+  const facts = gateFactsOf(state, { seq: request.seq, resendPayload: request.resendPayload }, request.trigger)
   // `canSubmitNow` already folds this in; what reads it here is dismissal,
   // which must keep the dialog open while any submission is in flight.
   //
@@ -501,7 +525,14 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   // every "read again" press: the route gate runs before the request even
   // goes out, and again right before the dialog would become visible, since
   // the user is free to navigate away from a host page while this read is in
-  // flight.
+  // flight. Both gates check the pages the request's trigger may show on
+  // (isDialogHostPathFor), and whether a first read shows at all depends on
+  // the trigger too (opensOnFirstRead). Both gates end the flow through
+  // offHostEnding: a first gate that leaves before it was ever visible closes
+  // as not-shown, which releases its held message -- it goes out exactly as
+  // it did before first gates existed -- and one that was visible closes as
+  // left-host, which clears it, whether the leave effect below or one of
+  // these gates sees the new path first.
   //
   // `visible` is read at the moment this effect starts, which is exactly
   // right here: nothing moves the dialog back from shown to hidden, so if
@@ -522,8 +553,8 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   // derives it from the request on every render, including the retargets
   // that never reach this effect at all.
   useEffect(() => {
-    if (!isConnectorRuntimeDialogHostPath(pathnameRef.current)) {
-      finish({ tell: { silent: visible ? "user-left" : "never-shown" }, event: null, close: "not-shown" })
+    if (!isDialogHostPathFor(requestRef.current.trigger, pathnameRef.current)) {
+      finish(offHostEnding(visible))
       return
     }
     const wasVisible = visible
@@ -554,12 +585,12 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
           : { tell: { silent: "never-shown" }, event: null, close: "not-shown" })
         return
       }
-      if (!isConnectorRuntimeDialogHostPath(pathnameRef.current)) {
+      if (!isDialogHostPathFor(requestRef.current.trigger, pathnameRef.current)) {
         dispatch(kept)
-        finish({ tell: { silent: wasVisible ? "user-left" : "never-shown" }, event: null, close: "not-shown" })
+        finish(offHostEnding(wasVisible))
         return
       }
-      const outcome = resolveDialogOutcome(result.report)
+      const outcome = resolveOutcomeFor(result.report, request.trigger)
       // A report the user has never seen and this request's trigger does
       // not open on (see opensOnFirstRead) is the one case where nothing is
       // installed at all: there is no dialog to keep open and nothing for it
@@ -608,14 +639,18 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
 
   // Leaving the host pages closes a dialog the user has already seen. A move
   // between two host pages is handled by the outer task-switch cleanup, not
-  // by this effect noticing the path changed.
+  // by this effect noticing the path changed. A first gate's pages are wider
+  // (isDialogHostPathFor), and leaving them after it was seen clears its
+  // held message: the create path then says the message was not sent.
   useEffect(() => {
-    if (visible && !isConnectorRuntimeDialogHostPath(pathname)) {
+    if (visible && !isDialogHostPathFor(requestRef.current.trigger, pathname)) {
       finish({ tell: { silent: "user-left" }, event: null, close: "left-host" })
     }
     // finish is a fresh function every render. This call says nothing and
-    // records nothing, so the only thing it reads is `close`, which is
-    // listed.
+    // records nothing, so what it reads is `close`, which is listed, and the
+    // trigger through requestRef: a first gate keeps its trigger for this
+    // instance's life, and a session check upgraded to a turn failure keeps
+    // the same host pages, so a stale trigger could not change the answer.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible, pathname, close])
 
@@ -843,7 +878,7 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
       return
     }
 
-    const newOutcome = resolveDialogOutcome(result.report)
+    const newOutcome = resolveOutcomeFor(result.report, request.trigger)
     // Only a met report can carry the resend the primary button promised --
     // see canResendReport, which handleRetryResend asks too, so the two
     // entry points cannot disagree about the same snapshot. Because the
@@ -863,6 +898,31 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
     // rejection would land at whole-dialog scope, next to a send-failed
     // panel for a save that in fact succeeded.
     const landed = { report: result.report, seq: seqAtStart }
+    if (request.trigger === "first_gate") {
+      // The create path holding the message sends it once this lets it go:
+      // stay while something is still fillable, release otherwise. Never a
+      // resend, so none of the resend wording below applies.
+      const notSent = { notice: { kind: "saved-not-sent" } } as const
+      settle(seqAtStart, {
+        unmounted: { silent: "sender-says-it" },
+        // Unreachable: this body's request cannot move to a new `seq` while
+        // it is a first gate. A failure frame or session check for its task
+        // leaves the request as it is, and a second first gate for its task
+        // has another gate id, so it mounts a new body (see the key on
+        // ConnectorRuntimeDialogBody) and this save settles as unmounted.
+        superseded: { tell: notSent },
+        current: newOutcome.kind === "fillable"
+          ? { tell: notSent, event: { type: "save-landed", ...landed } }
+          : {
+            tell: newOutcome.kind === "unsupported_only"
+              ? { notice: { kind: "only-unsupported-remaining", keys: uniqueKeys(newOutcome.blocking) } }
+              : { silent: "sender-says-it" },
+            event: { type: "save-landed", ...landed },
+            close: "resent",
+          },
+      })
+      return
+    }
     let current: Finish | "continue"
     switch (newOutcome.kind) {
       case "fillable":
@@ -1061,6 +1121,14 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
   const handleOpenChange = (open: boolean) => {
     if (open || busy) return
     handleDismiss()
+  }
+
+  // Lets a held first message go; its create path sends it. Not gated on the
+  // report: nothing here is written from it, and the turn still meets the
+  // per-turn check, whose own dialog offers a resend if it fails.
+  const handleSendHeld = () => {
+    if (busy) return
+    finish({ tell: { silent: "sender-says-it" }, event: null, close: "resent" })
   }
 
   const dialogFieldError = activeFieldError?.location.scope === "dialog" ? activeFieldError.disposition : null
@@ -1290,6 +1358,16 @@ function ConnectorRuntimeDialogBody({ request }: { request: ConnectorRuntimeDial
             {actions.includes("saveAndResend") && (
               <Button disabled={!canSubmitNow} onClick={() => handleSave(true)}>
                 {t("connectorRuntime.actions.saveAndResend")}
+              </Button>
+            )}
+            {actions.includes("saveAndSend") && (
+              <Button disabled={!canSubmitNow} onClick={() => handleSave(false)}>
+                {t("connectorRuntime.actions.saveAndSend")}
+              </Button>
+            )}
+            {actions.includes("sendHeld") && (
+              <Button disabled={busy} onClick={handleSendHeld}>
+                {t("connectorRuntime.actions.sendHeld")}
               </Button>
             )}
             {/* Both conditions, not just the retryable failure. A hint can

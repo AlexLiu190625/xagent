@@ -68,6 +68,7 @@ function baseFacts(overrides: Partial<GateFacts> = {}): GateFacts {
     drafts: {},
     invalidDraftKeys: new Map<string, InvalidObjectDraftReason>(),
     request: { seq: 1, resendPayload: null },
+    trigger: "turn_failure",
     ...overrides,
   }
 }
@@ -592,9 +593,9 @@ describe("reduceDialog", () => {
   ] as const)("recycles %s in one step when its snapshot is gone", (_name, phase, stillBusy) => {
     const request = { seq: 1, resendPayload: null }
     const state = shown(phase)
-    expect(deriveGates(gateFactsOf(state, request)).needsSnapshotRecycle).toBe(true)
+    expect(deriveGates(gateFactsOf(state, request, "turn_failure")).needsSnapshotRecycle).toBe(true)
     const next = reduceDialog(state, { type: "snapshot-gone" })
-    expect(deriveGates(gateFactsOf(next, request)).needsSnapshotRecycle).toBe(false)
+    expect(deriveGates(gateFactsOf(next, request, "turn_failure")).needsSnapshotRecycle).toBe(false)
     expect(busyOf(next)).toBe(stillBusy)
   })
 
@@ -602,7 +603,7 @@ describe("reduceDialog", () => {
   // gateFactsOf is the only thing that builds them from the dialog's state,
   // so it must hold that for every state the dialog can be in.
   it.each(STATES)("reads a retry out as busy too: %s", (_name, state) => {
-    const facts = gateFactsOf(state, { seq: 1, resendPayload: { clientMessageId: "cid-1" } })
+    const facts = gateFactsOf(state, { seq: 1, resendPayload: { clientMessageId: "cid-1" } }, "turn_failure")
     expect(facts.retrying).toBe(state.stage === "shown" && state.phase.kind === "retrying")
     if (facts.retrying) expect(facts.busy).toBe(true)
   })
@@ -815,7 +816,7 @@ describe("the dialog's endings", () => {
 })
 
 // Whether the read that would first show the dialog shows it, per trigger
-// and per outcome: every one of the eight pairs spelled out.
+// and per outcome: every one of the twelve pairs spelled out.
 describe("opensOnFirstRead", () => {
   it.each([
     ["turn_failure", "met", false],
@@ -826,7 +827,53 @@ describe("opensOnFirstRead", () => {
     ["session_open", "unsupported_only", false],
     ["session_open", "nothing_fillable", false],
     ["session_open", "fillable", true],
+    ["first_gate", "met", false],
+    ["first_gate", "unsupported_only", false],
+    ["first_gate", "nothing_fillable", false],
+    ["first_gate", "fillable", true],
   ] as const)("%s + %s -> %s", (trigger, kind, opens) => {
     expect(opensOnFirstRead(kind, trigger)).toBe(opens)
+  })
+})
+
+// A first gate's button set comes from its own function, and "save and send"
+// counts as a way to save, so its rows are editable.
+describe("deriveGates for a first gate", () => {
+  it.each([
+    ["fillable", ["saveAndSend"], true, FILLABLE_REPORT],
+    ["met", ["sendHeld"], false, MET_REPORT],
+    ["unsupported_only", ["sendHeld"], false, UNSUPPORTED_ONLY_REPORT],
+    ["nothing_fillable", ["sendHeld"], false, NOTHING_FILLABLE_REPORT],
+  ] as const)("%s -> %o, save entry point %s", (_kind, actions, canSave, r) => {
+    const gates = deriveGates(baseFacts({ report: r, reportSeq: 1, trigger: "first_gate" }))
+    expect(gates.actions).toEqual(actions)
+    expect(gates.hasSaveEntryPoint).toBe(canSave)
+  })
+
+  it.each(["turn_failure", "session_open"] as const)("keeps %s on the other button sets", (trigger) => {
+    expect(deriveGates(baseFacts({ report: FILLABLE_REPORT, reportSeq: 1, trigger })).actions).toEqual(["saveOnly"])
+  })
+
+  it("carries the trigger it is given", () => {
+    expect(gateFactsOf(INITIAL_DIALOG_STATE, { seq: 1, resendPayload: null }, "first_gate").trigger).toBe("first_gate")
+  })
+})
+
+// A first gate and a session check add no phase and no event: the dialog's
+// state machine is the one the turn-failure dialog already had.
+describe("keeps the dialog's phases and events as they were", () => {
+  const stateSource = readFileSync(path.resolve(__dirname, "./connector-runtime-dialog-state.ts"), "utf8")
+  const between = (from: string, to: string) => stateSource.slice(stateSource.indexOf(from), stateSource.indexOf(to, stateSource.indexOf(from)))
+  it("names the same phases", () => {
+    expect(Array.from(between("export type Phase =", "\n\n").matchAll(/kind: "([a-z-]+)"/g), m => m[1]))
+      .toEqual(["open", "saving", "sending", "send-failed", "retrying"])
+  })
+  it("names the same events", () => {
+    expect(Array.from(between("export type FinishingEvent =", "export type DialogEvent").matchAll(/\btype: "([a-z-]+)"/g), m => m[1])).toEqual([
+      "superseded", "save-rejected", "reject-refresh-settled", "save-landed", "resend-settled", "retry-settled",
+      "retry-abandoned", "save-rejected-refreshing", "save-landed-resending", "read-settled", "resend-failed",
+      "read-again", "draft-changed", "object-blurred", "save-started", "retry-started", "snapshot-gone",
+    ])
+    expect(stateSource).toContain("\nexport type DialogEvent = FinishingEvent | MidEvent | LocalEvent\n")
   })
 })
