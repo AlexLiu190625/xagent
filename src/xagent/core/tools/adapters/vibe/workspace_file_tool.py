@@ -60,12 +60,13 @@ class WorkspaceFileTools(WorkspaceFileOperations):
             page_chars: How many characters one read_tool_result reply
                 carries, from spill_read_page_chars. It is fixed here, not
                 taken per call, because read_tool_result's signature is the
-                model's argument list; get_tools() states the same number in
-                the tool description.
+                model's argument list. The inner operations object pages at
+                this size, and get_tools() states the same number, read from
+                that object, in the tool description.
         """
-        self.inner = WorkspaceFileOperations(workspace)
+        self.inner = WorkspaceFileOperations(workspace, page_chars=page_chars)
         self.workspace = workspace
-        self.read_page_chars = page_chars
+        self.read_page_chars = self.inner.read_page_chars
 
     def read_file(
         self,
@@ -173,7 +174,7 @@ class WorkspaceFileTools(WorkspaceFileOperations):
         """Get output file list from current workspace"""
         return self.inner.get_workspace_output_files()
 
-    def read_tool_result(  # type: ignore[override]
+    def read_tool_result(
         self,
         path: str | None = None,
         start: int | None = None,
@@ -182,19 +183,12 @@ class WorkspaceFileTools(WorkspaceFileOperations):
     ) -> Dict[str, Any]:
         """Read one engine-stored large tool result, or list them with no path.
 
-        The core method's ``page_chars`` is deliberately absent from this
-        signature: FunctionTool turns every parameter into a field of the
-        tool schema, so exposing it would let the model pick a page longer
-        than the output limit. The page size this instance was built with
-        is passed instead.
+        The page size is not a parameter: FunctionTool turns every parameter
+        into a field of the tool schema, so taking it here would let the
+        model pick a page longer than the output limit. The inner operations
+        object pages at the size this instance was built with.
         """
-        return self.inner.read_tool_result(
-            path,
-            start=start,
-            end=end,
-            offset=offset,
-            page_chars=self.read_page_chars,
-        )
+        return self.inner.read_tool_result(path, start=start, end=end, offset=offset)
 
     def list_all_user_files(  # type: ignore[override]
         self,

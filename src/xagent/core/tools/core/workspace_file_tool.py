@@ -204,8 +204,23 @@ class WorkspaceFileOperations:
     It works with workspace instances to ensure operations are restricted to workspace boundaries.
     """
 
-    def __init__(self, workspace: TaskWorkspace):
+    def __init__(
+        self, workspace: TaskWorkspace, *, page_chars: int = SPILL_READ_MAX_CHARS
+    ):
+        """
+        Args:
+            workspace: The workspace every operation is restricted to.
+            page_chars: How many characters one read_tool_result reply
+                carries, passed through to read_spilled_result. It is set
+                once here rather than taken per call because it is not a
+                model argument: the model-facing tool (WorkspaceFileTools in
+                adapters/vibe) computes it from the tool output limit with
+                spill_read_page_chars and exposes only path, start, end and
+                offset. read_spilled_result rejects a value outside 1 to
+                SPILL_READ_MAX_CHARS with ValueError on every read.
+        """
         self.workspace = workspace
+        self.read_page_chars = page_chars
 
     def _require_workspace_authority(self) -> None:
         """Fail closed before marked workspace-only reads or writes.
@@ -975,7 +990,6 @@ class WorkspaceFileOperations:
         start: int | None = None,
         end: int | None = None,
         offset: int = 0,
-        page_chars: int = SPILL_READ_MAX_CHARS,
     ) -> Dict[str, Any]:
         """Read one engine-stored tool result, or list them with no path.
 
@@ -990,19 +1004,16 @@ class WorkspaceFileOperations:
         meaning for that listing; a non-zero offset without a path is
         rejected rather than ignored.
 
-        page_chars is how many characters one read returns, passed through
-        to read_spilled_result. It is not a model argument: the model-facing
-        tool (WorkspaceFileTools.read_tool_result in adapters/vibe) keeps it
-        out of its own signature and supplies the value it was built with
-        from the tool output limit (spill_read_page_chars). The listing
-        pages by entry count, so it does not use page_chars.
+        One read returns at most read_page_chars characters, the page size
+        this instance was built with (see __init__). The listing pages by
+        entry count, so it does not use the page size.
 
         Rejections come back as classified failures rather than exceptions,
         because the caller records the return value as the tool observation
         the model reads. The workspace authority check is the exception:
         its ValueError propagates unchanged, as it does from every other
         File Operation method that calls _require_workspace_authority. A
-        page_chars read_spilled_result does not accept is a caller bug, not
+        page size read_spilled_result does not accept is a caller bug, not
         a model request, and its ValueError propagates too.
         """
         self._require_workspace_authority()
@@ -1017,7 +1028,7 @@ class WorkspaceFileOperations:
             start=start,
             end=end,
             offset=offset,
-            page_chars=page_chars,
+            page_chars=self.read_page_chars,
         )
 
 

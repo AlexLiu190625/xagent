@@ -3,6 +3,7 @@ Integration tests for output filter with tool factory.
 """
 
 import asyncio
+import inspect
 import logging
 import re
 import threading
@@ -29,6 +30,7 @@ from xagent.core.tools.adapters.vibe.sandboxed_tool.sandbox_config import (
     extract_bound_method_target,
 )
 from xagent.core.tools.adapters.vibe.workspace_file_tool import WorkspaceFileTools
+from xagent.core.tools.core.workspace_file_tool import WorkspaceFileOperations
 from xagent.core.tools.tool_result_spill import (
     SPILL_PLACEHOLDER_TEXT,
     SPILL_READ_TOOL_NAME,
@@ -1192,7 +1194,39 @@ async def test_read_back_page_size_follows_the_config_override_not_the_environme
         instance, _ = extract_bound_method_target(reader._target)
         assert reader._filter.max_chars == limit
         assert instance.read_page_chars == limit
+        assert instance.inner.read_page_chars == limit
         assert _stated_page_chars(reader) == limit
+
+
+def test_read_tool_result_pages_at_the_size_its_operations_object_was_built_with(
+    tmp_path,
+):
+    """The page size is a constructor argument of WorkspaceFileOperations,
+    not a read_tool_result argument. Without one the page is
+    SPILL_READ_MAX_CHARS, so a 10,000-character line comes back whole;
+    built with 8,000 it comes back as an 8,000-character preview.
+    WorkspaceFileTools hands its page size to its inner operations object,
+    so its read_tool_result takes the same parameters as the core method
+    and returns the same reply."""
+    workspace = TaskWorkspace(id="page-size-ctor", base_dir=str(tmp_path))
+    spill_dir = spill_dir_for_workspace(workspace.workspace_dir)
+    line = "".join(chr(ord("a") + index % 26) for index in range(10_000))
+    path = _store_for_reading(spill_dir, line, max_chars=100)
+
+    assert WorkspaceFileOperations(workspace).read_tool_result(path) == {
+        "relative_path": path,
+        "output": line,
+    }
+    paged = WorkspaceFileOperations(workspace, page_chars=8_000).read_tool_result(path)
+    assert paged["content_preview"] == line[:8_000]
+    assert paged["content_truncated"] is True
+
+    tools = WorkspaceFileTools(workspace, page_chars=8_000)
+    assert tools.read_page_chars == tools.inner.read_page_chars == 8_000
+    assert tools.read_tool_result(path) == paged
+    assert list(inspect.signature(WorkspaceFileTools.read_tool_result).parameters) == (
+        list(inspect.signature(WorkspaceFileOperations.read_tool_result).parameters)
+    )
 
 
 @pytest.mark.asyncio
