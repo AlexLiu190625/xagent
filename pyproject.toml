@@ -290,6 +290,9 @@ addopts = "-ra -q"
 testpaths = ["tests"]
 asyncio_mode = "auto"
 pythonpath = ["tests/_stubs"]
+# Fail a hung test instead of blocking its CI job until the job timeout.
+# A test's own @pytest.mark.timeout(...) still takes precedence.
+timeout = 300
 markers = [
   "integration: marks tests as integration tests",
   "slow: marks tests as slow running tests",

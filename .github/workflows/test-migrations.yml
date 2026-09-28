@@ -383,6 +383,7 @@ jobs:
     name: Test SQLite Migrations
     needs: detect-migration-changes
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Skip migration tests
@@ -453,6 +454,7 @@ jobs:
     name: Test PostgreSQL Migrations
     needs: detect-migration-changes
     runs-on: ubuntu-latest
+    timeout-minutes: 40
 
     services:
       postgres:

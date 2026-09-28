@@ -246,6 +246,7 @@ jobs:
 
   pre-commit:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
 
     steps:
@@ -327,6 +328,7 @@ jobs:
   pytest-fast:
     name: Pytest Fast (${{ matrix.name }})
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     needs: [changes, pre-commit]
     strategy:
@@ -425,6 +427,7 @@ jobs:
   pytest-fast-deepdoc:
     name: Pytest Fast Deepdoc (${{ matrix.name }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     needs: [changes, prepare-deepdoc-cache, pre-commit]
     strategy:
@@ -595,6 +598,7 @@ jobs:
 
   pytest-slow:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     needs: [changes, prepare-deepdoc-cache, pre-commit]
 
@@ -953,6 +957,7 @@ jobs:
   lancedb-memory-compatibility:
     name: LanceDB Memory Compatibility (${{ matrix.lancedb }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     strategy:
       fail-fast: false
