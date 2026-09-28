@@ -1123,6 +1123,25 @@ class DatabaseTraceHandler(BaseTraceHandler):
                     if attempt
                     else f"runtime:{event.id}"
                 )
+                payload: dict[str, Any] = {
+                    "data": data,
+                    "step_id": event.step_id,
+                    "protocol_event_id": str(event.id),
+                    "event_type": event_type_str,
+                    "parent_event_id": str(event.parent_id)
+                    if event.parent_id
+                    else None,
+                }
+                if event_type_str == "action_end_compact" and self.build_id is None:
+                    from .task_execution_event_writer import (
+                        compact_transcript_event_watermark,
+                    )
+
+                    watermark = compact_transcript_event_watermark(
+                        db, self.task_id, key, data
+                    )
+                    if watermark is not None:
+                        payload["transcript_watermark"] = watermark
                 fact = append_fact_no_commit(
                     db,
                     task_id=self.task_id,
@@ -1133,15 +1152,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
                     tool_attempt_id=attempt,
                     key=key,
                     kind="recovery_state" if is_state else event_type_str,
-                    payload={
-                        "data": data,
-                        "step_id": event.step_id,
-                        "protocol_event_id": str(event.id),
-                        "event_type": event_type_str,
-                        "parent_event_id": str(event.parent_id)
-                        if event.parent_id
-                        else None,
-                    },
+                    payload=payload,
                     occurred_at=timestamp,
                 )
                 data = cast(dict[str, Any], fact.payload["data"])

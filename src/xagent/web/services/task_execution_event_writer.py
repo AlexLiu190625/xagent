@@ -14,6 +14,10 @@ from uuid import uuid4
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from ...core.agent.context.execution import (
+    COMPACT_SUMMARY_METADATA_KEY,
+    COMPACT_WATERMARK_METADATA_KEY,
+)
 from ..models.chat_message import TaskChatMessage
 from ..models.task import Task, TaskStatus
 from ..models.task_execution_event import TaskExecutionEvent
@@ -200,3 +204,56 @@ def stage_applied_inputs_no_commit(db: Session, state: TaskExecutionEvent) -> No
                 key=key,
                 payload={"recovery_event_id": state.event_id},
             )
+
+
+def compact_transcript_event_watermark(
+    db: Session, task_id: int, key: str, data: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Resolve a root summary's transcript boundary while its row still exists.
+
+    This positions only the transcript prefix, not all runtime/tool facts
+    before that sequence. Keep the legacy metadata unchanged for old readers.
+
+    Every root V2 transcript row must reference its execution event. Bypassing
+    the fact-backed writers breaks this invariant: an unresolved watermark
+    propagates as ExecutionEventPersistenceError and fails the current run at
+    compaction, not just this write. Stage 3.3-C must carry event-native coverage
+    through model setup and compaction to remove this transitional lookup.
+    """
+    summary = data.get(COMPACT_SUMMARY_METADATA_KEY)
+    watermark = data.get(COMPACT_WATERMARK_METADATA_KEY)
+    if (
+        not isinstance(summary, str)
+        or not summary.strip()
+        or not isinstance(watermark, int)
+        or isinstance(watermark, bool)
+        or watermark <= 0
+    ):
+        return None
+    original = db.scalar(
+        select(TaskExecutionEvent).where(
+            TaskExecutionEvent.task_id == task_id,
+            TaskExecutionEvent.scope_id == "root",
+            TaskExecutionEvent.idempotency_key == key,
+        )
+    )
+    if original is not None:
+        # Replay preserves the first envelope even after projection cleanup,
+        # including older facts that predate this optional coordinate.
+        return cast(dict[str, Any] | None, original.payload.get("transcript_watermark"))
+    event = db.scalar(
+        select(TaskExecutionEvent)
+        .join(
+            TaskChatMessage,
+            TaskChatMessage.execution_event_id == TaskExecutionEvent.event_id,
+        )
+        .where(
+            TaskChatMessage.id == watermark,
+            TaskChatMessage.task_id == task_id,
+            TaskExecutionEvent.task_id == task_id,
+            TaskExecutionEvent.scope_id == "root",
+        )
+    )
+    if event is None:
+        raise ValueError("Compaction transcript watermark has no root execution event")
+    return {"scope_id": "root", "event_id": event.event_id, "sequence": event.sequence}

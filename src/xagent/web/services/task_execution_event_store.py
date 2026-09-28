@@ -123,20 +123,22 @@ def load_task_execution_events(
     task_id: int,
     scope_id: str,
     after_sequence: int = 0,
+    through_sequence: int | None = None,
     limit: int = MAX_EXECUTION_EVENT_PAGE_SIZE,
 ) -> list[TaskExecutionEvent]:
-    """Read one scope in commit order; reject page sizes outside 1–100."""
+    """Read one scope in commit order, optionally through a fixed inclusive bound.
+
+    Callers building a history capture the committed task sequence once and
+    reuse it across pages. Omitting the bound preserves the live-tail query.
+    Scope-local gaps are normal because sequence allocation is task-wide.
+    """
     if not 1 <= limit <= MAX_EXECUTION_EVENT_PAGE_SIZE:
         raise ValueError(f"limit must be between 1 and {MAX_EXECUTION_EVENT_PAGE_SIZE}")
-    return list(
-        db.scalars(
-            select(TaskExecutionEvent)
-            .where(
-                TaskExecutionEvent.task_id == task_id,
-                TaskExecutionEvent.scope_id == scope_id,
-                TaskExecutionEvent.sequence > after_sequence,
-            )
-            .order_by(TaskExecutionEvent.sequence)
-            .limit(limit)
-        )
+    query = select(TaskExecutionEvent).where(
+        TaskExecutionEvent.task_id == task_id,
+        TaskExecutionEvent.scope_id == scope_id,
+        TaskExecutionEvent.sequence > after_sequence,
     )
+    if through_sequence is not None:
+        query = query.where(TaskExecutionEvent.sequence <= through_sequence)
+    return list(db.scalars(query.order_by(TaskExecutionEvent.sequence).limit(limit)))
