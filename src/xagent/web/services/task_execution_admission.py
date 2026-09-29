@@ -69,6 +69,11 @@ def set_task_admission_hook(hook: AdmissionHook | None) -> None:
     _hook = hook
 
 
+def admission_enabled() -> bool:
+    """Whether this host installed a classifier; without one it stages no ticket."""
+    return _hook is not None
+
+
 def stage_task_admission(db: Session, command: TaskExecutionCommand) -> None:
     """Stage a new command's ticket in its acceptance transaction, exactly once."""
     if _hook is None or command.kind not in _EXECUTION_KINDS:
@@ -249,6 +254,28 @@ def _older_waiter() -> ColumnElement[bool]:
             command.status.notin_(_TERMINAL),
         )
         .correlate(TaskAdmissionTicket)
+    )
+
+
+def waiting_for_capacity(db: Session, command_id: int) -> bool:
+    """A pending command the claim scan would skip right now for admission.
+
+    Ingress uses this to acknowledge durable acceptance instead of holding a
+    request until capacity opens; it never predicts the later execution. A
+    host without a classifier staged no ticket, so it has nothing to check.
+    """
+    if not admission_enabled():
+        return False
+    return bool(
+        db.scalar(
+            select(~admission_eligible())
+            .select_from(TaskExecutionCommand)
+            .join(Task, Task.id == TaskExecutionCommand.task_id)
+            .where(
+                TaskExecutionCommand.id == command_id,
+                TaskExecutionCommand.status == "pending",
+            )
+        )
     )
 
 
