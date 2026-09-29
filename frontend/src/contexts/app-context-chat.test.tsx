@@ -9092,9 +9092,10 @@ describe("a new conversation's first message behind the first gate", () => {
 })
 
 // Who may open which dialog request, read off the production sources: a
-// first gate only from the create branch of the app context's sendMessage
-// (after the create response, before the message is staged), and a session
-// check only from the task page.
+// first gate only from the app context, and a session check only from the
+// task page. The scans count call sites and nothing else; that the one first
+// gate call sits in sendMessage's create branch, after the create response
+// and before the message is staged, is held by the behavior tests above.
 describe("opens the first gate and the session check from one place each", () => {
   const root = path.resolve(__dirname, "..")
   function productionSources(dir: string): string[] {
@@ -9110,15 +9111,8 @@ describe("opens the first gate and the session check from one place each", () =>
     .map(file => ({ file: path.relative(root, file), calls: Array.from(code(file).matchAll(pattern)).length }))
     .filter(({ calls }) => calls > 0)
 
-  it("calls openFirstGate once, in the create branch, before the message is staged", () => {
+  it("calls openFirstGate once, from the app context", () => {
     expect(callers(/\bopenFirstGate\s*\(/g)).toEqual([{ file: "contexts/app-context-chat.tsx", calls: 1 }])
-    const acc = code(path.join(root, "contexts/app-context-chat.tsx"))
-    const created = acc.indexOf("/api/chat/task/create`")
-    const gate = acc.search(/\bopenFirstGate\s*\(\s*newTaskId\s*\)/)
-    const staged = acc.search(/stagePendingDelivery\s*\(\s*\{\s*taskId\s*:\s*newTaskId\b/)
-    expect([created, gate, staged].every(at => at >= 0)).toBe(true)
-    expect(created).toBeLessThan(gate)
-    expect(gate).toBeLessThan(staged)
   })
 
   it("calls openSessionCheck only from the task page", () => {
