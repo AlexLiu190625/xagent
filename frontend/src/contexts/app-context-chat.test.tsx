@@ -9073,6 +9073,10 @@ describe("a new conversation's first message behind the first gate", () => {
   it("sends the released first message exactly once under StrictMode", async () => {
     stubFirstMessage(CONNECTOR_RUNTIME_REPORT_NEEDS_FILL)
     render(<React.StrictMode>{firstGateTree()}</React.StrictMode>)
+    // The provider has been updated before, as on a page that sent a message
+    // earlier, so the gate's update is computed during render (and twice here).
+    await act(async () => { firstGateActions!.stagePendingDelivery({ taskId: 5, clientMessageId: "warm", text: "x" }) })
+    await act(async () => { firstGateActions!.discardPendingDelivery("warm") })
     const openFirstGate = vi.spyOn(firstGateActions!, "openFirstGate")
     const { settled } = await sendFirstMessage()
     await connectNewTask()
