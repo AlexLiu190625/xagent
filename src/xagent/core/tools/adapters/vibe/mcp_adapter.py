@@ -2462,17 +2462,25 @@ async def load_execution_scoped_chrome_tools(
 
 
 # Grace given to an abandoned initialization to unwind on its own before its
-# HTTP transports are force-closed. It must exceed every cleanup bound the
-# transport libraries own, or a well-behaved unwind would be reported as a stall:
+# HTTP transports are force-closed.
+# It must exceed the cleanup bound of each transport this process has no
+# client to close for, or a well-behaved unwind would be reported as a stall:
 #   stdio     : 2s wait + 2s SIGTERM/SIGKILL escalation (measured: 4.04s)
 #   websocket : the websockets client's close_timeout default (10s)
-#   http      : bounded by this grace alone; the SDK's terminate-session DELETE
-#               inherits the connection's read timeout, which is far longer.
+# sse and streamable_http have no such bound to exceed: streamable_http's
+# terminate-session DELETE inherits the connection's read timeout (300s by
+# default in sessions.py), so for them this grace is the bound.
 # It must also exceed the retry backoff a load can still be sleeping through
-# when it notices it was abandoned (one 1s sleep in _load_direct_mcp_tools), or
-# a sealed load that is still backing off would be reported as alive after its
-# transports were force-closed.
-# Measured on mcp 1.19.0 / websockets 16.0; a test re-checks all three bounds.
+# when it notices it was abandoned (at most one of the 1s sleeps between
+# attempts in _load_direct_mcp_tools), or a sealed load that is still backing
+# off would be reported as alive after its transports were force-closed.
+# It must stay small too: grace plus that backoff must fit within the default
+# initialization timeout (60s): as long as force-closing ends abandoned
+# handshakes, that keeps the connection-test endpoint at no more than twice
+# its cap of handshakes at the default timeout. How long an abandoned
+# handshake can live, and so how many can coexist, grows with it.
+# Measured on mcp 1.19.0 / websockets 16.0; a test re-checks the stdio,
+# websocket and backoff bounds and the upper limit.
 _HANDSHAKE_RECLAIM_GRACE_SECONDS = 15.0
 
 # Transports whose session creator in sessions.py accepts an httpx client
@@ -2590,6 +2598,10 @@ async def _reclaim_abandoned_load(
     grace: float,
 ) -> None:
     """Bound how long one abandoned load keeps its transports.
+
+    The reaper itself lives at most two grace periods plus the time the
+    clients take to close: one wait before force-closing, one after. It ends
+    as soon as the load does.
 
     Nobody awaits this; it only logs. Waiting uses ``asyncio.wait``, which
     never retrieves the task's exception, so the load's own done-callback
