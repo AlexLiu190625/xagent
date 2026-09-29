@@ -6,6 +6,24 @@ holds capacity through the task owner's actual execution cleanup, including
 after a terminal business status has already been published. Expiry alone is
 never permission to reclaim capacity: the existing owner recovery must fence
 out that acquisition first.
+
+Capacity is charged per active execution, not per stamped ticket row. Every
+ticket the task's current owner holds in one bucket is the same execution: a
+RESUME admitted while the previous incarnation's cleanup still holds its ticket
+does not take a second slot. That relies on every new incarnation draining
+the previous one before it runs; a timed-out cancellation currently breaks that
+precondition (#2778), which is an activation gate. Live guidance joins the
+running execution without a slot from its own bucket, because the bucket
+classified a queue position and the execution it joins already paid for its
+slot; it must reserve one only if it becomes a new turn. Tickets carry no
+execution identity, so an incarnation classified into another bucket keeps the
+previous bucket's slot until this owner's next settled or idle release, not
+merely through cleanup (#2777). Counting distinct tasks is serialized by the
+bucket row lock taken before every stamp and by the exclusive owner stamp per
+task. The scan and claim predicates below must agree on this contract, so every
+executor must run the same revision before a host enables a policy. The
+snapshot counts every held task, including the waiter's own; it is display
+only (#2700).
 """
 
 from __future__ import annotations
@@ -161,18 +179,20 @@ def _lock_bucket(db: Session, key: str) -> TaskAdmissionBucket:
     ).scalar_one()
 
 
-def _live_count(bucket_key: object) -> ScalarSelect[int]:
+def _live_count(bucket_key: object, *, excluding_task_id: object) -> ScalarSelect[int]:
+    """Other tasks holding a slot; one task's held tickets are one execution."""
     ticket, task = aliased(TaskAdmissionTicket), aliased(Task)
     return (
-        select(func.count())
+        select(func.count(func.distinct(ticket.task_id)))
         .select_from(ticket)
         .join(task, task.id == ticket.task_id)
         .where(
             ticket.bucket_key == bucket_key,
+            ticket.task_id != excluding_task_id,
             ticket.owner_attempt_id == task.lease_attempt_id,
             ticket.runner_id == task.runner_id,
         )
-        .correlate(TaskAdmissionTicket)
+        .correlate(TaskAdmissionTicket, Task)
         .scalar_subquery()
     )
 
@@ -209,7 +229,7 @@ def admission_eligible() -> ColumnElement[bool]:
                 TaskAdmissionTicket.runner_id != Task.runner_id,
             ),
             or_(
-                _live_count(TaskAdmissionTicket.bucket_key)
+                _live_count(TaskAdmissionTicket.bucket_key, excluding_task_id=Task.id)
                 >= TaskAdmissionBucket.capacity,
                 _older_waiter(),
                 ~startup_eligible(),
@@ -221,7 +241,8 @@ def admission_eligible() -> ColumnElement[bool]:
 
 
 def _joins_running_execution() -> ColumnElement[bool]:
-    ticket, incoming = aliased(TaskAdmissionTicket), aliased(TaskAdmissionTicket)
+    """Guidance continues the held execution, whichever bucket classified it."""
+    ticket = aliased(TaskAdmissionTicket)
     return and_(
         TaskExecutionCommand.kind == "message",
         task_status_predicate.eq(TaskStatus.RUNNING),
@@ -229,9 +250,7 @@ def _joins_running_execution() -> ColumnElement[bool]:
         exists(
             select(1)
             .select_from(ticket)
-            .join(incoming, incoming.bucket_key == ticket.bucket_key)
             .where(
-                incoming.command_id == TaskExecutionCommand.id,
                 ticket.task_id == Task.id,
                 ticket.runner_id == Task.runner_id,
                 ticket.owner_attempt_id == Task.lease_attempt_id,
@@ -303,7 +322,9 @@ def reserve_task_admission(db: Session, command_id: int, lease: TaskLease) -> bo
         select(_older_waiter()).where(TaskAdmissionTicket.command_id == command_id)
     ):
         return False
-    active = db.scalar(select(_live_count(ticket.bucket_key)))
+    active = db.scalar(
+        select(_live_count(ticket.bucket_key, excluding_task_id=ticket.task_id))
+    )
     if active is not None and active >= bucket.capacity:
         return False
     if not reserve_startup(db, str(ticket.bucket_key)):
