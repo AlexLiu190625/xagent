@@ -6887,8 +6887,10 @@ export function AppProvider({
             const decision = held === null ? null : await held
             if (decision === "discarded") return
             if (decision === "cleared") {
-              // Fixed, translated text naming nothing the user typed; userFacing
-              // so ChatInput shows it instead of its generic "please try again".
+              // Fixed, translated text naming nothing the user typed. The new
+              // conversation page rethrows it to ChatInput, which shows a userFacing
+              // message instead of "please try again"; the agent page's handler
+              // toasts any error's message itself.
               throw Object.assign(new Error(t(FIRST_GATE_CLEARED_MESSAGE_KEY)), { userFacing: true })
             }
           }
