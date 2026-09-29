@@ -33,6 +33,7 @@ from xagent.core.agent.runtime import (
     prepare_llm_for_context,
     resolved_llm_metadata,
 )
+from xagent.core.model.chat.stream_progress import STREAM_ABORTED_KEY
 from xagent.core.model.chat.types import (
     CONTENT_SOURCE_KEY,
     CONTENT_SOURCE_REASONING_FALLBACK,
@@ -2919,3 +2920,231 @@ async def test_on_pattern_error_marks_the_pattern_error_as_reported() -> None:
     )
 
     assert runtime.pattern_error_reported is True
+
+
+class StreamingNoPayloadThenChatLLM:
+    """A stream that ends with nothing usable (only an END chunk, as an
+    aborted or cap-cut reasoning-only stream does) and a non-streaming
+    ``chat`` that answers. The runtime retries the call non-streaming."""
+
+    def __init__(
+        self,
+        *,
+        finish_reason: str = "no_progress",
+        chat_result: Any = None,
+        end_raw: Any = None,
+        usage: dict[str, int] | None = None,
+    ) -> None:
+        self.finish_reason = finish_reason
+        self.end_raw = end_raw
+        self.usage = usage
+        self.chat_result = (
+            chat_result
+            if chat_result is not None
+            else {"type": "text", "content": "retry answer", "finish_reason": "stop"}
+        )
+        self.chat_calls = 0
+
+    async def stream_chat(self, **_: Any) -> Any:
+        if self.finish_reason:
+            yield StreamChunk(
+                type=ChunkType.END, finish_reason=self.finish_reason, raw=self.end_raw
+            )
+        if self.usage is not None:
+            yield StreamChunk(type=ChunkType.USAGE, usage=self.usage)
+
+    async def chat(self, **_: Any) -> Any:
+        self.chat_calls += 1
+        return self.chat_result
+
+
+@pytest.mark.asyncio
+async def test_runtime_no_payload_fallback_is_stamped_and_lifted_to_trace(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#2785: the non-streaming retry taken because the stream produced no
+    payload must be visible on the response and on ``llm_call_end`` (the
+    #2786 markers only cover streams that returned a dict), and logged."""
+    events: list[dict[str, Any]] = []
+    runtime = PatternRuntime(
+        execution_id="task-123",
+        outbound_message_handler=OutboundCollector(),
+        tracer=_CaptureTracer(events),
+    )
+    context = ExecutionContext(execution_id="task-123")
+    llm = StreamingNoPayloadThenChatLLM()
+
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        result = await runtime.run_streaming_llm_call(llm, messages=[])
+
+    assert llm.chat_calls == 1
+    assert result["content"] == "retry answer"
+    assert result["finish_reason"] == "stop"  # the retry's own reason
+    assert result["stream_fallback"] == "no_payload"
+    assert result["stream_finish_reason"] == "no_progress"
+    assert "usage_missing" not in result  # not a stream reconstruction
+    fallback_logs = [
+        r for r in caplog.records if "no content or tool calls" in r.getMessage()
+    ]
+    assert len(fallback_logs) == 1
+    assert "no_progress" in fallback_logs[0].getMessage()
+
+    await runtime.on_llm_end(context=context, response=result)
+    data = events[-1]["data"]
+    assert data["stream_fallback"] == "no_payload"
+    assert data["stream_finish_reason"] == "no_progress"
+    assert data["finish_reason"] == "stop"
+    assert "stream_fallback" not in data["response"]
+    assert "stream_finish_reason" not in data["response"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_no_payload_fallback_carries_abort_reason_and_stream_usage() -> (
+    None
+):
+    """The provider names the predicate that aborted the stream in the END
+    chunk's ``raw``; a cap-cut stream that did send usage keeps that usage.
+    Both ride on the fallback response and reach ``llm_call_end``."""
+    events: list[dict[str, Any]] = []
+    runtime = PatternRuntime(
+        execution_id="task-123",
+        outbound_message_handler=OutboundCollector(),
+        tracer=_CaptureTracer(events),
+    )
+    context = ExecutionContext(execution_id="task-123")
+
+    aborted = StreamingNoPayloadThenChatLLM(
+        end_raw={STREAM_ABORTED_KEY: "empty_deltas"}
+    )
+    result = await runtime.run_streaming_llm_call(aborted, messages=[])
+    assert result[STREAM_ABORTED_KEY] == "empty_deltas"
+    assert "stream_usage" not in result
+    await runtime.on_llm_end(context=context, response=result)
+    assert events[-1]["data"][STREAM_ABORTED_KEY] == "empty_deltas"
+    assert "stream_usage" not in events[-1]["data"]
+
+    cap_cut = StreamingNoPayloadThenChatLLM(
+        finish_reason="length",
+        usage={"prompt_tokens": 6523, "completion_tokens": 8192, "total_tokens": 14715},
+    )
+    result = await runtime.run_streaming_llm_call(cap_cut, messages=[])
+    assert result["stream_finish_reason"] == "length"
+    assert result["stream_usage"]["completion_tokens"] == 8192
+    assert STREAM_ABORTED_KEY not in result
+    assert "usage" not in result  # the retry's own usage, not the stream's
+    await runtime.on_llm_end(context=context, response=result)
+    data = events[-1]["data"]
+    assert data["stream_usage"]["completion_tokens"] == 8192
+    assert "input_tokens" not in data
+    assert "stream_usage" not in data["response"]
+
+
+class StreamingToolCallAbortedLLM:
+    """A stream the provider aborted after a complete tool call: the final
+    TOOL_CALL snapshot carries the abort reason in ``raw``."""
+
+    async def stream_chat(self, **_: Any) -> Any:
+        tool_call = {
+            "index": 0,
+            "id": "call-1",
+            "function": {"name": "search", "arguments": '{"q":"x"}'},
+        }
+        yield StreamChunk(type=ChunkType.TOOL_CALL, tool_calls=[tool_call])
+        yield StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=[tool_call],
+            finish_reason="no_progress",
+            raw={STREAM_ABORTED_KEY: "tool_call_trailing_whitespace"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_runtime_aborted_tool_call_stream_lifts_abort_reason() -> None:
+    events: list[dict[str, Any]] = []
+    runtime = PatternRuntime(
+        execution_id="task-123",
+        outbound_message_handler=OutboundCollector(),
+        tracer=_CaptureTracer(events),
+    )
+    context = ExecutionContext(execution_id="task-123")
+
+    result = await runtime.run_streaming_llm_call(
+        StreamingToolCallAbortedLLM(), messages=[]
+    )
+
+    assert result["tool_calls"][0]["function"]["arguments"] == '{"q":"x"}'
+    assert result["finish_reason"] == "no_progress"
+    assert result[STREAM_ABORTED_KEY] == "tool_call_trailing_whitespace"
+    assert result["usage_missing"] is True
+    assert "stream_fallback" not in result
+
+    await runtime.on_llm_end(context=context, response=result)
+    data = events[-1]["data"]
+    assert data[STREAM_ABORTED_KEY] == "tool_call_trailing_whitespace"
+    assert data["finish_reason"] == "no_progress"
+    assert STREAM_ABORTED_KEY not in data["response"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_no_payload_fallback_without_stream_finish_reason() -> None:
+    """An empty stream (no chunk at all) is still marked as a fallback; the
+    absent stream finish reason adds no key."""
+    runtime = PatternRuntime()
+    llm = StreamingNoPayloadThenChatLLM(finish_reason="")
+
+    result = await runtime.run_streaming_llm_call(llm, messages=[])
+
+    assert result["stream_fallback"] == "no_payload"
+    assert "stream_finish_reason" not in result
+
+
+@pytest.mark.asyncio
+async def test_runtime_no_payload_fallback_leaves_a_bare_string_alone() -> None:
+    """A provider whose ``chat`` returns plain text cannot carry the marker;
+    the text is returned unchanged rather than wrapped (mirrors #2788)."""
+    runtime = PatternRuntime()
+    llm = StreamingNoPayloadThenChatLLM(chat_result="plain text")
+
+    result = await runtime.run_streaming_llm_call(llm, messages=[])
+
+    assert result == "plain text"
+
+
+@pytest.mark.asyncio
+async def test_runtime_stream_with_payload_carries_no_fallback_marker() -> None:
+    runtime = PatternRuntime()
+
+    result = await runtime.run_streaming_llm_call(
+        StreamingToolCallCutAtCapLLM(), messages=[]
+    )
+
+    assert "stream_fallback" not in result
+    assert "stream_finish_reason" not in result
+
+
+@pytest.mark.asyncio
+async def test_on_llm_end_ignores_non_string_fallback_markers() -> None:
+    events: list[dict[str, Any]] = []
+    runtime = PatternRuntime(
+        execution_id="task-123",
+        outbound_message_handler=OutboundCollector(),
+        tracer=_CaptureTracer(events),
+    )
+    context = ExecutionContext(execution_id="task-123")
+
+    await runtime.on_llm_end(
+        context=context,
+        response={
+            "content": "x",
+            "stream_fallback": True,
+            "stream_finish_reason": 3,
+            STREAM_ABORTED_KEY: ["empty_deltas"],
+            "stream_usage": "8192",
+        },
+    )
+
+    data = events[-1]["data"]
+    assert "stream_fallback" not in data
+    assert "stream_finish_reason" not in data
+    assert STREAM_ABORTED_KEY not in data
+    assert "stream_usage" not in data

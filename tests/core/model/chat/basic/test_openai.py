@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -21,9 +22,11 @@ from xagent.core.model.chat.basic.openai import (
 )
 from xagent.core.model.chat.error import retry_on
 from xagent.core.model.chat.exceptions import LLMEmptyContentError, LLMRetryableError
+from xagent.core.model.chat.stream_progress import STREAM_ABORTED_KEY
 from xagent.core.model.chat.types import (
     CONTENT_SOURCE_KEY,
     CONTENT_SOURCE_REASONING_FALLBACK,
+    ChunkType,
 )
 from xagent.core.retry.strategy import FixedDelay
 from xagent.core.retry.wrapper import create_retry_wrapper
@@ -2670,3 +2673,393 @@ class TestFinishReasonOnResponse:
         assert chunk is not None
         assert chunk.is_tool_call()
         assert chunk.finish_reason == "length"
+
+
+class TestStreamNoProgressAbort:
+    """#2785: a stream that keeps emitting chunks but stopped making progress
+    is abandoned by ``stream_chat`` itself, since the runtime never sees the
+    deltas ``_parse_stream_chunk`` drops and the interval timeout only
+    measures silence."""
+
+    _ENV = {
+        "XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT": "5",
+        "XAGENT_LLM_STREAM_DEGENERATE_WINDOW": "32",
+        "XAGENT_LLM_STREAM_DEGENERATE_MAX_PERIOD": "8",
+    }
+
+    @pytest.fixture(autouse=True)
+    def _small_thresholds(self, monkeypatch):
+        for name, value in self._ENV.items():
+            monkeypatch.setenv(name, value)
+        monkeypatch.delenv("XAGENT_LLM_STREAM_NO_PAYLOAD_ABORT_MODELS", raising=False)
+
+    class _ClosableStream:
+        """An async iterable with the ``close()`` coroutine the OpenAI SDK's
+        ``AsyncStream`` exposes; records whether the abort closed it."""
+
+        def __init__(self, chunks, *, before_yield=None):
+            self._chunks = chunks
+            self._before_yield = before_yield
+            self.closed = False
+            self.consumed = 0
+
+        def __aiter__(self):
+            return self._iterate()
+
+        async def _iterate(self):
+            for chunk in self._chunks:
+                if self._before_yield is not None:
+                    self._before_yield()
+                self.consumed += 1
+                yield chunk
+
+        async def close(self):
+            self.closed = True
+
+    @staticmethod
+    def _delta_chunk(*, content=None, tool_calls=None, finish_reason=None, **fields):
+        delta = SimpleNamespace(content=content, tool_calls=tool_calls, **fields)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(delta=delta, finish_reason=finish_reason)]
+        )
+
+    @staticmethod
+    def _patch_client(mocker, stream):
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = stream
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+    async def _collect(self, llm):
+        return [c async for c in llm.stream_chat([{"role": "user", "content": "x"}])]
+
+    @pytest.mark.asyncio
+    async def test_reasoning_loop_without_payload_ends_with_no_progress(
+        self, openai_llm_config, mocker, caplog
+    ):
+        """The dominant prod shape: reasoning deltas to the cap, no content, no
+        tool call. The stream is closed early and ends with an END chunk whose
+        ``finish_reason`` marks the abort, so the runtime's no-payload
+        fallback runs after seconds instead of ~105 s."""
+        chunks = [self._delta_chunk(reasoning_content="Let me think about it. ")]
+        chunks += [self._delta_chunk(reasoning_content="verify ") for _ in range(200)]
+        stream = self._ClosableStream(chunks)
+        self._patch_client(mocker, stream)
+        llm = OpenAILLM(**openai_llm_config)
+
+        with caplog.at_level(
+            logging.WARNING, logger="xagent.core.model.chat.basic.openai"
+        ):
+            result = await self._collect(llm)
+
+        assert [c.type for c in result] == [ChunkType.END]
+        assert result[0].finish_reason == "no_progress"
+        assert result[0].raw[STREAM_ABORTED_KEY] == "reasoning_repetition"
+        assert stream.closed is True
+        assert stream.consumed < 40  # cut at the window, not at the cap
+        abort_logs = [r for r in caplog.records if "Aborting" in r.getMessage()]
+        assert len(abort_logs) == 1
+        message = abort_logs[0].getMessage()
+        assert "gpt-4o-mini" in message
+        assert "reasoning_repetition" in message
+        assert "reasoning_fields=reasoning_content" in message
+        assert "verify" not in message  # names only, never values
+        # One warning per abort: the standalone field-name line is debug here.
+        assert not [
+            r
+            for r in caplog.records
+            if "no content or tool calls" in r.getMessage()
+            and r.levelno >= logging.WARNING
+        ]
+
+    @pytest.mark.asyncio
+    async def test_unrecognized_reasoning_spelling_is_still_inspected(
+        self, openai_llm_config, mocker
+    ):
+        """Predicate 1 reads whatever ``reasoning*`` field the delta carries, so
+        a loop under a non-default spelling is caught without waiting for the
+        field name to be learned from logs."""
+        chunks = [self._delta_chunk(reasoning="   ") for _ in range(200)]
+        stream = self._ClosableStream(chunks)
+        self._patch_client(mocker, stream)
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await self._collect(llm)
+
+        assert [c.type for c in result] == [ChunkType.END]
+        assert result[0].finish_reason == "no_progress"
+        assert stream.closed is True
+
+    @pytest.mark.asyncio
+    async def test_empty_deltas_end_with_no_progress(self, openai_llm_config, mocker):
+        chunks = [self._delta_chunk() for _ in range(50)]
+        stream = self._ClosableStream(chunks)
+        self._patch_client(mocker, stream)
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await self._collect(llm)
+
+        assert [c.type for c in result] == [ChunkType.END]
+        assert result[0].finish_reason == "no_progress"
+        assert stream.consumed == 5
+
+    @pytest.mark.asyncio
+    async def test_whitespace_tail_after_complete_tool_call_keeps_the_call(
+        self, openai_llm_config, mocker
+    ):
+        """Trace 5040325 shape: valid JSON followed by a whitespace loop. The
+        call survives; the delta that tripped the guard is dropped and the
+        trailing whitespace already streamed (below the window) is harmless
+        to ``json.loads``."""
+        chunks = [
+            self._delta_chunk(
+                tool_calls=[_tool_call_delta(0, "call_1", "search", '{"q": ')]
+            ),
+            self._delta_chunk(tool_calls=[_tool_call_delta(0, None, None, '"x"}')]),
+        ]
+        chunks += [
+            self._delta_chunk(tool_calls=[_tool_call_delta(0, None, None, "\n\t")])
+            for _ in range(100)
+        ]
+        stream = self._ClosableStream(chunks)
+        self._patch_client(mocker, stream)
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await self._collect(llm)
+
+        final = result[-1]
+        assert final.is_tool_call()
+        assert final.finish_reason == "no_progress"
+        assert final.raw[STREAM_ABORTED_KEY] == "tool_call_trailing_whitespace"
+        final_arguments = final.tool_calls[0]["function"]["arguments"]
+        assert json.loads(final_arguments) == {"q": "x"}
+        assert len(final_arguments) < len('{"q": "x"}') + 32
+        assert stream.closed is True
+        assert stream.consumed < 30
+        # The tail equals the last snapshot already streamed, so the runtime's
+        # merge sees a repeat, never a shorter "delta".
+        assert all(c.is_tool_call() for c in result)
+        assert final_arguments == result[-2].tool_calls[0]["function"]["arguments"]
+
+    @pytest.mark.asyncio
+    async def test_repeated_object_after_complete_tool_call_is_cut_at_first_byte(
+        self, openai_llm_config, mocker
+    ):
+        """Trace 4580191 shape: the same object repeated. Cut at the first
+        non-whitespace byte after the object closed; the first object is kept."""
+        chunks = [
+            self._delta_chunk(
+                tool_calls=[_tool_call_delta(0, "call_1", "search", '{"q": "x"}')]
+            ),
+            self._delta_chunk(
+                tool_calls=[_tool_call_delta(0, None, None, '{"q": "x"}')]
+            ),
+            self._delta_chunk(
+                tool_calls=[_tool_call_delta(0, None, None, '{"q": "x"}')]
+            ),
+        ]
+        stream = self._ClosableStream(chunks)
+        self._patch_client(mocker, stream)
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await self._collect(llm)
+
+        assert result[-1].finish_reason == "no_progress"
+        assert result[-1].tool_calls[0]["function"]["arguments"] == '{"q": "x"}'
+        assert stream.consumed == 2
+
+    @pytest.mark.asyncio
+    async def test_long_legitimate_reasoning_then_tool_call_is_untouched(
+        self, openai_llm_config, mocker
+    ):
+        """The DeepSeek / Qwen-thinking shape: many non-repetitive reasoning
+        deltas, then a tool call and a clean finish. Nothing is aborted and the
+        provider's own ``finish_reason`` survives."""
+        words = "first consider the user asked for a shift on Monday so we need".split()
+        chunks = [
+            self._delta_chunk(reasoning_content=f"{words[i % len(words)]}{i} ")
+            for i in range(300)
+        ]
+        chunks += [
+            self._delta_chunk(
+                tool_calls=[_tool_call_delta(0, "call_1", "search", '{"q": "x"}')]
+            ),
+            self._delta_chunk(finish_reason="tool_calls"),
+            SimpleNamespace(
+                choices=[],
+                usage=SimpleNamespace(
+                    prompt_tokens=3, completion_tokens=5, total_tokens=8
+                ),
+            ),
+        ]
+        stream = self._ClosableStream(chunks)
+        self._patch_client(mocker, stream)
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await self._collect(llm)
+
+        assert stream.closed is False
+        assert stream.consumed == len(chunks)
+        tool_chunks = [c for c in result if c.is_tool_call()]
+        assert tool_chunks[-1].finish_reason == "tool_calls"
+        assert result[-1].is_usage()
+        assert not any(c.finish_reason == "no_progress" for c in result)
+
+    @pytest.mark.asyncio
+    async def test_parallel_tool_call_after_a_complete_one_is_untouched(
+        self, openai_llm_config, mocker
+    ):
+        chunks = [
+            self._delta_chunk(
+                tool_calls=[_tool_call_delta(0, "call_1", "search", '{"q": "x"}')]
+            ),
+            self._delta_chunk(
+                tool_calls=[_tool_call_delta(1, "call_2", "search", '{"q": ')]
+            ),
+            self._delta_chunk(tool_calls=[_tool_call_delta(1, None, None, '"y"}')]),
+            self._delta_chunk(finish_reason="tool_calls"),
+        ]
+        stream = self._ClosableStream(chunks)
+        self._patch_client(mocker, stream)
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await self._collect(llm)
+
+        assert stream.closed is False
+        final = [c for c in result if c.is_tool_call()][-1]
+        assert final.finish_reason == "tool_calls"
+        assert [tc["function"]["arguments"] for tc in final.tool_calls] == [
+            '{"q": "x"}',
+            '{"q": "y"}',
+        ]
+
+    @pytest.mark.asyncio
+    async def test_open_object_growing_is_left_to_max_tokens(
+        self, openai_llm_config, mocker
+    ):
+        """The ``create_shift`` runaway: the object never closes, so the guard
+        does not fire and the stream runs to its (test) end."""
+        chunks = [
+            self._delta_chunk(
+                tool_calls=[
+                    _tool_call_delta(0, "call_1", "create_shift", '{"staff_ids": [')
+                ]
+            )
+        ]
+        chunks += [
+            self._delta_chunk(tool_calls=[_tool_call_delta(0, None, None, f"{i},")])
+            for i in range(300)
+        ]
+        chunks.append(self._delta_chunk(finish_reason="length"))
+        stream = self._ClosableStream(chunks)
+        self._patch_client(mocker, stream)
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await self._collect(llm)
+
+        assert stream.closed is False
+        assert stream.consumed == len(chunks)
+        assert result[-1].finish_reason == "length"
+
+    @pytest.mark.asyncio
+    async def test_no_payload_timeout_is_opt_in_by_model_name(
+        self, openai_llm_config, mocker, monkeypatch
+    ):
+        """The wall-clock trigger fires only for an allow-listed wire model
+        name, measured from the first delta, and only before any payload."""
+        monkeypatch.setenv(
+            "XAGENT_LLM_STREAM_NO_PAYLOAD_ABORT_MODELS", "gpt-4o-mini,other"
+        )
+        monkeypatch.setenv("XAGENT_LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS", "30")
+        monkeypatch.setenv("XAGENT_LLM_STREAM_DEGENERATE_WINDOW", "0")
+        monkeypatch.setenv("XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT", "0")
+        now = [1000.0]
+        monkeypatch.setattr(
+            "xagent.core.model.chat.stream_progress.time.monotonic", lambda: now[0]
+        )
+        words = "genuinely different reasoning every single time here".split()
+        chunks = [
+            self._delta_chunk(reasoning_content=words[i % len(words)] + str(i))
+            for i in range(50)
+        ]
+
+        def tick():
+            now[0] += 1.0  # one delta per simulated second
+
+        listed = self._ClosableStream(chunks, before_yield=tick)
+        self._patch_client(mocker, listed)
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await self._collect(llm)
+
+        assert result[-1].finish_reason == "no_progress"
+        assert listed.closed is True
+        assert 30 <= listed.consumed <= 32
+
+        # Same stream, model not listed: runs to the end.
+        monkeypatch.setenv("XAGENT_LLM_STREAM_NO_PAYLOAD_ABORT_MODELS", "other")
+        now[0] = 1000.0
+        unlisted = self._ClosableStream(chunks, before_yield=tick)
+        self._patch_client(mocker, unlisted)
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await self._collect(llm)
+
+        assert unlisted.closed is False
+        assert unlisted.consumed == 50
+        assert not any(c.finish_reason == "no_progress" for c in result)
+
+    @pytest.mark.asyncio
+    async def test_clean_stream_with_no_payload_logs_field_names(
+        self, openai_llm_config, mocker, caplog
+    ):
+        """A stream that ends on its own with neither content nor tool calls is
+        the invisible fallback path; log the reasoning field names (never their
+        values) so the spelling can be read off prod logs."""
+        chunks = [
+            self._delta_chunk(reasoning_details=[{"text": "secret thought"}]),
+            self._delta_chunk(finish_reason="length"),
+        ]
+        stream = self._ClosableStream(chunks)
+        self._patch_client(mocker, stream)
+        llm = OpenAILLM(**openai_llm_config)
+
+        with caplog.at_level(
+            logging.WARNING, logger="xagent.core.model.chat.basic.openai"
+        ):
+            result = await self._collect(llm)
+
+        assert [c.type for c in result] == [ChunkType.END]
+        assert result[0].finish_reason == "length"
+        assert stream.closed is False
+        field_logs = [
+            r for r in caplog.records if "no content or tool calls" in r.getMessage()
+        ]
+        assert len(field_logs) == 1
+        message = field_logs[0].getMessage()
+        assert "reasoning_details" in message
+        assert "secret thought" not in message
+        assert "aborted=no" in message
+
+    @pytest.mark.asyncio
+    async def test_stream_with_content_does_not_log_field_names(
+        self, openai_llm_config, mocker, caplog
+    ):
+        chunks = [
+            self._delta_chunk(content="Hello", reasoning_content="hmm"),
+            self._delta_chunk(finish_reason="stop"),
+        ]
+        stream = self._ClosableStream(chunks)
+        self._patch_client(mocker, stream)
+        llm = OpenAILLM(**openai_llm_config)
+
+        with caplog.at_level(
+            logging.WARNING, logger="xagent.core.model.chat.basic.openai"
+        ):
+            await self._collect(llm)
+
+        assert not [
+            r for r in caplog.records if "no content or tool calls" in r.getMessage()
+        ]

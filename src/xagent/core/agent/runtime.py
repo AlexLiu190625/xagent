@@ -26,6 +26,10 @@ from ..inline_file_delivery import InlineFileDelivery, InlineFileStreamGuard
 from ..model.chat.basic.base import BaseLLM
 from ..model.chat.error import is_context_length_error, retry_on
 from ..model.chat.exceptions import LLMContextLengthError, LLMToolProtocolError
+from ..model.chat.stream_progress import (
+    NO_PAYLOAD_STREAM_FALLBACK,
+    STREAM_ABORTED_KEY,
+)
 from ..model.chat.token_context import extract_cached_input_tokens
 from ..model.chat.tool_protocol import TOOL_PROTOCOL_ERROR_KEY
 from ..model.chat.types import ChunkType
@@ -614,7 +618,23 @@ class PatternRuntime:
                     response.update(provider_payload)
                 return stamp_stream_markers(response)
             if not saw_payload_chunk:
-                return await self.run_llm_call(llm, **kwargs)
+                # A stream that produced neither content nor a tool call
+                # (an aborted or cap-cut reasoning-only stream, #2785) is
+                # retried non-streaming. Log and mark it: the #2786 markers
+                # above only cover streams that returned a dict, so this
+                # path was invisible in the trace.
+                logger.warning(
+                    "LLM stream ended with no content or tool calls "
+                    "(finish_reason=%s); retrying as a non-streaming call",
+                    finish_reason or "none",
+                )
+                fallback_response = await self.run_llm_call(llm, **kwargs)
+                return self._stamp_stream_fallback(
+                    fallback_response,
+                    finish_reason,
+                    stream_aborted=provider_payload.get(STREAM_ABORTED_KEY),
+                    stream_usage=usage_payload,
+                )
             if usage_payload:
                 response = {
                     "content": content,
@@ -639,6 +659,35 @@ class PatternRuntime:
             raise
         finally:
             self._active_llm_tasks.discard(task)
+
+    def _stamp_stream_fallback(
+        self,
+        response: Any,
+        stream_finish_reason: str,
+        *,
+        stream_aborted: Any = None,
+        stream_usage: dict[str, Any] | None = None,
+    ) -> Any:
+        """Mark a non-streaming retry taken because the stream had no payload.
+
+        ``stream_fallback`` says the retry happened; ``stream_finish_reason``
+        is how the discarded stream ended (``no_progress`` for an abort,
+        ``length`` for a cap cut); ``stream_aborted`` names the predicate
+        that aborted it; ``stream_usage`` is the discarded stream's usage
+        when the provider sent one. ``on_llm_end`` lifts all of them onto
+        ``llm_call_end``. A bare-string response cannot carry them and is
+        returned unchanged.
+        """
+        if not isinstance(response, dict):
+            return response
+        response["stream_fallback"] = NO_PAYLOAD_STREAM_FALLBACK
+        if stream_finish_reason:
+            response["stream_finish_reason"] = stream_finish_reason
+        if isinstance(stream_aborted, str) and stream_aborted:
+            response[STREAM_ABORTED_KEY] = stream_aborted
+        if stream_usage:
+            response["stream_usage"] = dict(stream_usage)
+        return response
 
     async def _raise_if_interrupted(self, message: str) -> None:
         if await self.should_interrupt():
@@ -723,7 +772,7 @@ class PatternRuntime:
             raw = model_dump()
         if not isinstance(raw, dict):
             return
-        for key in ("reasoning_content", "reasoning"):
+        for key in ("reasoning_content", "reasoning", STREAM_ABORTED_KEY):
             if key in raw and raw[key] is not None:
                 current[key] = raw[key]
         provider_state = raw.get("_xagent_provider_state")
@@ -1475,6 +1524,10 @@ class PatternRuntime:
         cached_tokens = self._extract_cached_tokens(response)
         finish_reason = self._get_value(response, "finish_reason")
         usage_missing = self._get_value(response, "usage_missing") is True
+        stream_fallback = self._get_value(response, "stream_fallback")
+        stream_finish_reason = self._get_value(response, "stream_finish_reason")
+        stream_aborted = self._get_value(response, STREAM_ABORTED_KEY)
+        stream_usage = self._get_value(response, "stream_usage")
         await self._emit_trace_event(
             TraceEventType(TraceScope.ACTION, TraceAction.END, TraceCategory.LLM),
             task_id=str(event_metadata.get("task_id") or self._task_id(context)),
@@ -1498,6 +1551,26 @@ class PatternRuntime:
                     else {}
                 ),
                 **({"usage_missing": True} if usage_missing else {}),
+                **(
+                    {"stream_fallback": stream_fallback}
+                    if isinstance(stream_fallback, str) and stream_fallback
+                    else {}
+                ),
+                **(
+                    {"stream_finish_reason": stream_finish_reason}
+                    if isinstance(stream_finish_reason, str) and stream_finish_reason
+                    else {}
+                ),
+                **(
+                    {STREAM_ABORTED_KEY: stream_aborted}
+                    if isinstance(stream_aborted, str) and stream_aborted
+                    else {}
+                ),
+                **(
+                    {"stream_usage": dict(stream_usage)}
+                    if isinstance(stream_usage, dict) and stream_usage
+                    else {}
+                ),
                 **event_metadata,
             },
         )
