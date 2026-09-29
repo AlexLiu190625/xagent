@@ -2173,6 +2173,7 @@ export function AppProvider({
     createInitialState,
   )
   const pendingTaskToExecuteRef = useRef<{ description: string } | null>(null)
+  const firstGateTaskIdRef = useRef<number | null>(null)
   const startDelayedPlaybackRef = useRef<() => void>(() => {})
   // Read through a ref, not a useCallback dependency, so the dialog
   // provider's state changes never change handleMessage's or sendMessage's
@@ -3265,8 +3266,9 @@ export function AppProvider({
             // gated by the dispatch wrapper's task scoping, so a stray
             // background task's own pending task_info must not overwrite
             // what's about to be auto-sent for the task actually being
-            // viewed/connected.
-            if (taskStatus === 'pending' && task.description && !isMessageForOtherTask) {
+            // viewed/connected. A task whose first message went to the first
+            // gate is never armed: its description is that message (sendMessage).
+            if (taskStatus === 'pending' && task.description && !isMessageForOtherTask && taskId !== firstGateTaskIdRef.current) {
               pendingTaskToExecuteRef.current = { description: task.description }
               console.log('💾 Stored pending task for auto-execution:', taskData.description)
             }
@@ -6874,12 +6876,14 @@ export function AppProvider({
           // ends the hold (FirstGateDecision); the per-turn check still decides
           // whether the turn runs. Opened here, after the create response, not
           // from a mount effect: a gate opened in the provider's mount commit is
-          // cleared by its identity effect. The pending-task auto-send
-          // (pendingTaskToExecuteRef) cannot send the description meanwhile:
-          // onConnect clears that ref before the auto-send's timer reads it.
+          // cleared by its identity effect. The pending-task auto-send never
+          // sends this task's description, which is the held text: its ref is
+          // cleared here, and this task's pending task_info never arms it.
           if (shouldHoldFirstMessage(taskData.connector_runtime_requirements)) {
             // null: no provider mounted, or an id it rejects; nothing is held.
             const held = connectorRuntimeDialogRef.current.openFirstGate(newTaskId)
+            firstGateTaskIdRef.current = newTaskId
+            pendingTaskToExecuteRef.current = null
             const decision = held === null ? null : await held
             if (decision === "discarded") return
             if (decision === "cleared") {

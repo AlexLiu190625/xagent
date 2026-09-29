@@ -9034,9 +9034,8 @@ describe("a new conversation's first message behind the first gate", () => {
 
   // The pending-task auto-send predates the dialog: a pending task_info with
   // a description arms it, and on the next connect it would send that
-  // description after one second. onConnect disarms it with a timer of the
-  // same delay registered first, so a reconnect during the hold never sends
-  // the description the create request stored as the held message's text.
+  // description after one second. The held task's description is the held
+  // message's text, so a reconnect during the hold must never send it.
   it("never auto-sends the task description while the first message is held", async () => {
     stubFirstMessage(CONNECTOR_RUNTIME_REPORT_NEEDS_FILL)
     render(firstGateTree())
@@ -9064,6 +9063,37 @@ describe("a new conversation's first message behind the first gate", () => {
     act(() => { firstGateApp!.dispatch({ type: "TRIGGER_TASK_UPDATE" }) })
     wsHarness.isConnected = true
     act(() => { webSocketOptions.current?.onConnect?.() })
+    act(() => { vi.advanceTimersByTime(2000) })
+
+    expect(sendChatMessageMock).not.toHaveBeenCalled()
+    expect(screen.getByText("connectorRuntime.actions.saveAndSend")).toBeInTheDocument()
+  })
+
+  // Not by timer order: here the socket reports connected again with no
+  // onConnect, so onConnect's own one-second disarm never runs. The auto-send
+  // is armed before the send by another task's pending task_info, and the
+  // held task's pending task_info lands during the hold.
+  it("never auto-sends while the first message is held, even with no disarm timer", async () => {
+    const pendingTaskInfo = (id: number, description: string, taskId?: number) => ({
+      type: "trace_event",
+      timestamp: "2026-05-27T05:00:02Z",
+      ...(taskId === undefined ? {} : { task_id: taskId }),
+      data: {
+        event_id: `task-info-${id}`,
+        event_type: "task_info",
+        data: { id, title: description, description, status: "PENDING", created_at: "2026-05-27T05:00:00Z", updated_at: "2026-05-27T05:00:01Z" },
+      },
+    }) as unknown as TestWebSocketMessage
+    stubFirstMessage(CONNECTOR_RUNTIME_REPORT_NEEDS_FILL)
+    render(firstGateTree())
+    act(() => { webSocketOptions.current?.onMessage?.(pendingTaskInfo(7, "earlier")) })
+    await sendFirstMessage()
+    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.saveAndSend")).toBeInTheDocument())
+
+    vi.useFakeTimers()
+    act(() => { webSocketOptions.current?.onMessage?.(pendingTaskInfo(FIRST_GATE_TASK_ID, "hello", FIRST_GATE_TASK_ID)) })
+    wsHarness.isConnected = true
+    act(() => { firstGateApp!.dispatch({ type: "TRIGGER_TASK_UPDATE" }) })
     act(() => { vi.advanceTimersByTime(2000) })
 
     expect(sendChatMessageMock).not.toHaveBeenCalled()
