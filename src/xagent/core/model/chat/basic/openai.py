@@ -266,6 +266,18 @@ def field_content(message: Any, field_name: str) -> tuple[bool, Any]:
     return value is not None, value
 
 
+def _finish_reason_entry(choice: Any) -> Dict[str, str]:
+    """``{"finish_reason": ...}`` for a choice that reports one, else empty.
+
+    Carried on the response so ``llm_call_end`` can record how the
+    generation ended (#2786); a missing or blank reason adds no key.
+    """
+    finish_reason = getattr(choice, "finish_reason", None)
+    if isinstance(finish_reason, str) and finish_reason:
+        return {"finish_reason": finish_reason}
+    return {}
+
+
 def _message_reasoning_content(message: Any) -> tuple[bool, Any]:
     """Return whether a provider explicitly included reasoning content."""
     return field_content(message, "reasoning_content")
@@ -695,6 +707,7 @@ class OpenAICompatibleLLM(BaseLLM):
                     "type": "tool_call",
                     "tool_calls": tool_calls,
                     "raw": resp.model_dump(),
+                    **_finish_reason_entry(choice),
                 }
                 has_reasoning_content, reasoning_content = _message_reasoning_content(
                     message
@@ -750,6 +763,7 @@ class OpenAICompatibleLLM(BaseLLM):
                         "reasoning_content": reasoning_content,
                         "reasoning": reasoning_content,
                         "raw": resp.model_dump(),
+                        **_finish_reason_entry(choice),
                     }
                 # If there are no tool calls and no content, this is an error
                 raise LLMEmptyContentError(
@@ -760,6 +774,7 @@ class OpenAICompatibleLLM(BaseLLM):
                 "type": "text",
                 "content": content,
                 "raw": resp.model_dump(),
+                **_finish_reason_entry(choice),
             }
             if has_reasoning_content:
                 result["reasoning_content"] = reasoning_content
@@ -1070,6 +1085,7 @@ class OpenAICompatibleLLM(BaseLLM):
                     "type": "tool_call",
                     "tool_calls": tool_calls,
                     "raw": response.model_dump(),
+                    **_finish_reason_entry(choice),
                 }
                 has_reasoning_content, reasoning_content = _message_reasoning_content(
                     message
@@ -1115,6 +1131,7 @@ class OpenAICompatibleLLM(BaseLLM):
                         "reasoning_content": reasoning_content,
                         "reasoning": reasoning_content,
                         "raw": response.model_dump(),
+                        **_finish_reason_entry(choice),
                     }
                 # If there are no tool calls and no content, this is an error
                 raise LLMEmptyContentError(
@@ -1125,6 +1142,7 @@ class OpenAICompatibleLLM(BaseLLM):
                 "type": "text",
                 "content": content,
                 "raw": response.model_dump(),
+                **_finish_reason_entry(choice),
             }
             if has_reasoning_content:
                 text_result["reasoning_content"] = reasoning_content
@@ -1489,6 +1507,10 @@ class OpenAICompatibleLLM(BaseLLM):
 
         choice = raw_chunk.choices[0]
         delta = choice.delta
+        # Some OpenAI-compatible endpoints put ``finish_reason`` on the same
+        # chunk as the final delta instead of on a trailing empty one, so the
+        # delta-bearing chunks below carry it as well (#2786).
+        finish_reason = getattr(choice, "finish_reason", None) or ""
 
         # Handle token content
         if hasattr(delta, "content") and delta.content:
@@ -1496,6 +1518,7 @@ class OpenAICompatibleLLM(BaseLLM):
                 type=ChunkType.TOKEN,
                 content=delta.content,
                 delta=delta.content,
+                finish_reason=finish_reason,
                 raw=self._attach_reasoning_content_to_raw(
                     raw_chunk,
                     accumulated_reasoning_content,
@@ -1572,6 +1595,7 @@ class OpenAICompatibleLLM(BaseLLM):
                 return StreamChunk(
                     type=ChunkType.TOOL_CALL,
                     tool_calls=tool_calls_list,
+                    finish_reason=finish_reason,
                     raw=self._attach_reasoning_content_to_raw(
                         raw_chunk,
                         accumulated_reasoning_content,

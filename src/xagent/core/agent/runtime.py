@@ -509,6 +509,7 @@ class PatternRuntime:
             provider_payload: dict[str, Any] = {}
             protocol_error_payload: dict[str, Any] = {}
             saw_payload_chunk = False
+            finish_reason = ""
             stream = aiter(stream_chat(**kwargs))
             loop_completed = False
             try:
@@ -548,6 +549,9 @@ class PatternRuntime:
                     if chunk_usage:
                         self._merge_usage(usage_payload, chunk_usage)
                     self._merge_provider_payload(provider_payload, chunk)
+                    chunk_finish_reason = getattr(chunk, "finish_reason", None)
+                    if isinstance(chunk_finish_reason, str) and chunk_finish_reason:
+                        finish_reason = chunk_finish_reason
                     if on_chunk is not None:
                         await self._maybe_await(on_chunk(chunk))
                 loop_completed = True
@@ -574,6 +578,21 @@ class PatternRuntime:
             tool_calls = [
                 tool_call_chunks[index] for index in sorted(tool_call_chunks.keys())
             ]
+
+            def stamp_stream_markers(response: dict[str, Any]) -> dict[str, Any]:
+                # Keep a truncated or usage-less stream visible in the trace
+                # (#2786): ``on_llm_end`` lifts both keys onto ``llm_call_end``.
+                # ``usage_missing`` is stamped here, not inferred from an absent
+                # ``usage`` key downstream, because non-streaming envelopes
+                # never carry top-level usage and must not be counted as
+                # truncated streams. Every dict return is stamped; the
+                # bare-string return at the end cannot carry either key.
+                if finish_reason:
+                    response["finish_reason"] = finish_reason
+                if not usage_payload:
+                    response["usage_missing"] = True
+                return response
+
             if protocol_error_payload:
                 protocol_response = {
                     "type": "tool_protocol_error",
@@ -583,7 +602,7 @@ class PatternRuntime:
                 }
                 if usage_payload:
                     protocol_response["usage"] = usage_payload
-                return protocol_response
+                return stamp_stream_markers(protocol_response)
             if tool_calls:
                 response: dict[str, Any] = {
                     "content": content,
@@ -593,7 +612,7 @@ class PatternRuntime:
                     response["usage"] = usage_payload
                 if provider_payload:
                     response.update(provider_payload)
-                return response
+                return stamp_stream_markers(response)
             if not saw_payload_chunk:
                 return await self.run_llm_call(llm, **kwargs)
             if usage_payload:
@@ -603,9 +622,9 @@ class PatternRuntime:
                 }
                 if provider_payload:
                     response.update(provider_payload)
-                return response
+                return stamp_stream_markers(response)
             if provider_payload:
-                return {"content": content, **provider_payload}
+                return stamp_stream_markers({"content": content, **provider_payload})
             return content
 
         task: asyncio.Future[Any] = asyncio.ensure_future(consume_stream())
@@ -1440,6 +1459,8 @@ class PatternRuntime:
                 prompt_message_count=len(getattr(context, "messages", [])),
             )
         cached_tokens = self._extract_cached_tokens(response)
+        finish_reason = self._get_value(response, "finish_reason")
+        usage_missing = self._get_value(response, "usage_missing") is True
         await self._emit_trace_event(
             TraceEventType(TraceScope.ACTION, TraceAction.END, TraceCategory.LLM),
             task_id=str(event_metadata.get("task_id") or self._task_id(context)),
@@ -1457,6 +1478,12 @@ class PatternRuntime:
                     else {}
                 ),
                 **({"cached_input_tokens": cached_tokens} if cached_tokens else {}),
+                **(
+                    {"finish_reason": finish_reason}
+                    if isinstance(finish_reason, str) and finish_reason
+                    else {}
+                ),
+                **({"usage_missing": True} if usage_missing else {}),
                 **event_metadata,
             },
         )

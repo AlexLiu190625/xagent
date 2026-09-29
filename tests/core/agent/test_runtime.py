@@ -1129,6 +1129,8 @@ async def test_runtime_streaming_llm_call_merges_tool_call_argument_deltas() -> 
                 },
             }
         ],
+        # The stub never sends a usage chunk (#2786).
+        "usage_missing": True,
     }
 
 
@@ -1614,29 +1616,32 @@ class StreamingLLMWithCachedUsage:
         yield StreamChunk(type=ChunkType.END)
 
 
+class _CaptureTracer:
+    def __init__(self, events: list[dict[str, Any]]) -> None:
+        self._events = events
+
+    async def trace_event(
+        self,
+        event_type: Any,
+        task_id: Any = None,
+        step_id: Any = None,
+        data: Any = None,
+        parent_id: Any = None,
+    ) -> str:
+        self._events.append({"data": dict(data or {})})
+        return "evt"
+
+
 @pytest.mark.asyncio
 async def test_runtime_surfaces_cached_tokens_in_usage_and_trace() -> None:
     """Provider cache telemetry reaches the merged usage payload and the
     LLM end trace event as a normalized cached_input_tokens count."""
     events: list[dict[str, Any]] = []
-
-    class _CaptureTracer:
-        async def trace_event(
-            self,
-            event_type: Any,
-            task_id: Any = None,
-            step_id: Any = None,
-            data: Any = None,
-            parent_id: Any = None,
-        ) -> str:
-            events.append({"data": dict(data or {})})
-            return "evt"
-
     outbound = OutboundCollector()
     runtime = PatternRuntime(
         execution_id="task-123",
         outbound_message_handler=outbound,
-        tracer=_CaptureTracer(),
+        tracer=_CaptureTracer(events),
     )
     context = ExecutionContext(execution_id="task-123")
 
@@ -1648,6 +1653,183 @@ async def test_runtime_surfaces_cached_tokens_in_usage_and_trace() -> None:
     await runtime.on_llm_end(context=context, response=result)
     assert events[-1]["data"]["cached_input_tokens"] == 4
     assert events[-1]["data"]["input_tokens"] == 7
+
+
+class StreamingToolCallCutAtCapLLM:
+    """A stream that emits a complete tool call, then is cut at the output cap:
+    the provider reports ``finish_reason="length"`` and never sends usage."""
+
+    async def stream_chat(self, **_: Any) -> Any:
+        yield StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=[
+                {
+                    "index": 0,
+                    "id": "call-1",
+                    "function": {"name": "calculator", "arguments": '{"a":1}'},
+                }
+            ],
+        )
+        yield StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=[
+                {
+                    "index": 0,
+                    "id": "call-1",
+                    "function": {"name": "calculator", "arguments": '{"a":1}'},
+                }
+            ],
+            finish_reason="length",
+        )
+
+
+@pytest.mark.asyncio
+async def test_runtime_stream_without_usage_marks_usage_missing_and_finish_reason() -> (
+    None
+):
+    """#2786: a stream cut at the output cap without a usage chunk must leave
+    a visible marker on the reconstructed response and on ``llm_call_end``,
+    instead of silently dropping the token fields."""
+    events: list[dict[str, Any]] = []
+    runtime = PatternRuntime(
+        execution_id="task-123",
+        outbound_message_handler=OutboundCollector(),
+        tracer=_CaptureTracer(events),
+    )
+    context = ExecutionContext(execution_id="task-123")
+
+    result = await runtime.run_streaming_llm_call(
+        StreamingToolCallCutAtCapLLM(), messages=[]
+    )
+
+    assert result["tool_calls"][0]["function"]["name"] == "calculator"
+    # The final chunk repeats the accumulated arguments as a snapshot.
+    assert result["tool_calls"][0]["function"]["arguments"] == '{"a":1}'
+    assert "usage" not in result
+    assert result["finish_reason"] == "length"
+    assert result["usage_missing"] is True
+
+    await runtime.on_llm_end(context=context, response=result)
+    data = events[-1]["data"]
+    assert data["finish_reason"] == "length"
+    assert data["usage_missing"] is True
+    assert "input_tokens" not in data
+    assert "usage_missing" not in data["response"]
+    assert "finish_reason" not in data["response"]
+
+
+class StreamingProtocolErrorWithoutUsageLLM:
+    async def stream_chat(self, **_: Any) -> Any:
+        yield StreamChunk(
+            type=ChunkType.PROTOCOL_ERROR,
+            protocol_error={"code": "unavailable_tool_call"},
+        )
+        yield StreamChunk(type=ChunkType.END, finish_reason="stop")
+
+
+@pytest.mark.asyncio
+async def test_runtime_stream_protocol_error_response_carries_markers() -> None:
+    """The protocol-error envelope also reaches ``on_llm_end``, so it is
+    stamped like every other dict the stream reconstruction returns."""
+    runtime = PatternRuntime()
+
+    result = await runtime.run_streaming_llm_call(
+        StreamingProtocolErrorWithoutUsageLLM(), messages=[]
+    )
+
+    assert result["type"] == "tool_protocol_error"
+    assert result["finish_reason"] == "stop"
+    assert result["usage_missing"] is True
+
+
+class StreamingTextWithReasoningNoUsageLLM:
+    async def stream_chat(self, **_: Any) -> Any:
+        yield StreamChunk(
+            type=ChunkType.TOKEN,
+            delta="hello",
+            raw={"reasoning_content": "thinking"},
+        )
+        yield StreamChunk(type=ChunkType.END, finish_reason="length")
+
+
+@pytest.mark.asyncio
+async def test_runtime_stream_provider_payload_without_usage_carries_markers() -> None:
+    """A stream that never emits a usage chunk but does carry provider payload
+    (e.g. ``reasoning_content``) must still surface ``finish_reason`` and
+    ``usage_missing`` on the reconstructed response, not just the payload."""
+    runtime = PatternRuntime()
+
+    result = await runtime.run_streaming_llm_call(
+        StreamingTextWithReasoningNoUsageLLM(), messages=[]
+    )
+
+    assert result["content"] == "hello"
+    assert result["reasoning_content"] == "thinking"
+    assert result["finish_reason"] == "length"
+    assert result["usage_missing"] is True
+
+
+class StreamingTextWithUsageAndStopLLM:
+    async def stream_chat(self, **_: Any) -> Any:
+        yield StreamChunk(type=ChunkType.TOKEN, delta="hello")
+        yield StreamChunk(
+            type=ChunkType.USAGE,
+            usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+        )
+        yield StreamChunk(type=ChunkType.END, finish_reason="stop")
+
+
+@pytest.mark.asyncio
+async def test_runtime_stream_with_usage_keeps_shape_and_records_finish_reason() -> (
+    None
+):
+    """A clean stream keeps its existing token fields and gains only
+    ``finish_reason``; ``usage_missing`` is never emitted as ``False``."""
+    events: list[dict[str, Any]] = []
+    runtime = PatternRuntime(
+        execution_id="task-123",
+        outbound_message_handler=OutboundCollector(),
+        tracer=_CaptureTracer(events),
+    )
+    context = ExecutionContext(execution_id="task-123")
+
+    result = await runtime.run_streaming_llm_call(
+        StreamingTextWithUsageAndStopLLM(), messages=[]
+    )
+    assert result["content"] == "hello"
+    assert result["finish_reason"] == "stop"
+    assert "usage_missing" not in result
+
+    await runtime.on_llm_end(context=context, response=result)
+    data = events[-1]["data"]
+    assert data["input_tokens"] == 7
+    assert data["output_tokens"] == 3
+    assert data["finish_reason"] == "stop"
+    assert "usage_missing" not in data
+
+
+@pytest.mark.asyncio
+async def test_on_llm_end_omits_markers_for_responses_without_them() -> None:
+    """Non-streaming responses that carry neither key produce the same
+    ``llm_call_end`` payload as before #2786."""
+    events: list[dict[str, Any]] = []
+    runtime = PatternRuntime(
+        execution_id="task-123",
+        outbound_message_handler=OutboundCollector(),
+        tracer=_CaptureTracer(events),
+    )
+    context = ExecutionContext(execution_id="task-123")
+
+    await runtime.on_llm_end(context=context, response={"content": "plain"})
+    data = events[-1]["data"]
+    assert data["response"] == {"content": "plain"}
+    assert "finish_reason" not in data
+    assert "usage_missing" not in data
+
+    await runtime.on_llm_end(
+        context=context, response={"content": "x", "finish_reason": ""}
+    )
+    assert "finish_reason" not in events[-1]["data"]
 
 
 class RaisingCompactLLM:
