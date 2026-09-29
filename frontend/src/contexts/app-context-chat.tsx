@@ -20,7 +20,7 @@ import {
   type FileAccessPolicy,
 } from "@/contexts/file-access-context"
 import { useConnectorRuntimeDialogActionsIfMounted } from "@/contexts/connector-runtime-dialog-context"
-import { isConnectorRuntimeDialogTriggerCode } from "@/lib/connector-runtime-api"
+import { FIRST_GATE_CLEARED_MESSAGE_KEY, isConnectorRuntimeDialogTriggerCode, shouldHoldFirstMessage } from "@/lib/connector-runtime-api"
 
 interface WebSocketMessage {
   type: string
@@ -6867,6 +6867,27 @@ export function AppProvider({
           dispatch({ type: "TRIGGER_TASK_UPDATE" })
 
           // User message will be handled by backend via trace event
+
+          // A create report with a context value the user can fill here holds
+          // the message before it is staged or queued, so nothing of it reaches
+          // the transport or the dialog's resend candidates until the dialog
+          // ends the hold (FirstGateDecision); the per-turn check still decides
+          // whether the turn runs. Opened here, after the create response, not
+          // from a mount effect: a gate opened in the provider's mount commit is
+          // cleared by its identity effect. The pending-task auto-send
+          // (pendingTaskToExecuteRef) cannot send the description meanwhile:
+          // onConnect clears that ref before the auto-send's timer reads it.
+          if (shouldHoldFirstMessage(taskData.connector_runtime_requirements)) {
+            // null: no provider mounted, or an id it rejects; nothing is held.
+            const held = connectorRuntimeDialogRef.current.openFirstGate(newTaskId)
+            const decision = held === null ? null : await held
+            if (decision === "discarded") return
+            if (decision === "cleared") {
+              // Fixed, translated text naming nothing the user typed; userFacing
+              // so ChatInput shows it instead of its generic "please try again".
+              throw Object.assign(new Error(t(FIRST_GATE_CLEARED_MESSAGE_KEY)), { userFacing: true })
+            }
+          }
 
           // For new tasks, always send chat message to support file uploads
           console.log('💬 Queuing chat message for new task:', {
