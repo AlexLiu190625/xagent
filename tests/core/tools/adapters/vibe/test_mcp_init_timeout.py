@@ -18,7 +18,10 @@ from typing import Any
 import httpx
 import pytest
 
-from xagent.config import MCP_TOOL_INIT_TIMEOUT_SECONDS
+from xagent.config import (
+    MCP_TOOL_INIT_TIMEOUT_SECONDS,
+    get_mcp_tool_init_timeout_seconds,
+)
 from xagent.core.tools.adapters.vibe import mcp_adapter as mcp_adapter_module
 from xagent.core.tools.adapters.vibe.config import MCPFailurePolicy
 from xagent.core.tools.adapters.vibe.mcp_adapter import (
@@ -380,10 +383,10 @@ def _make_stalling_create_session(*, k: int, ending: str, has_factory: bool):
 async def test_abandoned_http_load_is_force_closed_after_grace_bare_coroutine(
     monkeypatch, caplog, transport, cleanup
 ):
-    """Variant a: a bare coroutine (no retry loop) that builds one client via
-    the instrumented connection's factory and then gets stuck. Whichever
-    shape its stuck cleanup takes, the reaper must force-close its client
-    after the grace period and let the task end.
+    """Variant a: a bare coroutine (no retry loop) that gets stuck while the
+    test holds one client built through the instrumented connection's
+    factory. Whichever shape its stuck cleanup takes, the reaper must
+    force-close its client after the grace period and let the task end.
 
     ``swallows_cancel``: swallows only the abandonment's cancel, then blocks
     on an unrelated event -- it is the reaper's *second* cancel (issued right
@@ -415,6 +418,7 @@ async def test_abandoned_http_load_is_force_closed_after_grace_bare_coroutine(
         return []  # pragma: no cover
 
     before = set(mcp_adapter_module._active_load_tasks)
+    reapers_before = set(mcp_adapter_module._RECLAIM_TASKS)
     with pytest.raises(TimeoutError):
         await _load_server_tools_bounded("s", bare_load(), 0.05, recorder=recorder)
     abandoned_at = asyncio.get_event_loop().time()
@@ -429,7 +433,7 @@ async def test_abandoned_http_load_is_force_closed_after_grace_bare_coroutine(
     assert client.aclose_calls == 1
     assert ended_after < 0.2 + 0.5
     await asyncio.sleep(0.05)
-    assert mcp_adapter_module._RECLAIM_TASKS == set()
+    assert _new_reapers(reapers_before) == set()
     assert len(_reclaim_warnings(caplog.records)) == 1
 
 
@@ -455,6 +459,7 @@ async def test_abandoned_http_load_is_force_closed_after_grace_real_retry_loop(
 
     recorder = _TransportRecorder("s")
     before = set(mcp_adapter_module._active_load_tasks)
+    reapers_before = set(mcp_adapter_module._RECLAIM_TASKS)
     with pytest.raises(TimeoutError):
         await _load_server_tools_bounded(
             "s",
@@ -481,7 +486,7 @@ async def test_abandoned_http_load_is_force_closed_after_grace_real_retry_loop(
     assert calls["n"] == 1  # zero new attempts
     assert ended_after < 1.5 + 1 + 0.5
     await asyncio.sleep(0.05)
-    assert mcp_adapter_module._RECLAIM_TASKS == set()
+    assert _new_reapers(reapers_before) == set()
     assert len(_reclaim_warnings(caplog.records)) == 1
     assert _still_alive_warnings(caplog.records) == []
 
@@ -514,6 +519,7 @@ async def test_reclaim_is_silent_when_abandoned_load_unwinds(
         return []  # pragma: no cover
 
     before = set(mcp_adapter_module._active_load_tasks)
+    reapers_before = set(mcp_adapter_module._RECLAIM_TASKS)
     with pytest.raises(TimeoutError):
         await _load_server_tools_bounded("s", bare_load(), 0.05, recorder=recorder)
 
@@ -524,14 +530,7 @@ async def test_reclaim_is_silent_when_abandoned_load_unwinds(
     assert _reclaim_warnings(caplog.records) == []
     # The reaper's own asyncio.wait({task}, ...) returns as soon as the task
     # ends, so it does not linger for the rest of the grace period.
-    await asyncio.wait_for(
-        _poll_until_empty(mcp_adapter_module._RECLAIM_TASKS), timeout=0.5
-    )
-
-
-async def _poll_until_empty(task_set) -> None:
-    while task_set:
-        await asyncio.sleep(0.02)
+    await _wait_until_no_new_reapers(reapers_before, timeout=0.5)
 
 
 def _new_active_load_task(before: set) -> "asyncio.Task[Any]":
@@ -547,6 +546,24 @@ def _new_active_load_task(before: set) -> "asyncio.Task[Any]":
         f"expected exactly one new load task, got {len(new_tasks)}"
     )
     return next(iter(new_tasks))
+
+
+def _new_reapers(before: set) -> "set[asyncio.Task[Any]]":
+    """Reapers added to ``_RECLAIM_TASKS`` since ``before`` was snapshotted.
+
+    Like ``_active_load_tasks``, that set is module-level and shared across
+    every test in this file, so a reaper another test left behind must not
+    count here.
+    """
+    return mcp_adapter_module._RECLAIM_TASKS - before
+
+
+async def _wait_until_no_new_reapers(before: set, timeout: float = 5.0) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while _new_reapers(before):
+        assert loop.time() < deadline, f"reapers still running after {timeout}s"
+        await asyncio.sleep(0.02)
 
 
 async def _assert_task_done_within(task: "asyncio.Task[Any]", timeout: float) -> None:
@@ -667,6 +684,7 @@ async def test_caller_cancellation_schedules_reclaim(monkeypatch, caller_context
 async def test_successful_load_never_reclaims(monkeypatch, tool_count):
     """A load that succeeds must never be handed to a reaper, whatever the
     number of tools it returns."""
+    reapers_before = set(mcp_adapter_module._RECLAIM_TASKS)
     connection, _counts = _counting_http_connection("streamable_http")
     recorder = _TransportRecorder("s")
     instrumented = recorder.instrument(connection)
@@ -682,7 +700,7 @@ async def test_successful_load_never_reclaims(monkeypatch, tool_count):
     result = await _load_server_tools_bounded("s", quick_load(), 5, recorder=recorder)
 
     assert len(result.tools) == tool_count
-    assert mcp_adapter_module._RECLAIM_TASKS == set()
+    assert _new_reapers(reapers_before) == set()
     assert client.aclose_calls == 0
     assert recorder._sealed is False
 
@@ -719,11 +737,12 @@ async def test_reclaim_failure_is_logged_and_contained(monkeypatch, caplog, rais
             await asyncio.Event().wait()  # stay stuck forever
 
     before = set(mcp_adapter_module._active_load_tasks)
+    reapers_before = set(mcp_adapter_module._RECLAIM_TASKS)
     with pytest.raises(TimeoutError):
         await _load_server_tools_bounded("s", bare_load(), 0.05, recorder=recorder)
 
     task = _new_active_load_task(before)
-    await _poll_until_empty(mcp_adapter_module._RECLAIM_TASKS)
+    await _wait_until_no_new_reapers(reapers_before)
 
     assert broken.aclose_calls == 1
     close_failures = [
@@ -741,16 +760,101 @@ async def test_reclaim_failure_is_logged_and_contained(monkeypatch, caplog, rais
         await task
 
 
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_reaper_own_failure_is_logged_and_contained(monkeypatch, caplog):
+    """A failure inside the reaper itself (here: force_close raising, which
+    it never does today) is logged once, and the reaper still ends normally
+    rather than carrying an exception nobody retrieves."""
+    caplog.set_level(logging.WARNING, logger=_LOGGER_NAME)
+    monkeypatch.setattr(mcp_adapter_module, "_HANDSHAKE_RECLAIM_GRACE_SECONDS", 0.1)
+    recorder = _TransportRecorder("s")
+
+    async def broken_force_close():
+        raise RuntimeError("reaper boom")
+
+    monkeypatch.setattr(recorder, "force_close", broken_force_close)
+    release = asyncio.Event()
+
+    async def stuck_load():
+        await _swallow_cancels_until(release)
+
+    before = set(mcp_adapter_module._active_load_tasks)
+    reapers_before = set(mcp_adapter_module._RECLAIM_TASKS)
+    with pytest.raises(TimeoutError):
+        await _load_server_tools_bounded("s", stuck_load(), 0.05, recorder=recorder)
+    task = _new_active_load_task(before)
+    reapers = _new_reapers(reapers_before)
+    assert len(reapers) == 1
+    (reaper,) = reapers
+    await _assert_task_done_within(reaper, timeout=2)
+    failures = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == _LOGGER_NAME
+        and "reclaiming an abandoned initialization failed" in r.getMessage()
+    ]
+    release.set()
+    await _assert_task_done_within(task, timeout=5)
+
+    assert reaper.exception() is None
+    assert failures == [
+        "MCP server s: reclaiming an abandoned initialization failed (RuntimeError)"
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize("abandoned_by", ["timeout", "caller_cancel"])
+async def test_abandoned_load_late_exception_is_consumed(caplog, abandoned_by):
+    """An abandoned load that later ends with an ordinary exception has that
+    exception retrieved exactly once by the loader (one DEBUG line), whether
+    it was abandoned by the timeout or by its caller being cancelled."""
+    caplog.set_level(logging.DEBUG, logger=_LOGGER_NAME)
+    started = asyncio.Event()
+
+    async def late_failing_load():
+        started.set()
+        await _swallow_cancels_for(0.1)
+        raise RuntimeError("late failure")
+
+    before = set(mcp_adapter_module._active_load_tasks)
+    if abandoned_by == "timeout":
+        with pytest.raises(TimeoutError):
+            await _load_server_tools_bounded("s", late_failing_load(), 0.05)
+    else:
+        caller = asyncio.ensure_future(
+            _load_server_tools_bounded("s", late_failing_load(), 30)
+        )
+        await started.wait()
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+    task = _new_active_load_task(before)
+    await _assert_task_done_within(task, timeout=2)
+    await asyncio.sleep(0)
+
+    consumed = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == _LOGGER_NAME
+        and r.levelno == logging.DEBUG
+        and "finished with: late failure" in r.getMessage()
+    ]
+    assert len(consumed) == 1
+
+
 @pytest.mark.parametrize(
     "transport",
     ["sse", "streamable_http", "stdio", "websocket", None, "carrier-pigeon"],
 )
 @pytest.mark.parametrize("custom_factory", [False, True])
-def test_transport_recorder_instrument_domain(transport, custom_factory):
+def test_transport_recorder_instrument_domain(monkeypatch, transport, custom_factory):
     """Only sse/streamable_http connections are instrumented; every other
     connection (including one with no transport key or an unknown one) comes
     back unchanged. Instrumenting delegates to the connection's own factory
-    when it has one, else to the module's default."""
+    when it has one, else to the module's default. The module default is
+    replaced by a stand-in, so no real httpx client is built."""
     recorder = _TransportRecorder("s")
     connection: dict = {"url": "http://x"}
     if transport is not None:
@@ -764,15 +868,23 @@ def test_transport_recorder_instrument_domain(transport, custom_factory):
 
         connection["httpx_client_factory"] = inner_factory
 
+    default_calls = {"n": 0}
+
+    def fake_default(headers=None, timeout=None, auth=None):
+        default_calls["n"] += 1
+        return _FakeHttpxClient()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_mcp_http_client", fake_default)
+
     out = recorder.instrument(connection)
 
     if transport in ("sse", "streamable_http"):
         assert out is not connection
         assert out["httpx_client_factory"] is not connection.get("httpx_client_factory")
         client = out["httpx_client_factory"]()
-        assert isinstance(client, _FakeHttpxClient) or not custom_factory
-        if custom_factory:
-            assert inner_calls["n"] == 1
+        assert isinstance(client, _FakeHttpxClient)
+        assert inner_calls["n"] == (1 if custom_factory else 0)
+        assert default_calls["n"] == (0 if custom_factory else 1)
         assert recorder._clients == [client]
     else:
         assert out is connection
@@ -833,19 +945,25 @@ async def test_instrumented_connection_never_leaves_session_creation(monkeypatch
 @pytest.mark.timeout(30)
 async def test_zero_timeout_never_reclaims(monkeypatch):
     """Timeout 0 disables both the deadline and the reclaim: the load coro
-    is awaited directly, the recorder is never touched at all."""
+    is awaited directly, the recorder is never touched at all. The load
+    suspends once, so a timeout of 0 treated as a deadline would expire
+    before it returns."""
+    reapers_before = set(mcp_adapter_module._RECLAIM_TASKS)
     connection, _counts = _counting_http_connection("streamable_http")
     recorder = _TransportRecorder("s")
     instrumented = recorder.instrument(connection)
     client = instrumented["httpx_client_factory"]()
 
-    async def quick_load():
+    async def suspending_load():
+        await asyncio.sleep(0.05)
         return MCPLoadResult(tools=(), loaded_servers=(), failures=())
 
-    result = await _load_server_tools_bounded("s", quick_load(), 0, recorder=recorder)
+    result = await _load_server_tools_bounded(
+        "s", suspending_load(), 0, recorder=recorder
+    )
 
     assert result.tools == ()
-    assert mcp_adapter_module._RECLAIM_TASKS == set()
+    assert _new_reapers(reapers_before) == set()
     assert client.aclose_calls == 0
     assert recorder._sealed is False
 
@@ -967,6 +1085,22 @@ def test_instrumentable_transports_match_session_creators():
     assert accepts_factory == mcp_adapter_module._INSTRUMENTABLE_TRANSPORTS
     assert does_not_accept == {"stdio", "websocket"}
 
+    # The creator table above is written by hand: check it names every
+    # transport create_session dispatches on, so a new transport cannot
+    # bypass this check.
+    import ast
+
+    tree = ast.parse(inspect.getsource(sessions_module.create_session))
+    dispatched = {
+        node.comparators[0].value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Compare)
+        and isinstance(node.left, ast.Name)
+        and node.left.id == "transport"
+        and isinstance(node.comparators[0], ast.Constant)
+    }
+    assert dispatched == set(creators)
+
 
 _I17_CELLS = [
     (transport, k, ending)
@@ -1007,6 +1141,7 @@ async def test_abandoned_load_starts_no_further_attempt(
     recorder = _TransportRecorder("s")
     caller_timeout = (k - 1) + 0.5
     before = set(mcp_adapter_module._active_load_tasks)
+    reapers_before = set(mcp_adapter_module._RECLAIM_TASKS)
     with pytest.raises(TimeoutError):
         await _load_server_tools_bounded(
             "s",
@@ -1046,7 +1181,7 @@ async def test_abandoned_load_starts_no_further_attempt(
     else:
         assert ended_after < grace + backoff + 0.5
 
-    await _poll_until_empty(mcp_adapter_module._RECLAIM_TASKS)
+    await _wait_until_no_new_reapers(reapers_before)
     assert _still_alive_warnings(caplog.records) == []
 
 
@@ -1089,11 +1224,12 @@ async def test_second_reclaim_warning_reports_live_load_count(monkeypatch, caplo
     task = None
     try:
         before = set(mcp_adapter_module._active_load_tasks)
+        reapers_before = set(mcp_adapter_module._RECLAIM_TASKS)
         with pytest.raises(TimeoutError):
             await _load_server_tools_bounded("s", bare_load(), 0.05, recorder=recorder)
 
         task = _new_active_load_task(before)
-        await _poll_until_empty(mcp_adapter_module._RECLAIM_TASKS)
+        await _wait_until_no_new_reapers(reapers_before)
 
         still_alive = [
             r
@@ -1120,11 +1256,13 @@ async def test_second_reclaim_warning_reports_live_load_count(monkeypatch, caplo
 @pytest.mark.asyncio
 @pytest.mark.timeout(30)
 async def test_reclaim_grace_exceeds_library_cleanup_bounds(monkeypatch):
-    """The grace period must exceed every cleanup bound the transport
-    libraries own (websocket's close_timeout default, stdio's termination
-    timeout), and the retry loop's remaining backoff -- measured against the
-    real retry loop, not the literal 1s/3-attempts constants, so a change to
-    either would be caught here rather than drift silently."""
+    """The grace period must exceed the cleanup bound of each transport it
+    cannot force-close (websocket's close_timeout default, stdio's
+    termination timeout) and the retry loop's backoff, and grace plus that
+    backoff must fit within the default initialization timeout. The backoff
+    is measured as the real retry loop exhausting every attempt, which is at
+    least what can remain after abandonment, not taken from the literal
+    1s/3-attempts constants, so a change to either is caught here."""
     import mcp.client.stdio as stdio_module
     import websockets.asyncio.client as ws_client_module
 
@@ -1159,3 +1297,9 @@ async def test_reclaim_grace_exceeds_library_cleanup_bounds(monkeypatch):
     assert len(result.failures) == 1
     assert result.failures[0].attempts == 3
     assert elapsed < mcp_adapter_module._HANDSHAKE_RECLAIM_GRACE_SECONDS
+
+    monkeypatch.delenv(MCP_TOOL_INIT_TIMEOUT_SECONDS, raising=False)
+    assert (
+        mcp_adapter_module._HANDSHAKE_RECLAIM_GRACE_SECONDS + elapsed
+        <= get_mcp_tool_init_timeout_seconds()
+    )
