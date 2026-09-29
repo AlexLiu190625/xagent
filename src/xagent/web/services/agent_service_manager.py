@@ -865,6 +865,7 @@ def _register_selected_task_files_isolated(
                     UploadedFile.file_id == selected_file_id,
                     UploadedFile.user_id == task_owner_id,
                     UploadedFile.storage_status != "compensating",
+                    UploadedFile.detached_reason.is_(None),
                     or_(
                         UploadedFile.task_id == task_id,
                         UploadedFile.task_id.is_(None),
