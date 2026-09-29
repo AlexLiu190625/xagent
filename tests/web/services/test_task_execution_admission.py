@@ -531,3 +531,79 @@ async def test_three_worker_processes_share_one_budget(host):
                 worker.join(5)
         results.close()
     assert all(worker.exitcode == 0 for worker in workers)
+
+
+async def test_deferred_joined_guidance_does_not_block_other_tasks_with_free_capacity(
+    host,
+):
+    admission.set_task_admission_hook(
+        lambda db, command: admission.AdmissionPolicy("tenant:batch", 2, 2)
+    )
+    first = enqueue(host)
+    execute = Execution(host)
+    assert await transport.dispatch_one_task_command(execute)
+    with host.sessions() as db:
+        task_id = db.get(TaskExecutionCommand, first.command_id).task_id
+    message = enqueue(host, task_id=task_id, kind=transport.TaskCommandKind.MESSAGE)
+
+    async def inject(command):
+        # The joined guidance defers on runtime injection and re-waits as
+        # pending without ever having held a slot of its own.
+        raise transport.TaskCommandDeferred("waiting for runtime injection")
+
+    await transport.dispatch_one_task_command(inject, command_db_id=message.command_id)
+    deferred = transport.load_task_command(message.command_id)
+    assert (deferred.status, deferred.attempt_count, deferred.defer_count) == (
+        "pending",
+        1,
+        1,
+    )
+
+    other = enqueue(host)
+    # Bucket capacity is 2 and only the first task holds a slot: the deferred
+    # guidance is joinable work, not a capacity waiter, so it is not the head.
+    assert await transport.dispatch_one_task_command(
+        execute, command_db_id=other.command_id
+    )
+    assert execute.started == [first.command_id, other.command_id]
+    # Both slots are held now; the deferred guidance still charges the pending
+    # budget while it waits, so one more waiter fills the budget of two.
+    third_task = enqueue(host)
+    assert not await transport.dispatch_one_task_command(
+        execute, command_db_id=third_task.command_id
+    )
+    with pytest.raises(admission.AdmissionQueueFull):
+        enqueue(host)
+    execute.finish.set()
+    execute.cleanup.set()
+
+
+async def test_interactive_head_blocked_by_its_own_batch_command_does_not_block_others(
+    host,
+):
+    holder = enqueue(host)
+    execute = Execution(host)
+    assert await transport.dispatch_one_task_command(execute)
+    # Task T: batch START waits behind the saturated batch bucket, then its
+    # interactive MESSAGE waits behind that START by per-task order.
+    batch = enqueue(host)
+    with host.sessions() as db:
+        task_id = db.get(TaskExecutionCommand, batch.command_id).task_id
+    admission.set_task_admission_hook(
+        lambda db, command: admission.AdmissionPolicy("tenant:interactive", 1, 20)
+    )
+    interactive = enqueue(host, task_id=task_id, kind=transport.TaskCommandKind.MESSAGE)
+    # Task J: interactive START from another task, accepted after T's MESSAGE.
+    other = enqueue(host)
+    assert await transport.dispatch_one_task_command(execute)
+    assert execute.started == [holder.command_id, other.command_id]
+    assert transport.load_task_command(batch.command_id).status == "pending"
+    assert transport.load_task_command(interactive.command_id).status == "pending"
+    # Same-task order and both capacity caps still hold: J now fills the
+    # interactive bucket, so a newer interactive task waits on capacity.
+    newer = enqueue(host)
+    assert not await transport.dispatch_one_task_command(execute)
+    for waiting in (batch, interactive, newer):
+        assert transport.load_task_command(waiting.command_id).attempt_count == 0
+    execute.finish.set()
+    execute.cleanup.set()

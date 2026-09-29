@@ -188,8 +188,8 @@ the original unaccepted selection; it cannot modify a newer replacement run.
 When a host installs an execution admission policy, an SDK or A2A reply is
 committed as a durable RESUME_INPUT command together with its admission ticket.
 If that ticket is provably waiting for capacity when ingress checks it (the
-bucket is full, an older waiter precedes it, or startup pacing has not yet
-released it), the V1 reply endpoint answers `202` with `status: "queued"`
+bucket is full, an older runnable waiter precedes it, or startup pacing has not
+yet released it), the V1 reply endpoint answers `202` with `status: "queued"`
 immediately instead of holding the request for
 `XAGENT_TASK_REPLY_WAIT_TIMEOUT_SECONDS` and returning `504 reply_outcome_unknown`. The response carries the accepted
 `command_id`, the `run_id` the task is waiting on, the acceptance
@@ -221,6 +221,15 @@ queued acknowledgment: A2A ingress has no projection for a queued reply, so a
 governed A2A reply keeps the existing wait and `504 reply_outcome_unknown`
 (with `accepted: true` and its `commandId`) until an A2A projection is designed,
 and the durable reply still runs when capacity opens.
+
+Within a bucket the oldest waiting command runs first, including for prompt
+dispatch by ID, and buckets stay independent of each other. A waiter is the
+bucket head only while it is its own task's next runnable command and needs a
+slot: a command behind any earlier unfinished command of its own task, or
+guidance that joins its task's running execution, is not a head and never
+delays other tasks' commands in that bucket. Per-task order still applies to
+the task's own commands, and a head whose business-retry deadline has not
+passed still delays later work in the same bucket.
 
 ## Runtime credential lifetime
 

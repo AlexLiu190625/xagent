@@ -37,7 +37,7 @@ from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.sql.selectable import ScalarSelect
 
 from ...config import get_shared_task_execution_enabled
-from ..models.task import Task, TaskStatus, task_status_predicate
+from ..models.task import Task, TaskStatus
 from ..models.task_admission import TaskAdmissionBucket, TaskAdmissionTicket
 from ..models.task_command import TaskExecutionCommand
 from .task_admission_observation import record_queue_full
@@ -240,37 +240,73 @@ def admission_eligible() -> ColumnElement[bool]:
     return or_(~blocked, _joins_running_execution())
 
 
-def _joins_running_execution() -> ColumnElement[bool]:
+def _joins_running_execution(
+    command: type[TaskExecutionCommand] = TaskExecutionCommand,
+    task: type[Task] = Task,
+) -> ColumnElement[bool]:
     """Guidance continues the held execution, whichever bucket classified it."""
     ticket = aliased(TaskAdmissionTicket)
     return and_(
-        TaskExecutionCommand.kind == "message",
-        task_status_predicate.eq(TaskStatus.RUNNING),
-        Task.control_state == "running",
+        command.kind == "message",
+        task.status == TaskStatus.RUNNING,
+        task.control_state == "running",
         exists(
             select(1)
             .select_from(ticket)
             .where(
-                ticket.task_id == Task.id,
-                ticket.runner_id == Task.runner_id,
-                ticket.owner_attempt_id == Task.lease_attempt_id,
+                ticket.task_id == task.id,
+                ticket.runner_id == task.runner_id,
+                ticket.owner_attempt_id == task.lease_attempt_id,
             )
-            .correlate(Task, TaskExecutionCommand)
+            .correlate(task, command)
         ),
     )
 
 
+def _behind_own_task(command: type[TaskExecutionCommand]) -> ColumnElement[bool]:
+    """Per-task order keeps this command behind an earlier open one of its task.
+
+    This is the transport's ``_unfinished_earlier_command`` for a ticketed
+    command: its cancel/pause carve-out never applies because those kinds
+    stage no ticket.
+    """
+    earlier = aliased(TaskExecutionCommand)
+    return exists(
+        select(1)
+        .where(
+            earlier.task_id == command.task_id,
+            earlier.id < command.id,
+            earlier.status.notin_(_TERMINAL),
+        )
+        .correlate(command)
+    )
+
+
 def _older_waiter() -> ColumnElement[bool]:
+    """An older unheld ticket in the bucket whose command needs the next slot.
+
+    The bucket head is the oldest waiting command that will take this
+    bucket's next slot, even while a retry deadline, startup pacing, or
+    routing still holds it. A command behind its own task's earlier open
+    command, whichever bucket that command waits in or runs under, cannot
+    use this bucket's capacity yet, and guidance that joins its task's
+    running execution never needs a slot of its own; neither is the head,
+    so neither delays other tasks.
+    """
     ticket, command = aliased(TaskAdmissionTicket), aliased(TaskExecutionCommand)
+    task = aliased(Task)
     return exists(
         select(1)
         .select_from(ticket)
         .join(command, command.id == ticket.command_id)
+        .join(task, task.id == ticket.task_id)
         .where(
             ticket.bucket_key == TaskAdmissionTicket.bucket_key,
             ticket.command_id < TaskAdmissionTicket.command_id,
             ~_held_ticket(ticket),
             command.status.notin_(_TERMINAL),
+            ~_behind_own_task(command),
+            ~_joins_running_execution(command, task),
         )
         .correlate(TaskAdmissionTicket)
     )
