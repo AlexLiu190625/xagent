@@ -7,7 +7,7 @@ import logging
 from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from ...config import COMPACT_THRESHOLD_DEFAULT
@@ -1174,6 +1174,20 @@ class PatternRuntime:
                 # then treat the replacement as an ordinary recoverable
                 # pattern exception instead of aborting the run.
                 logger.exception("finish_trace failed while reporting a pattern error")
+
+    async def load_committed_tool_outcome(
+        self, tool_call: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        if (
+            self.tracer is None
+            or getattr(self.tracer, "records_execution_events", False) is not True
+            or not tool_call.get("tool_attempt_id")
+        ):
+            return None
+        return cast(
+            dict[str, Any] | None,
+            await self.tracer.load_committed_tool_outcome(tool_call),
+        )
 
     async def on_tool_start(self, *, tool_call: dict[str, Any]) -> None:
         # Count one billable action per tool invocation, at invocation time.

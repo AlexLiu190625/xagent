@@ -921,3 +921,32 @@ def test_startup_pacing_blocks_a_reply_until_its_next_start(reply, request):
         assert reserve_startup(db, "tenant:batch")
         db.commit()
         assert admission.waiting_for_capacity(db, command_id) is True
+
+
+@pytest.mark.asyncio
+async def test_unknown_tool_effect_is_terminal_reply_outcome(reply, monkeypatch):
+    from types import SimpleNamespace
+
+    from xagent.core.agent.checkpoint import UnknownToolEffectError
+
+    with get_session_local()() as db:
+        db.get(Task, reply.task_id).source = "a2a"
+        db.commit()
+    post = AsyncMock(side_effect=UnknownToolEffectError("unknown external effect"))
+    manager = SimpleNamespace(
+        get_agent_for_task=AsyncMock(
+            return_value=SimpleNamespace(post_user_message=post)
+        )
+    )
+    monkeypatch.setattr(
+        task_resume.agent_runtime_service, "get_agent_manager", lambda: manager
+    )
+    command_id = module._admit_reply(reply, "a2a", "message", "original")
+    with get_session_local()() as db:
+        command = await claim_task_command(
+            db, runner_id="worker-1", command_db_id=command_id
+        )
+    await execute_durable_task_command(command)
+    assert module._read_reply_outcome(command_id)["outcome"] == "not_resumable"
+    assert module._admit_reply(reply, "a2a", "message", "original") == command_id
+    post.assert_awaited_once()

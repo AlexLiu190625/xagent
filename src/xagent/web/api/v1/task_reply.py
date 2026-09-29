@@ -8,6 +8,7 @@ from ....core.agent.checkpoint import (
     CheckpointAccessRefusedError,
     CheckpointCorruptError,
     CheckpointReadError,
+    UnknownToolEffectError,
 )
 from ...models.database import get_session_local
 from ...schemas.v1 import (
@@ -154,7 +155,7 @@ async def reply_to_task(
     except task_resume_service.TaskResumeNotResumableError as exc:
         raise V1ApiError(V1ErrorCode.INTERACTION_NOT_RESUMABLE, 409) from exc
     except CheckpointReadError as exc:
-        if isinstance(exc, CheckpointCorruptError):
+        if isinstance(exc, (CheckpointCorruptError, UnknownToolEffectError)):
             raise V1ApiError(V1ErrorCode.INTERACTION_NOT_RESUMABLE, 409) from exc
         if isinstance(exc, CheckpointAccessRefusedError):
             if exc.reason == "superseded_legacy":

@@ -25,6 +25,7 @@ from xagent.core.agent.checkpoint import (
     CheckpointCorruptError,
     CheckpointReadError,
     CheckpointUnavailableError,
+    UnknownToolEffectError,
 )
 from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.web.api.v1 import task_reply as task_reply_module
@@ -860,6 +861,11 @@ def test_reply_checkpoint_missing_restore_clears_an_unpaired_marker(mock_start_t
         ),
         (
             CheckpointCorruptError("all matching rows undecodable"),
+            409,
+            "interaction_not_resumable",
+        ),
+        (
+            UnknownToolEffectError("unknown external effect"),
             409,
             "interaction_not_resumable",
         ),

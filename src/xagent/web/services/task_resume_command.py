@@ -16,6 +16,7 @@ from ...core.agent.checkpoint import (
     CheckpointAccessRefusedError,
     CheckpointCorruptError,
     CheckpointReadError,
+    UnknownToolEffectError,
 )
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
@@ -516,7 +517,11 @@ async def _execute_resume_input(command: ClaimedTaskCommand) -> SettledTaskComma
             retry_with_new_id = True
         except TaskResumeBusyError:
             outcome = "busy"
-        except (TaskResumeNotResumableError, CheckpointCorruptError):
+        except (
+            TaskResumeNotResumableError,
+            CheckpointCorruptError,
+            UnknownToolEffectError,
+        ):
             outcome = "not_resumable"
         except CheckpointAccessRefusedError as exc:
             outcome = "not_resumable" if exc.reason == "superseded_legacy" else "busy"
