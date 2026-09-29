@@ -2474,11 +2474,12 @@ async def load_execution_scoped_chrome_tools(
 # when it notices it was abandoned (at most one of the 1s sleeps between
 # attempts in _load_direct_mcp_tools), or a sealed load that is still backing
 # off would be reported as alive after its transports were force-closed.
-# It must stay small too: grace plus that backoff must fit within the default
-# initialization timeout (60s): as long as force-closing ends abandoned
-# handshakes, that keeps the connection-test endpoint at no more than twice
-# its cap of handshakes at the default timeout. How long an abandoned
-# handshake can live, and so how many can coexist, grows with it.
+# It must stay small too: grace, the force-close itself and that backoff must
+# fit within the default initialization timeout (60s): as long as
+# force-closing ends abandoned handshakes, that keeps the connection-test
+# endpoint at no more than twice its cap of handshakes at the default
+# timeout. How long an abandoned handshake can live, and so how many can
+# coexist, grows with it.
 # Measured on mcp 1.19.0 / websockets 16.0; a test re-checks the stdio,
 # websocket and backoff bounds and the upper limit.
 _HANDSHAKE_RECLAIM_GRACE_SECONDS = 15.0
