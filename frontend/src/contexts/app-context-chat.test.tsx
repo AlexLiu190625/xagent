@@ -68,6 +68,8 @@ const routerPushMock = vi.hoisted(() => vi.fn())
 // simulate the viewed page without touching every other test in this file,
 // which all rely on the "/" default.
 const currentPathname = vi.hoisted(() => ({ current: "/" as string | null }))
+// Signed-in user seen by the connector-runtime dialog provider; no user by default.
+const authHarness = vi.hoisted(() => ({ user: undefined as { id: number } | undefined }))
 
 vi.mock("@/lib/api-wrapper", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api-wrapper")>()
@@ -83,7 +85,7 @@ vi.mock("next/navigation", () => ({
 }))
 
 vi.mock("@/contexts/auth-context", () => ({
-  useAuth: () => ({ token: "token" }),
+  useAuth: () => ({ token: "token", user: authHarness.user }),
 }))
 
 vi.mock("@/contexts/i18n-context", () => ({
@@ -8768,16 +8770,16 @@ function firstGateTree() {
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0))
 
 // Starts the first message and lets the create response land. The returned
-// promise never rejects: it settles to "sent" or to the error sendMessage
+// promise never rejects: it settles to "resolved" or to the error sendMessage
 // threw, so a test can read either without an unhandled rejection.
-async function sendFirstMessage(): Promise<{ settled: Promise<"sent" | unknown>; done: () => boolean }> {
+async function sendFirstMessage(): Promise<{ settled: Promise<"resolved" | unknown>; done: () => boolean }> {
   let finished = false
-  let settled: Promise<"sent" | unknown> = Promise.resolve("sent")
+  let settled: Promise<"resolved" | unknown> = Promise.resolve("resolved")
   await act(async () => {
     settled = firstGateApp!.sendMessage("hello", {
       clientMessageId: "turn-first",
       metadata: { request_id: "req-first" },
-    }).then(() => "sent" as const, (error: unknown) => error)
+    }).then(() => "resolved" as const, (error: unknown) => error)
     void settled.then(() => { finished = true })
     await tick()
   })
@@ -8792,6 +8794,21 @@ async function connectNewTask(): Promise<void> {
     webSocketOptions.current?.onConnect?.()
     await tick()
   })
+}
+
+// Renders the tree with a create report the user can fill, sends the first
+// message and opens the new task's socket, then waits for the held dialog.
+// `beforeSend` runs between the render and the send.
+async function startHeld(tree = firstGateTree(), beforeSend?: () => Promise<void> | void) {
+  stubFirstMessage(CONNECTOR_RUNTIME_REPORT_NEEDS_FILL)
+  const view = render(tree)
+  const stage = vi.spyOn(firstGateActions!, "stagePendingDelivery")
+  const openFirstGate = vi.spyOn(firstGateActions!, "openFirstGate")
+  await beforeSend?.()
+  const sent = await sendFirstMessage()
+  await connectNewTask()
+  await waitFor(() => expect(screen.getByText("connectorRuntime.actions.saveAndSend")).toBeInTheDocument())
+  return { ...sent, stage, openFirstGate, view }
 }
 
 function userMessages(): unknown[] {
@@ -8812,6 +8829,7 @@ describe("a new conversation's first message behind the first gate", () => {
     sendChatMessageMock.mockResolvedValue({ client_message_id: "turn-first", turn_id: "turn-first" })
     vi.mocked(toast.error).mockClear()
     currentPathname.current = "/task"
+    authHarness.user = undefined
     connectorRuntimeState = { request: null, payload: null }
     firstGateApp = undefined
     firstGateActions = undefined
@@ -8825,17 +8843,13 @@ describe("a new conversation's first message behind the first gate", () => {
     cleanup()
     localStorage.clear()
     currentPathname.current = "/"
+    authHarness.user = undefined
   })
 
   describe("holds the first message only while a real dialog holds it", () => {
     it("stages, queues and shows nothing until save and send lets it go", async () => {
-      stubFirstMessage(CONNECTOR_RUNTIME_REPORT_NEEDS_FILL)
-      render(firstGateTree())
-      const stage = vi.spyOn(firstGateActions!, "stagePendingDelivery")
-      const { settled, done } = await sendFirstMessage()
       // The socket is open for the new task: anything queued would go now.
-      await connectNewTask()
-      await waitFor(() => expect(screen.getByText("connectorRuntime.actions.saveAndSend")).toBeInTheDocument())
+      const { settled, done, stage } = await startHeld()
 
       expect(sendChatMessageMock).not.toHaveBeenCalled()
       expect(stage).not.toHaveBeenCalled()
@@ -8850,7 +8864,7 @@ describe("a new conversation's first message behind the first gate", () => {
       await waitFor(() => expect(sendChatMessageMock).toHaveBeenCalledTimes(1))
       expect(sendChatMessageMock.mock.calls[0]).toEqual(["hello", undefined, undefined, "turn-first", "req-first"])
       await act(async () => { await settled })
-      expect(await settled).toBe("sent")
+      expect(await settled).toBe("resolved")
       expect(stage.mock.calls).toEqual([[{ taskId: FIRST_GATE_TASK_ID, clientMessageId: "turn-first", text: "hello", files: [] }]])
       expect(userMessages()).toHaveLength(1)
       expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
@@ -8864,22 +8878,17 @@ describe("a new conversation's first message behind the first gate", () => {
       await connectNewTask()
       await waitFor(() => expect(sendChatMessageMock).toHaveBeenCalledTimes(1))
       expect(sendChatMessageMock.mock.calls[0]).toEqual(["hello", undefined, undefined, "turn-first", "req-first"])
-      expect(await settled).toBe("sent")
+      expect(await settled).toBe("resolved")
       expect(openFirstGate.mock.calls).toEqual([[FIRST_GATE_TASK_ID]])
       expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
     })
 
     it("returns without sending when the user closes the dialog", async () => {
-      stubFirstMessage(CONNECTOR_RUNTIME_REPORT_NEEDS_FILL)
-      render(firstGateTree())
-      const stage = vi.spyOn(firstGateActions!, "stagePendingDelivery")
-      const { settled } = await sendFirstMessage()
-      await connectNewTask()
-      await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+      const { settled, stage } = await startHeld()
 
       fireEvent.click(screen.getByRole("button", { name: "Close" }))
 
-      expect(await settled).toBe("sent")
+      expect(await settled).toBe("resolved")
       await act(async () => { await tick() })
       expect(sendChatMessageMock).not.toHaveBeenCalled()
       expect(stage).not.toHaveBeenCalled()
@@ -8888,17 +8897,38 @@ describe("a new conversation's first message behind the first gate", () => {
     })
 
     it("fails with the translated cleared sentence when a task switch takes the dialog away", async () => {
-      stubFirstMessage(CONNECTOR_RUNTIME_REPORT_NEEDS_FILL)
-      render(firstGateTree())
-      const stage = vi.spyOn(firstGateActions!, "stagePendingDelivery")
-      const { settled } = await sendFirstMessage()
-      await connectNewTask()
-      await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+      const { settled, stage } = await startHeld()
 
       await act(async () => { firstGateApp!.setTaskId(99, { navigate: false }) })
 
       const error = await settled
       expect(error).toBeInstanceOf(Error)
+      expect((error as Error).message).toBe("connectorRuntime.firstGateCleared")
+      expect((error as { userFacing?: unknown }).userFacing).toBe(true)
+      expect(sendChatMessageMock).not.toHaveBeenCalled()
+      expect(stage).not.toHaveBeenCalled()
+    })
+
+    it("fails with the cleared sentence when the signed-in user changes during the hold", async () => {
+      authHarness.user = { id: 1 }
+      const { settled, stage, view } = await startHeld()
+
+      authHarness.user = undefined
+      view.rerender(firstGateTree())
+
+      const error = await settled
+      expect((error as Error).message).toBe("connectorRuntime.firstGateCleared")
+      expect((error as { userFacing?: unknown }).userFacing).toBe(true)
+      expect(sendChatMessageMock).not.toHaveBeenCalled()
+      expect(stage).not.toHaveBeenCalled()
+    })
+
+    it("fails with the cleared sentence when the dialog provider unmounts during the hold", async () => {
+      const { settled, stage, view } = await startHeld()
+
+      view.unmount()
+
+      const error = await settled
       expect((error as Error).message).toBe("connectorRuntime.firstGateCleared")
       expect((error as { userFacing?: unknown }).userFacing).toBe(true)
       expect(sendChatMessageMock).not.toHaveBeenCalled()
@@ -8916,7 +8946,7 @@ describe("a new conversation's first message behind the first gate", () => {
       const { settled } = await sendFirstMessage()
       await connectNewTask()
       await waitFor(() => expect(sendChatMessageMock).toHaveBeenCalledTimes(1))
-      expect(await settled).toBe("sent")
+      expect(await settled).toBe("resolved")
       expect(apiRequestMock).not.toHaveBeenCalledWith(...connectorRuntimeReadCall)
     })
 
@@ -8939,7 +8969,7 @@ describe("a new conversation's first message behind the first gate", () => {
       expect(stage).toHaveBeenCalledTimes(1)
       await connectNewTask()
       await waitFor(() => expect(sendChatMessageMock).toHaveBeenCalledTimes(1))
-      expect(await settled).toBe("sent")
+      expect(await settled).toBe("resolved")
       expect(openFirstGate).not.toHaveBeenCalled()
       expect(apiRequestMock).not.toHaveBeenCalledWith(...connectorRuntimeReadCall)
     })
@@ -8955,7 +8985,7 @@ describe("a new conversation's first message behind the first gate", () => {
       const { settled } = await sendFirstMessage()
       await connectNewTask()
       await waitFor(() => expect(sendChatMessageMock).toHaveBeenCalledTimes(1))
-      expect(await settled).toBe("sent")
+      expect(await settled).toBe("resolved")
       expect(openFirstGate.mock.calls).toEqual([[FIRST_GATE_TASK_ID]])
       expect(apiRequestMock).not.toHaveBeenCalledWith(...connectorRuntimeReadCall)
       expect(toast.error).not.toHaveBeenCalled()
@@ -8964,11 +8994,7 @@ describe("a new conversation's first message behind the first gate", () => {
   })
 
   it("leaves the held message alone when another message's failure frame lands during the hold", async () => {
-    stubFirstMessage(CONNECTOR_RUNTIME_REPORT_NEEDS_FILL)
-    render(firstGateTree())
-    const { settled } = await sendFirstMessage()
-    await connectNewTask()
-    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.saveAndSend")).toBeInTheDocument())
+    const { settled } = await startHeld()
     const held = connectorRuntimeState.request as { seq: number; trigger: string; resendPayload: unknown }
 
     // The navigation to the new conversation lands, and the user sends a
@@ -9002,7 +9028,7 @@ describe("a new conversation's first message behind the first gate", () => {
     fireEvent.change(screen.getByLabelText("token"), { target: { value: "v" } })
     fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndSend"))
     await waitFor(() => expect(sendChatMessageMock).toHaveBeenCalledTimes(2))
-    expect(await settled).toBe("sent")
+    expect(await settled).toBe("resolved")
     act(() => {
       onMessage?.({
         type: "task_error", timestamp: "2026-05-27T05:00:03Z", task_id: FIRST_GATE_TASK_ID,
@@ -9101,20 +9127,16 @@ describe("a new conversation's first message behind the first gate", () => {
   })
 
   it("sends the released first message exactly once under StrictMode", async () => {
-    stubFirstMessage(CONNECTOR_RUNTIME_REPORT_NEEDS_FILL)
-    render(<React.StrictMode>{firstGateTree()}</React.StrictMode>)
-    // The provider has been updated before, as on a page that sent a message
-    // earlier, so the gate's update is computed during render (and twice here).
-    await act(async () => { firstGateActions!.stagePendingDelivery({ taskId: 5, clientMessageId: "warm", text: "x" }) })
-    await act(async () => { firstGateActions!.discardPendingDelivery("warm") })
-    const openFirstGate = vi.spyOn(firstGateActions!, "openFirstGate")
-    const { settled } = await sendFirstMessage()
-    await connectNewTask()
-    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.saveAndSend")).toBeInTheDocument())
+    const { settled, openFirstGate } = await startHeld(<React.StrictMode>{firstGateTree()}</React.StrictMode>, async () => {
+      // The provider has been updated before, as on a page that sent a message
+      // earlier, so the gate's update is computed during render (and twice here).
+      await act(async () => { firstGateActions!.stagePendingDelivery({ taskId: 5, clientMessageId: "warm", text: "x" }) })
+      await act(async () => { firstGateActions!.discardPendingDelivery("warm") })
+    })
     fireEvent.change(screen.getByLabelText("token"), { target: { value: "v" } })
     fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndSend"))
     await waitFor(() => expect(sendChatMessageMock).toHaveBeenCalledTimes(1))
-    expect(await settled).toBe("sent")
+    expect(await settled).toBe("resolved")
     await act(async () => { await tick() })
     expect(sendChatMessageMock).toHaveBeenCalledTimes(1)
     expect(openFirstGate).toHaveBeenCalledTimes(1)
