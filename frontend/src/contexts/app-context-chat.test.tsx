@@ -8373,9 +8373,12 @@ describe("connector runtime dialog trigger", () => {
   })
 
   // The task page counts on this order when it checks a conversation it has
-  // just started showing: sendMessage stages the first message's ticket in
-  // the same synchronous stretch that sets the new task id, so a check asked
-  // for from an effect on that task id always finds the ticket and yields.
+  // just started showing: for a first message that is not held, sendMessage
+  // stages its ticket in the same synchronous stretch that sets the new task
+  // id, so a check asked for from an effect on that task id always finds the
+  // ticket and yields. A held first message has no ticket until it is
+  // released; there the check yields to the first-gate request on the same
+  // task instead, which the first-gate cases below pin.
   it("stages a new conversation's first message before an effect on its task id can ask for a check", async () => {
     apiRequestMock.mockImplementation(async (url: string) => {
       if (typeof url === "string" && url.endsWith("/api/chat/task/create")) {
