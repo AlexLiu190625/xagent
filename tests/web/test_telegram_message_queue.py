@@ -1543,12 +1543,7 @@ async def test_successful_telegram_turn_hands_finalize_the_execution_result(
     monkeypatch: pytest.MonkeyPatch,
     is_new_task: bool,
 ) -> None:
-    """The waiting-branch call site forwards its own execute_task() result.
-
-    finalize_result has no reader for execution_result yet, but the channel
-    must already supply the exact object execute_task returned so a future
-    reader gets the full result mapping rather than a synthesized draft.
-    """
+    """New and resumed turns forward the original execution result to settlement."""
 
     bot = make_bot()
     bot.channel_id = 1
