@@ -748,7 +748,11 @@ def test_startup_upgrade_preserves_populated_model_and_circular_foreign_keys(
         }
     try_upgrade_db(sqlite_engine)
     try_upgrade_db(sqlite_engine)
-    assert get_alembic_revision(sqlite_engine) == "20260930_task_identity"
+    config = create_alembic_config(sqlite_engine)
+    assert (
+        get_alembic_revision(sqlite_engine)
+        == ScriptDirectory.from_config(config).get_current_head()
+    )
     with sqlite_engine.connect() as connection:
         assert connection.exec_driver_sql("SELECT * FROM tasks").all() == before_task
         assert (
