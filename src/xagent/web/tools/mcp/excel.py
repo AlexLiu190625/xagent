@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+from collections.abc import Iterator
 from typing import Annotated, Any
 from urllib.parse import quote, unquote, urlsplit
 
@@ -24,9 +25,14 @@ GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 DEFAULT_TIMEOUT_SECONDS = 30
 DEFAULT_COLLECTION_PAGE_SIZE = 20
 MAX_COLLECTION_PAGE_SIZE = 100
+DEFAULT_SCAN_CHUNK_ROWS = 100
+MAX_QUERY_MATCHES = 100
+MAX_QUERY_ROWS = 10_000
+MAX_QUERY_REQUESTS = 100
 
 StrictNonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
 StrictPageSize = Annotated[int, Field(strict=True, ge=1, le=MAX_COLLECTION_PAGE_SIZE)]
+StrictQueryMaxMatches = Annotated[int, Field(strict=True, ge=1, le=MAX_QUERY_MATCHES)]
 
 _VALID_CLEAR_APPLY_TO = frozenset({"All", "Formats", "Contents"})
 _EXCEL_MAX_COLUMN_NUMBER = 16_384  # XFD, the last column in an Excel worksheet
@@ -268,6 +274,171 @@ def _validate_non_negative_int(value: int, field_name: str) -> int:
     if value < 0:
         raise ValueError(f"{field_name} must be zero or a positive integer")
     return value
+
+
+def _parse_a1_cell(cell: str) -> tuple[int, int]:
+    """Return one-based ``(column, row)`` coordinates from an A1 cell."""
+    match = re.fullmatch(r"\$?([A-Za-z]+)\$?(\d+)", cell.strip())
+    if match is None:
+        raise ValueError(f"Graph returned an invalid used-range cell: {cell!r}")
+    letters, row_text = match.groups()
+    column = 0
+    for letter in letters.upper():
+        column = column * 26 + ord(letter) - ord("A") + 1
+    row = int(row_text)
+    if row < 1:
+        raise ValueError(f"Graph returned an invalid used-range row: {cell!r}")
+    return column, row
+
+
+def _column_name(column: int) -> str:
+    if not isinstance(column, int) or column < 1:
+        raise ValueError("column must be a positive integer")
+    letters: list[str] = []
+    while column:
+        column, remainder = divmod(column - 1, 26)
+        letters.append(chr(ord("A") + remainder))
+    return "".join(reversed(letters))
+
+
+def _parse_used_range_address(address: Any) -> tuple[int, int, int, int]:
+    if not isinstance(address, str) or not address.strip():
+        raise ValueError("Graph did not return a used-range address")
+    cells = address.rsplit("!", 1)[-1].split(":")
+    if len(cells) == 1:
+        cells = [cells[0], cells[0]]
+    if len(cells) != 2:
+        raise ValueError(f"Graph returned an invalid used-range address: {address!r}")
+    start_column, start_row = _parse_a1_cell(cells[0])
+    end_column, end_row = _parse_a1_cell(cells[1])
+    if end_column < start_column or end_row < start_row:
+        raise ValueError(f"Graph returned an inverted used-range address: {address!r}")
+    return start_column, start_row, end_column, end_row
+
+
+def _used_range_bounds(
+    file_path: str, worksheet: str, site_id: str | None, drive_id: str | None
+) -> tuple[int, int, int, int]:
+    """Fetch only used-range metadata so large matrices never cross the tool boundary."""
+    base = _workbook_base(file_path, site_id, drive_id)
+    segment = _odata_key_segment("worksheets", worksheet)
+    result = _graph_request(
+        "GET",
+        f"{base}/{segment}/usedRange(valuesOnly=true)",
+        params={"$select": "address"},
+        max_response_bytes=min(get_tool_max_output_length(), 16 * 1024),
+    )
+    return _parse_used_range_address(result.get("address"))
+
+
+def _resolve_query_rows(
+    used_bounds: tuple[int, int, int, int],
+    start_row: int | None,
+    end_row: int | None,
+) -> tuple[int, int]:
+    """Validate and clamp an optional query row window to the used range."""
+    used_start = used_bounds[1]
+    used_end = used_bounds[3]
+    for name, value in (("start_row", start_row), ("end_row", end_row)):
+        if value is not None:
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"{name} must be an integer")
+            if value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+    requested_start = used_start if start_row is None else start_row
+    requested_end = used_end if end_row is None else end_row
+    scan_start = max(used_start, requested_start)
+    scan_end = min(used_end, requested_end)
+    if scan_start > scan_end:
+        raise ValueError("the requested row range does not overlap the used range")
+    row_count = scan_end - scan_start + 1
+    if row_count > MAX_QUERY_ROWS:
+        raise ValueError(
+            f"Excel query covers {row_count} rows; narrow the range with "
+            f"start_row/end_row (maximum {MAX_QUERY_ROWS} rows)"
+        )
+    return scan_start, scan_end
+
+
+def _iter_used_range_rows(
+    file_path: str,
+    worksheet: str,
+    *,
+    start_column: int,
+    start_row: int,
+    end_column: int,
+    end_row: int,
+    site_id: str | None,
+    drive_id: str | None,
+) -> Iterator[tuple[int, list[Any], list[Any]]]:
+    """Yield ``(row_number, values, displayed_text)`` in bounded chunks."""
+    base = _workbook_base(file_path, site_id, drive_id)
+    segment = _odata_key_segment("worksheets", worksheet)
+    chunk_rows = min(DEFAULT_SCAN_CHUNK_ROWS, end_row - start_row + 1)
+    row_number = start_row
+    request_count = 0
+    while row_number <= end_row:
+        requested_end = min(row_number + chunk_rows - 1, end_row)
+        address = (
+            f"{_column_name(start_column)}{row_number}:"
+            f"{_column_name(end_column)}{requested_end}"
+        )
+        if request_count >= MAX_QUERY_REQUESTS:
+            raise ValueError(
+                "Excel query exceeded the request limit; narrow the range with "
+                "start_row/end_row"
+            )
+        request_count += 1
+        try:
+            result = _graph_request(
+                "GET",
+                f"{base}/{segment}/range(address='{_odata_string_literal(address)}')",
+                params={"$select": "rowCount,columnCount,values,text"},
+                max_response_bytes=get_tool_max_output_length(),
+            )
+        except _GraphResponseTooLargeError:
+            if chunk_rows == 1:
+                raise ValueError(
+                    f"A single-row Excel range still exceeds the ingress limit at "
+                    f"{address}; narrow the workbook before querying it."
+                ) from None
+            chunk_rows = max(1, chunk_rows // 2)
+            continue
+        except _GraphRequestError as exc:
+            if exc.status_code == 429:
+                raise ValueError(
+                    "Excel query was rate limited by Graph (HTTP 429); narrow "
+                    "the range and retry"
+                ) from None
+            raise
+
+        values = result.get("values", [])
+        text = result.get("text", values)
+        requested_rows = requested_end - row_number + 1
+        requested_columns = end_column - start_column + 1
+        if (
+            result.get("rowCount") != requested_rows
+            or result.get("columnCount") != requested_columns
+        ):
+            raise ValueError(
+                f"Graph returned an incomplete range for {address}; narrow the "
+                "range and retry"
+            )
+        for name, matrix in (("values", values), ("text", text)):
+            if (
+                not isinstance(matrix, list)
+                or len(matrix) != requested_rows
+                or any(
+                    not isinstance(row, list) or len(row) != requested_columns
+                    for row in matrix
+                )
+            ):
+                raise ValueError(f"Graph returned invalid {name} for range {address}")
+        for offset, (row_values, row_text) in enumerate(zip(values, text, strict=True)):
+            if row_number + offset > requested_end:
+                break
+            yield row_number + offset, row_values, row_text
+        row_number = requested_end + 1
 
 
 def _success_with_bounded_range(result: dict[str, Any]) -> str:
@@ -807,6 +978,184 @@ def excel_get_used_range(
             worksheet,
             file_path,
             e,
+        )
+        return _error(str(e))
+
+
+def _bounded_query_rows(
+    rows: list[dict[str, Any]],
+    matched_count: int,
+    *,
+    query: str,
+    scanned_range: str,
+) -> str:
+    """Keep exact counts while bounding the optional sample rows."""
+    shown_rows = list(rows)
+    output_truncated = False
+    while True:
+        match_limit_truncated = len(shown_rows) < matched_count
+        if output_truncated and match_limit_truncated:
+            truncation_reason = "max_matches_and_tool_output_limit"
+        elif output_truncated:
+            truncation_reason = "tool_output_limit"
+        elif match_limit_truncated:
+            truncation_reason = "max_matches"
+        else:
+            truncation_reason = None
+        response = _success(
+            rows=shown_rows,
+            matched_count=matched_count,
+            rows_returned=len(shown_rows),
+            rows_truncated=match_limit_truncated or output_truncated,
+            rows_truncated_reason=truncation_reason,
+            query=query,
+            scanned_range=scanned_range,
+            complete=True,
+        )
+        if len(response) <= get_tool_max_output_length() or not shown_rows:
+            return response
+        shown_rows.pop()
+        output_truncated = True
+
+
+@mcp.tool()
+def excel_count_values(
+    file_path: str,
+    worksheet: str,
+    column: str,
+    value: str,
+    case_sensitive: bool = False,
+    site_id: str | None = None,
+    drive_id: str | None = None,
+    start_row: int | None = None,
+    end_row: int | None = None,
+) -> str:
+    """Count exact displayed cell values in a used-range column.
+
+    Matching is trimmed and case-insensitive by default. The connector scans
+    bounded ranges internally and only returns the complete count. ``start_row``
+    and ``end_row`` can narrow the scan (for example, to exclude a header row).
+    """
+    try:
+        if not isinstance(value, str):
+            raise TypeError("value must be a string")
+        if not value.strip():
+            raise ValueError("value must not be empty")
+        if not isinstance(case_sensitive, bool):
+            raise TypeError("case_sensitive must be a boolean")
+        column_number = _column_number(column)
+        used_bounds = _used_range_bounds(file_path, worksheet, site_id, drive_id)
+        start_column, _, end_column, _ = used_bounds
+        scan_start, scan_end = _resolve_query_rows(used_bounds, start_row, end_row)
+        if column_number < start_column or column_number > end_column:
+            raise ValueError(
+                f"column {column.strip().upper()} is outside the used range "
+                f"{_column_name(start_column)}:{_column_name(end_column)}"
+            )
+        expected = value.strip() if case_sensitive else value.strip().casefold()
+        count = 0
+        for _, row_values, row_text in _iter_used_range_rows(
+            file_path,
+            worksheet,
+            start_column=column_number,
+            start_row=scan_start,
+            end_column=column_number,
+            end_row=scan_end,
+            site_id=site_id,
+            drive_id=drive_id,
+        ):
+            cell = row_text[0] if row_text else None
+            actual = "" if cell is None else str(cell).strip()
+            if not case_sensitive:
+                actual = actual.casefold()
+            if actual == expected:
+                count += 1
+        return _success(
+            column=column.strip().upper(),
+            value=value,
+            count=count,
+            scanned_range=(
+                f"{_column_name(column_number)}{scan_start}:"
+                f"{_column_name(column_number)}{scan_end}"
+            ),
+            complete=True,
+        )
+    except Exception as e:
+        logger.error(
+            "Error counting %r in column %s on worksheet %s in %s: %s",
+            value,
+            column,
+            worksheet,
+            file_path,
+            e,
+        )
+        return _error(str(e))
+
+
+@mcp.tool()
+def excel_find_rows(
+    file_path: str,
+    worksheet: str,
+    query: str,
+    case_sensitive: bool = False,
+    max_matches: StrictQueryMaxMatches = 20,
+    site_id: str | None = None,
+    drive_id: str | None = None,
+    start_row: int | None = None,
+    end_row: int | None = None,
+) -> str:
+    """Find rows containing a query across the used range.
+
+    All rows are scanned in the connector, while only a bounded sample of
+    matching rows is returned. ``matched_count`` therefore remains exact even
+    when the workbook contains more matches than can fit in the tool output.
+    ``start_row`` and ``end_row`` can narrow the scan (for example, to exclude
+    a header row).
+    """
+    try:
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("query is required")
+        if not isinstance(case_sensitive, bool):
+            raise TypeError("case_sensitive must be a boolean")
+        if not isinstance(max_matches, int) or isinstance(max_matches, bool):
+            raise TypeError("max_matches must be an integer")
+        if not 1 <= max_matches <= MAX_QUERY_MATCHES:
+            raise ValueError(f"max_matches must be between 1 and {MAX_QUERY_MATCHES}")
+        used_bounds = _used_range_bounds(file_path, worksheet, site_id, drive_id)
+        start_column, _, end_column, _ = used_bounds
+        scan_start, scan_end = _resolve_query_rows(used_bounds, start_row, end_row)
+        needle = query.strip() if case_sensitive else query.strip().casefold()
+        rows: list[dict[str, Any]] = []
+        matched_count = 0
+        scanned_range = (
+            f"{_column_name(start_column)}{scan_start}:"
+            f"{_column_name(end_column)}{scan_end}"
+        )
+        for row_number, row_values, row_text in _iter_used_range_rows(
+            file_path,
+            worksheet,
+            start_column=start_column,
+            start_row=scan_start,
+            end_column=end_column,
+            end_row=scan_end,
+            site_id=site_id,
+            drive_id=drive_id,
+        ):
+            haystack = "\t".join("" if cell is None else str(cell) for cell in row_text)
+            comparable = haystack if case_sensitive else haystack.casefold()
+            if needle in comparable:
+                matched_count += 1
+                if len(rows) < max_matches:
+                    rows.append({"row_number": row_number, "values": row_values})
+        return _bounded_query_rows(
+            rows,
+            matched_count,
+            query=query,
+            scanned_range=scanned_range,
+        )
+    except Exception as e:
+        logger.error(
+            "Error finding %r on worksheet %s in %s: %s", query, worksheet, file_path, e
         )
         return _error(str(e))
 
