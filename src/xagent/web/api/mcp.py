@@ -75,6 +75,7 @@ from ..models.mcp_oauth import (
 from ..models.public_mcp import PublicMCPApp
 from ..models.user import User
 from ..models.user_oauth import UserOAuth
+from ..services.google_picker import get_google_picker_config
 from ..services.mcp_oauth import (
     MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
     MCP_OAUTH_PERSISTED_VALUE_MAX_LENGTH,
@@ -3088,6 +3089,14 @@ def list_mcp_apps(
             app_copy["user_env_configured"] = app_user_env
             app_copy["configured_env_keys"] = app_configured_keys
             app_copy["env_source"] = app_env_source
+            if app.get("id") == "google-drive":
+                # The connector itself remains useful for files created by
+                # Xagent, but the existing-file authorization affordance must
+                # not be shown when its browser-facing Picker key is absent.
+                # Otherwise every click predictably ends in a 503.
+                app_copy["picker_configured"] = bool(
+                    get_google_picker_config(db) is not None
+                )
 
             if is_connected:
                 app_copy["server_id"] = server_id

@@ -2662,6 +2662,7 @@ class CloudFile(BaseModel):
     provider: str
     fileId: str = Field(pattern=r"^[^\r\n]*$")
     fileName: str
+    accountId: Optional[int] = Field(default=None, gt=0)
     resourceKey: Optional[str] = Field(default=None, pattern=r"^[^\r\n]*$")
 
 
@@ -2873,10 +2874,12 @@ async def _save_collection_config_after_ingest(
 
 
 def _load_google_credentials(
-    user_id: int, session_factory: sessionmaker[Session]
+    user_id: int,
+    session_factory: sessionmaker[Session],
+    account_id: Optional[int] = None,
 ) -> Any:
     with session_factory() as db:
-        return get_google_credentials(user_id, db)
+        return get_google_credentials(user_id, db, account_id)
 
 
 def _build_cloud_storage_filename(original_filename: str, file_id: str) -> str:
@@ -3979,7 +3982,9 @@ async def ingest_cloud(
                 try:
                     creds = await run_db_io_cancellation_safe(
                         lambda: _load_google_credentials(
-                            actor_user_id, credential_sessions
+                            actor_user_id,
+                            credential_sessions,
+                            file_info.accountId,
                         )
                     )
                 except HTTPException as e:

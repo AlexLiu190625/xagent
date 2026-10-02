@@ -17,15 +17,21 @@ import {
   Search,
   RefreshCw,
   Trash2,
+  FolderOpen,
 } from "lucide-react"
 import { toast } from "@/components/ui/sonner"
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
+import {
+  loadGooglePicker,
+  sanitizeGooglePickerDocuments,
+} from "@/lib/google-picker"
 
 export interface CloudFile {
   id: string
   name: string
   type: 'file' | 'folder'
+  accountId?: number
   size?: string
   updatedAt?: string
   resourceKey?: string
@@ -41,6 +47,13 @@ interface ConnectedAccount {
 // Keep in sync with CloudIngestRequest.files max_length in src/xagent/web/api/kb.py.
 const MAX_CLOUD_INGEST_FILES = 5
 
+function formatCloudFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`
+}
+
 interface CloudConnectDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -53,6 +66,7 @@ interface CloudConnectDialogProps {
   } | null
   initialSelectedFiles?: CloudFile[]
   onConfirm: (selectedFiles: CloudFile[]) => void
+  onPickerOpenChange?: (open: boolean) => void
 }
 
 export function CloudConnectDialog({
@@ -60,7 +74,8 @@ export function CloudConnectDialog({
   onOpenChange,
   provider,
   initialSelectedFiles = [],
-  onConfirm
+  onConfirm,
+  onPickerOpenChange,
 }: CloudConnectDialogProps) {
   const { t } = useI18n()
   const { token } = useAuth()
@@ -79,6 +94,18 @@ export function CloudConnectDialog({
   const [refreshTrigger, setRefreshTrigger] = useState(0)
   const [accountToDelete, setAccountToDelete] = useState<{ id: number | null, email: string | null }>({ id: null, email: null })
   const [isDeletingAccount, setIsDeletingAccount] = useState(false)
+  const [pickerLoading, setPickerLoading] = useState(false)
+  const [pickerLimitWarning, setPickerLimitWarning] = useState(false)
+  const [pickerConfigured, setPickerConfigured] = useState<boolean | null>(null)
+  const [isPickerOpen, setIsPickerOpen] = useState(false)
+  const pickerOpenRef = useRef(false)
+  const selectedFilesRef = useRef<CloudFile[]>([])
+
+  const setPickerOpen = useCallback((isOpen: boolean) => {
+    pickerOpenRef.current = isOpen
+    setIsPickerOpen(isOpen)
+    onPickerOpenChange?.(isOpen)
+  }, [onPickerOpenChange])
 
   // Helper to check if selected
   const isSelected = (id: string) => selectedFiles.some(f => f.id === id)
@@ -102,6 +129,30 @@ export function CloudConnectDialog({
     }
   }, [provider])
 
+  useEffect(() => {
+    if (provider?.id !== "google-drive") {
+      setPickerConfigured(null)
+      return
+    }
+    let cancelled = false
+    apiRequest(`${getApiUrl()}/api/cloud/google-drive/picker-availability`)
+      .then(async (response) => {
+        if (cancelled) return
+        if (!response.ok) {
+          setPickerConfigured(false)
+          return
+        }
+        const data = await response.json() as { configured?: boolean }
+        setPickerConfigured(data.configured === true)
+      })
+      .catch(() => {
+        if (!cancelled) setPickerConfigured(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [provider?.id])
+
   // Handle OAuth login
   const handleAuth = () => {
     const width = 500
@@ -116,6 +167,108 @@ export function CloudConnectDialog({
       `${provider?.name} Auth`,
       `width=${width},height=${height},left=${left},top=${top}`
     )
+  }
+
+  const openGooglePicker = async () => {
+    if (!provider || provider.id !== "google-drive" || !cloudUser) return
+
+    const selectedAccount = connectedAccounts.find(
+      account => (account.email || `Account ${account.id}`) === cloudUser,
+    )
+    if (!selectedAccount) return
+
+    setPickerOpen(true)
+    setPickerLoading(true)
+    try {
+      const response = await apiRequest(
+        `${getApiUrl()}/api/cloud/google-drive/picker-config?account_id=${selectedAccount.id}`,
+      )
+      if (!response.ok) {
+        if (response.status === 401) setCloudUser(undefined)
+        throw new Error(
+          response.status === 401
+            ? t("kb.dialog.cloudConnect.auth.expired")
+            : response.status === 409
+              ? t("kb.dialog.cloudConnect.picker.reconnect")
+            : response.status === 503
+              ? t("kb.dialog.cloudConnect.picker.notConfigured")
+              : t("kb.dialog.cloudConnect.picker.error"),
+        )
+      }
+      const config = await response.json() as {
+        access_token?: string
+        developer_key?: string
+        app_id?: string
+      }
+      if (!config.access_token || !config.developer_key || !config.app_id) {
+        throw new Error(t("kb.dialog.cloudConnect.picker.notConfigured"))
+      }
+
+      await loadGooglePicker()
+      const pickerApi = window.google?.picker
+      if (!pickerApi) throw new Error(t("kb.dialog.cloudConnect.picker.error"))
+
+      const docsView = new pickerApi.DocsView(pickerApi.ViewId.DOCS)
+        .setIncludeFolders(true)
+        .setEnableDrives(true)
+        // Folders remain available for navigation, but only files are
+        // selectable. `drive.file` does not reliably grant access to every
+        // child of a selected folder, so ingesting a folder would be
+        // misleading and would fail later for most users.
+        .setSelectFolderEnabled(false)
+      const picker = new pickerApi.PickerBuilder()
+        .setDeveloperKey(config.developer_key)
+        .setAppId(config.app_id)
+        .setOAuthToken(config.access_token)
+        .addView(docsView)
+        .enableFeature(pickerApi.Feature.MULTISELECT_ENABLED)
+        .setCallback(data => {
+          if (data.action !== pickerApi.Action.PICKED) {
+            if (data.action === pickerApi.Action.CANCEL) setPickerOpen(false)
+            return
+          }
+          setPickerOpen(false)
+
+          const pickedFiles: CloudFile[] = []
+          for (const document of sanitizeGooglePickerDocuments(data.docs)) {
+            const isFolder = document.mimeType === "application/vnd.google-apps.folder"
+            if (isFolder) continue
+            const file: CloudFile = {
+              id: document.id,
+              name: document.name || document.id,
+              type: "file",
+              accountId: selectedAccount.id,
+              resourceKey: document.resourceKey,
+              size: typeof document.sizeBytes === "number"
+                ? formatCloudFileSize(document.sizeBytes)
+                : undefined,
+            }
+            pickedFiles.push(file)
+          }
+
+          if (pickedFiles.length > 0) {
+            const merged = [...selectedFilesRef.current, ...pickedFiles]
+            const unique = merged.filter(
+              (file, index, all) => all.findIndex(item => item.id === file.id) === index,
+            )
+            const next = unique.slice(0, MAX_CLOUD_INGEST_FILES)
+            selectedFilesRef.current = next
+            setSelectedFiles(next)
+            if (unique.length > MAX_CLOUD_INGEST_FILES) setPickerLimitWarning(true)
+          }
+          setRefreshTrigger(value => value + 1)
+        })
+        .build()
+      picker.setVisible(true)
+    } catch (error) {
+      setPickerOpen(false)
+      console.error("Failed to open Google Drive Picker", error)
+      toast.error(error instanceof Error
+        ? error.message
+        : t("kb.dialog.cloudConnect.picker.error"))
+    } finally {
+      setPickerLoading(false)
+    }
   }
 
   useEffect(() => {
@@ -134,7 +287,9 @@ export function CloudConnectDialog({
   // Toggle selection
   const toggleSelection = (file: CloudFile) => {
     if (isSelected(file.id)) {
-      setSelectedFiles(prev => prev.filter(f => f.id !== file.id))
+      const next = selectedFilesRef.current.filter(f => f.id !== file.id)
+      selectedFilesRef.current = next
+      setSelectedFiles(next)
     } else {
       if (selectedFiles.length >= MAX_CLOUD_INGEST_FILES) {
         toast.error(t("kb.dialog.cloudConnect.selectedFiles.limitReached", {
@@ -142,7 +297,9 @@ export function CloudConnectDialog({
         }))
         return
       }
-      setSelectedFiles(prev => [...prev, file])
+      const next = [...selectedFilesRef.current, file]
+      selectedFilesRef.current = next
+      setSelectedFiles(next)
     }
   }
 
@@ -152,6 +309,7 @@ export function CloudConnectDialog({
     setSelectedDrive("")
     setCurrentPath([])
     setFiles([])
+    selectedFilesRef.current = []
     setSelectedFiles([])
     setConnectedAccounts([])
   }, [provider?.id])
@@ -217,7 +375,10 @@ export function CloudConnectDialog({
 
         if (response.ok) {
           const data = await response.json()
-          setFiles(data)
+          setFiles(data.map((file: CloudFile) => ({
+            ...file,
+            accountId: selectedAccount.id,
+          })))
         } else {
           if (response.status === 401) {
             setCloudUser(undefined) // Reset user if token invalid
@@ -241,10 +402,23 @@ export function CloudConnectDialog({
   const prevOpen = useRef(open)
   useEffect(() => {
     if (open && !prevOpen.current) {
+      selectedFilesRef.current = initialSelectedFiles
       setSelectedFiles(initialSelectedFiles)
     }
     prevOpen.current = open
   }, [open, initialSelectedFiles])
+
+  useEffect(() => {
+    selectedFilesRef.current = selectedFiles
+  }, [selectedFiles])
+
+  useEffect(() => {
+    if (!pickerLimitWarning) return
+    toast.error(t("kb.dialog.cloudConnect.selectedFiles.limitReached", {
+      count: MAX_CLOUD_INGEST_FILES,
+    }))
+    setPickerLimitWarning(false)
+  }, [pickerLimitWarning, t])
 
   // Reset current path when drive changes
   useEffect(() => {
@@ -302,8 +476,15 @@ export function CloudConnectDialog({
   const fileItems = filteredFiles.filter(f => f.type === 'file')
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-[900px] h-[80vh] max-h-[800px] flex flex-col">
+    <Dialog modal={!isPickerOpen} open={open} onOpenChange={onOpenChange}>
+      <DialogContent
+        className="sm:max-w-[900px] h-[80vh] max-h-[800px] flex flex-col"
+        onInteractOutside={(event) => {
+          // The Google Picker is rendered in a separate portal. While it is
+          // open, an outside click belongs to the Picker, not this dialog.
+          if (pickerOpenRef.current) event.preventDefault()
+        }}
+      >
         <DialogHeader>
           <DialogTitle>
             {t("kb.dialog.cloudConnect.auth.title", {
@@ -347,6 +528,20 @@ export function CloudConnectDialog({
               ]}
               placeholder={t("kb.dialog.cloudConnect.select.accountPlaceholder")}
             />
+            {provider?.id === "google-drive" && cloudUser && pickerConfigured === true && (
+              <Button
+                type="button"
+                variant="outline"
+                className="w-full"
+                onClick={openGooglePicker}
+                disabled={pickerLoading}
+              >
+                {pickerLoading
+                  ? <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  : <FolderOpen className="mr-2 h-4 w-4" />}
+                {t("kb.dialog.cloudConnect.picker.open")}
+              </Button>
+            )}
           </div>
 
           {/* Drive Selection */}

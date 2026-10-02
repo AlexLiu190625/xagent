@@ -9,6 +9,7 @@ import { useAuth } from "@/contexts/auth-context"
 import { useI18n } from "@/contexts/i18n-context"
 
 import type { AppIntegration } from "./types"
+import { GoogleDrivePickerButton } from "./google-drive-picker-button"
 
 export type { AppIntegration }
 
@@ -29,6 +30,7 @@ interface OfficialMcpSettingsDialogProps {
   onConnectStart?: (app: AppIntegration) => void
   onConfigure?: (app: AppIntegration) => void
   onManageKey?: (app: AppIntegration) => void
+  onPickerOpenChange?: (open: boolean) => void
   // True while the parent-owned connect request for this app is in flight
   // (e.g. a keyless connect fired via onConnectStart). Disables the Connect
   // trigger so rapid double-clicks can't fire overlapping POSTs, and gives
@@ -48,6 +50,7 @@ export function OfficialMcpSettingsDialog({
   onConnectStart,
   onConfigure,
   onManageKey,
+  onPickerOpenChange,
   isConnecting = false
 }: OfficialMcpSettingsDialogProps) {
   const { token, inTeam } = useAuth()
@@ -251,6 +254,16 @@ export function OfficialMcpSettingsDialog({
           </p>
 
           <div className="flex flex-col items-center justify-center gap-3 w-full">
+            {isGloballyConnected && app.id === "google-drive" && app.picker_configured !== false && (
+              <GoogleDrivePickerButton
+                connectedAccount={app.connected_account}
+                // Radix's modal focus trap/pointer lock can interfere with
+                // Picker's iframe, which is mounted outside DialogContent.
+                // Close this settings dialog before the browser Picker opens.
+                onBeforeOpen={() => onOpenChange(false)}
+                onPickerOpenChange={onPickerOpenChange}
+              />
+            )}
             {!isGloballyConnected && (
               <Button
                 className="w-full max-w-[200px] rounded-full h-11 font-medium bg-blue-600 text-white hover:bg-blue-700"
