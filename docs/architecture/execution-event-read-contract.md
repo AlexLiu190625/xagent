@@ -414,16 +414,58 @@ Display/Trace conversion is described in D below; whole-task isolation remains E
 
 ### Follow-up: bound model-context payload loading
 
-The current reader pages queries and batches anchor lookups, but retains every
-matching event payload before applying summary coverage and the tool window.
-Thus payload bytes read and setup memory still grow with lifetime history even
-when compaction covers old facts. This is a non-blocking follow-up to stage C.
-Select the applicable summary and retained batch identities first, then load
-only required payloads at the same fixed committed horizon. Selection must keep
-inputs applied after the summary boundary even when accepted before it, tool
-batches with outcomes after the boundary, and complete boundary batches. Verify
-bounded payload loading against large histories as well as equivalent model
-messages for these cross-boundary cases.
+The reader first finds the newest root summary at the fixed committed horizon
+that makes a usable coverage claim, reading summaries newest first (the first
+page holds one row). The model projection itself is unchanged; only the events
+it receives change:
+
+- **Native coverage** (`model_context_watermark`, floor F): every whitelisted
+  root event in `(F, H]`, plus the covered facts that suffix still projects,
+  fetched by identity columns in bounded `IN` batches. These are the
+  `input_accepted` rows of turns applied after F, and every start and outcome
+  of a tool batch with a start or outcome after F. Batch membership comes from
+  the start's `assistant_message_id`, found by `tool_attempt_id` when only the
+  outcome is after F. The reader also takes the latest root skill selection at
+  or before F. Rows fetched and payload bytes depend on the suffix, not on how
+  much history the summary covers.
+- **Legacy coverage** (`transcript_watermark` only): the same suffix, plus
+  every earlier root tool and `execution_settled` fact, and the latest
+  pre-floor skill selection. That coordinate covers transcript facts only, so
+  this part stays unbounded. Current V2 setup does not write legacy-only
+  coverage; it exists only in stage-A V2 data.
+- **No usable summary**: full history, as before, after one summary lookup.
+  This includes a long first run, whose compactions have no coordinate yet.
+  Summaries without a usable coordinate are read once more by that lookup.
+
+Behavior change: covered facts that are not projected are no longer read, so
+they are no longer validated again. That covers payload version, acceptance
+shape, application anchors, older summary coordinates, tool identity, and
+orphaned outcomes. Every fact the projection uses is validated in this read;
+covered facts that are not projected cannot affect the output, so they are not
+re-validated. Facts that are still projected keep every check. When several
+facts are corrupt, the first error reported may differ.
+
+`tests/web/services/task_event_context_reference.py` freezes the
+full-history reader as an oracle. `test_task_event_context_equivalence.py`
+compares both readers at every horizon and cutoff, and
+`test_task_event_context_read_budget.py` checks that queries, rows and bytes
+stay constant as covered history grows. The frozen oracle is removed in stage
+3.7; the live comparison against a full-history projection of the same reader
+stays.
+
+Follow-up limits:
+
+- The suffix can still grow without bound. Compactions inside one run reuse
+  the floor fixed at that run's setup, so they do not shorten it, and the
+  suffix read includes tool start and outcome payloads outside the
+  projection's 8-call window. Bounding that suffix is separate work.
+- Only client-fetched rows and bytes are bounded. Rows the database examines
+  still grow with the covered prefix: the summary lookup, the skill lookup and
+  the `turn_id`, `tool_attempt_id` and `assistant_message_id` `IN` lookups
+  filter on non-indexed columns within the `(task_id, scope_id, sequence)`
+  index range. A `(task_id, scope_id, kind, sequence)` index, or per-column
+  indexes, is a conditional follow-up if measured database time exceeds its
+  budget.
 
 
 ## Stage 3.3-D: event-backed display and Trace

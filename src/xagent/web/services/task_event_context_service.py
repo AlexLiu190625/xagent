@@ -150,6 +150,255 @@ def load_task_event_skill_name(db: Session, task_id: int) -> str | None:
     return _selected_skill_name(event) if event is not None else None
 
 
+_MODEL_KINDS = frozenset(
+    {
+        "input_accepted",
+        "input_applied",
+        "assistant_message",
+        "agent_message",
+        "tool_execution_start",
+        "tool_execution_end",
+        "tool_execution_failed",
+        "execution_settled",
+        "skill_select_end",
+        "action_end_compact",
+    }
+)
+_TOOL_KINDS = frozenset(
+    {"tool_execution_start", "tool_execution_end", "tool_execution_failed"}
+)
+_START_KINDS = frozenset({"tool_execution_start"})
+_ACCEPTED_KINDS = frozenset({"input_accepted"})
+_OUTCOME_KINDS = _TOOL_KINDS - _START_KINDS
+
+
+def _root_events(
+    db: Session, task_id: int, *, after: int, through: int, kinds: frozenset[str]
+) -> list[TaskExecutionEvent]:
+    events: list[TaskExecutionEvent] = []
+    cursor = after
+    # Do not load checkpoints or raw LLM prompts to build a model transcript.
+    query = select(TaskExecutionEvent).where(
+        TaskExecutionEvent.task_id == task_id,
+        TaskExecutionEvent.scope_id == "root",
+        TaskExecutionEvent.sequence <= through,
+        TaskExecutionEvent.kind.in_(kinds),
+    )
+    while page := list(
+        db.scalars(
+            query.where(TaskExecutionEvent.sequence > cursor)
+            .order_by(TaskExecutionEvent.sequence)
+            .limit(MAX_EXECUTION_EVENT_PAGE_SIZE)
+        )
+    ):
+        events.extend(page)
+        cursor = int(page[-1].sequence)
+    return events
+
+
+def _summary_coverage(
+    event: TaskExecutionEvent, anchors: dict[str, tuple[int, str, int]]
+) -> tuple[dict[str, Any], int, int] | None:
+    """Return a usable summary with its transcript and model floors."""
+    data = _data(event)
+    content = data.get("summary")
+    if not isinstance(content, str) or not content.strip():
+        return None
+    native = data.get(MODEL_CONTEXT_WATERMARK_METADATA_KEY)
+    legacy = event.payload.get("transcript_watermark")
+    if native is None and legacy is None:
+        return None  # Older summaries make no usable coverage claim.
+    floor, anchor_id = _coordinate(native if native is not None else legacy, event)
+    anchor = anchors.get(anchor_id)
+    if anchor is None or anchor[0] != floor:
+        raise ValueError(
+            f"Invalid model context coverage identity (task_id={event.task_id}, event_id={event.event_id})"
+        )
+    if floor >= event.sequence:
+        raise ValueError(
+            f"Summary covers a future event (task_id={event.task_id}, event_id={event.event_id})"
+        )
+    # Native coverage includes model history; A's coordinate only
+    # covers transcript facts, so earlier tool facts remain eligible.
+    summary = {
+        "role": "system",
+        "content": content,
+        CONTEXT_REFS_KEY: data.get(COMPACT_CONTEXT_REFS_METADATA_KEY, []),
+    }
+    return summary, floor, floor if native is not None else 0
+
+
+def _root_events_matching(
+    db: Session,
+    task_id: int,
+    *,
+    through: int,
+    kinds: frozenset[str],
+    column: Any,
+    values: set[Any],
+) -> list[TaskExecutionEvent]:
+    """Fetch covered facts by an identity column, in bounded IN batches."""
+    identities = sorted(value for value in values if value)
+    events: list[TaskExecutionEvent] = []
+    for offset in range(0, len(identities), MAX_EXECUTION_EVENT_PAGE_SIZE):
+        events.extend(
+            db.scalars(
+                select(TaskExecutionEvent)
+                .where(
+                    TaskExecutionEvent.task_id == task_id,
+                    TaskExecutionEvent.scope_id == "root",
+                    TaskExecutionEvent.sequence <= through,
+                    TaskExecutionEvent.kind.in_(kinds),
+                    column.in_(
+                        identities[offset : offset + MAX_EXECUTION_EVENT_PAGE_SIZE]
+                    ),
+                )
+                .order_by(TaskExecutionEvent.sequence)
+            )
+        )
+    return events
+
+
+def _latest_summary_floor(
+    db: Session, task_id: int, horizon: int
+) -> tuple[int, bool] | None:
+    """Find the summary the projection will keep, newest first.
+
+    Returns its floor and whether the coverage is native (model history), or
+    None when no summary at the horizon makes a usable coverage claim.
+    """
+    query = select(TaskExecutionEvent).where(
+        TaskExecutionEvent.task_id == task_id,
+        TaskExecutionEvent.scope_id == "root",
+        TaskExecutionEvent.kind == "action_end_compact",
+    )
+    # The newest summary is usually usable: do not page in older bodies first.
+    cursor, limit = horizon + 1, 1
+    while page := list(
+        db.scalars(
+            query.where(TaskExecutionEvent.sequence < cursor)
+            .order_by(TaskExecutionEvent.sequence.desc())
+            .limit(limit)
+        )
+    ):
+        for event in page:
+            # Unusable summaries reference no anchor and issue no lookup; the
+            # first one with a coordinate returns or raises, so this queries at
+            # most once. Batching the page would resolve unused older coordinates.
+            anchors = _load_context_anchors(db, task_id, horizon, [event])
+            coverage = _summary_coverage(event, anchors)
+            if coverage is not None:
+                return coverage[1], coverage[2] != 0
+        cursor, limit = int(page[-1].sequence), MAX_EXECUTION_EVENT_PAGE_SIZE
+    return None
+
+
+def _covered_facts_still_used(
+    db: Session, task_id: int, floor: int, suffix: list[TaskExecutionEvent]
+) -> list[TaskExecutionEvent]:
+    """Covered facts a native summary's suffix still projects.
+
+    Inputs accepted before the floor but applied after it, and every start and
+    outcome of a tool batch with any start or outcome after it. Selection reads
+    identity columns only; the projection still validates what it uses.
+
+    This mirrors the pre-floor facts ``_project`` consumes for a native floor.
+    Changing which of them the projection uses requires updating this function;
+    ``test_task_event_context_equivalence.py`` guards that against a live read
+    of the full history.
+    """
+    turns = {e.turn_id for e in suffix if e.kind == "input_applied"}
+    prior = _root_events_matching(
+        db,
+        task_id,
+        through=floor,
+        kinds=_ACCEPTED_KINDS,
+        column=TaskExecutionEvent.turn_id,
+        values=turns,
+    )
+    suffix_starts = [e for e in suffix if e.kind == "tool_execution_start"]
+    started = {e.tool_attempt_id for e in suffix_starts}
+    unmatched = {
+        e.tool_attempt_id
+        for e in suffix
+        if e.kind in _OUTCOME_KINDS and e.tool_attempt_id not in started
+    }
+    early = _root_events_matching(
+        db,
+        task_id,
+        through=floor,
+        kinds=_START_KINDS,
+        column=TaskExecutionEvent.tool_attempt_id,
+        values=unmatched,
+    )
+    # Batch membership comes from starts: an outcome's own batch id may not
+    # match its start, which the projection must still reject.
+    early += _root_events_matching(
+        db,
+        task_id,
+        through=floor,
+        kinds=_START_KINDS,
+        column=TaskExecutionEvent.assistant_message_id,
+        values={e.assistant_message_id for e in (*suffix_starts, *early)},
+    )
+    prior += early
+    prior += _root_events_matching(
+        db,
+        task_id,
+        through=floor,
+        kinds=_OUTCOME_KINDS,
+        column=TaskExecutionEvent.tool_attempt_id,
+        values={e.tool_attempt_id for e in (*suffix_starts, *early)},
+    )
+    return prior
+
+
+def _load_model_events(
+    db: Session, task_id: int, horizon: int
+) -> list[TaskExecutionEvent]:
+    """Root events the projection needs, ascending by sequence.
+
+    Without a usable summary this is the whole history. Otherwise it is the
+    suffix after the summary's floor plus the covered facts that suffix still
+    projects; covered facts that are not projected are neither read nor
+    revalidated.
+    """
+    found = _latest_summary_floor(db, task_id, horizon)
+    if found is None:
+        return _root_events(db, task_id, after=0, through=horizon, kinds=_MODEL_KINDS)
+    floor, native = found
+    suffix = _root_events(db, task_id, after=floor, through=horizon, kinds=_MODEL_KINDS)
+    if native:
+        prior = _covered_facts_still_used(db, task_id, floor, suffix)
+    else:
+        # A legacy coordinate covers transcript facts only: every earlier tool
+        # and settlement fact remains eligible, so this read is unbounded.
+        prior = _root_events(
+            db,
+            task_id,
+            after=0,
+            through=floor,
+            kinds=_TOOL_KINDS | {"execution_settled"},
+        )
+    if not any(event.kind == "skill_select_end" for event in suffix):
+        skill = db.scalar(
+            select(TaskExecutionEvent)
+            .where(
+                TaskExecutionEvent.task_id == task_id,
+                TaskExecutionEvent.scope_id == "root",
+                TaskExecutionEvent.kind == "skill_select_end",
+                TaskExecutionEvent.sequence <= floor,
+            )
+            .order_by(TaskExecutionEvent.sequence.desc())
+            .limit(1)
+        )
+        if skill is not None:
+            prior.append(skill)
+    # Starts found by attempt and by batch overlap.
+    by_sequence = {int(event.sequence): event for event in (*prior, *suffix)}
+    return [by_sequence[sequence] for sequence in sorted(by_sequence)]
+
+
 def load_task_event_context(
     db: Session,
     task_id: int,
@@ -198,37 +447,17 @@ def load_task_event_context(
             )
         horizon = min(horizon, boundary - 1)
 
-    events: list[TaskExecutionEvent] = []
-    cursor = 0
-    # Do not load checkpoints or raw LLM prompts to build a model transcript.
-    query = select(TaskExecutionEvent).where(
-        TaskExecutionEvent.task_id == task_id,
-        TaskExecutionEvent.scope_id == "root",
-        TaskExecutionEvent.sequence <= horizon,
-        TaskExecutionEvent.kind.in_(
-            {
-                "input_accepted",
-                "input_applied",
-                "assistant_message",
-                "agent_message",
-                "tool_execution_start",
-                "tool_execution_end",
-                "tool_execution_failed",
-                "execution_settled",
-                "skill_select_end",
-                "action_end_compact",
-            }
-        ),
-    )
-    while page := list(
-        db.scalars(
-            query.where(TaskExecutionEvent.sequence > cursor)
-            .order_by(TaskExecutionEvent.sequence)
-            .limit(MAX_EXECUTION_EVENT_PAGE_SIZE)
-        )
-    ):
-        events.extend(page)
-        cursor = int(page[-1].sequence)
+    return _project(db, task_id, horizon, _load_model_events(db, task_id, horizon))
+
+
+def _project(
+    db: Session, task_id: int, horizon: int, events: list[TaskExecutionEvent]
+) -> TaskEventContext:
+    """Project root model history from ``events``, ascending by sequence.
+
+    Changing which pre-floor facts this uses requires updating
+    ``_covered_facts_still_used``, guarded by the live-oracle equivalence test.
+    """
     anchors = _load_context_anchors(db, task_id, horizon, events)
     accepted: dict[str, TaskExecutionEvent] = {}
     applied: dict[str, int] = {}
@@ -266,35 +495,9 @@ def load_task_event_context(
         elif event.kind == "skill_select_end":
             skill_name = _selected_skill_name(event)
         elif event.kind == "action_end_compact":
-            data = _data(event)
-            content = data.get("summary")
-            if not isinstance(content, str) or not content.strip():
-                continue
-            native = data.get(MODEL_CONTEXT_WATERMARK_METADATA_KEY)
-            legacy = event.payload.get("transcript_watermark")
-            if native is None and legacy is None:
-                continue  # Older summaries make no usable coverage claim.
-            floor, anchor_id = _coordinate(
-                native if native is not None else legacy, event
-            )
-            anchor = anchors.get(anchor_id)
-            if anchor is None or anchor[0] != floor:
-                raise ValueError(
-                    f"Invalid model context coverage identity (task_id={event.task_id}, event_id={event.event_id})"
-                )
-            if floor >= event.sequence:
-                raise ValueError(
-                    f"Summary covers a future event (task_id={event.task_id}, event_id={event.event_id})"
-                )
-            # Native coverage includes model history; A's coordinate only
-            # covers transcript facts, so earlier tool facts remain eligible.
-            summary = {
-                "role": "system",
-                "content": content,
-                CONTEXT_REFS_KEY: data.get(COMPACT_CONTEXT_REFS_METADATA_KEY, []),
-            }
-            transcript_floor = floor
-            model_floor = floor if native is not None else 0
+            coverage = _summary_coverage(event, anchors)
+            if coverage is not None:
+                summary, transcript_floor, model_floor = coverage
 
     entries: list[tuple[int, list[dict[str, Any]]]] = []
     if summary is not None:
@@ -381,11 +584,7 @@ def load_task_event_context(
                             [{"role": "assistant", "content": content}],
                         )
                     )
-        elif event.kind in {
-            "tool_execution_start",
-            "tool_execution_end",
-            "tool_execution_failed",
-        }:
+        elif event.kind in _TOOL_KINDS:
             data = _data(event)
             if data.get("tool_name") in CONTROL_TOOL_NAMES:
                 continue

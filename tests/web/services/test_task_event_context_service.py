@@ -1,5 +1,6 @@
 """Model setup consumes facts even after compatibility content is removed."""
 
+import re
 from unittest.mock import patch
 
 import pytest
@@ -422,9 +423,34 @@ def test_corrupt_required_facts_fail_explicitly(canonical, broken):
             load_task_event_context(db, task_id)
 
 
-def test_fixed_horizon_paging_does_not_absorb_later_commit(canonical):
+@pytest.mark.parametrize("summarized", [False, True])
+def test_fixed_horizon_paging_does_not_absorb_later_commit(canonical, summarized):
     factory, task_id = canonical
     with factory() as db:
+        if summarized:
+            anchor = fact(
+                db,
+                task_id,
+                "assistant_message",
+                "covered",
+                {"content": "covered", "message_type": "assistant_response"},
+            )
+            fact(
+                db,
+                task_id,
+                "action_end_compact",
+                "summary",
+                {
+                    "data": {
+                        "summary": "saved summary",
+                        MODEL_CONTEXT_WATERMARK_METADATA_KEY: {
+                            "scope_id": "root",
+                            "event_id": anchor.event_id,
+                            "sequence": anchor.sequence,
+                        },
+                    }
+                },
+            )
         for i in range(105):
             fact(
                 db,
@@ -440,7 +466,10 @@ def test_fixed_horizon_paging_does_not_absorb_later_commit(canonical):
     def scalars(session, statement, *args, **kwargs):
         nonlocal inserted
         result = original(session, statement, *args, **kwargs)
-        if not inserted and "ORDER BY task_execution_events.sequence" in str(statement):
+        # Trigger on the first ascending page, not the newest-summary lookup.
+        if not inserted and re.search(
+            r"ORDER BY task_execution_events.sequence(?! DESC)", str(statement)
+        ):
             inserted = True
             # Same session models a later visible append without a SQLite reader lock.
             fact(
@@ -454,7 +483,8 @@ def test_fixed_horizon_paging_does_not_absorb_later_commit(canonical):
 
     with factory() as db, patch.object(factory.class_, "scalars", scalars):
         context = load_task_event_context(db, task_id)
-        assert len(context.messages) == 105
+        assert inserted
+        assert len(context.messages) == 105 + summarized
         assert all(message["content"] != "later" for message in context.messages)
 
 
@@ -652,11 +682,40 @@ def test_reference_queries_are_batched_and_include_internal_summary_anchors(cano
             sa.event.remove(db.bind, "before_cursor_execute", record)
     assert loaded.messages == [{"role": "system", "content": "summary 104"}]
     # 105 input applications and 105 summaries must not cause 210 round trips.
+    # Only the newest summary and its suffix are read: one anchor lookup each.
     assert len(statements) <= 10
     lookups = [
         (sql, parameters) for sql, parameters in statements if "event_id IN" in sql
     ]
-    assert len(lookups) == 3
+    assert len(lookups) == 2
+    assert all(len(parameters) <= 103 for _, parameters in lookups)
+    assert all("task_execution_events.payload," not in sql for sql, _ in lookups)
+
+
+def test_reference_queries_are_batched_without_a_summary(canonical):
+    factory, task_id = canonical
+    with factory() as db:
+        for index in range(105):
+            accept(db, task_id, str(index))
+            apply(db, task_id, str(index))
+        db.commit()
+        statements = []
+
+        def record(_conn, _cursor, statement, parameters, _context, _many):
+            if statement.lstrip().upper().startswith("SELECT"):
+                statements.append((statement, parameters))
+
+        sa.event.listen(db.bind, "before_cursor_execute", record)
+        try:
+            loaded = load_task_event_context(db, task_id)
+        finally:
+            sa.event.remove(db.bind, "before_cursor_execute", record)
+    assert len(loaded.messages) == 105
+    # 105 application anchors are fetched in two bounded IN batches.
+    lookups = [
+        (sql, parameters) for sql, parameters in statements if "event_id IN" in sql
+    ]
+    assert len(lookups) == 2
     assert all(len(parameters) <= 103 for _, parameters in lookups)
     assert all("task_execution_events.payload," not in sql for sql, _ in lookups)
 
