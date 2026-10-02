@@ -2692,7 +2692,7 @@ const zh = {
         describe: "描述你的 Agent",
         configure: "配置与连接",
         preview: "到右侧预览测试",
-        completed: "所有步骤已完成，点击 创建按钮 即可发布你的 Agent。",
+        completed: "试跑已完成。请检查结果，再点击「创建」保存为草稿。",
       },
       header: {
         title: "自定义 Agent",
@@ -2704,6 +2704,8 @@ const zh = {
         creating: "创建中...",
         updating: "更新中...",
         readOnly: "只读（管理员查看）",
+        startChat: "开始使用",
+        saveBeforeChat: "请先保存修改，再开始使用。",
       },
       viewTabs: {
         configure: "配置",
@@ -2763,7 +2765,8 @@ const zh = {
       },
       success: {
         created: "创建成功",
-        createdDesc: "你的 '{name}' 已成功创建",
+        createdDesc: "「{name}」已保存为草稿，尚未发布。你可以继续在预览中试跑；准备好后，点击「发布」，再点击「开始使用」。",
+        keepEditing: "继续编辑",
         published: "发布成功",
         unpublished: "已取消发布",
       },

@@ -82,7 +82,7 @@ vi.mock("sonner", () => ({
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: vi.fn(), replace: vi.fn() }),
-  useSearchParams: () => ({ get: () => null }),
+  useSearchParams: () => ({ get: (key: string) => key === "template" ? selectedTemplateId : null }),
 }))
 
 vi.mock("@/components/layout/resizable-three-column-layout", () => ({
@@ -175,6 +175,7 @@ import { AgentBuilder } from "./agent-builder"
 let storedToolCategories: string[] = ["ssh"]
 let putBody: { tool_categories?: string[] } | undefined
 let availableTools: unknown[] = []
+let selectedTemplateId: string | null = null
 let previewState: {
   messages: Array<{ role: string }>
   currentTask: Pick<Task, "id" | "status" | "completionOutcome"> | null
@@ -189,6 +190,7 @@ describe("AgentBuilder preview", () => {
     storedToolCategories = ["ssh"]
     putBody = undefined
     availableTools = []
+    selectedTemplateId = null
     previewState = { messages: [], currentTask: null, taskId: null, isProcessing: false }
     apiRequestMock.mockReset()
     setTaskIdMock.mockReset()
@@ -395,7 +397,10 @@ describe("AgentBuilder preview", () => {
       await waitFor(() => expect(screen.getByText("builds.editor.header.update")).toBeDisabled())
       if (mode === "create") {
         await waitFor(() => expect(apiRequestMock).toHaveBeenCalledWith("http://api.local/api/agents/43"))
-        fireEvent.click(screen.getByText("common.cancel"))
+        expect(screen.getByText("builds.editor.success.createdDesc")).toBeInTheDocument()
+        expect(screen.queryByText("builds.editor.header.startChat")).not.toBeInTheDocument()
+        fireEvent.click(screen.getByText("builds.editor.success.keepEditing"))
+        expect(apiRequestMock.mock.calls.some(([url]) => String(url).endsWith("/publish"))).toBe(false)
       }
       expectPreviewComplete(true)
     })
@@ -508,6 +513,66 @@ describe("AgentBuilder preview", () => {
       expectPreviewComplete(false)
       await act(async () => rejectSend(new Error("not delivered")))
       expectPreviewComplete(false)
+    })
+  })
+
+  describe("configuration completion", () => {
+    const configStep = () => screen.getByRole("button", { name: /builds.editor.stepGuide.configure/ })
+    const expectSectionHighlighted = (section: string, highlighted: boolean) => {
+      const label = section === "mcp" ? "tools.mcp.dialog.connector" : `builds.configForm.${section}.label`
+      const element = screen.getByText(label, { selector: "label" }).closest(".transition-all")
+      expect(element).not.toBeNull()
+      expect(element?.classList.contains("border-primary/30")).toBe(highlighted)
+    }
+
+    it("allows a model-only agent without optional tools, skills, or connections", async () => {
+      storedToolCategories = []
+      render(<AgentBuilder agentId="42" />)
+      await screen.findByDisplayValue("Existing SSH agent")
+      await waitFor(() => expect(configStep().querySelector("svg")).not.toBeNull())
+      for (const section of ["model", "knowledgeBase", "skills", "tools", "mcp"]) {
+        expectSectionHighlighted(section, false)
+      }
+    })
+
+    it("does not complete configuration just because a tool is selected without a model", async () => {
+      const baseImpl = apiRequestMock.getMockImplementation()!
+      apiRequestMock.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (url.endsWith("/api/agents/42")) {
+          const response = await baseImpl(url, init)
+          return new Response(JSON.stringify({ ...await response.json(), models: {} }))
+        }
+        return baseImpl(url, init)
+      })
+      render(<AgentBuilder agentId="42" />)
+      await screen.findByDisplayValue("Existing SSH agent")
+      expect(configStep().querySelector("svg")).toBeNull()
+      expectSectionHighlighted("model", true)
+      for (const section of ["knowledgeBase", "skills", "tools", "mcp"]) {
+        expectSectionHighlighted(section, false)
+      }
+    })
+
+    it.each(["knowledge", "mcp:missing-connector"])("still requires the template's %s capability", async (category) => {
+      selectedTemplateId = "required-capability"
+      const baseImpl = apiRequestMock.getMockImplementation()!
+      apiRequestMock.mockImplementation((url: string, init?: RequestInit) => {
+        if (url.endsWith("/api/templates/required-capability")) {
+          return Promise.resolve(new Response(JSON.stringify({
+            name: "Template agent",
+            agent_config: { instructions: "Use the required data source", tool_categories: [category] },
+          })))
+        }
+        return baseImpl(url, init)
+      })
+      render(<AgentBuilder />)
+      await screen.findByDisplayValue("Template agent")
+      expect(configStep().querySelector("svg")).toBeNull()
+      expectSectionHighlighted("model", false)
+      expectSectionHighlighted("knowledgeBase", category === "knowledge")
+      expectSectionHighlighted("mcp", category === "mcp:missing-connector")
+      expectSectionHighlighted("skills", false)
+      expectSectionHighlighted("tools", false)
     })
   })
 

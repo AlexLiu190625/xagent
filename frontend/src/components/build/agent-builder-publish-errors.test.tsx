@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const toastErrorMock = vi.hoisted(() => vi.fn())
+const routerPushMock = vi.hoisted(() => vi.fn())
 
 vi.mock("@/lib/api-wrapper", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api-wrapper")>(
@@ -79,7 +80,7 @@ vi.mock("@/lib/branding", () => ({
 vi.mock("sonner", () => ({ toast: { error: toastErrorMock, success: vi.fn() } }))
 
 vi.mock("next/navigation", () => ({
-  useRouter: () => ({ push: vi.fn(), replace: vi.fn() }),
+  useRouter: () => ({ push: routerPushMock, replace: vi.fn() }),
   useSearchParams: () => ({ get: () => null }),
 }))
 
@@ -348,10 +349,58 @@ async function expectToast(expected: string) {
 beforeEach(() => {
   apiRequestMock.mockReset()
   toastErrorMock.mockReset()
+  routerPushMock.mockReset()
   globalThis.WebSocket = vi.fn() as unknown as typeof WebSocket
 })
 
 afterEach(() => cleanup())
+
+describe("AgentBuilder published-agent handoff", () => {
+  it("offers Start chat after explicit publication, without navigating automatically", async () => {
+    installEditModeApi("draft", "__no_failing_path__", NO_FAILING_RESPONSE)
+    render(<AgentBuilder agentId={AGENT_ID} />)
+    await waitForLoadedBuilder()
+    expect(screen.queryByText("builds.editor.header.startChat")).not.toBeInTheDocument()
+    expect(apiRequestMock.mock.calls.some(([, opts]) => opts?.method === "POST")).toBe(false)
+
+    fireEvent.click(screen.getByText("builds.editor.header.publish"))
+    const startChat = await screen.findByRole("button", { name: "builds.editor.header.startChat" })
+    await waitFor(() => expect(startChat).toBeEnabled())
+    expect(routerPushMock).not.toHaveBeenCalled()
+    apiRequestMock.mockClear()
+    fireEvent.click(startChat)
+    expect(routerPushMock).toHaveBeenCalledTimes(1)
+    expect(routerPushMock).toHaveBeenCalledWith(`/agent/${AGENT_ID}`)
+    expect(apiRequestMock).not.toHaveBeenCalled()
+  })
+
+  it("does not leave unsaved changes behind when starting a chat", async () => {
+    installEditModeApi("published", "__no_failing_path__", NO_FAILING_RESPONSE)
+    render(<AgentBuilder agentId={AGENT_ID} />)
+    await waitForLoadedBuilder()
+    const startChat = screen.getByRole("button", { name: "builds.editor.header.startChat" })
+    expect(startChat).toBeEnabled()
+    fireEvent.change(screen.getByDisplayValue("Existing Agent"), { target: { value: "Unsaved name" } })
+    expect(startChat).toBeDisabled()
+    expect(startChat).toHaveAttribute("title", "builds.editor.header.saveBeforeChat")
+    fireEvent.click(startChat)
+    expect(routerPushMock).not.toHaveBeenCalled()
+
+    fireEvent.change(screen.getByDisplayValue("Unsaved name"), { target: { value: "Existing Agent" } })
+    expect(startChat).toBeEnabled()
+  })
+
+  it("does not expose the owner-only chat route in a read-only builder", async () => {
+    installBaseApiMocks((url) => {
+      if (url.endsWith(`/api/agents/${AGENT_ID}`))
+        return Promise.resolve(jsonResponse({ ...agentResponse("published"), can_edit: false }))
+      return null
+    })
+    render(<AgentBuilder agentId={AGENT_ID} />)
+    await waitForLoadedBuilder()
+    expect(screen.queryByText("builds.editor.header.startChat")).not.toBeInTheDocument()
+  })
+})
 
 // The three edit-mode actions differ only in which agent status they load,
 // which POST fails, which control triggers them and which localized fallback

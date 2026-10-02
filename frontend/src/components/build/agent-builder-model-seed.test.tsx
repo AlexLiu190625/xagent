@@ -176,6 +176,7 @@ type Gate = { release: () => void }
 
 function installApi(opts: {
   models: unknown
+  status?: "draft" | "published"
   userDefaults?: unknown[]
   llms?: unknown[]
   canEdit?: boolean
@@ -195,7 +196,7 @@ function installApi(opts: {
         const sent = JSON.parse(o.body || "{}")
         return Promise.resolve(
           new Response(
-            JSON.stringify(agentResponse(sent.models ?? opts.models)),
+            JSON.stringify({ ...agentResponse(sent.models ?? opts.models), status: opts.status ?? "draft" }),
             { status: 200 }
           )
         )
@@ -233,7 +234,7 @@ function installApi(opts: {
         return defer(
           opts.gateAgent,
           new Response(
-            JSON.stringify(agentResponse(opts.models, opts.canEdit ?? true)),
+            JSON.stringify({ ...agentResponse(opts.models, opts.canEdit ?? true), status: opts.status ?? "draft" }),
             { status: 200 }
           )
         )
@@ -318,6 +319,49 @@ describe("AgentBuilder edit-mode general-model seed", () => {
     fireEvent.click(updateButton())
 
     expect((await savedModels()).general).toBe(DEFAULT_MODEL_ID)
+  })
+
+  it.each([null, { general: null }])("does not block Start chat for an automatically seeded published agent (%j)", async (models) => {
+    installApi({ models, status: "published" })
+    render(<AgentBuilder agentId={AGENT_ID} />)
+    await loaded()
+    await waitFor(() => expect(generalSelect().value).toBe(String(DEFAULT_MODEL_ID)))
+
+    const startChat = screen.getByText("builds.editor.header.startChat")
+    expect(updateButton()).toBeEnabled()
+    expect(startChat).toBeEnabled()
+    expect(startChat).not.toHaveAttribute("title")
+    expect(apiRequestMock.mock.calls.some(([, opts]) => opts?.method === "PUT")).toBe(false)
+
+    fireEvent.change(nameBox(), { target: { value: "Renamed" } })
+    expect(startChat).toBeDisabled()
+    expect(startChat).toHaveAttribute("title", "builds.editor.header.saveBeforeChat")
+  })
+
+  it("still blocks Start chat for an actual model edit and retires the seed exemption after saving", async () => {
+    installApi({
+      models: { general: null },
+      status: "published",
+      llms: [
+        { id: DEFAULT_MODEL_ID, model_name: "seeded-llm" },
+        { id: 7, model_name: "other-llm" },
+      ],
+    })
+    render(<AgentBuilder agentId={AGENT_ID} />)
+    await loaded()
+    await waitFor(() => expect(generalSelect().value).toBe(String(DEFAULT_MODEL_ID)))
+    const startChat = screen.getByText("builds.editor.header.startChat")
+    expect(startChat).toBeEnabled()
+
+    fireEvent.change(generalSelect(), { target: { value: "7" } })
+    expect(startChat).toBeDisabled()
+    fireEvent.click(updateButton())
+    expect((await savedModels()).general).toBe(7)
+    await waitFor(() => expect(updateButton()).toBeDisabled())
+    expect(startChat).toBeEnabled()
+
+    fireEvent.change(generalSelect(), { target: { value: String(DEFAULT_MODEL_ID) } })
+    expect(startChat).toBeDisabled()
   })
 
   it("still blocks Publish once the user edits something else", async () => {

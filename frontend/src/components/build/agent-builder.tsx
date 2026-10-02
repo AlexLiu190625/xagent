@@ -1893,19 +1893,14 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       return !isSelected || !isConnected
     })
   )
-  const useTemplateSpecificHighlights =
-    templateMissingKb || templateMissingSkills || templateMissingTools || templateMissingMcp
   const describeStepCompleted = Boolean(name.trim() && description.trim() && instructions.trim())
-  const configStepCompleted = isTemplateRequirementsPending
-    ? false
-    : isTemplateBuildFlow
-      ? !templateMissingKb && !templateMissingSkills && !templateMissingTools && !templateMissingMcp
-      : (
-        selectedKbs.length > 0 ||
-        selectedSkills.length > 0 ||
-        selectedToolCategories.length > 0 ||
-        selectedMcpServers.length > 0
-      )
+  // Plain agents need a model, not an arbitrary optional tool or connector.
+  // Templates still require their declared capabilities before this step completes.
+  const configStepCompleted = Boolean(modelConfig.general)
+    && !isTemplateRequirementsPending
+    && (!isTemplateBuildFlow || (
+      !templateMissingKb && !templateMissingSkills && !templateMissingTools && !templateMissingMcp
+    ))
   const previewStepCompleted = previewCompletionTaskId !== null
     && state.taskId === previewCompletionTaskId
     && state.currentTask?.id === String(previewCompletionTaskId)
@@ -1913,11 +1908,6 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     && state.currentTask.completionOutcome !== "partial"
     && state.currentTask.completionOutcome !== "blocked"
     && !state.isProcessing
-  const shouldHighlightConfigStep = !configStepCompleted
-  const shouldHighlightKbSection = useTemplateSpecificHighlights ? templateMissingKb : shouldHighlightConfigStep
-  const shouldHighlightSkillsSection = useTemplateSpecificHighlights ? templateMissingSkills : shouldHighlightConfigStep
-  const shouldHighlightToolsSection = useTemplateSpecificHighlights ? templateMissingTools : shouldHighlightConfigStep
-  const shouldHighlightConnectorSection = useTemplateSpecificHighlights ? templateMissingMcp : shouldHighlightConfigStep
 
   const buildSteps = [
     {
@@ -2098,6 +2088,17 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                     {t("builds.editor.header.publish")}
                   </Button>
                 )
+              )}
+              {isEditMode && originalData?.status === "published" && (
+                <Button
+                  variant="secondary"
+                  onClick={() => router.push(`/agent/${localAgentId}`)}
+                  disabled={isCreating || loadingAgent || publishBlockedByEdits || failedStagedTriggers.length > 0 || createdWebhookSecrets.length > 0}
+                  title={publishBlockedByEdits ? t("builds.editor.header.saveBeforeChat") : undefined}
+                >
+                  <MessageSquare className="mr-2 h-4 w-4" />
+                  {t("builds.editor.header.startChat")}
+                </Button>
               )}
             </>
           )}
@@ -2333,7 +2334,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         </div>
 
         {/* Model Selection */}
-        <div ref={modelSectionRef} className="space-y-4">
+        <div ref={modelSectionRef} className={cn(getConfigSectionClasses(!modelConfig.general), "space-y-4")}>
           <div className="flex items-center justify-between">
             <Label>{t("builds.configForm.model.label")}</Label>
             <Button
@@ -2460,7 +2461,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         </div>
 
         {/* Knowledge Base - Multi Select */}
-        <div className={getConfigSectionClasses(shouldHighlightKbSection)}>
+        <div className={getConfigSectionClasses(templateMissingKb)}>
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-1.5">
               <Label>{t("builds.configForm.knowledgeBase.label")}</Label>
@@ -2515,7 +2516,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         </div>
 
         {/* Skills - Multi Select */}
-        <div className={getConfigSectionClasses(shouldHighlightSkillsSection)}>
+        <div className={getConfigSectionClasses(templateMissingSkills)}>
           <div className="flex items-center gap-1.5">
             <Label>{t("builds.configForm.skills.label")}</Label>
             <InfoTooltip content={t("builds.configForm.model.tips.skills")} />
@@ -2556,7 +2557,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         </div>
 
         {/* Tools - Multi Select by Category */}
-        <div className={getConfigSectionClasses(shouldHighlightToolsSection)}>
+        <div className={getConfigSectionClasses(templateMissingTools)}>
           <div className="flex items-center gap-1.5">
             <Label>{t("builds.configForm.tools.label")}</Label>
             <InfoTooltip content={t("builds.configForm.model.tips.tools")} />
@@ -2742,7 +2743,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           </div>
         )}
 
-        <div className={getConfigSectionClasses(shouldHighlightConnectorSection)}>
+        <div className={getConfigSectionClasses(templateMissingMcp)}>
           <div className="flex items-center gap-1.5">
             <Label>{t("tools.mcp.dialog.connector")}</Label>
           </div>
@@ -3079,7 +3080,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           <DialogFooter className="gap-2 sm:justify-end">
             <div className="flex w-full sm:w-auto gap-2 justify-end">
               <Button variant="outline" onClick={handleDialogClose}>
-                {t("common.cancel")}
+                {t("builds.editor.success.keepEditing")}
               </Button>
               <Button onClick={handleDialogPublish}>
                 {t("builds.editor.header.publish")}
