@@ -1,4 +1,6 @@
 import base64
+import errno
+import hashlib
 import io
 import json
 import os
@@ -38,6 +40,13 @@ class MockResponse:
                 f"{self.status_code} Client Error: Error for url: {self.url}",
                 response=self,
             )
+
+    def iter_content(self, chunk_size=1):
+        for offset in range(0, len(self.content), chunk_size):
+            yield self.content[offset : offset + chunk_size]
+
+    def close(self):
+        return None
 
 
 class _FakeSession:
@@ -504,12 +513,298 @@ def test_normalize_path_rejects_dot_segments_directly():
     assert onedrive._normalize_path("Documents/report.pdf") == "Documents/report.pdf"
 
 
+def test_download_file_streams_to_task_output_and_hashes_content(monkeypatch, tmp_path):
+    task_dir = tmp_path / "task"
+    task_dir.mkdir()
+    monkeypatch.setenv("XAGENT_ONEDRIVE_OUTPUT_DIR", str(task_dir))
+    content = b"binary office content"
+    metadata = MockResponse(
+        {
+            "id": "item-1",
+            "name": "Issue Tracker.xlsx",
+            "size": len(content),
+            "file": {
+                "mimeType": (
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                ),
+                "hashes": {"quickXorHash": _quickxor_hash(content)},
+            },
+        }
+    )
+    # Deliberately omit downloadUrl to exercise the authenticated /content
+    # fallback used by personal OneDrive accounts.
+    content_response = MockResponse(content=content)
+    mock_request = Mock(side_effect=[metadata, content_response])
+    monkeypatch.setattr(onedrive.requests, "request", mock_request)
+
+    result = json.loads(onedrive.onedrive_download_file("Issue Tracker.xlsx"))
+
+    assert result["status"] == "success"
+    assert result["size"] == len(content)
+    assert result["sha256"] == hashlib.sha256(content).hexdigest()
+    output_path = task_dir / "output" / "Issue Tracker.xlsx"
+    assert output_path.read_bytes() == content
+    download_call = mock_request.call_args_list[1]
+    assert download_call.kwargs["url"].endswith("/me/drive/items/item-1/content")
+    assert download_call.kwargs["headers"]["Authorization"] == "Bearer test-graph-token"
+    assert download_call.kwargs["stream"] is True
+
+
+def test_download_file_uses_graph_download_url_without_auth_header(
+    monkeypatch, tmp_path
+):
+    task_dir = tmp_path / "task"
+    task_dir.mkdir()
+    monkeypatch.setenv("XAGENT_ONEDRIVE_OUTPUT_DIR", str(task_dir))
+    content = b"direct download"
+    metadata = MockResponse(
+        {
+            "id": "item-2",
+            "name": "report.pdf",
+            "size": len(content),
+            "file": {
+                "mimeType": "application/pdf",
+                "hashes": {"quickXorHash": _quickxor_hash(content)},
+            },
+            "@microsoft.graph.downloadUrl": "https://download.example/item-2",
+        }
+    )
+    content_response = MockResponse(content=content)
+    mock_request = Mock(side_effect=[metadata, content_response])
+    monkeypatch.setattr(onedrive.requests, "request", mock_request)
+
+    result = json.loads(onedrive.onedrive_download_file("report.pdf"))
+
+    assert result["status"] == "success"
+    download_call = mock_request.call_args_list[1]
+    assert download_call.kwargs["url"] == "https://download.example/item-2"
+    assert download_call.kwargs["headers"] == {"Accept": "*/*"}
+
+
+def test_download_file_reports_http_status_without_leaking_download_url(
+    monkeypatch, tmp_path
+):
+    task_dir = tmp_path / "task"
+    task_dir.mkdir()
+    monkeypatch.setenv("XAGENT_ONEDRIVE_OUTPUT_DIR", str(task_dir))
+    metadata = MockResponse(
+        {
+            "id": "item-3",
+            "name": "report.pdf",
+            "size": 4,
+            "file": {"mimeType": "application/pdf"},
+        }
+    )
+    failed_download = MockResponse(
+        status_code=404,
+        content=b"not found",
+        url="https://download.example/item-3?secret=token",
+    )
+    mock_request = Mock(side_effect=[metadata, failed_download])
+    monkeypatch.setattr(onedrive.requests, "request", mock_request)
+
+    result = json.loads(onedrive.onedrive_download_file("report.pdf"))
+
+    assert result == {
+        "status": "error",
+        "message": "OneDrive file download failed with HTTP 404",
+    }
+    assert "download.example" not in result["message"]
+    assert not list((task_dir / ".xagent-onedrive-downloads").glob("*.part"))
+
+
+def test_download_file_cleans_partial_file_on_size_mismatch(monkeypatch, tmp_path):
+    task_dir = tmp_path / "task"
+    task_dir.mkdir()
+    monkeypatch.setenv("XAGENT_ONEDRIVE_OUTPUT_DIR", str(task_dir))
+    metadata = MockResponse(
+        {
+            "id": "item-4",
+            "name": "report.pdf",
+            "size": 4,
+            "file": {"mimeType": "application/pdf"},
+        }
+    )
+    content_response = MockResponse(content=b"too long")
+    monkeypatch.setattr(
+        onedrive.requests, "request", Mock(side_effect=[metadata, content_response])
+    )
+
+    result = json.loads(onedrive.onedrive_download_file("report.pdf"))
+
+    assert result["status"] == "error"
+    assert (
+        result["message"] == "OneDrive file size changed while it was being downloaded"
+    )
+    assert not (task_dir / "output" / "report.pdf").exists()
+    assert not list((task_dir / ".xagent-onedrive-downloads").glob("*.part"))
+
+
+def test_download_file_rejects_metadata_over_limit_before_streaming(
+    monkeypatch, tmp_path
+):
+    task_dir = tmp_path / "task"
+    task_dir.mkdir()
+    monkeypatch.setenv("XAGENT_ONEDRIVE_OUTPUT_DIR", str(task_dir))
+    mock_request = Mock(
+        return_value=MockResponse(
+            {
+                "id": "item-5",
+                "name": "huge.bin",
+                "size": onedrive._MAX_DOWNLOAD_BYTES + 1,
+                "file": {},
+            }
+        )
+    )
+    monkeypatch.setattr(onedrive.requests, "request", mock_request)
+
+    result = json.loads(onedrive.onedrive_download_file("huge.bin"))
+
+    assert result["status"] == "error"
+    assert "over the 2 GiB limit" in result["message"]
+    assert mock_request.call_count == 1
+
+
+def test_download_file_reserves_a_collision_free_output_name(monkeypatch, tmp_path):
+    task_dir = tmp_path / "task"
+    task_dir.mkdir()
+    output_dir = task_dir / "output"
+    output_dir.mkdir()
+    (output_dir / "report.pdf").write_bytes(b"existing")
+    monkeypatch.setenv("XAGENT_ONEDRIVE_OUTPUT_DIR", str(task_dir))
+    content = b"new report"
+    metadata = MockResponse(
+        {
+            "id": "item-6",
+            "name": "report.pdf",
+            "size": len(content),
+            "file": {"mimeType": "application/pdf"},
+        }
+    )
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(side_effect=[metadata, MockResponse(content=content)]),
+    )
+
+    result = json.loads(onedrive.onedrive_download_file("report.pdf"))
+
+    assert result["status"] == "success"
+    assert result["filename"] == "report (1).pdf"
+    assert (output_dir / "report.pdf").read_bytes() == b"existing"
+    assert (output_dir / "report (1).pdf").read_bytes() == content
+
+
+def test_download_file_preserves_extension_for_cjk_and_long_names(
+    monkeypatch, tmp_path
+):
+    task_dir = tmp_path / "task"
+    task_dir.mkdir()
+    monkeypatch.setenv("XAGENT_ONEDRIVE_OUTPUT_DIR", str(task_dir))
+    cases = [
+        ("季度报告.xlsx", "file.xlsx"),
+        ("a" * 300 + ".docx", "a" * 195 + ".docx"),
+    ]
+    for index, (remote_name, expected_name) in enumerate(cases):
+        content = f"content-{index}".encode()
+        metadata = MockResponse(
+            {
+                "id": f"item-name-{index}",
+                "name": remote_name,
+                "size": len(content),
+                "file": {},
+            }
+        )
+        monkeypatch.setattr(
+            onedrive.requests,
+            "request",
+            Mock(side_effect=[metadata, MockResponse(content=content)]),
+        )
+
+        result = json.loads(onedrive.onedrive_download_file(remote_name))
+
+        assert result["status"] == "success"
+        assert result["filename"] == expected_name
+        assert (task_dir / "output" / expected_name).read_bytes() == content
+
+
+def test_publish_download_file_falls_back_when_hard_links_are_unavailable(
+    monkeypatch, tmp_path
+):
+    temporary_path = tmp_path / "staging.part"
+    temporary_path.write_bytes(b"downloaded")
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    monkeypatch.setattr(
+        onedrive.os,
+        "link",
+        Mock(side_effect=OSError(errno.EPERM, "hard links unavailable")),
+    )
+
+    output_path = onedrive._publish_download_file(
+        temporary_path, output_dir, "report.pdf"
+    )
+
+    assert output_path.read_bytes() == b"downloaded"
+    assert not temporary_path.exists()
+
+
+def test_download_file_rejects_folder_metadata(monkeypatch, tmp_path):
+    task_dir = tmp_path / "task"
+    task_dir.mkdir()
+    monkeypatch.setenv("XAGENT_ONEDRIVE_OUTPUT_DIR", str(task_dir))
+    monkeypatch.setattr(
+        onedrive,
+        "_graph_request",
+        Mock(return_value={"id": "folder-1", "name": "Folder", "size": 0}),
+    )
+
+    result = json.loads(onedrive.onedrive_download_file("Folder"))
+
+    assert result == {
+        "status": "error",
+        "message": "OneDrive item is not a file",
+    }
+
+
+def test_download_file_requires_task_workspace(monkeypatch):
+    monkeypatch.delenv("XAGENT_ONEDRIVE_OUTPUT_DIR", raising=False)
+    result = json.loads(onedrive.onedrive_download_file("Issue Tracker.xlsx"))
+    assert result["status"] == "error"
+    assert "XAGENT_ONEDRIVE_OUTPUT_DIR" in result["message"]
+
+
+def test_download_output_dir_handles_symlink_loop(monkeypatch, tmp_path):
+    task_dir = tmp_path / "task"
+    monkeypatch.setenv("XAGENT_ONEDRIVE_OUTPUT_DIR", str(task_dir))
+    monkeypatch.setattr(
+        onedrive.Path,
+        "resolve",
+        Mock(side_effect=RuntimeError("symlink loop")),
+    )
+
+    assert onedrive._download_output_dir() == task_dir / "output"
+    assert (task_dir / "output").is_dir()
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("季度报告.xlsx", "file.xlsx"),
+        ("a" * 300 + ".docx", "a" * 195 + ".docx"),
+    ],
+)
+def test_safe_download_filename_preserves_extension(name, expected):
+    assert onedrive._safe_download_filename(name) == expected
+
+
 @pytest.mark.parametrize(
     "call",
     [
         lambda: onedrive.onedrive_list_items(folder_path="../../etc"),
         lambda: onedrive.onedrive_get_item(path="../../etc/passwd"),
         lambda: onedrive.onedrive_get_file_content("../../etc/passwd"),
+        lambda: onedrive.onedrive_download_file("../../etc/passwd"),
         lambda: onedrive.onedrive_create_folder("new-folder", parent_path="../../etc"),
         lambda: onedrive.onedrive_upload_text_file("../../etc/passwd", "x"),
     ],
@@ -517,6 +812,7 @@ def test_normalize_path_rejects_dot_segments_directly():
         "onedrive_list_items",
         "onedrive_get_item",
         "onedrive_get_file_content",
+        "onedrive_download_file",
         "onedrive_create_folder",
         "onedrive_upload_text_file",
     ],
