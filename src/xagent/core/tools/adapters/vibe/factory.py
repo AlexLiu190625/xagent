@@ -1146,6 +1146,7 @@ class ToolFactory:
     async def _create_mcp_tools_from_configs(
         mcp_configs: list[dict[str, Any]],
         sandbox: Optional["Sandbox"] = None,
+        workspace: Any | None = None,
         actor_stdio_session_identities: "Mapping[str, ActorMCPStdioSessionIdentity] | None" = None,
         actor_stdio_session_consumer: "ActorMCPStdioSessionConsumer | None" = None,
     ) -> list[Tool]:
@@ -1310,8 +1311,7 @@ class ToolFactory:
                             raise
                         except Exception as exc:
                             logger.warning(
-                                "Actor stdio session consumer failed for server "
-                                "'%s' (%s)",
+                                "Actor stdio session consumer failed for server '%s' (%s)",
                                 server_name,
                                 type(exc).__name__,
                             )
@@ -1334,7 +1334,8 @@ class ToolFactory:
                                 configs_by_name
                             ),
                             sandbox=sandbox,
-                        )  # type: ignore[arg-type]
+                            workspace=workspace,
+                        )
                         normal_tools.extend(load_result.tools)
                         unavailable_tools.extend(
                             ToolFactory._unavailable_mcp_tools_from_load_failures(

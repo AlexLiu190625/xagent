@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from threading import Event, Lock, local
 from uuid import UUID
 
@@ -1555,3 +1556,64 @@ def test_list_all_user_files_includes_durable_only_uploads(tmp_path, mock_worksp
 @pytest.fixture
 def mock_workspace_db():
     yield
+
+
+def test_stage_and_discard_external_upload_file(tmp_path, monkeypatch):
+    workspace = TaskWorkspace(id="task_stage", base_dir=str(tmp_path / "workspaces"))
+    source = workspace.input_dir / "report.xlsx"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"workbook")
+    monkeypatch.setattr(workspace, "resolve_file_id_detached", lambda _: source)
+
+    staged = workspace.stage_file_for_external_upload("file-id")
+
+    assert staged.is_file()
+    assert staged.read_bytes() == b"workbook"
+    assert staged.is_relative_to(workspace.temp_dir / ".xagent-internal" / "mcp-upload")
+    assert str(staged) not in workspace.get_allowed_dirs()
+    assert any(
+        staged.is_relative_to(Path(directory))
+        for directory in workspace.get_allowed_dirs()
+    )
+
+    workspace.discard_staged_external_upload(staged)
+    assert not staged.exists()
+    assert not staged.parent.exists()
+    with pytest.raises(ValueError, match="outside the task staging area"):
+        workspace.discard_staged_external_upload(tmp_path / "outside.txt")
+
+
+def test_stage_external_upload_rejects_unregistered_file(tmp_path):
+    workspace = TaskWorkspace(id="task_stage_missing", base_dir=str(tmp_path))
+
+    with pytest.raises(FileNotFoundError, match="File not found"):
+        workspace.stage_file_for_external_upload("not-registered")
+
+
+def test_external_upload_staging_rejects_symlinked_internal_root(tmp_path):
+    workspace = TaskWorkspace(id="task_stage_root", base_dir=str(tmp_path))
+    escaped = tmp_path / "escaped"
+    escaped.mkdir()
+    workspace.internal_temp_dir.symlink_to(escaped, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="outside temp directory"):
+        workspace.discard_staged_external_upload(
+            escaped / "mcp-upload" / "staged" / "file.xlsx"
+        )
+
+
+def test_stage_external_upload_rejects_source_symlink_outside_storage(
+    tmp_path, monkeypatch
+):
+    workspace = TaskWorkspace(id="task_stage_source", base_dir=str(tmp_path))
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.txt"
+    outside.write_text("secret", encoding="utf-8")
+    link = workspace.input_dir / "report.xlsx"
+    link.symlink_to(outside)
+    monkeypatch.setattr(workspace, "resolve_file_id_detached", lambda _: link)
+
+    try:
+        with pytest.raises(FileNotFoundError, match="File not found"):
+            workspace.stage_file_for_external_upload("file-id")
+    finally:
+        outside.unlink(missing_ok=True)

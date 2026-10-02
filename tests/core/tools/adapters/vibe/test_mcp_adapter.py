@@ -4,6 +4,7 @@ import logging
 import re
 import subprocess
 import sys
+import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import FrozenInstanceError
@@ -30,6 +31,7 @@ from xagent.core.tools.adapters.vibe.mcp_adapter import (
     MCPWriteHint,
     _build_mcp_tool_adapter,
     _compact_json,
+    _durable_upload_fields,
     _exception_indicates_http_401,
     _mcp_return_value_as_string,
     _split_url_token,
@@ -469,6 +471,283 @@ def test_build_mcp_tool_adapter_marks_all_tools_safe_when_server_opts_in():
     )
 
     assert adapter.metadata.concurrency_safe is True
+
+
+@pytest.mark.parametrize(
+    ("server_name", "tool_name", "field_name"),
+    [
+        ("OneDrive", "onedrive_upload_file", "local_file_path"),
+        ("SharePoint", "sharepoint_upload_file", "local_file_path"),
+        ("Google Drive", "google_drive_upload_file", "file_path"),
+        ("Slack", "slack_upload_file", "file_path"),
+    ],
+)
+def test_durable_upload_mapping_covers_builtin_connectors(
+    server_name, tool_name, field_name
+):
+    assert _durable_upload_fields(server_name, tool_name) == (field_name,)
+    assert _durable_upload_fields("Google_Drive", "google_drive_upload_file") == ()
+
+
+@pytest.mark.asyncio
+async def test_mcp_upload_file_ref_is_staged_and_cleaned_after_connector_call(
+    monkeypatch,
+):
+    mcp_tool = SimpleNamespace(
+        name="onedrive_upload_file",
+        description="Upload a local file",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "local_file_path": {"type": "string"},
+                "remote_path": {"type": "string"},
+            },
+        },
+    )
+
+    class FakeWorkspace:
+        def __init__(self):
+            self.staged = []
+            self.discarded = []
+
+        def stage_file_for_external_upload(self, file_id):
+            self.staged.append(file_id)
+            return "/task/temp/.xagent-internal/mcp-upload/staged/file.xlsx"
+
+        def discard_staged_external_upload(self, path):
+            self.discarded.append(path)
+
+    workspace = FakeWorkspace()
+    adapter = _build_mcp_tool_adapter(
+        "OneDrive",
+        {"transport": "stdio", "command": "python", "args": []},
+        mcp_tool,
+        workspace=workspace,
+    )
+    captured = {}
+
+    class FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            captured["name"] = name
+            captured["arguments"] = arguments
+            return CallToolResult(content=[], isError=False)
+
+    @asynccontextmanager
+    async def fake_create_session(_connection):
+        yield FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", fake_create_session)
+
+    result = await adapter.run_json_async(
+        {
+            "local_file_path": "file:31218a9f-1497-4216-9f75-1fc8d51368c4",
+            "remote_path": "Issue Tracker - Open High Priority.xlsx",
+        }
+    )
+
+    assert result["is_error"] is False
+    assert workspace.staged == ["31218a9f-1497-4216-9f75-1fc8d51368c4"]
+    assert captured["name"] == "onedrive_upload_file"
+    assert captured["arguments"]["local_file_path"].endswith("/file.xlsx")
+    assert captured["arguments"]["remote_path"].endswith(".xlsx")
+    assert workspace.discarded == [
+        "/task/temp/.xagent-internal/mcp-upload/staged/file.xlsx"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_mcp_upload_result_redacts_internal_staging_path(monkeypatch):
+    mcp_tool = SimpleNamespace(
+        name="onedrive_upload_file",
+        description="Upload a local file",
+        inputSchema={
+            "type": "object",
+            "properties": {"local_file_path": {"type": "string"}},
+        },
+    )
+
+    class FakeWorkspace:
+        def stage_file_for_external_upload(self, file_id):
+            return "/task/temp/.xagent-internal/mcp-upload/staged/file.xlsx"
+
+        def discard_staged_external_upload(self, path):
+            return None
+
+    adapter = _build_mcp_tool_adapter(
+        "OneDrive",
+        {"transport": "stdio", "command": "python", "args": []},
+        mcp_tool,
+        workspace=FakeWorkspace(),
+    )
+
+    class FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            del name, arguments, kwargs
+            return CallToolResult(
+                content=[
+                    TextContent(
+                        type="text",
+                        text=(
+                            "File is empty: "
+                            "/task/temp/.xagent-internal/mcp-upload/staged/file.xlsx"
+                        ),
+                    )
+                ],
+                isError=True,
+            )
+
+    @asynccontextmanager
+    async def fake_create_session(_connection):
+        yield FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", fake_create_session)
+    result = await adapter.run_json_async(
+        {"local_file_path": "file:31218a9f-1497-4216-9f75-1fc8d51368c4"}
+    )
+
+    text = result["content"][0]["text"]
+    assert "/task/temp/.xagent-internal" not in text
+    assert "file:31218a9f-1497-4216-9f75-1fc8d51368c4" in text
+
+
+@pytest.mark.asyncio
+async def test_mcp_upload_discards_staged_file_when_connector_raises(monkeypatch):
+    mcp_tool = SimpleNamespace(
+        name="onedrive_upload_file",
+        description="Upload a local file",
+        inputSchema={
+            "type": "object",
+            "properties": {"local_file_path": {"type": "string"}},
+        },
+    )
+
+    class FakeWorkspace:
+        def __init__(self):
+            self.discarded = []
+
+        def stage_file_for_external_upload(self, file_id):
+            return "/task/temp/.xagent-internal/mcp-upload/staged/file.xlsx"
+
+        def discard_staged_external_upload(self, path):
+            self.discarded.append(path)
+
+    workspace = FakeWorkspace()
+    adapter = _build_mcp_tool_adapter(
+        "OneDrive",
+        {"transport": "stdio", "command": "python", "args": []},
+        mcp_tool,
+        workspace=workspace,
+    )
+
+    class FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            del name, arguments, kwargs
+            raise RuntimeError("connector failed")
+
+    @asynccontextmanager
+    async def fake_create_session(_connection):
+        yield FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", fake_create_session)
+    result = await adapter.run_json_async(
+        {"local_file_path": "file:31218a9f-1497-4216-9f75-1fc8d51368c4"}
+    )
+
+    assert result["is_error"] is True
+    assert workspace.discarded == [
+        "/task/temp/.xagent-internal/mcp-upload/staged/file.xlsx"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_mcp_upload_staging_cancellation_cleans_worker_result():
+    mcp_tool = SimpleNamespace(
+        name="onedrive_upload_file",
+        description="Upload a local file",
+        inputSchema={
+            "type": "object",
+            "properties": {"local_file_path": {"type": "string"}},
+        },
+    )
+
+    class FakeWorkspace:
+        def __init__(self):
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.discarded = []
+
+        def stage_file_for_external_upload(self, file_id):
+            self.started.set()
+            assert self.release.wait(2)
+            return "/task/temp/.xagent-internal/mcp-upload/staged/file.xlsx"
+
+        def discard_staged_external_upload(self, path):
+            self.discarded.append(path)
+
+    workspace = FakeWorkspace()
+    adapter = _build_mcp_tool_adapter(
+        "OneDrive",
+        {"transport": "stdio", "command": "python", "args": []},
+        mcp_tool,
+        workspace=workspace,
+    )
+
+    staging_task = asyncio.create_task(
+        adapter._stage_external_upload_args(
+            {"local_file_path": "file:31218a9f-1497-4216-9f75-1fc8d51368c4"}
+        )
+    )
+    assert await asyncio.to_thread(workspace.started.wait, 2)
+    staging_task.cancel()
+    staging_task.cancel()
+    workspace.release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await staging_task
+    assert workspace.discarded == [
+        "/task/temp/.xagent-internal/mcp-upload/staged/file.xlsx"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_mcp_upload_missing_file_id_has_public_safe_error(monkeypatch):
+    mcp_tool = SimpleNamespace(
+        name="onedrive_upload_file",
+        description="Upload a local file",
+        inputSchema={
+            "type": "object",
+            "properties": {"local_file_path": {"type": "string"}},
+        },
+    )
+
+    class FakeWorkspace:
+        def stage_file_for_external_upload(self, file_id):
+            raise FileNotFoundError(file_id)
+
+    adapter = _build_mcp_tool_adapter(
+        "OneDrive",
+        {"transport": "stdio", "command": "python", "args": []},
+        mcp_tool,
+        workspace=FakeWorkspace(),
+    )
+
+    result = await adapter.run_json_async(
+        {"local_file_path": "file:31218a9f-1497-4216-9f75-1fc8d51368c4"}
+    )
+
+    assert result == {
+        "content": [{"text": "file_id not found or not accessible."}],
+        "is_error": True,
+    }
 
 
 def test_exception_indicates_http_401_uses_bounded_status_signals():
@@ -2948,8 +3227,7 @@ async def test_mcp_tool_execution_error_redacts_prefixed_credential_assignments(
     class _FakeSession:
         async def initialize(self):
             raise RuntimeError(
-                "MCP_API_KEY=SECRET-abc123 rejected; "
-                "SERVICE_ACCESS_TOKEN=tok-987654 expired"
+                "MCP_API_KEY=SECRET-abc123 rejected; SERVICE_ACCESS_TOKEN=tok-987654 expired"
             )
 
     @asynccontextmanager
@@ -3764,8 +4042,7 @@ def test_rejected_metadata_is_reported_once_per_tool(caplog):
     ]
     assert len(lines) == 1
     assert lines[0] == (
-        "MCP tool reject_probe dropped 7 field schema metadata keys "
-        "and 1 unreadable field schemas"
+        "MCP tool reject_probe dropped 7 field schema metadata keys and 1 unreadable field schemas"
     )
 
 
