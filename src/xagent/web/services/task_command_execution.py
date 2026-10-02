@@ -88,6 +88,7 @@ from .chat_history_service import (
     DELIVERY_OUTCOME_UNKNOWN,
     DELIVERY_PENDING,
     UserMessageDeliveryClaim,
+    accepted_message_content_matches,
     claim_user_message_delivery_no_commit,
     inspect_user_message_delivery,
     mark_user_message_delivery_sync,
@@ -723,16 +724,19 @@ def _reconcile_command_acceptance_graph(
                 Task.status == expected_status,
                 Task.run_id == expected_run_id,
             )
-            if task_query.first() is None:
+            task = task_query.first()
+            if task is None:
                 pass
             else:
                 message = (
-                    reconcile_db.query(TaskChatMessage)
+                    reconcile_db.query(TaskChatMessage.id)
                     .filter(
                         TaskChatMessage.task_id == task_id,
                         TaskChatMessage.role == "user",
                         TaskChatMessage.turn_id == turn_id,
-                        TaskChatMessage.content == content.strip(),
+                        accepted_message_content_matches(
+                            cast(int, task.conversation_storage_version), content
+                        ),
                         TaskChatMessage.delivery_status.in_(
                             (
                                 DELIVERY_PENDING,
@@ -4915,7 +4919,7 @@ def _load_command_message_delivery_status(
     SessionLocal = get_session_local()
     with SessionLocal() as db:
         message = (
-            db.query(TaskChatMessage)
+            db.query(TaskChatMessage.delivery_status)
             .filter(
                 TaskChatMessage.task_id == task_id,
                 TaskChatMessage.role == "user",

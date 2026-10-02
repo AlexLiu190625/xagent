@@ -12,7 +12,8 @@ from typing import Any, cast
 from uuid import uuid4
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, defer
+from sqlalchemy.orm.attributes import set_committed_value
 
 from ...core.agent.context.execution import (
     COMPACT_SUMMARY_METADATA_KEY,
@@ -77,6 +78,36 @@ def append_fact_no_commit(
     )
 
 
+def load_event_chat_message(
+    db: Session, event: TaskExecutionEvent
+) -> TaskChatMessage | None:
+    """Keep projection identity/control fields; take content only from its fact."""
+    if (
+        event.payload_version != 1
+        or not isinstance(event.payload, dict)
+        or not isinstance(event.payload.get("content"), str)
+    ):
+        raise ValueError(f"Unsupported chat fact {event.event_id}")
+    message = db.scalar(
+        select(TaskChatMessage)
+        .options(
+            defer(cast(Any, TaskChatMessage.content)),
+            defer(cast(Any, TaskChatMessage.attachments)),
+            defer(cast(Any, TaskChatMessage.interactions)),
+        )
+        .where(
+            TaskChatMessage.task_id == event.task_id,
+            TaskChatMessage.execution_event_id == event.event_id,
+        )
+    )
+    if message is not None:
+        for field in ("content", "attachments", "interactions"):
+            # Supply the existing return shape without fetching or rewriting
+            # the legacy content columns, even in an already populated session.
+            set_committed_value(message, field, event.payload.get(field))
+    return message
+
+
 def stage_chat_message_no_commit(
     db: Session, message: TaskChatMessage
 ) -> TaskChatMessage:
@@ -134,11 +165,7 @@ def stage_chat_message_no_commit(
     )
     # Reuse the committed envelope, including an empty attachments list and the
     # actual accepted turn identity. The old row is only a compatibility reader.
-    existing = db.scalar(
-        select(TaskChatMessage).where(
-            TaskChatMessage.execution_event_id == event.event_id,
-        )
-    )
+    existing = load_event_chat_message(db, event)
     if existing is not None:
         return existing
     message.execution_event_id = event.event_id

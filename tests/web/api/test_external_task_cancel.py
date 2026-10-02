@@ -319,7 +319,9 @@ async def test_settlement_text_by_task_source(
     monkeypatch.setattr(
         task_orchestrator,
         "load_task_setup_snapshot_sync",
-        lambda *_args, **_kwargs: SimpleNamespace(task=SimpleNamespace(id=task_id)),
+        lambda *_args, **_kwargs: SimpleNamespace(
+            task=SimpleNamespace(id=task_id, conversation_storage_version=1)
+        ),
     )
     monkeypatch.setattr(task_orchestrator, "_get_agent_manager", MagicMock())
 
@@ -426,7 +428,9 @@ async def test_interrupted_transcript_settlement_wins(
     monkeypatch.setattr(
         task_orchestrator,
         "load_task_setup_snapshot_sync",
-        lambda *_args, **_kwargs: SimpleNamespace(task=SimpleNamespace(id=task_id)),
+        lambda *_args, **_kwargs: SimpleNamespace(
+            task=SimpleNamespace(id=task_id, conversation_storage_version=1)
+        ),
     )
     monkeypatch.setattr(task_orchestrator, "_get_agent_manager", MagicMock())
 

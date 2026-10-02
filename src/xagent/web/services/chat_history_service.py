@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, defer
+from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.sql.elements import ColumnElement
 
 from ...core.agent.attachments import build_image_context_references
@@ -24,6 +25,7 @@ from ...core.agent.transcript import (
 from ...core.context_ref import CONTEXT_REFS_KEY, ContextReference
 from ..models.chat_message import TaskChatMessage
 from ..models.task import TraceEvent
+from ..models.task_execution_event import TaskExecutionEvent
 from .assistant_history_safety import (
     LEGACY_UNTRUSTED_ASSISTANT_MESSAGE_TYPE,
     assistant_history_has_safe_ancillary_payload,
@@ -37,6 +39,7 @@ from .ops_signals import (
     register_degradation,
 )
 from .task_execution_event_writer import (
+    load_event_chat_message,
     stage_chat_message_no_commit,
     stage_delivery_fact_no_commit,
 )
@@ -143,6 +146,23 @@ def _delivery_payload_matches(
     ) == _attachment_identity(attachments)
 
 
+def accepted_message_content_matches(
+    storage_version: int, content: str
+) -> ColumnElement[bool]:
+    """Content predicate for acceptance reconciliation's existing control row."""
+    if storage_version != 2:
+        return TaskChatMessage.content == content.strip()
+    return TaskChatMessage.execution_event_id.in_(
+        select(TaskExecutionEvent.event_id).where(
+            TaskExecutionEvent.task_id == TaskChatMessage.task_id,
+            TaskExecutionEvent.scope_id == "root",
+            TaskExecutionEvent.kind == "input_accepted",
+            TaskExecutionEvent.payload_version == 1,
+            TaskExecutionEvent.payload["content"].as_string() == content.strip(),
+        )
+    )
+
+
 def inspect_user_message_delivery(
     db: Session,
     task_id: int,
@@ -153,15 +173,41 @@ def inspect_user_message_delivery(
 ) -> Optional[UserMessageDeliveryClaim]:
     """Return the durable outcome for ``turn_id`` without creating a row."""
 
-    existing = (
-        db.query(TaskChatMessage)
-        .filter(
-            TaskChatMessage.task_id == task_id,
-            TaskChatMessage.role == "user",
-            TaskChatMessage.turn_id == turn_id,
+    from .task_execution_event_writer import uses_execution_events
+
+    if uses_execution_events(db, task_id):
+        event = db.scalar(
+            select(TaskExecutionEvent).where(
+                TaskExecutionEvent.task_id == task_id,
+                TaskExecutionEvent.scope_id == "root",
+                TaskExecutionEvent.idempotency_key == f"message:{turn_id}",
+                TaskExecutionEvent.kind == "input_accepted",
+            )
         )
-        .first()
-    )
+        if event is None:
+            projection_id = db.scalar(
+                select(TaskChatMessage.id).where(
+                    TaskChatMessage.task_id == task_id,
+                    TaskChatMessage.role == "user",
+                    TaskChatMessage.turn_id == turn_id,
+                )
+            )
+            if projection_id is not None:
+                raise ValueError(
+                    f"Missing accepted input for task {task_id}, turn {turn_id}"
+                )
+            return None
+        existing = load_event_chat_message(db, event)
+    else:
+        existing = (
+            db.query(TaskChatMessage)
+            .filter(
+                TaskChatMessage.task_id == task_id,
+                TaskChatMessage.role == "user",
+                TaskChatMessage.turn_id == turn_id,
+            )
+            .first()
+        )
     if existing is None:
         return None
     return UserMessageDeliveryClaim(
@@ -263,11 +309,11 @@ def mark_user_message_delivery(
         TaskChatMessage.role == "user",
         TaskChatMessage.turn_id == turn_id,
     )
-    message = query.first()
-    if message is None:
+    current_status = query.with_entities(TaskChatMessage.delivery_status).first()
+    if current_status is None:
         return UserMessageDeliveryTransition(status=None, outcome="missing")
 
-    current = str(message.delivery_status)
+    current = str(current_status[0])
     if current == status:
         return UserMessageDeliveryTransition(status=current, outcome="idempotent")
     allowed_targets = {
@@ -295,10 +341,10 @@ def mark_user_message_delivery(
     # A concurrent terminal transition won after the read. Reload the durable
     # state instead of issuing an unguarded write that could regress it.
     db.expire_all()
-    raced = query.first()
+    raced = query.with_entities(TaskChatMessage.delivery_status).first()
     if raced is None:
         return UserMessageDeliveryTransition(status=None, outcome="missing")
-    raced_status = str(raced.delivery_status)
+    raced_status = str(raced[0])
     return UserMessageDeliveryTransition(
         status=raced_status,
         outcome="idempotent" if raced_status == status else "conflict",
@@ -715,15 +761,22 @@ def persist_assistant_message_no_commit(
 ) -> Optional[TaskChatMessage]:
     """Stage an assistant transcript row for an atomic caller-owned commit."""
 
-    # The outbound writer holds the task lock and already recorded this fact.
+    # The outbound writer holds the task lock and supplies the committed
+    # fact's message and interactions, including on an idempotent retry.
+    existing = None
     if execution_event_id is not None:
-        existing = (
-            db.query(TaskChatMessage)
-            .filter(TaskChatMessage.execution_event_id == execution_event_id)
-            .first()
+        existing = db.scalar(
+            select(TaskChatMessage)
+            .options(
+                defer(cast(Any, TaskChatMessage.content)),
+                defer(cast(Any, TaskChatMessage.attachments)),
+                defer(cast(Any, TaskChatMessage.interactions)),
+            )
+            .where(
+                TaskChatMessage.task_id == task_id,
+                TaskChatMessage.execution_event_id == execution_event_id,
+            )
         )
-        if existing is not None:
-            return existing
 
     reconciled_content = (
         content
@@ -739,6 +792,11 @@ def persist_assistant_message_no_commit(
         reconciled_content, interactions
     )
     normalized_content = transcript_content.strip()
+    if existing is not None:
+        set_committed_value(existing, "content", normalized_content)
+        set_committed_value(existing, "interactions", interactions)
+        set_committed_value(existing, "attachments", None)
+        return existing
     if not normalized_content:
         return None
     message = TaskChatMessage(

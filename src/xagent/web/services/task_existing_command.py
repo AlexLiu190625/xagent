@@ -58,6 +58,29 @@ def enqueue_existing_execution(
         if changed != 1:
             raise TaskTurnError("busy")
         db.refresh(task)
+        if task.conversation_storage_version == 2:
+            from .task_execution_event_writer import append_fact_no_commit
+
+            # V1 executes the stored description without another chat row.
+            # V2 still needs an accepted input occurrence before the command
+            # can be acknowledged or its runtime user_message can be emitted.
+            append_fact_no_commit(
+                db,
+                task_id=task_id,
+                run_id=run_id,
+                turn_id=turn_id,
+                kind="input_accepted",
+                key=f"message:{turn_id}",
+                payload={
+                    "user_id": task_owner_user_id,
+                    "role": "user",
+                    "content": task_description,
+                    "message_type": "user_message",
+                    "attachments": None,
+                    "interactions": None,
+                    "turn_id": turn_id,
+                },
+            )
         start = TaskStartPayload(
             version=1,
             run_id=run_id,

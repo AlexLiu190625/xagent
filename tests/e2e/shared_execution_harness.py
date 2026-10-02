@@ -244,6 +244,21 @@ def _host(pipe, environment: dict[str, str], role: str, root: str) -> None:
     os.dup2(log.fileno(), 1)
     os.dup2(log.fileno(), 2)
     _install_model_boundary(root_path, role)
+    if (root_path / "event-read-acceptance").exists():
+        import sqlalchemy as sa
+
+        from tests.shared.execution_event_read_guard import reject_legacy_content
+        from xagent.web.models.task import Task
+
+        # Select V2 before INSERT only in these test processes; production
+        # creation defaults and existing task versions are unchanged.
+        def select_event_storage(_mapper, _connection, task):
+            task.conversation_storage_version = 2
+
+        sa.event.listen(Task, "before_insert", select_event_storage)
+        sa.event.listen(
+            sa.engine.Engine, "before_cursor_execute", reject_legacy_content
+        )
     if (root_path / "gmail-public-key.pem").exists():
         from tests.e2e.test_shared_gmail import install_gmail_network_boundary
 
@@ -428,12 +443,14 @@ class SharedExecutionApp:
 
 
 @pytest.fixture
-def shared_app(tmp_path, monkeypatch):
+def shared_app(tmp_path, monkeypatch, request):
     from xagent.web.models.database import get_engine, get_session_local, init_db
     from xagent.web.models.user import User
 
     root = tmp_path / "hosts"
     root.mkdir()
+    if getattr(request, "param", 1) == 2:
+        (root / "event-read-acceptance").touch()
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'shared.db'}")
     monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(tmp_path / "uploads"))
     monkeypatch.setenv("LANGFUSE_TRACING_ENABLED", "false")

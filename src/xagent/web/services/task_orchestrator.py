@@ -50,7 +50,7 @@ import logging
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 from uuid import uuid4
 
 from sqlalchemy import func
@@ -1132,6 +1132,37 @@ def _task_requires_actor_policy_sync(
         return _task_requires_actor_policy(db, task_id, task_owner_user_id)
 
 
+def _accept_existing_event_input_sync(
+    lease: TaskLease, task_owner_user_id: int, payload: TaskTurnPayload
+) -> None:
+    """Record a local V2 execute input before invoking its runtime."""
+    from ..models.database import get_session_local
+    from .task_execution_event_writer import append_fact_no_commit
+    from .task_lease_service import lock_task_lease_no_commit
+
+    with get_session_local()() as db:
+        if not lock_task_lease_no_commit(db, lease):
+            raise TaskLeaseLostError("Lease changed before existing input acceptance")
+        append_fact_no_commit(
+            db,
+            task_id=lease.task_id,
+            run_id=lease.run_id,
+            turn_id=payload.turn_id,
+            kind="input_accepted",
+            key=f"message:{payload.turn_id}",
+            payload={
+                "user_id": task_owner_user_id,
+                "role": "user",
+                "content": payload.transcript_message,
+                "message_type": "user_message",
+                "attachments": None,
+                "interactions": None,
+                "turn_id": payload.turn_id,
+            },
+        )
+        db.commit()
+
+
 def reserve_task_start_no_commit(
     db: Session,
     *,
@@ -1503,6 +1534,7 @@ def _reconcile_claimed_turn_after_commit_ack_failure(
     from ..models.chat_message import TaskChatMessage
     from ..models.database import get_session_local
     from ..models.uploaded_file import UploadedFile
+    from .chat_history_service import accepted_message_content_matches
 
     SessionLocal = get_session_local()
     for attempt in range(3):
@@ -1523,12 +1555,15 @@ def _reconcile_claimed_turn_after_commit_ack_failure(
             )
             if task is not None:
                 message = (
-                    reconcile_db.query(TaskChatMessage)
+                    reconcile_db.query(TaskChatMessage.id)
                     .filter(
                         TaskChatMessage.task_id == task_id,
                         TaskChatMessage.role == "user",
                         TaskChatMessage.turn_id == payload.turn_id,
-                        TaskChatMessage.content == payload.transcript_message.strip(),
+                        accepted_message_content_matches(
+                            cast(int, task.conversation_storage_version),
+                            payload.transcript_message,
+                        ),
                         TaskChatMessage.delivery_status.in_(
                             (
                                 DELIVERY_PENDING,
@@ -1909,17 +1944,37 @@ def finish_turn(
     status = fresh.status
 
     if status == TaskStatus.COMPLETED:
-        latest_assistant = (
-            bg_db.query(TaskChatMessage)
-            .filter(
-                TaskChatMessage.task_id == task_id,
-                TaskChatMessage.role == "assistant",
+        if fresh.conversation_storage_version == 2:
+            from ..models.task_execution_event import TaskExecutionEvent
+            from .task_event_display import event_data
+
+            latest_fact = (
+                bg_db.query(TaskExecutionEvent)
+                .filter(
+                    TaskExecutionEvent.task_id == task_id,
+                    TaskExecutionEvent.scope_id == "root",
+                    TaskExecutionEvent.run_id == fresh.run_id,
+                    TaskExecutionEvent.kind == "assistant_message",
+                )
+                .order_by(TaskExecutionEvent.sequence.desc())
+                .first()
             )
-            .order_by(TaskChatMessage.id.desc())
-            .first()
-        )
-        if latest_assistant is not None:
-            fresh.output = latest_assistant.content
+            output = (
+                event_data(latest_fact)["content"] if latest_fact is not None else None
+            )
+        else:
+            latest_assistant = (
+                bg_db.query(TaskChatMessage)
+                .filter(
+                    TaskChatMessage.task_id == task_id,
+                    TaskChatMessage.role == "assistant",
+                )
+                .order_by(TaskChatMessage.id.desc())
+                .first()
+            )
+            output = latest_assistant.content if latest_assistant is not None else None
+        if output is not None:
+            fresh.output = output
             fresh.error_message = None
             sync_workforce_run_status(bg_db, fresh, TaskStatus.COMPLETED)
             sync_trigger_run_status(bg_db, fresh, TaskStatus.COMPLETED)
@@ -1927,7 +1982,7 @@ def finish_turn(
             logger.info(
                 "finish_turn: task %s output written (%d chars)",
                 task_id,
-                len(latest_assistant.content),
+                len(output),
             )
             return committed
         else:
@@ -2220,6 +2275,19 @@ def _schedule_bg(
                     )
                     if snapshot is None:
                         raise RuntimeError("task vanished before snapshot load")
+
+                    if (
+                        not preacquired_lease
+                        and snapshot.task.conversation_storage_version == 2
+                    ):
+                        # Local execute has no START acceptance transaction.
+                        # Its prior-history snapshot is already fixed; persist
+                        # this input under the exact lease before runtime starts.
+                        await run_db_io_cancellation_safe(
+                            lambda: _accept_existing_event_input_sync(
+                                lease, task_owner_user_id, payload
+                            )
+                        )
 
                     scope = await run_db_io_cancellation_safe(
                         lambda: resolve_execution_scope(task_id)

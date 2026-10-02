@@ -19,7 +19,11 @@ from ..models.task import Task, TaskStatus
 from ..models.task_command import TaskExecutionCommand
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
-from .chat_history_service import DELIVERY_FAILED, mark_user_message_delivery
+from .chat_history_service import (
+    DELIVERY_FAILED,
+    accepted_message_content_matches,
+    mark_user_message_delivery,
+)
 from .db_runtime import drain_async_task_cancellation_safe, run_db_io_cancellation_safe
 from .mcp_runtime import (
     MCPActorAuthorizationPolicy,
@@ -103,7 +107,10 @@ def reconcile_start_acceptance(
                 TaskChatMessage.task_id == task_id,
                 TaskChatMessage.turn_id == payload.turn_id,
                 TaskChatMessage.role == "user",
-                TaskChatMessage.content == payload.transcript_message.strip(),
+                accepted_message_content_matches(
+                    cast(int, task.conversation_storage_version),
+                    payload.transcript_message,
+                ),
             )
         ).first()
         if message is None:

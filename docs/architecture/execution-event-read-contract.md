@@ -472,3 +472,102 @@ Task-level token counters remain existing business metadata. Queries page facts 
 a captured horizon; total history payload loading is not claimed to be bounded
 independently of lifetime history. Whole-task legacy-read isolation is stage E;
 activation, removal and conversion remain stages 3.4–3.6.
+
+
+## Stage 3.3-E: consumer isolation and acceptance evidence
+
+The acceptance suite exercises V2 model setup, recovery, live/replayed display,
+REST steps, conversation logs, and ordinary/workforce child inspection against
+one event history. Its SQL tripwire rejects selected compatibility content:
+`task_chat_messages.content/attachments/interactions`, `trace_events.data`,
+`dag_executions.current_plan/skipped_steps`, `trace_message_blobs.message_data`,
+and `trace_checkpoint_blobs.blob_data`. It also rejects chat-content predicates,
+including aliased columns. Fresh sessions and contradictory compatibility rows
+prevent an ORM identity map or matching duplicate data from hiding a dependency.
+This is an acceptance-test instrument, not a production query interceptor.
+
+Identity and control reads remain allowed: task ownership/storage version,
+leases/run fences, command and delivery status, interaction CAS and checkpoint
+anchors, chat/event identity joins, file authorization and bytes, and blob hashes
+and sizes used to write compatibility projections. Trace `turn_id` deduplication and checkpoint kind/execution/run JSON
+predicates classify old rows without fetching their content. The shared log
+relationship loader may select chat content only through its explicit V1-task
+subquery; monitoring permits Trace content only inside its task-joined V1 source branch.
+Cached-query tests change the actual bound version to V2 and require rejection;
+mixed-version aggregate tests also check that V2 compatibility rows are excluded. No business table or compatibility write is removed.
+
+
+| Retained read | Entry/use | Stage 3.5 disposition |
+| --- | --- | --- |
+| `task_chat_messages.id`, `task_id`, `user_id`, `role`, `turn_id`, `execution_event_id`, `delivery_status` and existing identity/timestamp metadata | Delivery inspection/transition in `chat_history_service`; START/command commit reconciliation; legacy integer watermark joins in event context/writer | 3.5-A replaces V2 delivery and identity joins before 3.5-B stops these projection writes. Content always comes from the event. |
+| `trace_events.id`, `event_id`, `task_id`, `build_id`, `event_type`, timestamps; `data.turn_id` identity and checkpoint-kind/execution/run JSON predicates | `trace_handlers` projection deduplication/pruning and task/interaction legacy anchor retention | 3.5-A removes the remaining compatibility-row anchor dependency; 3.5-B can then stop legacy Trace writes/pruning for V2. No selected `data` payload is allowed. |
+| `trace_message_blobs.message_hash/message_bytes`; `trace_checkpoint_blobs.blob_hash/blob_kind/blob_bytes` and task IDs | Existing checkpoint codec deduplicates compatibility writes | Keep while compatibility projections are written; stop with 3.5-B. Recovery does not fetch blob bodies in the current inline event format. |
+| `tasks` owner, storage version, status/control/state version, run/runner/acquisition/lease fields, checkpoint pointers | Authorization, snapshot setup, scheduler/settlement and recovery fences | Business ownership remains authoritative; migrate only compatibility checkpoint pointers in 3.5-A. |
+| `task_execution_commands` status, target run, command identity/payload and attempt/claim fields | Durable input dispatch and START/reply retry | Preserve command ownership and CAS; do not replace them with historical event state. |
+| `task_interaction_requests` status/active slot, run, request/response payloads, responder/expiry and resume identity fields | Human-response validation, CAS and exact resume targeting | Request/response and CAS remain business state; remove the legacy `resume_trace_event_id` dependency before stopping compatibility writes. |
+| File records/links and authorized file bytes | Upload ownership, task binding, attachment materialization and downloads | Preserve file authorization; file contents are legitimate referenced business data. |
+
+Tests reuse real web/worker processes and the existing scripted model boundary
+for create/continue/poll, WebSocket execute/reconnect, SDK/A2A replies after worker
+replacement, cancellation, pause/resume, files, running input delivery, worker loss,
+A2A reconnect, and workforce children. The storage-version override
+and read tripwire are installed only in those test processes. Production creation
+still defaults to V1. Retry and ambiguous-commit checks compare V2 accepted facts
+while retaining existing delivery identities and statuses. Completed-turn output
+uses the current run's assistant fact. Existing shared execute commands accept
+an input fact in the same transaction as their durable command. Local existing
+execution accepts the input after capturing prior history and acquiring its lease,
+before calling the runtime, with the exact acquisition fence held through the
+fact commit. A replaced lease or failed fact write prevents execution. Both modes
+have a scheduler-level test that checks the current input is accepted exactly
+once and absent from prior model history.
+
+### Retention and failure windows
+
+Current `recovery_state` events contain the inline snapshot, before the legacy
+checkpoint codec creates deduplicated blob references. The retention test writes
+three checkpoints with a one-row legacy limit, verifies all three recovery facts
+and compatibility blobs survive pruning, then removes the legacy checkpoints and
+blob caches and recovers the latest snapshot using only facts. This proves the
+current format; it does not establish garbage-collection rules for a future
+blob-referencing event format. Such a format must retain every referenced blob
+for at least the referencing event's lifetime before activation.
+
+Existing recovery tests cover committed tool outcomes before checkpoint commit,
+unknown effects that must not execute again, stale leases, rejected restores,
+and independent child scopes. Acceptance tests add command/input transaction
+rollback, event-backed delivery retry, and poisoned-projection commit
+reconciliation. Fixed-horizon paging tests verify later commits do not enter an
+already captured model/display view.
+
+### Long-history baseline and activation limit
+
+`test_execution_event_history_baseline.py` creates 100, 1,000, and 10,000 covered
+assistant messages of 8,192 ASCII bytes each, a saved summary, and one retained
+answer. V1 and V2 model readers return exactly the same two messages. V2 display
+returns the full history at the captured horizon. Each measurement uses separate
+fresh-session passes for query/row counts, memory, and elapsed time.
+
+Representative local results (2026-10-01):
+
+| Database | Covered messages | V2 model queries / fetched rows | Fetched values (MiB) | Python peak (MiB) | Model time (ms) | Display peak (MiB) / time (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| SQLite | 100 | 5 / 104 | 0.80 | 1.72 | 1.62 | 2.77 / 5.28 |
+| SQLite | 1,000 | 14 / 1,004 | 8.02 | 10.32 | 12.09 | 26.73 / 46.01 |
+| SQLite | 10,000 | 104 / 10,004 | 80.23 | 96.29 | 119.22 | 266.61 / 565.76 |
+| PostgreSQL | 100 | 5 / 104 | 0.80 | 1.03 | 6.64 | 2.77 / 8.75 |
+| PostgreSQL | 1,000 | 14 / 1,004 | 8.03 | 9.77 | 42.05 | 26.88 / 84.33 |
+| PostgreSQL | 10,000 | 104 / 10,004 | 80.31 | 97.06 | 410.14 | 268.08 / 907.02 |
+
+V1 model reads stay at three queries/three rows (194–203 serialized bytes), about
+42–44 KiB Python peak, and 0.42–1.62 ms across these cases. Fetched bytes are the
+UTF-8 JSON size of fetched values, not database wire traffic. Memory is
+`tracemalloc` Python allocation peak, not process RSS or database memory. Timings
+are local warm measurements, not an SLO or an activation budget.
+
+The measurements confirm the stage-C follow-up: V2 model payload reads and memory
+still grow with lifetime history despite compaction. Query paging alone does not
+bound total payload loading. Before broad activation, stage 3.4 must set and
+validate explicit setup-memory/latency budgets or require the bounded-loading
+follow-up. This step does not activate V2, migrate old tasks, remove compatibility
+writes, or claim bounded history memory.
