@@ -58,6 +58,7 @@ from ..auth_dependencies import get_current_user, is_admin_user
 from ..mcp_apps import (
     get_all_mcp_apps,
     get_app_for_mcp_server,
+    get_catalog_mcp_oauth_credentials,
     normalize_catalog_key,
     restrict_to_app_scoped_oauth_grant,
 )
@@ -3822,12 +3823,59 @@ def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dic
     return server, app_info
 
 
+def _resolve_catalog_mcp_oauth_auth(app_id: str, auth_config: Any) -> dict[str, Any]:
+    """Resolve trusted deployment credentials for a catalog MCP OAuth app.
+
+    Catalog payloads are returned to browser clients, so a builtin must not
+    place a static OAuth secret in ``launch_config``. HubSpot's hosted MCP
+    server does not use Dynamic Client Registration; replace its safe marker
+    here immediately before the shared server row is reconciled. The normal
+    MCPServer write path encrypts the resulting client secret at rest.
+    """
+    if not isinstance(auth_config, dict):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid remote OAuth configuration",
+        )
+    resolved = dict(auth_config)
+    credential_provider = resolved.pop("credential_provider", None)
+    if credential_provider is None:
+        return resolved
+    credentials = get_catalog_mcp_oauth_credentials(app_id, credential_provider)
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unsupported catalog OAuth credential provider",
+        )
+
+    # Keep catalog reconciliation/startup independent of this optional
+    # connector's deployment credentials. The connect path validates these
+    # values immediately before it calls this helper, while an empty pair lets
+    # a future catalog sync materialize a safe, unavailable placeholder.
+    resolved.update(credentials[0])
+    return resolved
+
+
+def _require_catalog_mcp_oauth_credentials(app_id: str) -> None:
+    """Fail closed when a user actually starts a static-client OAuth flow."""
+    credentials = get_catalog_mcp_oauth_credentials(app_id)
+    if credentials is None:
+        return
+    _, missing = credentials
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"{app_id} MCP is not configured. Missing: {', '.join(missing)}",
+        )
+
+
 def _ensure_catalog_mcp_oauth_server(
     db: Session, app_id: str
 ) -> tuple[MCPServer, dict]:
     """Idempotently ensure the shared server row for a remote-MCP OAuth
-    (DCR-capable) catalog app exists, without creating any per-user
-    association. Returns (server, app_info). Mirrors
+    catalog app exists, without creating any per-user association. Supports
+    both DCR-capable apps and trusted static-client builtins. Returns
+    (server, app_info). Mirrors
     _ensure_catalog_app_server's hijack guards, but for a streamable_http/
     sse/websocket server row instead of a stdio one.
     """
@@ -3844,9 +3892,10 @@ def _ensure_catalog_mcp_oauth_server(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="This app is not a remote-OAuth connector",
         )
+    _require_catalog_mcp_oauth_credentials(app_id)
     launch = app_info.get("launch_config") or {}
     url = launch.get("url")
-    auth = launch.get("auth") or {}
+    auth = _resolve_catalog_mcp_oauth_auth(app_id, launch.get("auth") or {})
     transport = str(app_info["transport"])
     server_name = str(app_info["id"])
 

@@ -4,7 +4,7 @@ This module provides a scalable structure for defining supported MCP application
 their OAuth configurations, and server launch configurations.
 """
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
@@ -13,7 +13,11 @@ from typing import Any, Dict, List
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from ..config import get_google_restricted_scopes
+from ..config import (
+    get_google_restricted_scopes,
+    get_hubspot_mcp_client_id,
+    get_hubspot_mcp_client_secret,
+)
 from .builtin_mcp_registry import (
     _persisted_builtin_provenance_matches,
     get_builtin_execution_fields_and_optional_scopes,
@@ -99,6 +103,60 @@ APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT = frozenset(
         "word",
     }
 )
+
+# Static-client remote MCP connectors resolve their deployment credentials
+# from server-side configuration. Keep the provider metadata in one table so
+# catalog reconciliation, connect-time validation, and actor canonicalization
+# cannot drift apart as more connectors adopt this pattern.
+_CATALOG_MCP_OAUTH_CREDENTIAL_PROVIDERS: dict[
+    str,
+    tuple[
+        str,
+        Callable[[], str | None],
+        Callable[[], str | None],
+        str,
+        str,
+    ],
+] = {
+    "hubspot": (
+        "hubspot",
+        get_hubspot_mcp_client_id,
+        get_hubspot_mcp_client_secret,
+        "XAGENT_HUBSPOT_MCP_CLIENT_ID",
+        "XAGENT_HUBSPOT_MCP_CLIENT_SECRET",
+    ),
+}
+
+
+def get_catalog_mcp_oauth_credentials(
+    app_id: str, credential_provider: object | None = None
+) -> tuple[dict[str, str], tuple[str, ...]] | None:
+    """Resolve a static-client catalog provider, if one is registered.
+
+    The returned values are safe for internal canonical comparisons and server
+    configuration only; callers must never include them in catalog responses.
+    Empty values are returned for missing optional deployment settings so
+    catalog reconciliation can proceed, while the missing environment names
+    let user-facing connect flows fail closed.
+    """
+    provider_key = credential_provider if credential_provider is not None else app_id
+    if not isinstance(provider_key, str):
+        return None
+    spec = _CATALOG_MCP_OAUTH_CREDENTIAL_PROVIDERS.get(provider_key)
+    if spec is None or spec[0] != app_id:
+        return None
+    client_id = spec[1]() or ""
+    client_secret = spec[2]() or ""
+    missing = tuple(
+        env_name
+        for env_name, value in (
+            (spec[3], client_id),
+            (spec[4], client_secret),
+        )
+        if not value
+    )
+    return {"client_id": client_id, "client_secret": client_secret}, missing
+
 
 # Word's seed migration deliberately preserves a pre-existing custom row with
 # the same app_id. Such a row must keep the OAuth behavior it had before Word
@@ -981,11 +1039,37 @@ def classify_actor_remote_oauth_server(
 
     launch = app_info.get("launch_config") or {}
     expected_auth = launch.get("auth") or {}
+    static_client_credentials = False
+    if isinstance(expected_auth, Mapping):
+        expected_auth = dict(expected_auth)
+        credential_provider = expected_auth.pop("credential_provider", None)
+        if credential_provider is not None:
+            credentials = get_catalog_mcp_oauth_credentials(app_id, credential_provider)
+            if credentials is None:
+                raise RemoteOAuthServerDefinitionError(
+                    "remote OAuth credential provider is unsupported"
+                )
+            expected_auth.update(credentials[0])
+            static_client_credentials = True
     decrypted_auth = server._decrypt_auth_config(server.auth)
     if not isinstance(decrypted_auth, Mapping):
         raise RemoteOAuthServerDefinitionError("remote OAuth auth is invalid")
     actual_auth = dict(decrypted_auth)
     actual_auth.pop("app_id", None)
+    if static_client_credentials:
+        # These values are deployment secrets and may be rotated without
+        # changing the already-connected server's canonical definition. The
+        # connect path has already persisted them securely; actor validation
+        # only needs to ensure a usable pair exists, not compare against the
+        # current process environment.
+        if not actual_auth.get("client_id") or not actual_auth.get("client_secret"):
+            raise RemoteOAuthServerDefinitionError(
+                "remote OAuth static-client credentials are unavailable"
+            )
+        expected_auth.pop("client_id", None)
+        expected_auth.pop("client_secret", None)
+        actual_auth.pop("client_id", None)
+        actual_auth.pop("client_secret", None)
     failures = []
     if str(server.managed or "") != "external":
         failures.append("managed")
