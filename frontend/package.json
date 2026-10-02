@@ -47,6 +47,7 @@
     "dagre": "^0.8.5",
     "date-fns": "^4.1.0",
     "docx-preview": "^0.3.7",
+    "dompurify": "^3.4.16",
     "eslint": "^8.0.0",
     "eslint-config-next": "15.0.0",
     "framer-motion": "^12.28.1",
