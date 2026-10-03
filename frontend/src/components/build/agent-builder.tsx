@@ -136,6 +136,20 @@ interface AgentBuilderProps {
   agentId?: string
 }
 
+interface PreviewAttachment {
+  file_id: string
+  name: string
+  size: number
+  type?: string
+}
+
+interface PreviewRecord {
+  taskId: number
+  configKey: string | null
+  message: string
+  files: Array<File | PreviewAttachment>
+}
+
 interface TemplateRequirements {
   requiredSkills: string[]
   requiredToolCategories: string[]
@@ -713,13 +727,38 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
   const fileInputRef = useRef<HTMLInputElement>(null)
   const previewTaskIdRef = useRef<number | null>(null)
-  // Bumped by resetPreviewSession (Clear, mount/unmount); a mismatch silently drops an in-flight send's task and error.
+  // A reset or new send invalidates in-flight history loads and older sends.
   const previewGenerationRef = useRef(0)
   // Bumped by invalidatePreviewTask on config changes; a mismatch still sends the in-flight message but won't cache its task.
   const previewConfigGenerationRef = useRef(0)
   // Only an accepted send for the current configuration can complete the guide.
   // Keep this reactive: invalidating the cached task must also remove its checkmark.
   const [previewCompletionTaskId, setPreviewCompletionTaskId] = useState<number | null>(null)
+  const [lastPreview, setLastPreview] = useState<PreviewRecord | null>(null)
+  const lastPreviewRef = useRef<PreviewRecord | null>(null)
+  useEffect(() => { lastPreviewRef.current = lastPreview }, [lastPreview])
+  const [previewHistoryLoading, setPreviewHistoryLoading] = useState(false)
+  const [previewHistoryError, setPreviewHistoryError] = useState(false)
+  const [previewHistoryRetry, setPreviewHistoryRetry] = useState(0)
+  const [previewSending, setPreviewSending] = useState(false)
+  const previewSendingRef = useRef(false)
+
+  const bindPreviewTask = async (agentId: string | number) => {
+    // Builder-chat callbacks can outlive the render that started the chat.
+    const record = lastPreviewRef.current
+    if (!record) return
+    try {
+      const binding = await apiRequest(`${getApiUrl()}/api/agents/${agentId}/preview-task`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task_id: record.taskId }),
+      })
+      if (!binding.ok) throw new Error("Preview association failed")
+    } catch (error) {
+      console.error("Failed to associate preview:", error)
+      toast.error(t("builds.preview.errors.linkFailed"))
+    }
+  }
 
   const resetPreviewSession = useCallback(() => {
     previewGenerationRef.current += 1
@@ -763,6 +802,51 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   useEffect(() => {
     invalidatePreviewTask()
   }, [previewConfigKey, invalidatePreviewTask])
+
+  const openPreviewRecord = useCallback((record: PreviewRecord) => {
+    closeFilePreview()
+    previewTaskIdRef.current = record.taskId
+    setPreviewCompletionTaskId(record.taskId)
+    // The normal task socket restores messages, execution status and files.
+    setTaskId(record.taskId, { navigate: false })
+  }, [closeFilePreview, setTaskId])
+
+  const loadedAgentId = originalData?.id
+  useEffect(() => {
+    if (!localAgentId || !isInitialDataLoaded || String(loadedAgentId) !== localAgentId || readOnly) return
+    // Saving a new agent must not replace its currently visible preview.
+    if (lastPreview !== null) {
+      setPreviewHistoryLoading(false)
+      return
+    }
+    let active = true
+    const generation = previewGenerationRef.current
+    setPreviewHistoryLoading(true)
+    setPreviewHistoryError(false)
+    const load = async () => {
+      try {
+        const response = await apiRequest(`${getApiUrl()}/api/agents/${localAgentId}/preview-task`)
+        if (!response.ok) throw new Error("Preview history request failed")
+        const data = await response.json()
+        if (!active || generation !== previewGenerationRef.current || !data?.task_id) return
+        const record: PreviewRecord = {
+          taskId: data.task_id,
+          configKey: data.config_key,
+          message: data.message,
+          files: data.attachments,
+        }
+        setLastPreview(record)
+        openPreviewRecord(record)
+      } catch (error) {
+        console.error("Failed to load preview history:", error)
+        if (active && generation === previewGenerationRef.current) setPreviewHistoryError(true)
+      } finally {
+        if (active) setPreviewHistoryLoading(false)
+      }
+    }
+    void load()
+    return () => { active = false }
+  }, [localAgentId, isInitialDataLoaded, loadedAgentId, readOnly, previewHistoryRetry, openPreviewRecord, lastPreview])
 
   // Fetch Data
   useEffect(() => {
@@ -1192,10 +1276,18 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     return labels[category] || category
   }
 
-  const handlePreviewSendMessage = async (content: string, _config?: any, files?: File[]) => {
-    const generationAtStart = previewGenerationRef.current
+  const handlePreviewSendMessage = async (content: string, _config?: any, files?: Array<File | PreviewAttachment>, fresh = false) => {
+    if (previewSendingRef.current) {
+      // Reject, rather than acknowledge, so ChatInput retains its draft/files.
+      throw Object.assign(new Error("Preview send is already pending"), { errorCode: "task_busy" })
+    }
+    previewSendingRef.current = true
+    setPreviewSending(true)
+    setPreviewHistoryError(false)
+    const generationAtStart = ++previewGenerationRef.current
     const configGenerationAtStart = previewConfigGenerationRef.current
     setPreviewCompletionTaskId(null)
+    let failureMessage = t("builds.preview.errors.requestFailed")
     try {
       // Check if general model is selected
       if (!modelConfig.general) {
@@ -1212,8 +1304,24 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         return
       }
 
-      let previewTaskId = previewTaskIdRef.current
-      const processedFiles = (files || []).map(f => ({
+      let previewTaskId = !fresh && lastPreview?.configKey === previewConfigKey
+        ? previewTaskIdRef.current : null
+      // Uploads are task-bound. A fresh run needs its own copies, never a moved
+      // file_id or broader cross-task access. Download checks existing access;
+      // the normal send path uploads each copy into the new task's scope.
+      const sendFiles = files ? await Promise.all(files.map(async file => {
+        if (file instanceof File) {
+          return fresh ? new File([file], file.name, { type: file.type }) : file
+        }
+        const response = await apiRequest(`${getApiUrl()}/api/files/download/${encodeURIComponent(file.file_id)}`)
+        if (!response.ok) {
+          failureMessage = t("builds.preview.errors.filesUnavailable")
+          throw new Error("Original preview attachment is unavailable")
+        }
+        return new File([await response.arrayBuffer()], file.name, { type: file.type || "" })
+      })) : undefined
+      if (previewGenerationRef.current !== generationAtStart) return
+      const processedFiles = (sendFiles || []).map(f => ({
         file_id: (f as any).file_id,
         name: f.name,
         size: f.size,
@@ -1247,6 +1355,9 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               tool_categories: finalToolCategories,
               is_preview: true,
               preview_agent_id: localAgentId && typeof localAgentId === 'string' ? parseInt(localAgentId) : null,
+              // Compare the selected configuration, not resolved default model
+              // ids. This is history metadata, never an execution instruction.
+              preview_config_key: previewConfigKey,
             },
             execution_mode: executionMode,
             is_visible: false,
@@ -1267,6 +1378,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         if (previewConfigGenerationRef.current === configGenerationAtStart) {
           previewTaskIdRef.current = previewTaskId
         }
+        setLastPreview({ taskId: previewTaskId, configKey: previewConfigKey, message: backendMessage, files: sendFiles || [] })
 
         // Close any file preview opened from the previous preview task before switching context.
         closeFilePreview()
@@ -1298,7 +1410,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         dispatch({ type: "TRIGGER_TASK_UPDATE" })
       }
 
-      await sendMessage(backendMessage, { force: true, targetTaskId: previewTaskId }, files)
+      await sendMessage(backendMessage, { force: true, targetTaskId: previewTaskId }, sendFiles)
       if (
         previewGenerationRef.current === generationAtStart
         && previewConfigGenerationRef.current === configGenerationAtStart
@@ -1313,11 +1425,14 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         payload: {
           id: `preview-error-${Date.now()}`,
           role: "assistant",
-          content: t("builds.preview.errors.requestFailed"),
+          content: failureMessage,
           timestamp: Date.now().toString(),
           isResult: true,
         }
       })
+    } finally {
+      previewSendingRef.current = false
+      setPreviewSending(false)
     }
   }
 
@@ -1651,6 +1766,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         } else {
           const newAgent = await response.json()
           setCreatedAgent(newAgent)
+          await bindPreviewTask(newAgent.id)
 
           // Staged triggers (configured before the agent existed, #928) go
           // through the regular trigger API now that a real agent id exists.
@@ -1902,6 +2018,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       !templateMissingKb && !templateMissingSkills && !templateMissingTools && !templateMissingMcp
     ))
   const previewStepCompleted = previewCompletionTaskId !== null
+    && lastPreview?.configKey === previewConfigKey
     && state.taskId === previewCompletionTaskId
     && state.currentTask?.id === String(previewCompletionTaskId)
     && state.currentTask?.status === "completed"
@@ -2993,6 +3110,33 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           </Button>
         </div>
       </div>
+      {previewHistoryLoading && (
+        <div className="px-4 py-2 text-xs text-muted-foreground" role="status">{t("builds.preview.historyLoading")}</div>
+      )}
+      {previewHistoryError && (
+        <div className="flex items-center gap-2 border-b px-4 py-2 text-xs" role="alert">
+          <span>{t("builds.preview.errors.historyFailed")}</span>
+          <Button size="sm" variant="ghost" onClick={() => setPreviewHistoryRetry(value => value + 1)}>{t("common.retry")}</Button>
+        </div>
+      )}
+      {lastPreview && (
+        <div className="space-y-2 border-b px-4 py-3 text-xs">
+          <p role="status" className={lastPreview.configKey !== previewConfigKey ? "text-amber-700 dark:text-amber-400" : "text-muted-foreground"}>
+            {t(lastPreview.configKey === null ? "builds.preview.configUnknown" : lastPreview.configKey !== previewConfigKey ? "builds.preview.configChanged" : "builds.preview.currentConfig")}
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {state.taskId !== lastPreview.taskId && (
+              <Button size="sm" variant="outline" disabled={previewSending} onClick={() => openPreviewRecord(lastPreview)}>{t("builds.preview.viewLast")}</Button>
+            )}
+            <Button size="sm" variant="outline"
+              disabled={previewSending || state.isProcessing || state.isHistoryLoading || previewHistoryLoading || loadingAgent || !modelConfig.general || !lastPreview.message}
+              onClick={() => void handlePreviewSendMessage(lastPreview.message, undefined, lastPreview.files, true)
+                .catch(() => toast.error(t("clientErrors.taskBusy")))}>
+              {t("builds.preview.rerunSample")}
+            </Button>
+          </div>
+        </div>
+      )}
       <div className="flex-1 min-h-0">
         <TaskConversationPanel
           mode="embedded-preview"
@@ -3034,7 +3178,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               modelConfig, selectedKbs, selectedSkills, selectedToolCategories
             }}
             onUpdateConfig={(updates) => {
-              if (updates.id !== undefined) setLocalAgentId(updates.id.toString());
+              if (updates.id !== undefined) {
+                if (!localAgentId) void bindPreviewTask(updates.id)
+                setLocalAgentId(updates.id.toString())
+              }
               if (updates.name !== undefined) setName(updates.name);
               if (updates.description !== undefined) setDescription(updates.description);
               if (updates.instructions !== undefined) setInstructions(updates.instructions);

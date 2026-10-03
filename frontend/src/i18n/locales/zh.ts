@@ -2962,6 +2962,12 @@ const zh = {
       title: "预览",
       live: "实时预览",
       synced: "配置已同步",
+      historyLoading: "正在加载你上次的试跑…",
+      currentConfig: "此次试跑使用当前配置，请查看下方结果。",
+      configChanged: "配置已变更。下方结果来自旧配置，请重新运行样例以验证改动。",
+      configUnknown: "此历史试跑没有配置快照，请重新运行样例以验证当前配置。",
+      viewLast: "查看上次试跑",
+      rerunSample: "重新运行原样例",
       initialMessage: "你好！我是你的 Agent 预览。你可以在这里测试你的配置。",
       chat: {
         placeholder: "与你的 Agent 对话...",
@@ -2976,6 +2982,9 @@ const zh = {
       errors: {
         noModel: "请先选择通用模型",
         requestFailed: "预览请求失败，请检查网络连接",
+        historyFailed: "无法加载你上次的试跑。",
+        filesUnavailable: "原样例附件已不可用，请重新上传后再试跑；此次未启动新任务。",
+        linkFailed: "Agent 已保存，但未能关联试跑记录。请重新试跑以保留此 Agent 的结果。",
       }
     }
   },

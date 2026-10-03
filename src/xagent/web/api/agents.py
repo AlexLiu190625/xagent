@@ -4,10 +4,13 @@ import logging
 import secrets
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, cast
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
+from sqlalchemy import String
+from sqlalchemy import cast as sql_cast
+from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -23,8 +26,10 @@ from ...core.tools.core.document_search import find_missing_knowledge_bases
 from ...core.tracing import create_agent_tracer
 from ..auth_dependencies import get_current_user, is_admin_user
 from ..models.agent import Agent, AgentOrigin
+from ..models.chat_message import TaskChatMessage
 from ..models.database import get_db, release_db_connection_if_clean
 from ..models.model import Model as DBModel
+from ..models.task import Task
 from ..models.user import User
 from ..schemas.agent_api_key import (
     APIKeyGenerateResponse,
@@ -826,6 +831,97 @@ async def get_agent(
     except Exception as e:
         logger.error(f"Failed to get agent {agent_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class AgentPreviewTaskResponse(BaseModel):
+    task_id: int
+    config_key: str | None
+    message: str
+    attachments: list[dict[str, Any]]
+
+
+class AgentPreviewTaskBinding(BaseModel):
+    task_id: int = Field(gt=0)
+
+
+@router.get("/{agent_id}/preview-task", response_model=AgentPreviewTaskResponse | None)
+async def get_agent_preview_task(
+    agent_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AgentPreviewTaskResponse | None:
+    """Find this editor's latest preview, without exposing teammates' transcripts."""
+    user_id = int(current_user.id)
+    if AgentStore(db).get_owned_agent(user_id, agent_id) is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    task = (
+        db.query(Task)
+        .filter(
+            Task.user_id == user_id,
+            Task.is_visible.is_(False),
+            # Compare serialized JSON scalars, never cast client JSON to an
+            # integer/bool: malformed legacy values must not break PostgreSQL
+            # history reads. SQLite serializes JSON true as 1.
+            sql_cast(Task.agent_config["is_preview"], String).in_(("true", "1")),
+            or_(
+                sql_cast(Task.agent_config["preview_agent_id"], String)
+                == str(agent_id),
+                sql_cast(Task.agent_config["preview_history_agent_id"], String)
+                == str(agent_id),
+            ),
+        )
+        .order_by(Task.id.desc())
+        .first()
+    )
+    if task is None:
+        return None
+    sample = (
+        db.query(TaskChatMessage)
+        .filter(TaskChatMessage.task_id == task.id, TaskChatMessage.role == "user")
+        .order_by(TaskChatMessage.id.asc())
+        .first()
+    )
+    config = cast(dict[str, Any], task.agent_config or {})
+    key = config.get("preview_config_key")
+    return AgentPreviewTaskResponse(
+        task_id=int(task.id),
+        config_key=key if isinstance(key, str) else None,
+        # Retry the original submitted sample even if delivery failed or is
+        # unknown. Without a persisted first turn, its files cannot be restored.
+        message=str(sample.content) if sample is not None else "",
+        attachments=(sample.attachments or []) if sample is not None else [],
+    )
+
+
+@router.put("/{agent_id}/preview-task", status_code=204)
+async def bind_agent_preview_task(
+    agent_id: int,
+    binding: AgentPreviewTaskBinding,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> None:
+    """Associate a pre-save preview after creating the agent; never reparent it."""
+    user_id = int(current_user.id)
+    if AgentStore(db).get_owned_agent(user_id, agent_id) is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    task = (
+        db.query(Task)
+        .filter(Task.id == binding.task_id, Task.user_id == user_id)
+        .with_for_update()
+        .first()
+    )
+    config = cast(dict[str, Any], task.agent_config or {}) if task is not None else {}
+    if task is None or task.is_visible or config.get("is_preview") is not True:
+        raise HTTPException(status_code=404, detail="Preview task not found")
+    if any(
+        config.get(key) not in (None, agent_id)
+        for key in ("preview_agent_id", "preview_history_agent_id")
+    ):
+        raise HTTPException(status_code=409, detail="Preview belongs to another agent")
+    # History association is deliberately separate from preview_agent_id: binding
+    # must not change the tool/runtime identity of a preview already executing.
+    task.agent_config = {**config, "preview_history_agent_id": agent_id}  # type: ignore[assignment]
+    db.commit()
 
 
 @router.put("/{agent_id}", response_model=AgentResponse)

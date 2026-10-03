@@ -2967,6 +2967,12 @@ Build when you need.`,
       title: "Preview",
       live: "Live Preview",
       synced: "Config Synced",
+      historyLoading: "Loading your last preview…",
+      currentConfig: "Preview uses the current configuration. Review the result below.",
+      configChanged: "Configuration changed. This result is from an earlier configuration; run the sample again to test your changes.",
+      configUnknown: "This older preview has no configuration snapshot. Run the sample again to test the current configuration.",
+      viewLast: "View last preview",
+      rerunSample: "Run original sample again",
       initialMessage: "Hello! I am the preview of your agent. You can test your configuration here.",
       chat: {
         placeholder: "Chat with your agent...",
@@ -2981,6 +2987,9 @@ Build when you need.`,
       errors: {
         noModel: "Please select a general model first",
         requestFailed: "Preview request failed, please check network connection",
+        historyFailed: "Could not load your last preview.",
+        filesUnavailable: "An original sample attachment is unavailable. Upload it again before rerunning; no new preview was started.",
+        linkFailed: "Agent saved, but its preview could not be linked. Run a new preview to retain a result for this agent.",
       }
     }
   },
