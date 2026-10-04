@@ -838,6 +838,10 @@ export function ChatInput({
       ) {
         deliveryAttemptRef.current = null;
       }
+      // A containing surface (e.g. Builder preview) may already show a
+      // persistent error. Keep retry state, but do not duplicate its notice.
+      if (typeof error === "object" && error !== null
+        && (error as { notificationHandled?: unknown }).notificationHandled === true) return;
       const errorCode = typeof error === "object" && error !== null
         ? readClientErrorCode((error as { errorCode?: unknown }).errorCode)
         : null;

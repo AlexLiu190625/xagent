@@ -361,6 +361,7 @@ export interface Interaction {
 }
 import {
   useWebSocket,
+  MessageDeliveryError,
   type WebSocketConnection,
   type WebSocketConnectionFailure,
 } from "@/hooks/use-websocket"
@@ -2062,6 +2063,7 @@ interface PendingMessage {
   force?: boolean
   clientMessageId?: string
   requestId?: string
+  start?: () => boolean
   resolve?: () => void
   reject?: (error: Error) => void
 }
@@ -2702,6 +2704,7 @@ export function AppProvider({
       // Ensure we are sending to the correct task
       // If targetTaskId is set, it must match the current connected task
       if (pendingMessage.targetTaskId) {
+        if (stateRef.current.taskId !== pendingMessage.targetTaskId) return
         // We use lastConnectedTaskId.current because state.taskId might be updated before the socket is connected
         // But sendChatMessage sends to the currently connected socket.
         // We need to make sure the CURRENT socket corresponds to the targetTaskId.
@@ -2714,6 +2717,12 @@ export function AppProvider({
           return
         }
       }
+
+      // The queue owns only the connection wait. Once claimed, the transport
+      // owns upload cancellation and acknowledgement timeouts/dispositions.
+      if (pendingMessageRef.current !== pendingMessage || pendingMessage.start?.() === false) return
+      pendingMessageRef.current = null
+      setPendingMessage(current => current === pendingMessage ? null : current)
 
       console.log('📤 Sending pending message:', {
         message: pendingMessage.message,
@@ -2747,26 +2756,36 @@ export function AppProvider({
     if (!pendingMessage?.targetTaskId) return
     if (state.taskId === pendingMessage.targetTaskId) return
     pendingMessage.reject?.(
-      new Error('Message not sent: the conversation was reset before it could be delivered.')
+      new MessageDeliveryError('Message not sent: the conversation was reset before it could be delivered.', 'not_sent')
     )
     setPendingMessage(current => (current === pendingMessage ? null : current))
   }, [pendingMessage, state.taskId])
 
-  const queuePendingMessage = useCallback((message: Omit<PendingMessage, 'resolve' | 'reject'>) => {
+  const queuePendingMessage = useCallback((message: Omit<PendingMessage, 'start' | 'resolve' | 'reject'>) => {
     return new Promise<void>((resolve, reject) => {
+      let waiting = true
       const timeout = window.setTimeout(() => {
+        waiting = false
         setPendingMessage(current => (
           current?.clientMessageId === message.clientMessageId ? null : current
         ))
-        reject(new Error('Message not sent: timed out waiting for the task connection.'))
+        reject(new MessageDeliveryError('Message not sent: timed out waiting for the task connection.', 'not_sent'))
       }, 30000)
       setPendingMessage({
         ...message,
+        start: () => {
+          if (!waiting) return false
+          waiting = false
+          window.clearTimeout(timeout)
+          return true
+        },
         resolve: () => {
+          waiting = false
           window.clearTimeout(timeout)
           resolve()
         },
         reject: (error) => {
+          waiting = false
           window.clearTimeout(timeout)
           reject(error)
         },

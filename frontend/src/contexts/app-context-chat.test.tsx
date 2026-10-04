@@ -95,7 +95,8 @@ vi.mock("@/contexts/i18n-context", () => ({
   }),
 }))
 
-vi.mock("@/hooks/use-websocket", () => ({
+vi.mock("@/hooks/use-websocket", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/hooks/use-websocket")>(),
   useWebSocket: (options: {
     connection?: {
       identity: string
@@ -2182,7 +2183,84 @@ describe("AppProvider websocket message routing", () => {
     })
 
     expect(deliveryError?.message).toMatch(/reset/)
+    expect(deliveryError).toMatchObject({ disposition: "not_sent" })
     expect(sendChatMessageMock).not.toHaveBeenCalled()
+  })
+
+  it("rejects a queued send if the task changes while the old socket is still connected", async () => {
+    let selectTask!: (taskId: number) => void
+    let queue!: () => Promise<void>
+    function ConnectedSwitchProbe() {
+      const { setTaskId, setPendingMessage } = useApp()
+      selectTask = taskId => setTaskId(taskId, { navigate: false })
+      queue = () => new Promise<void>((resolve, reject) => setPendingMessage({
+        message: "old task message", targetTaskId: 9, resolve, reject,
+      }))
+      return null
+    }
+    render(<AppProvider token="token"><ConnectedSwitchProbe /></AppProvider>)
+    act(() => selectTask(9))
+    act(() => webSocketOptions.current?.onConnect?.())
+    let deliveryError: unknown
+    await act(async () => {
+      // Queue and switch in the same tick: socket 9 is still connected when
+      // effects run, but the current conversation already belongs to task 10.
+      void queue().catch(error => { deliveryError = error })
+      selectTask(10)
+    })
+    expect(deliveryError).toMatchObject({ disposition: "not_sent" })
+    expect(sendChatMessageMock).not.toHaveBeenCalled()
+  })
+
+  it.each(["waiting", "slow-upload", "legacy-caller"])("limits only the connection wait, not the active send (%s)", async scenario => {
+    const connected = scenario !== "waiting"
+    vi.useFakeTimers()
+    let send!: () => Promise<void>
+    let finish!: () => void
+    let result: unknown = "pending"
+    sendChatMessageMock.mockReturnValueOnce(new Promise<void>(resolve => { finish = resolve }))
+    function QueuedSendProbe() {
+      const { sendMessage, setTaskId, setPendingMessage } = useApp()
+      send = () => {
+        setTaskId(9, { navigate: false })
+        if (scenario === "legacy-caller") {
+          return new Promise<void>((resolve, reject) => setPendingMessage({
+            message: "legacy prompt", targetTaskId: 9, resolve, reject,
+          }))
+        }
+        return sendMessage("slow attachment", { targetTaskId: 9, clientMessageId: "slow-upload" }, [new File(["data"], "sample.csv")])
+      }
+      return null
+    }
+    wsHarness.isConnected = false
+    try {
+      const view = render(<AppProvider token="token"><QueuedSendProbe /></AppProvider>)
+      await act(async () => { void send().then(() => { result = "accepted" }, error => { result = error }) })
+      if (connected) {
+        await act(async () => {
+          wsHarness.isConnected = true
+          webSocketOptions.current?.onConnect?.()
+        })
+        expect(sendChatMessageMock).toHaveBeenCalledOnce()
+      }
+      await act(async () => { await vi.advanceTimersByTimeAsync(31_000) })
+      if (connected) {
+        expect(result).toBe("pending")
+        await act(async () => { finish() })
+        expect(result).toBe("accepted")
+        expect(sendChatMessageMock).toHaveBeenCalledOnce()
+      } else {
+        expect(result).toMatchObject({ disposition: "not_sent" })
+        await act(async () => {
+          wsHarness.isConnected = true
+          webSocketOptions.current?.onConnect?.()
+        })
+        expect(sendChatMessageMock).not.toHaveBeenCalled()
+      }
+      view.unmount()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it("shows the sender's message live when a new task's run dies before tracing", async () => {

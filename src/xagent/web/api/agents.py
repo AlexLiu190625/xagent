@@ -859,6 +859,15 @@ async def get_agent_preview_task(
         .filter(
             Task.user_id == user_id,
             Task.is_visible.is_(False),
+            # A task is allocated before attachment upload. Until a user turn
+            # is persisted it is only staging, not a restorable preview. Keep
+            # submitted failed/unknown turns: they still contain the sample.
+            db.query(TaskChatMessage.id)
+            .filter(
+                TaskChatMessage.task_id == Task.id,
+                TaskChatMessage.role == "user",
+            )
+            .exists(),
             # Compare serialized JSON scalars, never cast client JSON to an
             # integer/bool: malformed legacy values must not break PostgreSQL
             # history reads. SQLite serializes JSON true as 1.
@@ -887,7 +896,7 @@ async def get_agent_preview_task(
         task_id=int(task.id),
         config_key=key if isinstance(key, str) else None,
         # Retry the original submitted sample even if delivery failed or is
-        # unknown. Without a persisted first turn, its files cannot be restored.
+        # unknown. A pre-upload staging task was excluded by the query above.
         message=str(sample.content) if sample is not None else "",
         attachments=(sample.attachments or []) if sample is not None else [],
     )

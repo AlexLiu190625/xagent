@@ -117,6 +117,27 @@ def test_attachment_only_sample_returns_empty_text_without_losing_files():
     ]
 
 
+@pytest.mark.parametrize("has_previous", [False, True])
+def test_unsubmitted_preview_does_not_replace_previous_sample(has_previous):
+    headers = _admin_headers()
+    agent = create_agent(headers)
+    previous = create_preview(agent["user_id"], agent["id"]) if has_previous else None
+    empty = create_preview(agent["user_id"], agent["id"], status=TaskStatus.PENDING)
+    with _direct_db_session() as db:
+        # Task creation precedes file upload. A failed upload has no submitted
+        # user turn; even an assistant-only diagnostic is not a retry sample.
+        sample = db.query(TaskChatMessage).filter_by(task_id=empty).one()
+        sample.role = "assistant"
+        db.commit()
+    response = client.get(f"/api/agents/{agent['id']}/preview-task", headers=headers)
+    assert response.status_code == 200
+    if previous is None:
+        assert response.json() is None
+    else:
+        assert response.json()["task_id"] == previous
+        assert response.json()["attachments"][0]["file_id"] == "sample-id"
+
+
 def test_link_presave_preview_without_changing_runtime_identity():
     headers = _admin_headers()
     agent = create_agent(headers)
@@ -288,20 +309,46 @@ def test_postgresql_preview_query_ignores_malformed_metadata():
             )
             db.add(task)
             db.flush()
+            db.add(
+                TaskChatMessage(
+                    task_id=task.id,
+                    user_id=user.id,
+                    role="user",
+                    content="Sample",
+                    message_type="message",
+                )
+            )
             for config in malformed_preview_configs(agent.id):
+                malformed = Task(
+                    user_id=user.id,
+                    title="Malformed metadata",
+                    is_visible=False,
+                    agent_config=config,
+                )
+                db.add(malformed)
+                db.flush()
                 db.add(
-                    Task(
+                    TaskChatMessage(
+                        task_id=malformed.id,
                         user_id=user.id,
-                        title="Malformed metadata",
-                        is_visible=False,
-                        agent_config=config,
+                        role="user",
+                        content="Malformed preview sample",
+                        message_type="message",
                     )
                 )
+            db.add(
+                Task(
+                    user_id=user.id,
+                    title="Upload failed before submission",
+                    is_visible=False,
+                    agent_config={"is_preview": True, "preview_agent_id": agent.id},
+                )
+            )
             db.commit()
             result = asyncio.run(get_agent_preview_task(agent.id, user, db))
             assert result is not None
             assert result.task_id == task.id
-            assert result.message == ""
+            assert result.message == "Sample"
             assert result.attachments == []
             # Binding metadata uses the same safe predicate as runtime metadata.
             task.agent_config = {

@@ -1277,9 +1277,9 @@ describe("ChatInput", () => {
     })
   })
 
-  it("keeps the draft when durable delivery is rejected", async () => {
+  it.each([false, true])("keeps a rejected draft without duplicating a handled notification (%s)", async notificationHandled => {
     const onInputChange = vi.fn()
-    const onSend = vi.fn().mockRejectedValue(new Error("Message was rejected"))
+    const onSend = vi.fn().mockRejectedValue(Object.assign(new Error("Message was rejected"), { notificationHandled }))
     const { container } = render(
       <ChatInput
         hideConfig
@@ -1300,6 +1300,7 @@ describe("ChatInput", () => {
     expect(onSend.mock.calls[0][1]).toEqual(
       expect.objectContaining({ clientMessageId: expect.any(String) })
     )
+    expect(toastErrorMock).toHaveBeenCalledTimes(notificationHandled ? 0 : 1)
   })
 
   it("localizes coded send failures without displaying their raw message", async () => {
