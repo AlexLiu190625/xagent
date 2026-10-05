@@ -10,7 +10,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, cast
 
-from sqlalchemy import select
+from sqlalchemy import ARRAY, Text, case, func, literal, select, type_coerce
 from sqlalchemy.orm import Session
 
 from ...core.agent.attachments import build_image_context_references
@@ -104,23 +104,26 @@ def _load_context_anchors(
     identities = sorted(references)
     anchors: dict[str, tuple[int, str, int]] = {}
     for offset in range(0, len(identities), MAX_EXECUTION_EVENT_PAGE_SIZE):
+        # event_id is globally unique: look it up on that index alone and
+        # apply the task, scope and horizon predicates here, so the planner
+        # cannot scan the task's rows through the (task, scope, sequence) index.
         rows = db.execute(
             select(
                 TaskExecutionEvent.event_id,
+                TaskExecutionEvent.task_id,
+                TaskExecutionEvent.scope_id,
                 TaskExecutionEvent.sequence,
                 TaskExecutionEvent.kind,
                 TaskExecutionEvent.payload_version,
             ).where(
-                TaskExecutionEvent.task_id == task_id,
-                TaskExecutionEvent.scope_id == "root",
-                TaskExecutionEvent.sequence <= horizon,
                 TaskExecutionEvent.event_id.in_(
                     identities[offset : offset + MAX_EXECUTION_EVENT_PAGE_SIZE]
                 ),
             )
         )
-        for event_id, sequence, kind, version in rows:
-            anchors[event_id] = (sequence, kind, version)
+        for event_id, owner, scope_id, sequence, kind, version in rows:
+            if owner == task_id and scope_id == "root" and sequence <= horizon:
+                anchors[event_id] = (sequence, kind, version)
     return anchors
 
 
@@ -172,27 +175,85 @@ _ACCEPTED_KINDS = frozenset({"input_accepted"})
 _OUTCOME_KINDS = _TOOL_KINDS - _START_KINDS
 
 
-def _root_events(
-    db: Session, task_id: int, *, after: int, through: int, kinds: frozenset[str]
-) -> list[TaskExecutionEvent]:
-    events: list[TaskExecutionEvent] = []
+def _page_root_events(
+    db: Session, query: Any, after: int, *, scalars: bool
+) -> list[Any]:
+    rows: list[Any] = []
     cursor = after
-    # Do not load checkpoints or raw LLM prompts to build a model transcript.
-    query = select(TaskExecutionEvent).where(
-        TaskExecutionEvent.task_id == task_id,
-        TaskExecutionEvent.scope_id == "root",
-        TaskExecutionEvent.sequence <= through,
-        TaskExecutionEvent.kind.in_(kinds),
-    )
-    while page := list(
-        db.scalars(
+    while True:
+        paged = (
             query.where(TaskExecutionEvent.sequence > cursor)
             .order_by(TaskExecutionEvent.sequence)
             .limit(MAX_EXECUTION_EVENT_PAGE_SIZE)
         )
-    ):
-        events.extend(page)
+        page = list(db.scalars(paged) if scalars else db.execute(paged))
+        if not page:
+            return rows
+        rows.extend(page)
         cursor = int(page[-1].sequence)
+
+
+def _settlement_payload(db: Session) -> Any:
+    """The settlement payload without ``result.agent_result``, computed in SQL.
+
+    The projection never reads the embedded agent context, which dominates the
+    size of a production settlement. Unknown dialects fetch the full payload.
+    """
+    column = TaskExecutionEvent.payload
+    dialect = db.get_bind().dialect.name
+    if dialect == "postgresql":
+        # ``#-`` raises when its path crosses an array, so only object-valued
+        # results are stripped; any other payload is returned as stored.
+        stripped: Any = case(
+            (
+                func.jsonb_typeof(column.op("#>")(literal(["result"], ARRAY(Text))))
+                == "object",
+                column.op("#-")(literal(["result", "agent_result"], ARRAY(Text))),
+            ),
+            else_=column,
+        )
+    elif dialect == "sqlite":
+        stripped = func.json_remove(column, "$.result.agent_result")
+    else:
+        return column
+    return type_coerce(stripped, column.type)
+
+
+def _root_events(
+    db: Session, task_id: int, *, after: int, through: int, kinds: frozenset[str]
+) -> list[TaskExecutionEvent]:
+    # Do not load checkpoints or raw LLM prompts to build a model transcript.
+    def scoped(*entities: Any) -> Any:
+        return select(*entities).where(
+            TaskExecutionEvent.task_id == task_id,
+            TaskExecutionEvent.scope_id == "root",
+            TaskExecutionEvent.sequence <= through,
+        )
+
+    others = kinds - {"execution_settled"}
+    events: list[TaskExecutionEvent] = []
+    if others:
+        events = _page_root_events(
+            db,
+            scoped(TaskExecutionEvent).where(TaskExecutionEvent.kind.in_(others)),
+            after,
+            scalars=True,
+        )
+    if len(others) == len(kinds):
+        return events
+    # Settlements are detached copies built from the stripped payload; the
+    # session never holds a row whose payload differs from the database.
+    columns = [c for c in TaskExecutionEvent.__table__.c if c.name != "payload"]
+    rows = _page_root_events(
+        db,
+        scoped(*columns, _settlement_payload(db).label("payload")).where(
+            TaskExecutionEvent.kind == "execution_settled"
+        ),
+        after,
+        scalars=False,
+    )
+    events.extend(TaskExecutionEvent(**row._mapping) for row in rows)
+    events.sort(key=lambda event: int(event.sequence))
     return events
 
 

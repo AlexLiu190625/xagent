@@ -365,6 +365,141 @@ def test_settlement_statuses_on_both_sides_of_the_floor(canonical, legacy):
     assert len([m for m in result if m["role"] == "system"]) == (5 if legacy else 3)
 
 
+def _settle_payload(db, task_id, key, payload):
+    return fact(db, task_id, "execution_settled", key, payload)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_settlements_with_agent_result_project_without_it(canonical, legacy):
+    factory, task_id = canonical
+    context = {"messages": [{"role": "user", "content": "q" * 4096}]}
+    with factory() as db:
+        for key, status in [("before", "failed"), ("before-ok", "completed")]:
+            _settle_payload(
+                db,
+                task_id,
+                key,
+                {
+                    "status": status,
+                    "result": {
+                        "success": status != "failed",
+                        "status": status,
+                        "failure_reason": f"{key} reason",
+                        "failed_step_id": "s1",
+                        "agent_result": {"context": context},
+                    },
+                },
+            )
+        say(db, task_id, "covered")
+        summarize(db, task_id, "s", last_root(db, task_id), legacy=legacy)
+        _settle_payload(
+            db,
+            task_id,
+            "after",
+            {
+                "status": "failed",
+                "result": {
+                    "status": "failed",
+                    "failure_reason": "after reason",
+                    "agent_result": {"context": context},
+                },
+            },
+        )
+        db.commit()
+    systems = [
+        m["content"] for m in messages(sweep(factory, task_id)) if m["role"] == "system"
+    ]
+    assert any("after reason" in text for text in systems)
+    assert any("before reason" in text for text in systems) == legacy
+
+
+def _result_missing(db, task_id, key):
+    _settle_payload(db, task_id, key, {"status": "failed"})
+
+
+def _result_string(db, task_id, key):
+    _settle_payload(db, task_id, key, {"status": "failed", "result": "boom"})
+
+
+def _result_list(db, task_id, key):
+    _settle_payload(db, task_id, key, {"status": "failed", "result": [1, 2]})
+
+
+def _result_null(db, task_id, key):
+    _settle_payload(db, task_id, key, {"status": "failed", "result": None})
+
+
+def _agent_result_missing(db, task_id, key):
+    _settle_payload(
+        db,
+        task_id,
+        key,
+        {"status": "failed", "result": {"status": "failed", "failure_reason": "r"}},
+    )
+
+
+def _agent_result_scalar(db, task_id, key):
+    _settle_payload(
+        db,
+        task_id,
+        key,
+        {"result": {"success": False, "agent_result": "text", "failure_reason": "r"}},
+    )
+
+
+def _agent_result_null_with_top_status(db, task_id, key):
+    _settle_payload(
+        db,
+        task_id,
+        key,
+        {"status": "cancelled", "result": {"agent_result": None}},
+    )
+
+
+def _payload_is_list(db, task_id, key):
+    _settle_payload(db, task_id, key, [{"result": {"agent_result": 1}}])
+
+
+def _payload_data_wrapper(db, task_id, key):
+    _settle_payload(
+        db,
+        task_id,
+        key,
+        {
+            "result": {"status": "failed", "agent_result": {"big": "x" * 64}},
+            "data": {"result": {"status": "failed", "agent_result": {"k": 1}}},
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        _result_missing,
+        _result_string,
+        _result_list,
+        _result_null,
+        _agent_result_missing,
+        _agent_result_scalar,
+        _agent_result_null_with_top_status,
+        _payload_is_list,
+        _payload_data_wrapper,
+    ],
+)
+@pytest.mark.parametrize("legacy", [False, True])
+def test_settlement_shapes_without_agent_result_match_the_oracle(
+    canonical, shape, legacy
+):
+    factory, task_id = canonical
+    with factory() as db:
+        shape(db, task_id, "before")
+        say(db, task_id, "covered")
+        summarize(db, task_id, "s", last_root(db, task_id), legacy=legacy)
+        shape(db, task_id, "after")
+        purge_legacy(db, task_id)
+    sweep(factory, task_id)
+
+
 def test_child_scopes_reuse_root_identities(canonical):
     factory, task_id = canonical
     with factory() as db:
