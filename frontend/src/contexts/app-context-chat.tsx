@@ -4046,13 +4046,19 @@ export function AppProvider({
             dispatch({ type: "ADD_STEP", payload: step })
 
             // Also add to traceEvents for displaying execution logs
+            // Preserve the failed outcome in the display event vocabulary;
+            // dag_step_end is emitted by the backend for both outcomes.
+            const displayEventType = step.status === "failed" ? "dag_step_failed" : eventType
             const traceEvent: TraceEvent = {
               event_id: generateMessageId(`trace-step-end`),
-              event_type: eventType,
+              event_type: displayEventType,
               step_id: message.step_id || eventData.step_id || stepName,
               timestamp: message.timestamp,
               data: {
-                action: t('agent.logs.event.actions.dag_step_end'),
+                action: t(displayEventType === "dag_step_failed"
+                  ? 'agent.logs.event.actions.dag_step_failed'
+                  : 'agent.logs.event.actions.dag_step_end'),
+                error: eventData.error,
                 step_name: stepName,
                 description: eventData.description,
                 tool_names: eventData.tool_name ? [eventData.tool_name] : eventData.tool_names || [],

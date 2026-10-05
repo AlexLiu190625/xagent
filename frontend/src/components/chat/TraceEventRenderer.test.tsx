@@ -68,6 +68,62 @@ vi.mock("@/components/file/pptx-preview-renderer", () => ({
 import { TraceEventRenderer } from "./TraceEventRenderer"
 
 describe("TraceEventRenderer", () => {
+  it("renders a failed DAG end correctly both live and after replay", () => {
+    const events = [
+      {
+        event_id: "export-start",
+        event_type: "dag_step_start",
+        step_id: "export",
+        timestamp: 1000,
+        data: { step_name: "Export verified data" },
+      },
+      {
+        event_id: "export-end",
+        event_type: "dag_step_end",
+        step_id: "export",
+        timestamp: 2000,
+        data: { status: "completed", result: "Verified output" },
+      },
+      {
+        event_id: "verify-start",
+        event_type: "dag_step_start",
+        step_id: "verify",
+        timestamp: 3000,
+        data: { step_name: "Verify remaining data" },
+      },
+      {
+        event_id: "verify-end",
+        event_type: "dag_step_end",
+        step_id: "verify",
+        timestamp: 4000,
+        data: { status: "failed", error: "Iteration limit reached" },
+      },
+    ]
+    const { container, rerender, unmount } = render(
+      <TraceEventRenderer events={events.slice(0, -1)} taskStatus="running" />,
+    )
+    expect(screen.getByRole("button", { name: "Verify remaining data" })).toBeInTheDocument()
+
+    rerender(<TraceEventRenderer events={events} taskStatus="running" />)
+    const assertStepOutcomes = () => {
+      const successful = screen.getByRole("button", { name: "Export verified data" })
+      const failed = screen.getByRole("button", { name: "Verify remaining data" })
+      expect(successful.querySelector(".text-green-500")).not.toBeNull()
+      expect(failed.querySelector(".text-red-500")).not.toBeNull()
+      expect(failed.querySelector(".text-green-500")).toBeNull()
+      if (failed.getAttribute("aria-expanded") === "false") fireEvent.click(failed)
+      fireEvent.click(screen.getByRole("button", { name: /traceEventRenderer.executionFailed/ }))
+      expect(screen.getByText("Iteration limit reached")).toBeInTheDocument()
+    }
+    assertStepOutcomes()
+    expect(container.querySelector(".animate-spin")).toBeNull()
+
+    // A successful partial handoff completes the task, not its failed step.
+    unmount()
+    render(<TraceEventRenderer events={events} taskStatus="completed" />)
+    assertStepOutcomes()
+  })
+
   it("ignores null, primitive, and malformed trace event entries", () => {
     expect(() => render(
       <TraceEventRenderer

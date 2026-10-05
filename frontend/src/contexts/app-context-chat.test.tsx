@@ -603,6 +603,27 @@ describe("AppProvider websocket message routing", () => {
     expect(screen.getByTestId("conversation-storage-version")).toHaveTextContent("2")
   })
 
+  it.each(["failed", "completed", undefined])("preserves DAG end status %s and error for the conversation trace", (status) => {
+    render(<AppProvider token="token"><SeedRunningTask /><SessionControlsProbe /></AppProvider>)
+    const error = status === "failed" ? "Iteration limit reached" : undefined
+    act(() => {
+      webSocketOptions.current?.onMessage?.(dagTraceMessage("dag_step_end", 1, {
+        step_id: "verify",
+        step_name: "Verify remaining data",
+        ...(status ? { status } : {}),
+        error,
+      }))
+    })
+    const { state } = getSessionControls()
+    expect(state.steps.find(step => step.id === "verify")?.status).toBe(status ?? "completed")
+    const trace = [
+      ...state.traceEvents,
+      ...state.messages.flatMap(message => message.traceEvents ?? []),
+    ].find(event => event.step_id === "verify")
+    expect(trace?.event_type).toBe(status === "failed" ? "dag_step_failed" : "dag_step_end")
+    expect((trace?.data as Record<string, unknown>).error).toBe(error)
+  })
+
   it.each(["paused", "waiting_for_user"])("keeps V2 child navigation metadata after partial %s task info", (status) => {
     render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
     act(() => { webSocketOptions.current?.onMessage?.(taskInfoMessage(1, { conversation_storage_version: 2 })) })

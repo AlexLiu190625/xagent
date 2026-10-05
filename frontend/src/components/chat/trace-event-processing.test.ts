@@ -52,6 +52,71 @@ const ev = (event_type: string, data: Record<string, unknown>) => ({
 
 const stepStart = ev("dag_step_start", { step_name: "Search" })
 
+describe("processTraceEvents DAG step outcomes", () => {
+  it.each([undefined, "failed", "completed"])(
+    "keeps a failed DAG step separate from successful siblings when task status is %s",
+    (taskStatus) => {
+      const steps = processTraceEvents([
+        stepStart,
+        ev("dag_step_end", { status: "completed", result: "Verified output" }),
+        { ...ev("dag_step_start", { step_name: "Verify remaining data" }), step_id: "verify" },
+        {
+          ...ev("dag_step_end", { status: "failed", error: "Iteration limit reached" }),
+          step_id: "verify",
+        },
+      ], t, taskStatus)
+
+      expect(steps[0]).toMatchObject({ status: "completed", output: "Verified output" })
+      expect(steps[1]).toMatchObject({ status: "failed", output: "" })
+      expect(steps[1].actions).toEqual([
+        expect.objectContaining({
+          type: "error",
+          status: "failed",
+          data: { error: "Iteration limit reached" },
+        }),
+      ])
+    },
+  )
+
+  it.each(["dag_step_end", "dag_step_failed"])("ends unfinished actions on %s without changing completed work", (eventType) => {
+    const [step] = processTraceEvents([
+      stepStart,
+      ev("tool_execution_start", { tool_name: "read_file", tool_call_id: "done" }),
+      ev("tool_execution_end", { tool_name: "read_file", tool_call_id: "done", result: "Verified rows" }),
+      ev("tool_execution_start", { tool_name: "web_search", tool_call_id: "pending-1" }),
+      ev("tool_execution_start", { tool_name: "web_search", tool_call_id: "pending-2" }),
+      ev(eventType, { status: "failed", error: "Step stopped" }),
+    ], t, "completed")
+
+    expect(step.status).toBe("failed")
+    expect(step.actions[0]).toMatchObject({ status: "completed", data: { output: "Verified rows" } })
+    expect(step.actions.slice(1)).toHaveLength(2)
+    step.actions.slice(1).forEach((action) => {
+      expect(action).toMatchObject({ status: "failed", data: { error: "Step stopped" } })
+    })
+  })
+
+  it("uses the existing fallback for failed DAG steps without an error message", () => {
+    const [step] = processTraceEvents([
+      stepStart,
+      ev("dag_step_end", { status: "failed" }),
+    ], t)
+
+    expect(step.status).toBe("failed")
+    expect(step.actions[0].data.error).toBe("traceEventRenderer.unknownError")
+  })
+
+  it.each(["completed", undefined])("preserves successful and legacy DAG ends with status %s", (status) => {
+    const [step] = processTraceEvents([
+      stepStart,
+      ev("dag_step_end", { ...(status ? { status } : {}), result: "Verified output" }),
+    ], t)
+
+    expect(step).toMatchObject({ status: "completed", output: "Verified output" })
+    expect(step.actions[0]).toMatchObject({ type: "info", status: "completed" })
+  })
+})
+
 describe("processTraceEvents tool_call_id attribution", () => {
   it("normalizes malformed trace data before nested access", () => {
     const malformedEvents = [

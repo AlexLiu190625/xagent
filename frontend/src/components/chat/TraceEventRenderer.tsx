@@ -770,7 +770,10 @@ export function processTraceEvents(
         }
       }
 
-      if (event.event_type === 'dag_step_end' || event.event_type === 'step_completed' || event.event_type === 'react_task_end' || event.event_type === 'task_completion') {
+      // DAG steps emit the same end event for success and failure.
+      const isFailedDagStepEnd = event.event_type === 'dag_step_end' && eventData.status === 'failed';
+      const isFailedDagStep = isFailedDagStepEnd || event.event_type === 'dag_step_failed';
+      if (!isFailedDagStepEnd && (event.event_type === 'dag_step_end' || event.event_type === 'step_completed' || event.event_type === 'react_task_end' || event.event_type === 'task_completion')) {
         step.status = 'completed';
         const shouldShowStepResult = event.event_type === 'dag_step_end' || event.event_type === 'step_completed';
         const result = shouldShowStepResult
@@ -794,9 +797,9 @@ export function processTraceEvents(
         });
       }
 
-      if (['dag_step_failed', 'tool_execution_failed', 'llm_call_failed', 'react_task_failed', 'agent_error', 'trace_error'].includes(event.event_type as string)) {
+      if (isFailedDagStep || ['tool_execution_failed', 'llm_call_failed', 'react_task_failed', 'agent_error', 'trace_error'].includes(event.event_type as string)) {
         const isTerminalFailure =
-          ['dag_step_failed', 'react_task_failed', 'agent_error', 'trace_error'].includes(event.event_type as string);
+          isFailedDagStep || ['react_task_failed', 'agent_error', 'trace_error'].includes(event.event_type as string);
         if (isTerminalFailure) {
           step.status = 'failed';
         } else if (step.status === 'pending') {
@@ -880,6 +883,15 @@ export function processTraceEvents(
             status: 'failed',
             timestamp,
             data: { error: errorMessage }
+          });
+        }
+        if (isFailedDagStep) {
+          // The step has stopped even if the task later delivers a partial answer.
+          step.actions.forEach(action => {
+            if (action.status === 'running') {
+              action.status = 'failed';
+              action.data.error = errorMessage;
+            }
           });
         }
       }
