@@ -188,6 +188,22 @@ OPTIONS_REQUIRED_GUIDANCE = (
     "field sent without options is shown to the user as a free-text input."
 )
 
+CLARIFICATION_GUIDANCE = (
+    "Ask only the few questions needed now, preferably at most three related "
+    "questions per turn. Use selection fields when the choices are known. "
+    "A skipped or uncertain answer is missing information, not permission or "
+    "acceptance of a default; keep any dependent action blocked."
+)
+
+SUGGESTED_VALUE_GUIDANCE = (
+    "Optional suggested answer, shown for the user to choose, never submitted "
+    "automatically. For select_one/select_multiple or a suggested action_cards "
+    "choice, use an existing option value. An action_cards default_value may "
+    "instead carry a website URL already provided by the user as context for "
+    "an input_url field; this does not select or authorize the action. "
+    "Suggest safe preferences, never invent facts, action targets or consent."
+)
+
 # Handed back to the model beside ``degraded_fields``: the echoed list already
 # shows ``text_input`` where it wrote ``select_one``, but a model does not diff
 # its own call against the echo.
