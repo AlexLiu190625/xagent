@@ -16,6 +16,11 @@ import pytest
             "_upload_allowed_dirs",
             "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS",
         ),
+        (
+            "jira_attachment",
+            "allowed_file_dirs",
+            "XAGENT_JIRA_FILE_ALLOWED_DIRS",
+        ),
     ],
 )
 def test_connectors_delegate_configured_upload_roots_to_shared_parser(
@@ -42,6 +47,11 @@ def test_connectors_delegate_configured_upload_roots_to_shared_parser(
             "google_drive",
             "_upload_allowed_dirs",
             "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS",
+        ),
+        (
+            "jira_attachment",
+            "allowed_file_dirs",
+            "XAGENT_JIRA_FILE_ALLOWED_DIRS",
         ),
     ],
 )

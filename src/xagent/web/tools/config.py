@@ -3822,6 +3822,7 @@ class WebToolConfig(BaseToolConfig):
                 env["XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"] = allowed_file_dirs
                 env["XAGENT_SHAREPOINT_FILE_ALLOWED_DIRS"] = allowed_file_dirs
                 env["XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"] = allowed_file_dirs
+                env["XAGENT_JIRA_FILE_ALLOWED_DIRS"] = allowed_file_dirs
             # Distinct from the read allowlists above: Google Drive and
             # OneDrive download tools write NEW files into the task workspace, so they
             # get their own single-value, task-dir-only vars rather than

@@ -275,6 +275,7 @@ _DURABLE_UPLOAD_FIELDS: dict[tuple[str, str], tuple[str, ...]] = {
     ("sharepoint", "sharepoint_upload_file"): ("local_file_path",),
     ("google-drive", "google_drive_upload_file"): ("file_path",),
     ("slack", "slack_upload_file"): ("file_path",),
+    ("jira", "jira_add_attachment"): ("file_path",),
 }
 
 # Built-in connector tools that create a real binary under the current task
