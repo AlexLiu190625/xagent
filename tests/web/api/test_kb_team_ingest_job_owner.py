@@ -222,7 +222,7 @@ def test_document_ingest_job_owner_is_actor_not_team_storage_tenant(
                 captured, "job-2", BackgroundJobType.KB_INGEST_DOCUMENT
             ),
         ),
-        patch.object(kb_module, "admit_kb_ingest_target") as admit,
+        patch.object(kb_module, "async_admit_kb_ingest_target") as admit,
         patch.object(kb_module, "_cleanup_background_ingest_staging_file"),
         patch.object(
             kb_module, "_enqueue_background_job_or_503_async", side_effect=_passthrough

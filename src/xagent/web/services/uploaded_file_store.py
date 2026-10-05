@@ -28,6 +28,11 @@ from ...core.file_storage.keys import (
 from ..models.database import get_session_local, release_db_connection_if_clean
 from ..models.task import Task
 from ..models.uploaded_file import UploadedFile
+from .kb_reference_protection import (
+    guard_upload_compensation,
+    notify_file_publication,
+    record_cleanup_fence,
+)
 from .managed_file_ref import (
     DurableStorageOperationError,
     ManagedFileRef,
@@ -672,6 +677,8 @@ def settle_uploaded_file_compensation_no_commit(
         updated_at_filter,
     )
     changed = query.delete(synchronize_session=False)
+    if changed == 1:
+        record_cleanup_fence(db, file_id)
     return "deleted" if changed == 1 else None
 
 
@@ -1168,8 +1175,11 @@ def register_local_uploads_sync(
                 )
 
 
+@guard_upload_compensation
 def compensate_registered_uploads_sync(
     claims: Sequence[RegisteredUploadCompensationClaim],
+    *,
+    _release_claim_locks: Callable[[], None] | None = None,
 ) -> None:
     """Rollback only registrations still owned by the cancelled request.
 
@@ -1232,6 +1242,7 @@ def compensate_registered_uploads_sync(
                 )
             )
             if claimed_count == 1:
+                record_cleanup_fence(db, registration_claim.file_id)
                 persisted_claimed_at = _load_uploaded_file_compensation_token_no_commit(
                     db,
                     row_id=int(row[0]),
@@ -1251,6 +1262,9 @@ def compensate_registered_uploads_sync(
                     )
                 )
         db.commit()
+
+    if _release_claim_locks is not None:
+        _release_claim_locks()
 
     cleaned: list[ClaimedRegisteredUploadCompensation] = []
     unresolved: list[ClaimedRegisteredUploadCompensation] = []
@@ -1387,6 +1401,7 @@ class UploadedFileStore:
             raise ValueError("Pre-uploaded file must have a durable checksum")
         self.db.add(file_record)
         self.db.flush()
+        notify_file_publication(self.db, str(file_record.file_id))
         return file_record
 
     def upsert_already_durable(

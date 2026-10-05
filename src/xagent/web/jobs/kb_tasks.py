@@ -30,11 +30,12 @@ from ...core.tools.core.RAG_tools.pipelines.web_ingestion import (
 from ...core.tools.core.RAG_tools.utils.user_scope import user_scope_context
 from ..config import get_upload_path
 from ..models.background_job import BackgroundJob
-from ..models.database import get_session_local
+from ..models.database import get_session_local, release_db_connection_if_clean
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
 from ..services.background_jobs import update_job_progress
 from ..services.kb_ingest_targets import is_latest_kb_ingest_generation
+from ..services.kb_reference_protection import coordinate_ingest_job
 from .exceptions import BackgroundJobHandlerError
 from .progress import BackgroundJobProgressManager
 
@@ -188,6 +189,7 @@ def _cleanup_failed_job_collection_metadata_after_api_ingest(
     )
 
 
+@coordinate_ingest_job
 def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]:
     payload = dict(job.payload or {})
     target_path = payload.get("target_path")
@@ -575,13 +577,16 @@ def _is_staged_document_generation_latest(
 ) -> bool:
     if not _has_generation_gate(payload):
         return True
-    return is_latest_kb_ingest_generation(
+    latest = is_latest_kb_ingest_generation(
         db,
         user_id=int(payload["user_id"]),
         collection=str(payload["collection"]),
         target_path=str(payload["target_path"]),
         generation_id=str(payload["generation_id"]),
     )
+    if not release_db_connection_if_clean(db):
+        raise RuntimeError("KB generation check requires a clean transaction")
+    return latest
 
 
 def _cleanup_failed_staged_job_collection_metadata_if_current(

@@ -272,6 +272,9 @@ def configure_db(
         )
 
     _SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=_engine)
+    from ..services.kb_reference_protection import install_file_reference_validator
+
+    install_file_reference_validator()
 
 
 def _initialize_database_schema(engine: Engine) -> list[dict[str, Any]]:

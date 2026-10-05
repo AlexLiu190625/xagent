@@ -199,6 +199,31 @@ def isolate_path_config_caches() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True, scope="function")
+def isolate_process_database_binding() -> Iterator[None]:
+    """Keep temporary Web SQL configuration from leaking into later tests."""
+    from sqlalchemy.engine import Engine
+
+    from xagent.web.models import database
+
+    previous = database._SessionLocal, database._engine
+    try:
+        yield
+    finally:
+        engine = database._engine
+        database._SessionLocal, database._engine = previous
+        if isinstance(engine, Engine) and engine is not previous[1]:
+            engine.dispose()
+
+
+@pytest.fixture
+def monkeypatch(
+    isolate_process_database_binding: None, monkeypatch: pytest.MonkeyPatch
+) -> pytest.MonkeyPatch:
+    """Undo test patches before restoring the original process SQL binding."""
+    return monkeypatch
+
+
+@pytest.fixture(autouse=True, scope="function")
 def isolate_rag_storage(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Isolate per-test RAG/KB storage paths and reset global storage state.
 

@@ -221,17 +221,26 @@ def test_build_preview_splits_importable_and_archived(openclaw_home: Path) -> No
 
 @pytest.fixture
 def db_session() -> Iterator[object]:
+    from xagent.web.models import database
     from xagent.web.models.database import Base, get_engine, get_session_local, init_db
 
+    previous = database._SessionLocal, database._engine
     temp_dir = tempfile.mkdtemp()
     db_url = f"sqlite:///{os.path.join(temp_dir, 'test.db')}"
-    init_db(db_url=db_url)
-    session = get_session_local()()
     try:
-        yield session
+        init_db(db_url=db_url)
+        engine = get_engine()
+        session = get_session_local()()
+        try:
+            yield session
+        finally:
+            session.close()
+            Base.metadata.drop_all(bind=engine)
     finally:
-        session.close()
-        Base.metadata.drop_all(bind=get_engine())
+        engine = database._engine
+        database._SessionLocal, database._engine = previous
+        if engine is not None and engine is not previous[1]:
+            engine.dispose()
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
@@ -248,6 +257,37 @@ def _make_user(db) -> object:
     db.commit()
     db.refresh(user)
     return user
+
+
+def test_database_teardown_preserves_standalone_document_registration(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from xagent.core.tools.core.RAG_tools.file.register_document import (
+        register_document,
+    )
+    from xagent.core.tools.core.RAG_tools.storage.lancedb_stores import (
+        LanceDBVectorIndexStore,
+    )
+    from xagent.web.models import database
+
+    monkeypatch.setattr(database, "_SessionLocal", None)
+    monkeypatch.setattr(database, "_engine", None)
+    lifecycle = db_session.__wrapped__()
+    try:
+        next(lifecycle)
+    finally:
+        lifecycle.close()
+
+    source = tmp_path / "standalone.txt"
+    source.write_text("A source independent of the temporary Web database.")
+    result = register_document(
+        collection="standalone", source_path=str(source), file_id="standalone-file"
+    )
+    assert result["created"] is True
+    records = LanceDBVectorIndexStore().list_document_records_by_file_ids(
+        ["standalone-file"]
+    )
+    assert [row.doc_id for row in records] == [result["doc_id"]]
 
 
 def test_loader_imports_agent_skills_and_interval_schedule(

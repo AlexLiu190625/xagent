@@ -8,6 +8,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..models.kb_ingest_target import KBIngestTarget
+from .kb_reference_protection import guard_ingest_admission
 
 
 def _target_query(
@@ -39,6 +40,7 @@ def _target_query_for_update(
     ).with_for_update()
 
 
+@guard_ingest_admission
 def admit_kb_ingest_target(
     db: Session,
     *,

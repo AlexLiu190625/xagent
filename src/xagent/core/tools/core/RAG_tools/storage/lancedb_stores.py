@@ -54,6 +54,7 @@ from .contracts import (
     VectorIndexStore,
     build_filter_from_dict,
 )
+from .file_reference import guard_document_upsert
 from .lancedb_filter_utils import (
     translate_filter_expression,
 )
@@ -2227,6 +2228,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             return f"({backend_filter}) AND ({user_filter})"
         return backend_filter
 
+    @guard_document_upsert
     def upsert_documents(self, records: List[Dict[str, Any]]) -> None:
         """Upsert document records to LanceDB.
 
@@ -2719,6 +2721,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         # LanceDB schema operations don't have async variants, use sync
         return self.get_vector_dimension(table_name)
 
+    @guard_document_upsert
     async def upsert_documents_async(self, records: List[Dict[str, Any]]) -> None:
         """Upsert document records using async LanceDB API."""
         from ..LanceDB.schema_manager import ensure_documents_table

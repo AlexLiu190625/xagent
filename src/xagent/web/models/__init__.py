@@ -44,6 +44,7 @@ from .trigger import (
     TriggerType,
 )
 from .uploaded_file import UploadedFile
+from .uploaded_file_cleanup_fence import UploadedFileCleanupFence
 from .user import User, UserDefaultModel, UserModel
 from .user_api_key import UserApiKey
 from .user_channel import SlackOAuthFlowState, UserChannel
@@ -115,6 +116,7 @@ __all__ = [
     "KBIngestTarget",
     "TaskChatMessage",
     "UploadedFile",
+    "UploadedFileCleanupFence",
     "SandboxInfo",
     "SandboxSnapshot",
     "DurableSandboxLifecycle",

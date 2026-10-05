@@ -40,6 +40,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import JSONResponse
+from filelock import Timeout
 from googleapiclient.discovery import build  # type: ignore
 from googleapiclient.http import MediaIoBaseDownload  # type: ignore
 from pydantic import BaseModel, Field, ValidationError
@@ -158,10 +159,16 @@ from ..services.kb_file_service import (
     upsert_uploaded_file_record as _upsert_uploaded_file_record,
 )
 from ..services.kb_ingest_targets import (
-    admit_kb_ingest_target,
     release_kb_ingest_target_generation,
     tombstone_kb_ingest_target,
     tombstone_kb_ingest_targets_for_collection,
+)
+from ..services.kb_reference_protection import (
+    ADMISSION_BUSY_MESSAGE,
+    ADMISSION_CONFLICT_MESSAGE,
+    FileReferenceConflict,
+    async_admit_kb_ingest_target,
+    select_new_ingest_file_id,
 )
 from ..services.knowledge_base_team_scope import (
     KnowledgeBaseAccess,
@@ -2568,6 +2575,14 @@ def handle_kb_exceptions(func: T) -> T:
             return await func(*args, **kwargs)
         except HTTPException:
             raise
+        except Timeout:
+            raise HTTPException(
+                status_code=503,
+                detail=ADMISSION_BUSY_MESSAGE,
+                headers={"Retry-After": "15"},
+            )
+        except FileReferenceConflict:
+            raise HTTPException(status_code=409, detail=ADMISSION_CONFLICT_MESSAGE)
         except RollbackFailureError as e:
             logger.error("KB rollback failure in %s: %s", func.__name__, e)
             raise HTTPException(status_code=500, detail=str(e))
@@ -3751,7 +3766,10 @@ async def create_ingest_job(
     file_id = (
         str(existing_file_record.file_id)
         if existing_file_record is not None
-        else _background_ingest_file_id(user_id=int(_user.id), storage_path=file_path)
+        else select_new_ingest_file_id(
+            db,
+            _background_ingest_file_id(user_id=int(_user.id), storage_path=file_path),
+        )
     )
     staged_file_path = _build_background_ingest_staging_path(
         user_id=int(_user.id),
@@ -3865,7 +3883,7 @@ async def create_ingest_job(
         if dict(job.payload or {}).get("source_path") != str(staged_file_path):
             _cleanup_background_ingest_staging_file(staged_file_path)
             return job
-        admit_kb_ingest_target(
+        await async_admit_kb_ingest_target(
             db,
             user_id=int(_user.id),
             collection=safe_collection,
@@ -3875,7 +3893,7 @@ async def create_ingest_job(
             job_id=str(job.id),
             file_sha256=file_sha256,
         )
-    except Exception:
+    except BaseException:
         db.rollback()
         _cleanup_background_ingest_staging_file(staged_file_path)
         raise

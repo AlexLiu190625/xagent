@@ -49,6 +49,7 @@ from sqlalchemy.orm import Session
 
 from ..models.uploaded_file import UploadedFile
 from .db_runtime import is_database_pool_timeout, run_db_io_cancellation_safe
+from .kb_reference_protection import guard_cleanup_claim
 from .uploaded_file_store import (
     _load_uploaded_file_compensation_token_no_commit,
     delete_registered_preview_caches,
@@ -177,6 +178,7 @@ def _delete_local_file(storage_path: str) -> None:
         local_path.unlink()
 
 
+@guard_cleanup_claim
 def _claim_orphan(db: Session, candidate: _OrphanUploadCandidate) -> datetime | None:
     """CAS-claim one still-unbound row; return its persisted generation token.
 
@@ -185,9 +187,11 @@ def _claim_orphan(db: Session, candidate: _OrphanUploadCandidate) -> datetime | 
     request compensation) mutually exclusive, and ``task_id IS NULL`` makes
     the claim lose to any bind that committed first. Binders in turn use
     conditional updates excluding ``compensating`` rows, so whichever side
-    commits first wins outright. Committed immediately so the claim is
-    visible before any storage I/O starts.
+    commits first wins outright. After the reference guard admits this file,
+    unlink its local cache before the CAS; the guard commits the claim and
+    cleanup fence before durable-object deletion starts.
     """
+    _delete_local_file(candidate.storage_path)
     claimed_at = datetime.now(timezone.utc)
     claimed = (
         db.query(UploadedFile)
@@ -220,18 +224,15 @@ def _claim_orphan(db: Session, candidate: _OrphanUploadCandidate) -> datetime | 
     if token is None:
         db.rollback()
         return None
-    db.commit()
     return token
 
 
 def _reap_orphan(db: Session, candidate: _OrphanUploadCandidate) -> bool:
     """Reap one candidate; True only when its metadata row was deleted."""
-    # Local bytes first, while the row is still available: a consumer that
+    # The guarded claim unlinks local bytes while the row is available: a consumer that
     # binds after this re-materializes from the durable object, and the
     # generic stale-compensation recovery (which owns every post-claim crash
     # window but knows no storage_path) then never has a local file to leak.
-    _delete_local_file(candidate.storage_path)
-
     token = _claim_orphan(db, candidate)
     if token is None:
         return False  # bound, or claimed by another owner — spared

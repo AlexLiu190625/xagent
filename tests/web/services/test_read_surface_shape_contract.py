@@ -153,7 +153,20 @@ class _Environment:
 
 
 @pytest.fixture(scope="module")
-def _environment(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Environment]:
+def _environment(
+    tmp_path_factory: pytest.TempPathFactory, request: pytest.FixtureRequest
+) -> Iterator[_Environment]:
+    from xagent.web.models import database
+
+    previous = database._SessionLocal, database._engine
+
+    def restore_database_binding() -> None:
+        current = database._engine
+        database._SessionLocal, database._engine = previous
+        if current is not None and current is not previous[1]:
+            current.dispose()
+
+    request.addfinalizer(restore_database_binding)
     db_path = tmp_path_factory.mktemp("read_surface_shape_contract") / "test.db"
     init_db(db_url=f"sqlite:///{db_path}")
     engine = get_engine()
@@ -220,16 +233,17 @@ def _environment(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Environm
     assert key_resp.status_code == 200, key_resp.text
     api_key_headers = {"Authorization": f"Bearer {key_resp.json()['full_key']}"}
 
-    yield _Environment(
-        client=client,
-        session_factory=session_factory,
-        user_id=user_id,
-        agent_id=agent_id,
-        jwt_headers=jwt_headers,
-        api_key_headers=api_key_headers,
-    )
-
-    Base.metadata.drop_all(bind=engine)
+    try:
+        yield _Environment(
+            client=client,
+            session_factory=session_factory,
+            user_id=user_id,
+            agent_id=agent_id,
+            jwt_headers=jwt_headers,
+            api_key_headers=api_key_headers,
+        )
+    finally:
+        Base.metadata.drop_all(bind=engine)
 
 
 # ---------------------------------------------------------------------------

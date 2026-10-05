@@ -21,6 +21,8 @@ from datetime import timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, cast
 
+from ..storage.file_reference import guard_document_restore
+
 if TYPE_CHECKING:
     from .models import KBVectorStorageCleanupResult
 
@@ -1369,6 +1371,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             rows_by_table=rows_by_table,
         )
 
+    @guard_document_restore
     def restore_document_rows(
         self, snapshot: KBDocumentRowsSnapshot, *, user_id: int, is_admin: bool
     ) -> None:

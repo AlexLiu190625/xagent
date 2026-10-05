@@ -908,7 +908,7 @@ def test_ingest_job_uses_staged_snapshot_in_payload(app_with_kb):
                 "xagent.web.api.kb.create_background_job",
                 side_effect=fake_create_background_job,
             ),
-            patch("xagent.web.api.kb.admit_kb_ingest_target"),
+            patch("xagent.web.api.kb.async_admit_kb_ingest_target"),
             patch(
                 "xagent.web.api.kb._enqueue_background_job_or_503_async",
                 side_effect=fake_enqueue,
