@@ -754,13 +754,90 @@ def _fetch_and_summarize_page(
     return issues, result.get("nextPageToken")
 
 
+def _continuation_note(
+    *,
+    returned_count: int,
+    limit: int,
+    page_size: int,
+    approximate_total_count: int | None = None,
+) -> str:
+    """Plain-language continuation note for a search page that has a
+    next_page_token.
+
+    `truncated` and `next_page_token` are easy for a model to read past --
+    in production most agents stop at the first page -- so the same fact is
+    also stated as a sentence next to the data, including *why* the page is
+    short when it is: `page_size < limit` means this tool shrank the page
+    to fit the output limit, `returned_count < page_size` means fewer issues
+    came back than the page was asked for (Jira returned fewer, or a
+    malformed entry was dropped -- the note does not say which). Each reason
+    is only stated when it is true of this page.
+
+    A page shorter than `limit` never tells the model it may stop: the
+    caller asked for `limit` rows and did not get them, which is exactly
+    the case where agents were stopping. The note does not know which page
+    of a search it is on, so what it says about stopping early is about what
+    has been fetched so far, never about "this page" alone.
+    """
+    # The count is an estimate and can lag live data. One that is not
+    # above what this page already returned, while a next page exists,
+    # contradicts itself ("30 of ~12"), so it is treated as unknown.
+    if approximate_total_count is not None and approximate_total_count > returned_count:
+        parts = [
+            f"This page returned {returned_count} of ~{approximate_total_count} "
+            "matching issues."
+        ]
+    else:
+        parts = [
+            f"This page returned {returned_count} of the matching issues; more remain."
+        ]
+    if page_size < limit:
+        parts.append(
+            f"The page size was shrunk from {limit} to {page_size} to fit the "
+            "tool output limit."
+        )
+    if returned_count < page_size:
+        parts.append(
+            "Fewer issues came back than the requested page size "
+            f"({returned_count} of {page_size})."
+        )
+    if returned_count >= limit:
+        # The page holds everything the caller asked for, so stopping is
+        # legitimate unless the question needs every match. This is also
+        # the note of a later page, whose issues are not the first results,
+        # so the stopping condition is stated over what has been fetched so
+        # far and in terms of a count N. "First N in this query's sort
+        # order" rather than "most recent": the JQL may sort ascending.
+        parts.append(
+            "If the question needs every match (counting, listing, "
+            "summarizing), call again with next_page_token until truncated "
+            "is false before answering; stop early only if the issues "
+            "fetched so far already answer it (for example, it needs only "
+            "the first N results in this query's sort order and you already "
+            "have N)."
+        )
+    else:
+        parts.append(
+            f"This page holds fewer issues than the {limit} requested; keep "
+            "calling with next_page_token to collect them, and until "
+            "truncated is false if the question needs every match."
+        )
+    return " ".join(parts)
+
+
 def _build_search_response(
     issues: list[dict[str, Any]],
     *,
     total_count: int | None = None,
     approximate_total_count: int | None = None,
     next_token: str | None,
+    limit: int,
+    page_size: int,
 ) -> str:
+    # `limit` is the caller's page size after clamping (max_results) and
+    # `page_size` the one this page was actually fetched at; they only feed
+    # the continuation note (see _continuation_note).
+    #
     # Field order matters here: the count fields/returned_count/truncated/
     # next_page_token come before the (much larger) issues list so that
     # if this string is ever truncated downstream anyway, the caller
@@ -790,8 +867,18 @@ def _build_search_response(
         returned_count=len(issues),
         truncated=bool(next_token),
         next_page_token=next_token or None,
-        issues=issues,
     )
+    # Only present when there is a next page (omitted, not null, on a final
+    # page), and ahead of `issues` for the same downstream-truncation
+    # reason as the fields above.
+    if next_token:
+        payload["note"] = _continuation_note(
+            returned_count=len(issues),
+            limit=limit,
+            page_size=page_size,
+            approximate_total_count=approximate_total_count,
+        )
+    payload["issues"] = issues
     return _success(**payload)
 
 
@@ -928,6 +1015,12 @@ def jira_search_issues(
     Compare either one against returned_count to know whether more
     issues exist beyond what truncated/next_page_token alone would
     tell you.
+    The response also carries a `note` field, present ONLY when truncated
+    is true (absent on a final page): a plain-language statement of how
+    much of the result this page holds, why the page is short when it is
+    (shrunk by this tool to fit the output limit, or fewer issues came
+    back than were asked for), and when to keep paging. Read it before
+    answering any question about all matching issues or how many there are.
     """
     try:
         resolved_cloud_id = _resolve_cloud_id(cloud_id)
@@ -974,7 +1067,12 @@ def jira_search_issues(
                 allow_retry=is_first_attempt,
                 raw_fields=raw_fields,
             )
-            response = _build_search_response(issues, next_token=next_token)
+            # The continuation note is part of the response, so it is
+            # measured here too (without the count, which is only fetched
+            # after a page has fit).
+            response = _build_search_response(
+                issues, next_token=next_token, limit=max_results, page_size=size
+            )
             if len(response) <= max_output_length:
                 fit = True
                 break
@@ -1042,6 +1140,8 @@ def jira_search_issues(
                 total_count=exact_total_count,
                 approximate_total_count=approximate_total_count,
                 next_token=next_token,
+                limit=max_results,
+                page_size=size,
             )
             if len(with_count) <= max_output_length:
                 response = with_count
@@ -1050,7 +1150,8 @@ def jira_search_issues(
                 # ever what tips an already-fitting page over budget,
                 # drop it rather than fail a search that otherwise fit
                 # -- reuse `response` (the loop's already-fitting,
-                # already-built page) instead of paying for another
+                # already-built page, whose count-free note still says
+                # more pages remain) instead of paying for another
                 # full serialization of `issues` just to reproduce the
                 # same page again.
                 exact_total_count = None

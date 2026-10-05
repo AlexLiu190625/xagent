@@ -1086,11 +1086,14 @@ def test_search_issues_cursor_stuck_error_is_also_bounded(monkeypatch):
     # The pagination-cursor-stuck error is a second, independent _error
     # call site with the same unmeasured-against-the-cap gap the
     # minimal-page-overflow error had -- must be fixed the same way, not
-    # just at the one call site a review happened to point at. An empty
-    # page (129 chars serialized) fits the 130-char budget so the "does
-    # the page fit" check passes and this error path is actually
-    # reached; the full cursor-stuck message (136 chars) doesn't, so the
-    # response must be the truncated form instead.
+    # just at the one call site a review happened to point at. The page is
+    # stubbed to 129 chars so it fits the 130-char budget (the "does the
+    # page fit" check passes and this error path is actually reached),
+    # while the full cursor-stuck message (136 chars) doesn't, so the
+    # response must be the truncated form instead. A real page with a
+    # next token carries the continuation note and is always longer than
+    # that message, so a real page cannot sit in the window between "the
+    # page fits" and "the message fits".
     page = {"issues": [], "nextPageToken": "same-token"}
     mock_request = Mock(
         side_effect=[
@@ -1100,6 +1103,7 @@ def test_search_issues_cursor_stuck_error_is_also_bounded(monkeypatch):
     )
     monkeypatch.setattr(jira.requests, "request", mock_request)
     monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 130)
+    monkeypatch.setattr(jira, "_build_search_response", lambda *a, **k: "x" * 129)
 
     raw_response = jira.jira_search_issues(
         "project = ENG", next_page_token="same-token"
@@ -1242,20 +1246,30 @@ def test_search_issues_exact_and_approximate_total_count_are_mutually_exclusive(
     issues = [jira._summarize_issue({"key": "ENG-1", "fields": {"summary": "a"}})]
 
     exact_only = json.loads(
-        jira._build_search_response(issues, total_count=1, next_token=None)
+        jira._build_search_response(
+            issues, total_count=1, next_token=None, limit=50, page_size=50
+        )
     )
     assert exact_only["total_count"] == 1
     assert "approximate_total_count" not in exact_only
 
     approximate_only = json.loads(
         jira._build_search_response(
-            issues, approximate_total_count=50, next_token="next-token"
+            issues,
+            approximate_total_count=50,
+            next_token="next-token",
+            limit=50,
+            page_size=50,
         )
     )
     assert approximate_only["total_count"] is None
     assert approximate_only["approximate_total_count"] == 50
 
-    neither = json.loads(jira._build_search_response(issues, next_token="next-token"))
+    neither = json.loads(
+        jira._build_search_response(
+            issues, next_token="next-token", limit=50, page_size=50
+        )
+    )
     assert neither["total_count"] is None
     assert "approximate_total_count" not in neither
 
@@ -1302,7 +1316,10 @@ def test_search_issues_skips_approximate_count_when_no_headroom_left(monkeypatch
     monkeypatch.setattr(jira.requests, "request", mock_request)
     fitting_length = len(
         jira._build_search_response(
-            [jira._summarize_issue(page["issues"][0])], next_token="next-token"
+            [jira._summarize_issue(page["issues"][0])],
+            next_token="next-token",
+            limit=50,
+            page_size=50,
         )
     )
     monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: fitting_length + 5)
@@ -1337,19 +1354,312 @@ def test_search_issues_drops_total_count_and_reuses_fitting_response_on_overflow
     monkeypatch.setattr(jira.requests, "request", mock_request)
     fitting_length = len(
         jira._build_search_response(
-            [jira._summarize_issue(page["issues"][0])], next_token="next-token"
+            [jira._summarize_issue(page["issues"][0])],
+            next_token="next-token",
+            limit=50,
+            page_size=50,
         )
     )
     monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: fitting_length + 25)
 
     with caplog.at_level(logging.INFO, logger="jira-mcp"):
-        result = json.loads(jira.jira_search_issues("project = ENG", raw_fields=False))
+        raw_result = jira.jira_search_issues("project = ENG", raw_fields=False)
+    result = json.loads(raw_result)
 
     assert result["total_count"] is None
     assert "approximate_total_count" not in result
     assert mock_request.call_count == 3
     assert "exact_total=None" in caplog.text
     assert "approximate_total=None" in caplog.text
+    # Dropping the count must not drop the continuation note: the note is
+    # the signal that more pages exist, the count is only advisory.
+    assert result["note"] == jira._continuation_note(
+        returned_count=1, limit=50, page_size=50
+    )
+    assert len(raw_result) <= fitting_length + 25
+
+
+# Wording fragments of the continuation note's structural sentences. The
+# positive and the negative assertions share them, so rewording the note
+# fails a test instead of silently turning a "not in" check into a vacuous
+# one. Everything else is asserted through numbers and field names only,
+# except one regression literal in the later-page test, which pins the old
+# "this page is enough" sentence because that sentence is the regression.
+_NOTE_SHRUNK = "shrunk from"
+_NOTE_CAME_BACK = "Fewer issues came back"
+_NOTE_STOP_EARLY = "stop early only if the issues fetched so far"
+
+
+def _search_page(count: int, *, next_token: str | None, summary_length: int = 1):
+    page: dict = {
+        "issues": [
+            _raw_issue_with_summary(f"ENG-{i}", summary_length) for i in range(count)
+        ]
+    }
+    if next_token:
+        page["nextPageToken"] = next_token
+    return page
+
+
+def test_continuation_note_for_a_full_page_says_how_much_was_returned():
+    note = jira._continuation_note(
+        returned_count=30, limit=30, page_size=30, approximate_total_count=177
+    )
+
+    assert "30 of ~177" in note
+    assert "next_page_token" in note
+    assert "truncated" in note
+    # The page holds everything that was asked for, so stopping can be right,
+    # but only if what has been fetched so far already answers the question.
+    assert _NOTE_STOP_EARLY in note
+    assert _NOTE_SHRUNK not in note
+    assert _NOTE_CAME_BACK not in note
+
+
+@pytest.mark.parametrize("approximate_total_count", [None, 0, 12, 30])
+def test_continuation_note_ignores_an_estimate_not_above_the_returned_count(
+    approximate_total_count,
+):
+    # The estimate can lag live data. One that is not above what this page
+    # already returned, while a next page exists, contradicts itself, so
+    # the note falls back to the count-free wording instead of printing
+    # "30 of ~12".
+    note = jira._continuation_note(
+        returned_count=30,
+        limit=30,
+        page_size=30,
+        approximate_total_count=approximate_total_count,
+    )
+
+    assert "~" not in note
+    assert note == jira._continuation_note(returned_count=30, limit=30, page_size=30)
+
+
+def test_continuation_note_says_the_tool_shrank_the_page_and_is_never_enough():
+    note = jira._continuation_note(
+        returned_count=10, limit=100, page_size=10, approximate_total_count=177
+    )
+
+    assert f"{_NOTE_SHRUNK} 100 to 10" in note
+    assert _NOTE_CAME_BACK not in note
+    # 10 of the 100 requested: stopping here is the failure #2829 is about.
+    assert _NOTE_STOP_EARLY not in note
+    assert "next_page_token" in note
+
+
+def test_continuation_note_says_fewer_came_back_and_is_never_enough():
+    note = jira._continuation_note(
+        returned_count=3, limit=50, page_size=50, approximate_total_count=177
+    )
+
+    assert _NOTE_CAME_BACK in note
+    assert "(3 of 50)" in note
+    assert _NOTE_SHRUNK not in note
+    assert _NOTE_STOP_EARLY not in note
+
+
+def test_continuation_note_gives_both_reasons_when_both_apply():
+    note = jira._continuation_note(
+        returned_count=7, limit=100, page_size=10, approximate_total_count=177
+    )
+
+    assert f"{_NOTE_SHRUNK} 100 to 10" in note
+    assert _NOTE_CAME_BACK in note
+    assert "(7 of 10)" in note
+    assert _NOTE_STOP_EARLY not in note
+
+
+def test_continuation_note_for_an_empty_page_with_a_token_is_never_enough():
+    note = jira._continuation_note(returned_count=0, limit=50, page_size=50)
+
+    assert "(0 of 50)" in note
+    assert _NOTE_STOP_EARLY not in note
+
+
+def test_build_search_response_builds_the_note_from_the_count_it_carries():
+    issues = [jira._summarize_issue({"key": "ENG-1", "fields": {"summary": "a"}})]
+
+    response = json.loads(
+        jira._build_search_response(
+            issues,
+            approximate_total_count=50,
+            next_token="next-token",
+            limit=50,
+            page_size=50,
+        )
+    )
+
+    assert response["approximate_total_count"] == 50
+    assert response["note"] == jira._continuation_note(
+        returned_count=1, limit=50, page_size=50, approximate_total_count=50
+    )
+
+
+def test_search_issues_first_page_carries_the_continuation_note(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=_search_page(30, next_token="next-token")),
+            MockResponse(json_data={"count": 177}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(
+        jira.jira_search_issues("project = ENG", limit=30, raw_fields=False)
+    )
+
+    assert result["note"] == jira._continuation_note(
+        returned_count=30, limit=30, page_size=30, approximate_total_count=177
+    )
+    # The note sits ahead of the issues array, so a downstream length cut
+    # takes issues first and the continuation signal survives.
+    keys = list(result)
+    assert keys.index("note") < keys.index("issues")
+
+
+def test_search_issues_later_page_carries_a_count_free_note(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=_search_page(30, next_token="page-3-token")),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(
+        jira.jira_search_issues(
+            "project = ENG", limit=30, next_page_token="page-2-token", raw_fields=False
+        )
+    )
+
+    note = result["note"]
+    assert note == jira._continuation_note(returned_count=30, limit=30, page_size=30)
+    # A later page holds results past the first ones, so the note must not
+    # tell the model that this page alone is enough (review of #2841). The
+    # old wording is pinned literally on purpose: it is the regression.
+    assert _NOTE_STOP_EARLY in note
+    assert "this page is enough" not in note
+
+
+def test_search_issues_note_says_when_the_page_was_shrunk_to_fit_the_output_limit(
+    monkeypatch,
+):
+    large_page = _search_page(20, next_token="orig-token", summary_length=200)
+    small_page = _search_page(10, next_token="retry-token", summary_length=200)
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=large_page),
+            MockResponse(json_data=small_page),
+            MockResponse(json_data={"count": 500}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+    # Calibrated against the page that is expected to be returned, so the
+    # 20-issue page overflows while the 10-issue page (note and count
+    # included) fits.
+    small_length = len(
+        jira._build_search_response(
+            [jira._summarize_issue(i) for i in small_page["issues"]],
+            approximate_total_count=500,
+            next_token="retry-token",
+            limit=50,
+            page_size=10,
+        )
+    )
+    budget = small_length + 20
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: budget)
+
+    raw_result = jira.jira_search_issues("project = ENG", raw_fields=False)
+    result = json.loads(raw_result)
+
+    assert result["returned_count"] == 10
+    assert result["note"] == jira._continuation_note(
+        returned_count=10, limit=50, page_size=10, approximate_total_count=500
+    )
+    assert len(raw_result) <= budget
+
+
+def test_search_issues_counts_the_note_against_the_output_budget(monkeypatch):
+    page = _search_page(5, next_token="orig-token")
+    retry_page = _search_page(2, next_token="retry-token")
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=page),
+            MockResponse(json_data=retry_page),
+            MockResponse(json_data={"count": 99}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+    with_note = jira._build_search_response(
+        [jira._summarize_issue(i) for i in page["issues"]],
+        next_token="orig-token",
+        limit=50,
+        page_size=50,
+    )
+    without_note = json.loads(with_note)
+    without_note.pop("note")
+    budget = len(with_note) - 1
+    # The premise of this test: the 5-issue page fits the budget only if the
+    # note is left out of the measurement.
+    assert len(json.dumps(without_note, ensure_ascii=False)) <= budget
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: budget)
+
+    raw_result = jira.jira_search_issues("project = ENG", raw_fields=False)
+    result = json.loads(raw_result)
+
+    # The note is what tipped the 5-issue page over the budget, so the
+    # search was refetched at the next smaller size.
+    assert result["returned_count"] == 2
+    assert result["next_page_token"] == "retry-token"
+    retry_call = mock_request.call_args_list[2]
+    assert retry_call.kwargs["params"]["maxResults"] == jira._RETRY_PAGE_SIZE
+    assert len(raw_result) <= budget
+
+
+def test_search_issues_note_says_when_fewer_issues_came_back_than_requested(
+    monkeypatch,
+):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=_search_page(3, next_token="next-token")),
+            MockResponse(json_data={"count": 177}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_search_issues("project = ENG", raw_fields=False))
+
+    # Nothing was shrunk by the tool here (page_size == limit), so the note
+    # must not say it was.
+    assert result["note"] == jira._continuation_note(
+        returned_count=3, limit=50, page_size=50, approximate_total_count=177
+    )
+
+
+@pytest.mark.parametrize("next_page_token", ["", "page-2-token"])
+def test_search_issues_final_page_has_no_note(monkeypatch, next_page_token):
+    # A first page that is also the last, and a later page that is the
+    # last: neither has anything left to continue to.
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=_search_page(2, next_token=None)),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(
+        jira.jira_search_issues(
+            "project = ENG", next_page_token=next_page_token, raw_fields=False
+        )
+    )
+
+    assert result["truncated"] is False
+    assert "note" not in result
 
 
 def test_search_issues_raw_fields_returns_the_unslimmed_jira_shape(monkeypatch):
