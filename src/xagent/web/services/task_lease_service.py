@@ -334,6 +334,11 @@ def task_lease_expires_at(now: datetime | None = None) -> datetime:
     return (now or utc_now()) + timedelta(seconds=get_task_lease_ttl_seconds())
 
 
+TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR = (
+    "Task execution stopped with an unknown tool effect; automatic replay is unsafe."
+)
+
+
 class CheckpointRecoveryVerdict(str, Enum):
     """Result of resolving one recovery candidate's checkpoint pointer.
 
@@ -487,6 +492,85 @@ def _resolve_legacy_checkpoint_recovery(
     )
 
 
+def _resolve_event_checkpoint_recovery(
+    db: Session,
+    *,
+    task_id: int,
+    run_id: str | None,
+) -> CheckpointRecoveryVerdict:
+    """Classify one V2 run from its committed recovery facts.
+
+    ``CheckpointUnavailableError`` and ``SQLAlchemyError`` propagate: the
+    caller decides whether an undetermined read is retried or deferred.
+    """
+
+    from ...core.agent.checkpoint import (
+        CheckpointAccessRefusedError,
+        CheckpointCorruptError,
+        UnknownToolEffectError,
+    )
+    from .task_execution_event_recovery import read_event_checkpoint
+
+    if run_id is None:
+        return CheckpointRecoveryVerdict.NOT_RECOVERABLE
+    try:
+        data = read_event_checkpoint(
+            db,
+            task_id=task_id,
+            scope_id="root",
+            execution_id=str(task_id),
+            run_id=run_id,
+        )
+    except UnknownToolEffectError:
+        return CheckpointRecoveryVerdict.UNKNOWN_TOOL_EFFECT
+    except (CheckpointCorruptError, CheckpointAccessRefusedError):
+        return CheckpointRecoveryVerdict.NOT_RECOVERABLE
+    return (
+        CheckpointRecoveryVerdict.RECOVERABLE
+        if data is not None
+        else CheckpointRecoveryVerdict.NOT_RECOVERABLE
+    )
+
+
+def run_has_unknown_tool_effect(db: Session, lease: TaskLease) -> bool:
+    """Whether a V2 run that ended without a result left a tool effect unknown.
+
+    Uses the classification lease recovery applies to an expired run: the
+    run's latest checkpoint names a started tool attempt with no committed
+    outcome. Legacy (V1) tasks are never classified. A read that cannot be
+    completed raises -- after the same degradation signal recovery's read
+    registers -- so the caller rolls back and leaves the exact lease to TTL
+    recovery, which repeats this classification.
+    """
+
+    from ...core.agent.checkpoint import CheckpointUnavailableError
+    from .task_execution_event_writer import uses_execution_events
+
+    try:
+        if not uses_execution_events(db, lease.task_id):
+            return False
+        verdict = _resolve_event_checkpoint_recovery(
+            db, task_id=lease.task_id, run_id=lease.run_id
+        )
+    except (CheckpointUnavailableError, SQLAlchemyError) as exc:
+        # Same signal as recovery's read; do not publish SQL/parameters.
+        detail = f"task_id={lease.task_id}: {type(exc).__name__}"
+        logger.warning(
+            "Settlement unknown-effect classification unavailable: %s", detail
+        )
+        register_degradation(CHECKPOINT_RECOVERY_UNAVAILABLE, detail)
+        raise
+    if verdict is not CheckpointRecoveryVerdict.UNKNOWN_TOOL_EFFECT:
+        return False
+    logger.warning(
+        "Task %s run %s settles as an unknown tool effect (verdict %s)",
+        lease.task_id,
+        lease.run_id,
+        verdict.value,
+    )
+    return True
+
+
 def resolve_checkpoint_recovery(
     db: Session,
     candidate: TaskLeaseRecoveryCandidate,
@@ -512,36 +596,13 @@ def resolve_checkpoint_recovery(
     resolution instead of failing the candidate outright.
     """
 
-    from ...core.agent.checkpoint import (
-        CheckpointAccessRefusedError,
-        CheckpointCorruptError,
-        CheckpointUnavailableError,
-        UnknownToolEffectError,
-    )
+    from ...core.agent.checkpoint import CheckpointUnavailableError
     from .task_execution_event_writer import uses_execution_events
 
     try:
         if uses_execution_events(db, candidate.task_id):
-            from .task_execution_event_recovery import read_event_checkpoint
-
-            if candidate.run_id is None:
-                return CheckpointRecoveryVerdict.NOT_RECOVERABLE
-            try:
-                data = read_event_checkpoint(
-                    db,
-                    task_id=candidate.task_id,
-                    scope_id="root",
-                    execution_id=str(candidate.task_id),
-                    run_id=candidate.run_id,
-                )
-            except UnknownToolEffectError:
-                return CheckpointRecoveryVerdict.UNKNOWN_TOOL_EFFECT
-            except (CheckpointCorruptError, CheckpointAccessRefusedError):
-                return CheckpointRecoveryVerdict.NOT_RECOVERABLE
-            return (
-                CheckpointRecoveryVerdict.RECOVERABLE
-                if data is not None
-                else CheckpointRecoveryVerdict.NOT_RECOVERABLE
+            return _resolve_event_checkpoint_recovery(
+                db, task_id=candidate.task_id, run_id=candidate.run_id
             )
     except (CheckpointUnavailableError, SQLAlchemyError) as exc:
         # Include the storage-version probe; do not publish SQL/parameters.

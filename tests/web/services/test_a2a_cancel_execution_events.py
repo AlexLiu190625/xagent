@@ -108,7 +108,8 @@ async def test_cancel_fact_failure_rolls_back_state_and_retry_succeeds(
     a2a_task, monkeypatch
 ):
     ctx = a2a_task
-    append = writer.append_task_execution_event_no_commit
+    # The result fact goes through the append variant that reports an insert.
+    append = writer._append_task_execution_event_no_commit
 
     def fail_after_append(*args, **kwargs):
         append(*args, **kwargs)
@@ -116,7 +117,7 @@ async def test_cancel_fact_failure_rolls_back_state_and_retry_succeeds(
 
     with monkeypatch.context() as patch:
         patch.setattr(
-            writer, "append_task_execution_event_no_commit", fail_after_append
+            writer, "_append_task_execution_event_no_commit", fail_after_append
         )
         with pytest.raises(OSError, match="cancel fact unavailable"):
             await a2a_task_cancel.cancel_a2a_task(**ctx.target)

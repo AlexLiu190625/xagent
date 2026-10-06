@@ -7,6 +7,7 @@ creation default; there is deliberately no API for switching existing tasks.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, cast
 from uuid import uuid4
@@ -24,9 +25,40 @@ from ..models.chat_message import TaskChatMessage
 from ..models.task import Task, TaskStatus
 from ..models.task_execution_event import TaskExecutionEvent
 from .task_execution_event_store import (
+    _append_task_execution_event_no_commit,
     append_task_execution_event_no_commit,
     lock_task_execution_events_no_commit,
 )
+
+
+@dataclass(frozen=True)
+class FactWitness:
+    """Identity of one fact row inserted by the transaction that staged it.
+
+    ``event_id`` is allocated by that insert, so finding the row after a
+    commit error proves that exact transaction committed; another writer's
+    fact under the same idempotency key carries a different ``event_id``.
+    """
+
+    task_id: int
+    scope_id: str
+    idempotency_key: str
+    event_id: str
+
+
+def fact_witness_committed_no_commit(db: Session, witness: FactWitness) -> bool:
+    """Whether ``witness``'s row is visible to ``db``'s transaction."""
+    return (
+        db.scalar(
+            select(TaskExecutionEvent.id).where(
+                TaskExecutionEvent.task_id == witness.task_id,
+                TaskExecutionEvent.scope_id == witness.scope_id,
+                TaskExecutionEvent.idempotency_key == witness.idempotency_key,
+                TaskExecutionEvent.event_id == witness.event_id,
+            )
+        )
+        is not None
+    )
 
 
 def uses_execution_events(db: Session, task_id: int) -> bool:
@@ -47,6 +79,35 @@ def _fact_json_default(value: Any) -> Any:
     raise TypeError(f"Unsupported execution fact value: {type(value).__name__}")
 
 
+def _fact_values(
+    *,
+    task_id: int,
+    kind: str,
+    key: str,
+    payload: dict[str, Any],
+    scope_id: str,
+    run_id: str | None,
+    turn_id: str | None,
+    assistant_message_id: str | None,
+    tool_attempt_id: str | None,
+    occurred_at: datetime | None,
+) -> dict[str, Any]:
+    return dict(
+        task_id=task_id,
+        scope_id=scope_id,
+        kind=kind,
+        idempotency_key=key,
+        payload=json.loads(
+            json.dumps(payload, default=_fact_json_default, allow_nan=False)
+        ),
+        run_id=run_id,
+        turn_id=turn_id,
+        assistant_message_id=assistant_message_id,
+        tool_attempt_id=tool_attempt_id,
+        occurred_at=occurred_at or datetime.now(timezone.utc),
+    )
+
+
 def append_fact_no_commit(
     db: Session,
     *,
@@ -63,18 +124,46 @@ def append_fact_no_commit(
 ) -> TaskExecutionEvent:
     return append_task_execution_event_no_commit(
         db,
-        task_id=task_id,
-        scope_id=scope_id,
-        kind=kind,
-        idempotency_key=key,
-        payload=json.loads(
-            json.dumps(payload, default=_fact_json_default, allow_nan=False)
+        **_fact_values(
+            task_id=task_id,
+            kind=kind,
+            key=key,
+            payload=payload,
+            scope_id=scope_id,
+            run_id=run_id,
+            turn_id=turn_id,
+            assistant_message_id=assistant_message_id,
+            tool_attempt_id=tool_attempt_id,
+            occurred_at=occurred_at,
         ),
-        run_id=run_id,
-        turn_id=turn_id,
-        assistant_message_id=assistant_message_id,
-        tool_attempt_id=tool_attempt_id,
-        occurred_at=occurred_at or datetime.now(timezone.utc),
+    )
+
+
+def _append_fact_reporting_insert_no_commit(
+    db: Session,
+    *,
+    task_id: int,
+    kind: str,
+    key: str,
+    payload: dict[str, Any],
+    scope_id: str = "root",
+    run_id: str | None = None,
+) -> tuple[TaskExecutionEvent, bool]:
+    """``append_fact_no_commit`` that also says whether it inserted the row."""
+    return _append_task_execution_event_no_commit(
+        db,
+        **_fact_values(
+            task_id=task_id,
+            kind=kind,
+            key=key,
+            payload=payload,
+            scope_id=scope_id,
+            run_id=run_id,
+            turn_id=None,
+            assistant_message_id=None,
+            tool_attempt_id=None,
+            occurred_at=None,
+        ),
     )
 
 
@@ -191,16 +280,31 @@ def stage_delivery_fact_no_commit(
 
 def stage_result_fact_no_commit(
     db: Session, task: Task, result: dict[str, Any]
-) -> None:
-    if task.conversation_storage_version == 2:
-        append_fact_no_commit(
-            db,
-            task_id=int(task.id),
-            kind="execution_settled",
-            key=f"result:{task.run_id}:{task.state_version}:{task.status.value}",
-            run_id=cast(str | None, task.run_id),
-            payload={"status": task.status.value, "result": result},
-        )
+) -> FactWitness | None:
+    """Stage the run's ``execution_settled`` fact.
+
+    Returns the witness of the row this call inserted, or ``None`` for a
+    legacy task or an idempotent replay of an already committed fact.
+    """
+    if task.conversation_storage_version != 2:
+        return None
+    key = f"result:{task.run_id}:{task.state_version}:{task.status.value}"
+    event, inserted = _append_fact_reporting_insert_no_commit(
+        db,
+        task_id=int(task.id),
+        kind="execution_settled",
+        key=key,
+        run_id=cast(str | None, task.run_id),
+        payload={"status": task.status.value, "result": result},
+    )
+    if not inserted:
+        return None
+    return FactWitness(
+        task_id=int(task.id),
+        scope_id=cast(str, event.scope_id),
+        idempotency_key=key,
+        event_id=cast(str, event.event_id),
+    )
 
 
 def stage_applied_inputs_no_commit(db: Session, state: TaskExecutionEvent) -> None:

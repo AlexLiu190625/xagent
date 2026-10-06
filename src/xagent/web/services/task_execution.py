@@ -55,7 +55,7 @@ from typing import (
 )
 from urllib.parse import unquote
 
-from sqlalchemy import case, func, or_, select, update
+from sqlalchemy import case, func, or_, select, text, update
 from sqlalchemy.orm import Session
 
 from ...config import (
@@ -87,7 +87,11 @@ from ..models.task import Task, TaskStatus, task_status_predicate
 from ..models.uploaded_file import UploadedFile
 from .llm_utils import AutoModelUnavailableError
 from .task_events import DeliveryNotifier, publish_task_event
-from .task_execution_event_writer import stage_result_fact_no_commit
+from .task_execution_event_writer import (
+    FactWitness,
+    fact_witness_committed_no_commit,
+    stage_result_fact_no_commit,
+)
 from .task_lease_service import (
     lock_task_lease_for_settlement_no_commit,
     lock_task_lease_no_commit,
@@ -1705,6 +1709,132 @@ class _TaskExecutionFinalization:
     late_result: bool = False
 
 
+@dataclass(frozen=True)
+class _ChatMessageWitness:
+    """A legacy transcript row inserted by one finalize transaction.
+
+    Matched by its whole staged content, not only its id: SQLite can reuse
+    the rowid of a rolled-back insert for another writer's message.
+    """
+
+    task_id: int
+    message_id: int
+    role: str
+    message_type: str
+    content: str
+
+
+_FinalizationWitness = Union[FactWitness, _ChatMessageWitness]
+
+# Bound the read-back's wait for an in-flight COMMIT on PostgreSQL. SQLite's
+# busy timeout bounds the same wait there.
+_FINALIZATION_READ_BACK_LOCK_TIMEOUT = "5s"
+
+
+def _finalization_witness_committed(witness: _FinalizationWitness) -> bool:
+    """Read back one finalize witness after waiting for in-flight COMMITs."""
+    from ..models.chat_message import TaskChatMessage
+    from .task_execution_event_store import lock_task_execution_events_no_commit
+
+    with get_session_local()() as read_db:
+        try:
+            if read_db.get_bind().dialect.name == "postgresql":
+                read_db.execute(
+                    text("SELECT set_config('lock_timeout', :lock, true)"),
+                    {"lock": _FINALIZATION_READ_BACK_LOCK_TIMEOUT},
+                )
+            # The finalize transaction held this task row until its COMMIT
+            # resolved; taking the same lock first waits for that outcome.
+            # It is this session's only lock, so it cannot invert an order.
+            lock_task_execution_events_no_commit(read_db, witness.task_id)
+            if isinstance(witness, FactWitness):
+                return fact_witness_committed_no_commit(read_db, witness)
+            return (
+                read_db.scalar(
+                    select(TaskChatMessage.id).where(
+                        TaskChatMessage.id == witness.message_id,
+                        TaskChatMessage.task_id == witness.task_id,
+                        TaskChatMessage.role == witness.role,
+                        TaskChatMessage.message_type == witness.message_type,
+                        TaskChatMessage.content == witness.content,
+                    )
+                )
+                is not None
+            )
+        finally:
+            read_db.rollback()
+
+
+def _commit_finalization_or_reconcile(
+    finalize_db: Session,
+    *,
+    task_id: int,
+    witness: _FinalizationWitness | None,
+) -> None:
+    """Commit one result transition, or prove an unacknowledged COMMIT applied.
+
+    A driver can raise after the server committed. Without this read-back the
+    run would be reported as a setup/run failure that the fenced settlement
+    cannot apply (the row is no longer RUNNING), so neither the result nor a
+    failure would ever be announced.
+
+    Only a row this transaction inserted proves its COMMIT: the task row's
+    status/state version cannot, because a rolled-back FAILED result releases
+    the row to a coordinator cancel that commits the same FAILED state and
+    version without this result. The transaction is atomic, so its witness
+    row stands for every write in it. Without a witness (a legacy branch
+    that inserts no row, or a replayed fact), or when the read-back cannot
+    decide, the commit error is re-raised unchanged.
+    """
+    try:
+        finalize_db.commit()
+        return
+    except Exception as commit_error:
+        try:
+            finalize_db.rollback()
+        except Exception:
+            logger.warning(
+                "Task %s finalization rollback failed after a commit error",
+                task_id,
+                exc_info=True,
+            )
+        if witness is None:
+            raise
+        try:
+            committed = _finalization_witness_committed(witness)
+        except Exception:
+            logger.warning(
+                "Task %s finalization commit read-back failed",
+                task_id,
+                exc_info=True,
+            )
+            committed = False
+        if not committed:
+            raise commit_error
+        logger.warning(
+            "Task %s result commit was not acknowledged but is committed; "
+            "continuing with the committed result",
+            task_id,
+        )
+
+
+def _finalization_broadcast_meta(task: Task) -> dict[str, Any]:
+    """Read the result broadcast fields from the flushed, uncommitted row.
+
+    Taken before COMMIT so a reconciled commit never lazy-loads expired
+    attributes through a session whose rollback may have failed. The flush
+    makes ``updated_at`` (set by the database) the value being committed.
+    """
+    return {
+        "id": int(task.id),
+        "title": task.title,
+        "description": task.description,
+        "execution_mode": getattr(task, "execution_mode", None),
+        "updated_at": task.updated_at,
+        "completion_outcome": task.completion_outcome,
+    }
+
+
 def _finalize_task_execution_result_isolated(
     *,
     task_id: int,
@@ -1819,9 +1949,10 @@ def _finalize_task_execution_result_isolated(
 
         waiting_for_control = False
         terminal_state_committed = False
-        # Only a pause transition owns this transaction. Canceled, failed and
-        # already-paused tasks ignore the late result and roll back its files.
-        pause_commit_pending = False
+        # Only a pause or wait transition owns this transaction. Canceled,
+        # failed and already-paused tasks ignore the late result and roll back
+        # its files.
+        control_commit_pending = False
         final_control_snapshot: TaskControlSnapshot | None = None
         final_task_status = pre_run_status.value
 
@@ -1876,11 +2007,9 @@ def _finalize_task_execution_result_isolated(
                     task_updated,
                     task_updated.status,
                 )
-                stage_result_fact_no_commit(finalize_db, task_updated, result)
-                finalize_db.commit()
-                metadata_committed = True
                 terminal_state_committed = True
                 waiting_for_control = True
+                control_commit_pending = True
             elif (
                 result.get("injection_outcome_unknown")
                 and (
@@ -1911,7 +2040,7 @@ def _finalize_task_execution_result_isolated(
                 )
                 terminal_state_committed = True
                 waiting_for_control = True
-                pause_commit_pending = True
+                control_commit_pending = True
             elif task_updated.status not in {
                 TaskStatus.PAUSED,
                 TaskStatus.WAITING_FOR_USER,
@@ -1958,6 +2087,10 @@ def _finalize_task_execution_result_isolated(
                 and bool(result.get("success", False))
                 and task_updated.status == TaskStatus.PAUSED
             )
+            # A legacy row inserted by this transaction; V2 uses its result
+            # fact instead. Wait and pause transitions insert no legacy row.
+            legacy_witness: _ChatMessageWitness | None = None
+            result_commit_pending = control_commit_pending
             if not waiting_for_control or preserve_unknown_result:
                 if task_user_id is None:
                     raise ValueError(
@@ -1984,7 +2117,7 @@ def _finalize_task_execution_result_isolated(
                     or (preserve_unknown_result and result.get("success", False))
                     else None,
                 )
-                persist_assistant_message_no_commit(
+                assistant_message = persist_assistant_message_no_commit(
                     finalize_db,
                     task_id=task_id,
                     user_id=task_user_id,
@@ -1998,23 +2131,40 @@ def _finalize_task_execution_result_isolated(
                     ),
                     content_is_reconciled=True,
                 )
-                stage_result_fact_no_commit(finalize_db, task_updated, result)
-                finalize_db.commit()
+                if (
+                    assistant_message is not None
+                    and task_updated.conversation_storage_version != 2
+                ):
+                    finalize_db.flush()
+                    legacy_witness = _ChatMessageWitness(
+                        task_id=task_id,
+                        message_id=int(assistant_message.id),
+                        role=str(assistant_message.role),
+                        message_type=str(assistant_message.message_type),
+                        content=str(assistant_message.content),
+                    )
+                result_commit_pending = True
+
+            if result_commit_pending:
+                fact_witness = stage_result_fact_no_commit(
+                    finalize_db, task_updated, result
+                )
+                finalize_db.flush()
+                broadcast_meta = _finalization_broadcast_meta(task_updated)
+                _commit_finalization_or_reconcile(
+                    finalize_db,
+                    task_id=task_id,
+                    # Ownerless legacy callers keep failing on a commit error.
+                    witness=(
+                        (fact_witness or legacy_witness)
+                        if task_lease is not None
+                        else None
+                    ),
+                )
                 metadata_committed = True
                 terminal_state_committed = True
-
-            if pause_commit_pending and not metadata_committed:
-                stage_result_fact_no_commit(finalize_db, task_updated, result)
-                finalize_db.commit()
-                metadata_committed = True
-            broadcast_meta = {
-                "id": int(task_updated.id),
-                "title": task_updated.title,
-                "description": task_updated.description,
-                "execution_mode": getattr(task_updated, "execution_mode", None),
-                "updated_at": task_updated.updated_at,
-                "completion_outcome": task_updated.completion_outcome,
-            }
+            else:
+                broadcast_meta = _finalization_broadcast_meta(task_updated)
         else:
             broadcast_meta = {
                 "id": task_id,
@@ -2804,6 +2954,10 @@ def _finalize_resumed_task(
             finalized["late_result"] = True
             return finalized
         stage_result_fact_no_commit(db, task, result)
+        # A lost acknowledgement here is not reconciled yet: the lease is
+        # released in this transaction, so only the result fact's witness
+        # (returned above) can prove the commit. That belongs with the
+        # same-identity retry work.
         db.commit()
         metadata_committed = True
         finalized["lease_released"] = True

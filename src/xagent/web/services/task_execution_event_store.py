@@ -55,7 +55,40 @@ def append_task_execution_event_no_commit(
     tool_attempt_id: str | None = None,
     payload_version: int = 1,
 ) -> TaskExecutionEvent:
-    """Stage one fact, serializing appends until the caller commits/rolls back.
+    """Stage one fact, serializing appends until the caller commits/rolls back."""
+    event, _inserted = _append_task_execution_event_no_commit(
+        db,
+        task_id=task_id,
+        scope_id=scope_id,
+        idempotency_key=idempotency_key,
+        kind=kind,
+        payload=payload,
+        occurred_at=occurred_at,
+        run_id=run_id,
+        turn_id=turn_id,
+        assistant_message_id=assistant_message_id,
+        tool_attempt_id=tool_attempt_id,
+        payload_version=payload_version,
+    )
+    return event
+
+
+def _append_task_execution_event_no_commit(
+    db: Session,
+    *,
+    task_id: int,
+    scope_id: str,
+    idempotency_key: str,
+    kind: str,
+    payload: dict[str, Any],
+    occurred_at: datetime,
+    run_id: str | None = None,
+    turn_id: str | None = None,
+    assistant_message_id: str | None = None,
+    tool_attempt_id: str | None = None,
+    payload_version: int = 1,
+) -> tuple[TaskExecutionEvent, bool]:
+    """Stage one fact and report whether this transaction inserted it.
 
     An UPDATE acquires a task-row lock on PostgreSQL and a writer lock on
     SQLite, including when SQLite SELECT FOR UPDATE would do nothing. The
@@ -95,7 +128,7 @@ def append_task_execution_event_no_commit(
             if key != "payload"
         ):
             raise ExecutionEventConflict("Idempotency key identifies a different event")
-        return existing
+        return existing, False
 
     db.execute(
         update(Task)
@@ -114,7 +147,7 @@ def append_task_execution_event_no_commit(
     )
     db.add(event)
     db.flush()
-    return event
+    return event, True
 
 
 def load_task_execution_events(

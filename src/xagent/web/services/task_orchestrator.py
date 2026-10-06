@@ -106,6 +106,7 @@ from .task_execution_controller import (
 )
 from .task_execution_host import enqueues_task_turns
 from .task_lease_service import (
+    TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR,
     TaskLease,
     TaskLeaseHeartbeatOutcome,
     TaskLeaseLostError,
@@ -117,6 +118,7 @@ from .task_lease_service import (
     get_runner_id,
     lock_task_lease_for_settlement_no_commit,
     release_task_lease,
+    run_has_unknown_tool_effect,
     run_task_lease_heartbeat,
     run_while_task_lease_owned,
     stop_task_lease_heartbeat,
@@ -1755,6 +1757,7 @@ def settle_task_lease_isolated(
     client_error_message: str = CLIENT_SAFE_TASK_FAILURE,
     client_message_type: str = TASK_FAILURE_MESSAGE_TYPE,
     terminal_event_state: dict[str, Any] | None = None,
+    classify_unknown_tool_effect: bool = False,
 ) -> bool:
     """Settle exactly one run/runner lease in one worker-owned Session.
 
@@ -1772,6 +1775,15 @@ def settle_task_lease_isolated(
 
     When supplied, ``terminal_event_state`` receives the committed V2 control
     identity after commit; the caller can publish without re-reading latest state.
+
+    ``classify_unknown_tool_effect`` is for a run that raised: if its V2
+    facts show a started tool attempt with no committed outcome, the failure
+    is recorded as an unknown tool effect -- the classification lease
+    recovery applies -- instead of ``error_message``. The tool is not
+    automatically replayed. The read runs only after the fenced failure
+    matched the RUNNING row, inside that transaction. When it cannot
+    complete, this raises and the lease is retained, so TTL recovery
+    classifies the run instead.
 
     On checkout or commit failure the transaction is rolled back and the lease
     is intentionally retained for TTL recovery; this function never creates an
@@ -1793,6 +1805,11 @@ def settle_task_lease_isolated(
                 )
                 if failed:
                     task = settle_db.query(Task).filter(Task.id == lease.task_id).one()
+                    if classify_unknown_tool_effect and run_has_unknown_tool_effect(
+                        settle_db, lease
+                    ):
+                        error_message = TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR
+                        setattr(task, "error_message", error_message)
                     sync_workforce_run_status(settle_db, task, TaskStatus.FAILED)
                     sync_trigger_run_status(settle_db, task, TaskStatus.FAILED)
                     if task.user_id is not None:
@@ -2179,6 +2196,7 @@ def _schedule_bg(
         client_history_message_type = TASK_FAILURE_MESSAGE_TYPE
         broadcast_error_message: str | None = None
         broadcast_error_code: str | None = None
+        classify_unknown_tool_effect = False
         defer_settlement_to_ttl_recovery = False
         skip_delivery_reconciliation = False
         # Positive evidence for finalize's delivery target: once
@@ -2466,6 +2484,9 @@ def _schedule_bg(
                             f"{type(setup_or_run_err).__name__}: {setup_or_run_err}"
                         )
                         broadcast_error_message = CLIENT_SAFE_TASK_FAILURE
+                        # E.g. a tool ran but its result commit failed: the
+                        # settlement must say the effect is unknown.
+                        classify_unknown_tool_effect = True
                     logger.error(
                         "bg task %s setup/run failed: %s",
                         task_id,
@@ -2517,6 +2538,9 @@ def _schedule_bg(
                                 ),
                                 client_message_type=client_history_message_type,
                                 terminal_event_state=terminal_event_state,
+                                classify_unknown_tool_effect=(
+                                    classify_unknown_tool_effect
+                                ),
                             )
                         )
                         # Gate on the returned value, not on "didn't raise":

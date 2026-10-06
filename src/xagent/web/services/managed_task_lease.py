@@ -22,11 +22,13 @@ from .db_runtime import (
 )
 from .execution_result_projection import completion_outcome_for_status
 from .task_lease_service import (
+    TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR,
     TaskLease,
     TaskLeaseHeartbeatOutcome,
     acquire_task_lease_cancellation_safe,
     acquire_task_lease_no_commit,
     release_task_lease_no_commit,
+    run_has_unknown_tool_effect,
     run_task_lease_heartbeat,
     stop_task_lease_heartbeat,
 )
@@ -51,7 +53,14 @@ def finalize_managed_task_lease_result(
     execution_result: Mapping[str, Any] | None = None,
     completion: tuple[int, dict[str, Any]] | None = None,
 ) -> bool:
-    """Atomically persist one inline transport result under its exact lease."""
+    """Atomically persist one inline transport result under its exact lease.
+
+    A FAILED settlement without an ``execution_result`` is a run that raised
+    (or was abandoned). When its V2 facts show a started tool attempt with no
+    committed outcome, it is recorded as an unknown tool effect, the
+    classification lease recovery applies; the tool is not automatically
+    replayed.
+    """
 
     if status == TaskStatus.RUNNING:
         raise ValueError("Cannot finalize a managed lease with RUNNING status")
@@ -65,6 +74,12 @@ def finalize_managed_task_lease_result(
             db.rollback()
             return False
 
+        if (
+            status == TaskStatus.FAILED
+            and execution_result is None
+            and run_has_unknown_tool_effect(db, lease)
+        ):
+            error_message = TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR
         db.expire_all()
         task = db.query(Task).filter(Task.id == lease.task_id).one()
         setattr(
@@ -126,6 +141,9 @@ def finalize_managed_task_lease_result(
                 "output",
                 history_content if status == TaskStatus.COMPLETED else None,
             )
+        # A lost acknowledgement is not reconciled here: the lease is released
+        # in this transaction, so only the result fact's witness can prove the
+        # commit. That belongs with the same-identity retry work.
         db.commit()
     except Exception:
         db.rollback()
