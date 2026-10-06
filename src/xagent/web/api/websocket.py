@@ -74,7 +74,11 @@ from ..services.assistant_history_safety import (
     assistant_history_has_safe_ancillary_payload,
     client_safe_assistant_history_content,
 )
-from ..services.assistant_question_replay import load_transcript_replay
+from ..services.assistant_question_display import question_content_for_display
+from ..services.assistant_question_replay import (
+    QUESTION_MESSAGE_TYPES,
+    load_transcript_replay,
+)
 from ..services.chat_history_service import (
     DELIVERY_COMPLETED,
     DELIVERY_DISPATCHED,
@@ -230,6 +234,7 @@ async def send_message_delivery(
 
 
 CHECKPOINT_EVENT_TYPE_NAME = str(CHECKPOINT_EVENT_TYPE)
+_QUESTION_DISPLAY_VERSION = 1
 
 
 # Exception text can carry file paths, SQL fragments, provider payloads and
@@ -2292,6 +2297,7 @@ def _load_historical_stream_snapshot_sync(
             if (
                 isinstance(cached, dict)
                 and cached.get("trace_scope") == trace_scope
+                and cached.get("question_display_version") == _QUESTION_DISPLAY_VERSION
                 and cached.get("updated_at") == task_updated_at
                 and cached.get("max_trace_event_id") == int(max_trace_event_id)
                 and cached.get("max_chat_message_id") == int(max_chat_message_id)
@@ -2469,6 +2475,7 @@ def _load_historical_stream_snapshot_sync(
                         content=content,
                         message_type=str(chat_message.message_type),
                     )
+                    unreconciled_content = content
                     content = reconcile_assistant_file_references(
                         db,
                         task_id=int(task_id),
@@ -2538,6 +2545,20 @@ def _load_historical_stream_snapshot_sync(
                         if assistant_ancillary_is_safe
                         else None
                     )
+                    if chat_message.message_type in QUESTION_MESSAGE_TYPES:
+                        # Keep the canonical content for dedup above. Project
+                        # the display before rewriting links inside controls.
+                        projected_content = question_content_for_display(
+                            unreconciled_content, interactions
+                        )
+                        if projected_content != unreconciled_content:
+                            content = reconcile_assistant_file_references(
+                                db,
+                                task_id=int(task_id),
+                                user_id=int(task.user_id),
+                                content=projected_content,
+                                records=transcript.file_reference_records,
+                            )
                     data = {
                         "message": content,
                         "content": content,
@@ -2709,6 +2730,7 @@ def _load_historical_stream_snapshot_sync(
                     cache_key,
                     {
                         "trace_scope": trace_scope,
+                        "question_display_version": _QUESTION_DISPLAY_VERSION,
                         "updated_at": task_updated_at,
                         "max_trace_event_id": int(max_trace_event_id),
                         "max_chat_message_id": int(max_chat_message_id),

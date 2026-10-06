@@ -1338,12 +1338,13 @@ describe("AppProvider websocket message routing", () => {
     })
   })
 
-  it("does not re-print the question when replay is followed by the waiting re-assert", async () => {
+  it.each([
+    "Round 1: please confirm",
+    "Round 1: please confirm\n\nPlease answer the following questions:\n- Proceed?",
+  ])("does not re-print the question when replay is followed by the waiting re-assert (%#)", async (transcriptText) => {
     // After the snapshot, the server re-asserts WAITING_FOR_USER with the
-    // question text read straight off the transcript row
-    // (get_latest_waiting_question returns TaskChatMessage.content), so it is
-    // byte-identical to the replayed row event. Suppressing the trace twin
-    // must not leave that frame as a fresh third bubble.
+    // same public display text as the replayed row. Both the clean projection
+    // and older servers' expanded transcript must yield only one bubble.
     render(
       <AppProvider token="token">
         <SeedRunningTask />
@@ -1357,8 +1358,6 @@ describe("AppProvider websocket message routing", () => {
       expect(screen.getByTestId("task-status").textContent).toBe("running")
     })
     const interactions = [{ type: "confirm", label: "Proceed?" }]
-    const transcriptText =
-      "Round 1: please confirm\n\nPlease answer the following questions:\n- Proceed?"
 
     act(() => {
       onMessage?.({

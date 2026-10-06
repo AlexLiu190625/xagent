@@ -457,6 +457,69 @@ def test_a7_marker_matches_table_absent_reads_the_legacy_transcript(
     assert interactions == [{"type": "text_input", "label": "Live"}]
 
 
+@pytest.mark.parametrize("marker", [None, 1])
+def test_public_question_is_short_but_internal_question_stays_complete(_db, marker):
+    task = _make_task(_db, marker=marker)
+    interactions = [{"type": "confirm", "label": "Approve sending?", "default": False}]
+    row = persist_assistant_message(
+        _db,
+        int(task.id),
+        int(task.user_id),
+        "Please review",
+        message_type="question",
+        interactions=interactions,
+    )
+    canonical = row.content
+    assert "Please answer the following questions:" in canonical
+    assert read_surface.get_pending_interaction_question(_db, task) == (
+        "Please review",
+        interactions,
+    )
+    assert chat_history_service.get_latest_waiting_question(_db, int(task.id)) == (
+        canonical,
+        interactions,
+    )
+    assert row.content == canonical
+
+
+@pytest.mark.parametrize("tier, storage_version", [("native", 1), ("legacy", 2)])
+def test_raw_native_and_event_questions_are_not_shortened(
+    _db, monkeypatch, tier, storage_version
+):
+    task = _make_task(_db, marker=1)
+    task.conversation_storage_version = storage_version
+    interactions = [{"type": "text_input", "label": "Owner"}]
+    # This happens to look like an appendix but is authored prompt text, not
+    # a legacy transcript. The display projection must not guess otherwise.
+    raw = "Question\n\n\nPlease answer the following questions:\n- Owner: text input"
+    monkeypatch.setattr(
+        read_surface,
+        "materialize_compatibility_view",
+        lambda *args, **kwargs: CompatibilityQuestionView(
+            tier=tier, question=raw, interactions=interactions
+        ),
+    )
+    assert read_surface.get_pending_interaction_question(_db, task) == (
+        raw,
+        interactions,
+    )
+
+
+def test_raw_event_question_fast_path_is_not_shortened(_db, monkeypatch):
+    task = _make_task(_db, marker=None)
+    task.conversation_storage_version = 2
+    interactions = [{"type": "text_input", "label": "Owner"}]
+    raw = "Question\n\n\nPlease answer the following questions:\n- Owner: text input"
+    monkeypatch.setattr(
+        "xagent.web.services.task_execution_event_recovery.read_event_waiting_question",
+        lambda *args: (raw, interactions),
+    )
+    assert read_surface.get_pending_interaction_question(_db, task) == (
+        raw,
+        interactions,
+    )
+
+
 def test_a8_marker_matches_no_active_row_recovers_a_superseded_only_row(
     _db: Session,
 ) -> None:

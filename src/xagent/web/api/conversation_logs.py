@@ -35,6 +35,8 @@ from ..models.task_execution_event import TaskExecutionEvent
 from ..models.trigger import AgentTrigger, TriggerRun
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
+from ..services.assistant_question_display import question_content_for_display
+from ..services.assistant_question_replay import QUESTION_MESSAGE_TYPES
 from ..services.conversation_log_sources import (
     EXTERNAL_TASK_SOURCE,
     get_external_task_public_context,
@@ -595,8 +597,10 @@ def _serialize_transcript_with_events(
     # assistant (2), since compaction happens before the assistant reply.
     rows: list[tuple[float, int, dict[str, Any]]] = []
     for message in sorted(messages, key=_message_sort_key):
-        content = message.content
+        content = str(message.content or "")
         if message.role == "assistant":
+            if message.message_type in QUESTION_MESSAGE_TYPES:
+                content = question_content_for_display(content, message.interactions)
             content = reconcile_assistant_file_references(
                 db,
                 task_id=int(task.id),
