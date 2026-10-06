@@ -881,7 +881,7 @@ def _register_selected_task_files_isolated(
     registrations: list[tuple[str, Optional[str]]] = []
     for selected_file in selected_files:
         source_path = ensure_uploaded_file_local_path(selected_file)
-        if not source_path.exists() or not source_path.is_file():
+        if source_path is None or not source_path.exists() or not source_path.is_file():
             continue
 
         registrations.append(

@@ -37,6 +37,10 @@ class ScopedFileStorage:
     def backend(self) -> str:
         return self._storage.backend
 
+    @property
+    def base_uri(self) -> str:
+        return self._storage.base_uri
+
     def _scoped(self, key: str, *, strict: bool = True) -> str:
         normalized = normalize_storage_key(key, strict=strict)
         if normalized != self._prefix and not normalized.startswith(self._prefix + "/"):
@@ -90,6 +94,11 @@ class ScopedFileStorage:
 
     def materialize(self, key: str, filename: str | None = None) -> Path:
         return self._storage.materialize(self._scoped(key, strict=False), filename)
+
+    def materialized_path(self, key: str, filename: str | None = None) -> Path:
+        return self._storage.materialized_path(
+            self._scoped(key, strict=False), filename
+        )
 
     def copy_to_path(self, key: str, target_path: Path) -> Path:
         return self._storage.copy_to_path(self._scoped(key, strict=False), target_path)

@@ -84,6 +84,12 @@ from ..services.managed_file_ref import (
     guess_media_type,
     log_durable_storage_fault,
 )
+from ..services.uploaded_file_cleanup_publication import (
+    FilePublicationUnavailable,
+    async_managed_copy,
+    guard_preview_publication,
+    preview_cache_hit,
+)
 from ..services.uploaded_file_store import (
     LocalUploadRegistration,
     UploadedFileStore,
@@ -212,6 +218,18 @@ def _svg_png_cache_path(svg_path: Path, file_id: Optional[str] = None) -> Path:
 
 
 def _rasterize_svg_preview(svg_path: Path, file_id: Optional[str] = None) -> Path:
+    cached = preview_cache_hit(
+        svg_path, _svg_png_cache_path(svg_path, file_id), file_id
+    )
+    if cached is not None:
+        return cached
+    return _rasterize_svg_preview_uncached(svg_path, file_id)
+
+
+@guard_preview_publication
+def _rasterize_svg_preview_uncached(
+    svg_path: Path, file_id: Optional[str] = None
+) -> Path:
     cache_path = _svg_png_cache_path(svg_path, file_id)
     try:
         if (
@@ -275,6 +293,10 @@ async def _inline_preview_response(
             # on this event loop (the public preview endpoint makes this
             # externally triggerable).
             png_path = await asyncio.to_thread(_rasterize_svg_preview, path, file_id)
+        except (DurableObjectMissingError, FilePublicationUnavailable) as exc:
+            raise HTTPException(status_code=404, detail="File not found") from exc
+        except DurableStorageOperationError as exc:
+            _raise_durable_storage_unavailable(exc, "svg preview", file_id=file_id)
         except Exception as exc:
             raise HTTPException(
                 status_code=422,
@@ -488,22 +510,27 @@ async def _stage_uploaded_file(
     folder: str | None,
     user_id: int,
     written_paths: list[Path],
+    written_identities: dict[Path, tuple[int, int]],
 ) -> Path:
     """Run local staging off-loop and publish its path to request cleanup."""
 
-    worker = asyncio.create_task(
-        asyncio.to_thread(
-            _reserve_and_copy_upload,
+    def stage() -> tuple[Path, tuple[int, int]]:
+        path = _reserve_and_copy_upload(
             uploaded,
             task_id=task_id,
             folder=folder,
             user_id=user_id,
         )
-    )
-    target_path, cancellation = await await_task_settlement(worker)
+        info = path.lstat()
+        return path, (info.st_dev, info.st_ino)
+
+    worker = asyncio.create_task(asyncio.to_thread(stage))
+    result, cancellation = await await_task_settlement(worker)
+    target_path, identity = result
     # The request cleanup owner knows this exact path before any subsequent
     # preview, registration, or cancellation-cleanup await point.
     written_paths.append(target_path)
+    written_identities[target_path] = identity
     if cancellation is not None:
         raise cancellation
     return target_path
@@ -524,6 +551,7 @@ async def store_uploaded_files(
     parsed_task_id = _parse_task_id(task_id)
     uploaded_files: list[dict[str, Any]] = []
     written_paths: list[Path] = []
+    written_identities: dict[Path, tuple[int, int]] = {}
     registrations: list[LocalUploadRegistration] = []
     previews: dict[str, Any] = {}
     completed = False
@@ -564,6 +592,7 @@ async def store_uploaded_files(
                     folder=folder,
                     user_id=user_id,
                     written_paths=written_paths,
+                    written_identities=written_identities,
                 )
             except _InvalidUploadPathError as e:
                 logger.warning(f"Invalid folder name rejected: {folder!r} - {e}")
@@ -662,7 +691,21 @@ async def store_uploaded_files(
 
                     def _delete_local_paths() -> None:
                         for path in written_paths:
-                            _delete_staged_upload(path)
+                            try:
+                                if upload_path_is_registered_sync(path):
+                                    continue
+                                try:
+                                    info = path.lstat()
+                                except FileNotFoundError:
+                                    continue
+                                if (info.st_dev, info.st_ino) == written_identities[
+                                    path
+                                ]:
+                                    _delete_staged_upload(path)
+                            except Exception:
+                                logger.exception(
+                                    "Failed to reconcile staged upload path: %s", path
+                                )
 
                     cleanup_worker = asyncio.create_task(
                         asyncio.to_thread(_delete_local_paths)
@@ -1152,6 +1195,20 @@ def _pptx_pdf_cache_path(pptx_path: Path, file_id: Optional[str] = None) -> Path
 async def _convert_pptx_to_pdf(
     pptx_path: Path, file_id: Optional[str] = None
 ) -> Optional[Path]:
+    if pptx_path.suffix.lower() != ".pptx":
+        return None
+    cached = await asyncio.to_thread(
+        preview_cache_hit, pptx_path, _pptx_pdf_cache_path(pptx_path, file_id), file_id
+    )
+    if cached is not None:
+        return cached
+    return await _convert_pptx_to_pdf_uncached(pptx_path, file_id)
+
+
+@guard_preview_publication
+async def _convert_pptx_to_pdf_uncached(
+    pptx_path: Path, file_id: Optional[str] = None
+) -> Optional[Path]:
     """Convert a .pptx to PDF via LibreOffice with on-disk caching.
 
     Returns the path to the cached PDF on success, or ``None`` when soffice
@@ -1190,7 +1247,9 @@ async def _convert_pptx_to_pdf(
         # /tmp), which on Docker/production layouts is a different mount than
         # the uploads volume — the later `replace()` would then fail with
         # EXDEV (Invalid cross-device link). Per PR #542 review.
-        with tempfile.TemporaryDirectory(dir=cache_path.parent) as temp_dir:
+        with tempfile.TemporaryDirectory(
+            dir=cache_path.parent, prefix=f".{file_id or cache_path.stem}.preview-"
+        ) as temp_dir:
             proc = await asyncio.create_subprocess_exec(
                 "soffice",
                 "--headless",
@@ -1512,7 +1571,9 @@ async def download_file(
         if file_ref.has_durable_object:
             try:
                 if local_path_is_trusted:
-                    restored_path = file_ref.ensure_local()
+                    restored_path = await async_managed_copy(
+                        file_ref, restore_local=True
+                    )
                     accel_response = _accel_redirect_response(
                         restored_path,
                         owner_user_id=owner_user_id,
@@ -1523,7 +1584,9 @@ async def download_file(
                     if accel_response is not None:
                         return accel_response
                 else:
-                    restored_path = file_ref.materialize(allow_existing_local=False)
+                    restored_path = await async_managed_copy(
+                        file_ref, allow_existing_local=False
+                    )
                 return FileResponse(
                     path=str(restored_path),
                     filename=file_name,
@@ -1537,6 +1600,8 @@ async def download_file(
                 )
             except DurableObjectIntegrityError as exc:
                 raise _file_integrity_failed() from exc
+            except FilePublicationUnavailable as exc:
+                raise HTTPException(status_code=404, detail="File not found") from exc
             except DurableObjectMissingError:
                 restored_path = file_ref.local_path
                 _ensure_under_uploads(restored_path, owner_user_id)
@@ -1856,18 +1921,19 @@ async def preview_file(
                     return accel_response
         if file_ref.has_durable_object:
             try:
-                materialized_path = file_ref.materialize(
-                    allow_existing_local=local_path_is_trusted
+                materialized_path = await async_managed_copy(
+                    file_ref, allow_existing_local=local_path_is_trusted
                 )
             except DurableObjectIntegrityError as exc:
                 raise _file_integrity_failed() from exc
             except DurableStorageOperationError as exc:
                 _raise_durable_storage_unavailable(exc, "preview", file_id=file_id)
+            except FilePublicationUnavailable as exc:
+                raise HTTPException(status_code=404, detail="File not found") from exc
             except DurableObjectMissingError:
                 materialized_path = file_ref.local_path
                 _ensure_under_uploads(materialized_path, owner_user_id)
-            if validation_only:
-                release_db_connection_if_clean(db)
+            release_db_connection_if_clean(db)
             return await _inline_preview_response(
                 materialized_path,
                 filename=file_name,
@@ -1903,8 +1969,7 @@ async def preview_file(
         if accel_response is not None:
             return accel_response
 
-    if validation_only:
-        release_db_connection_if_clean(db)
+    release_db_connection_if_clean(db)
     return await _inline_preview_response(
         full_path,
         filename=file_name,
@@ -1953,13 +2018,15 @@ async def preview_pptx_as_pdf(
         local_path_is_trusted = _is_under_uploads(full_path, owner_user_id)
         if file_ref.has_durable_object:
             try:
-                pptx_path = file_ref.materialize(
-                    allow_existing_local=local_path_is_trusted
+                pptx_path = await async_managed_copy(
+                    file_ref, allow_existing_local=local_path_is_trusted
                 )
             except DurableObjectIntegrityError as exc:
                 raise _file_integrity_failed() from exc
             except DurableStorageOperationError as exc:
                 _raise_durable_storage_unavailable(exc, "pptx preview", file_id=file_id)
+            except FilePublicationUnavailable as exc:
+                raise HTTPException(status_code=404, detail="File not found") from exc
             except DurableObjectMissingError:
                 # Durable record points at nothing; fall back to whatever
                 # is on disk (or 404 below if it's gone too).
@@ -1985,7 +2052,11 @@ async def preview_pptx_as_pdf(
     # the source file.  Legacy / non-UUID ids pass None and fall back to
     # the path-hash key.
     managed_file_id = file_id if is_valid_uuid(file_id) else None
-    pdf_path = await _convert_pptx_to_pdf(pptx_path, file_id=managed_file_id)
+    release_db_connection_if_clean(db)
+    try:
+        pdf_path = await _convert_pptx_to_pdf(pptx_path, file_id=managed_file_id)
+    except (DurableObjectMissingError, FilePublicationUnavailable) as exc:
+        raise HTTPException(status_code=404, detail="File not found") from exc
     if pdf_path is None:
         # Distinct 503 lets the frontend fall back gracefully instead of
         # showing an error banner.
@@ -2044,8 +2115,8 @@ async def public_download_file(
         local_path_is_trusted = _is_under_uploads(file_ref.local_path, owner_user_id)
         if file_ref.has_durable_object:
             try:
-                target_path = file_ref.materialize(
-                    allow_existing_local=local_path_is_trusted
+                target_path = await async_managed_copy(
+                    file_ref, allow_existing_local=local_path_is_trusted
                 )
                 target_is_durable = True
             except DurableObjectIntegrityError as exc:
@@ -2054,6 +2125,8 @@ async def public_download_file(
                 _raise_durable_storage_unavailable(
                     exc, "public download", file_id=file_id
                 )
+            except FilePublicationUnavailable as exc:
+                raise HTTPException(status_code=404, detail="File not found") from exc
             except DurableObjectMissingError:
                 target_path = file_ref.local_path
         else:
@@ -2114,8 +2187,9 @@ async def public_preview_file(
         owner_user_id = _file_user_id_value(file_record)
         if file_ref.has_durable_object and not relative_path:
             try:
-                target_path = file_ref.materialize(
-                    allow_existing_local=_is_under_uploads(base_path, owner_user_id)
+                target_path = await async_managed_copy(
+                    file_ref,
+                    allow_existing_local=_is_under_uploads(base_path, owner_user_id),
                 )
             except DurableObjectIntegrityError as exc:
                 raise _file_integrity_failed() from exc
@@ -2123,12 +2197,13 @@ async def public_preview_file(
                 _raise_durable_storage_unavailable(
                     exc, "public preview", file_id=file_id
                 )
+            except FilePublicationUnavailable as exc:
+                raise HTTPException(status_code=404, detail="File not found") from exc
             except DurableObjectMissingError:
                 target_path = file_ref.local_path
                 _ensure_under_uploads(target_path, owner_user_id)
             filename = str(file_record.filename)
-            if validation_only:
-                release_db_connection_if_clean(db)
+            release_db_connection_if_clean(db)
             return await _inline_preview_response(
                 target_path,
                 filename=filename,
@@ -2167,7 +2242,7 @@ async def public_preview_file(
             _validate_public_task_file_access(db, asset_record, token)
             asset_ref = ManagedFileRef(asset_record)
             try:
-                target_path = asset_ref.ensure_local()
+                target_path = await async_managed_copy(asset_ref, restore_local=True)
             except DurableObjectIntegrityError as exc:
                 raise _file_integrity_failed() from exc
             except DurableStorageOperationError as exc:
@@ -2181,6 +2256,8 @@ async def public_preview_file(
                     "public preview task asset",
                     file_id=asset_record.file_id,
                 )
+            except FilePublicationUnavailable as exc:
+                raise HTTPException(status_code=404, detail="File not found") from exc
             except DurableObjectMissingError:
                 target_path = asset_ref.local_path
             _ensure_under_uploads(target_path, owner_user_id)
@@ -2188,8 +2265,7 @@ async def public_preview_file(
     if not target_path.exists() or not target_path.is_file():
         raise HTTPException(status_code=404, detail="File not found")
 
-    if validation_only:
-        release_db_connection_if_clean(db)
+    release_db_connection_if_clean(db)
     return await _inline_preview_response(
         target_path,
         filename=target_path.name,

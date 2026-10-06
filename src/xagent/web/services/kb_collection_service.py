@@ -23,7 +23,7 @@ from .kb_file_service import (
     _delete_uploaded_file_if_orphaned_impl,
     find_referenced_file_ids,
 )
-from .uploaded_file_store import UploadedFileStore
+from .uploaded_file_store import UploadedFileStore, UploadedFileVersionConflict
 
 if TYPE_CHECKING:
     from ...core.tools.core.RAG_tools.core.schemas import CollectionOperationResult
@@ -338,6 +338,7 @@ def _delete_collection_uploaded_files_impl(
         prefixes = tuple(d + os.sep for d in dirs)
         query = db.query(UploadedFile).filter(
             UploadedFile.user_id == user_id,
+            UploadedFile.storage_status != "compensating",
             or_(
                 UploadedFile.storage_path.in_(dirs),
                 *(
@@ -356,7 +357,11 @@ def _delete_collection_uploaded_files_impl(
             # SQLite's LIKE ignores ASCII case.
             if path not in dirs and not path.startswith(prefixes):
                 continue
-            store.delete(file_record, delete_local=False, after_commit=after_commit)
+            try:
+                store.delete(file_record, delete_local=False, after_commit=after_commit)
+            except UploadedFileVersionConflict:
+                # A cleanup claimant or replacement generation owns this row.
+                continue
             deleted_uploaded_files += 1
 
     return deleted_uploaded_files

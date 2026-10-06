@@ -32,12 +32,15 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from ...core.agent.attachments import project_file_info_to_chip
-from ...core.execution_scope import resolve_execution_scope
+from ...core.execution_scope import ExecutionScope, resolve_execution_scope
 from ...core.file_ref import FILE_REF_MODEL_INSTRUCTIONS
 from ..models.database import release_db_connection_if_clean
 from ..models.task import Task
 from ..models.uploaded_file import UploadedFile
-from .managed_file_ref import ensure_uploaded_file_local_path
+from .managed_file_ref import (
+    async_ensure_uploaded_file_local_path,
+    ensure_uploaded_file_local_path,
+)
 from .task_file_lifecycle import lock_attachment_task
 
 logger = logging.getLogger(__name__)
@@ -47,15 +50,19 @@ logger = logging.getLogger(__name__)
 class _TurnFileRecordSnapshot:
     """Detached fields needed to materialize one authorized upload."""
 
+    id: int
     user_id: int
     file_id: str
     filename: str
     file_size: int
     mime_type: str | None
     storage_path: str
+    storage_backend: str | None
     storage_key: str | None
+    storage_uri: str | None
     storage_status: str | None
     checksum: str | None
+    etag: str | None
 
 
 def _task_execution_scope_in_session(
@@ -128,14 +135,14 @@ def normalize_filename(filename: str) -> str:
     return normalized_name
 
 
-def resolve_turn_file_infos(
+def _load_turn_file_snapshots(
     *,
     file_ids: List[str],
     owner_user_id: int,
     db: Session,
     task_id: Optional[int] = None,
-) -> Tuple[List[Dict[str, Any]], List[str]]:
-    """Resolve file ids to bindable file-info dicts WITHOUT mutating them.
+) -> tuple[list[_TurnFileRecordSnapshot], list[str], ExecutionScope | None]:
+    """Load detached file metadata and release a clean caller connection.
 
     A file id resolves when a row exists that is owned by ``owner_user_id``,
     is either unbound (``task_id IS NULL``) or already bound to ``task_id``,
@@ -150,11 +157,7 @@ def resolve_turn_file_infos(
             ``None`` (task not created yet), only unbound files resolve.
 
     Returns:
-        ``(file_info_list, missing_ids)``. ``file_info_list`` preserves input
-        order and carries the same shape the WebSocket path produces
-        (file_id, name, original_name, size, type, path). ``missing_ids``
-        lists ids that did not resolve (bad id, wrong owner, bound to another
-        task, or missing bytes) so callers can decide strict-vs-lenient.
+        Detached snapshots, missing ids, and the resolved task execution scope.
     """
     if task_id is not None:
         bind_filter: Any = or_(
@@ -179,7 +182,7 @@ def resolve_turn_file_infos(
         normalized_ids.append(file_id)
 
     if not normalized_ids:
-        return [], missing
+        return [], missing, None
 
     records = (
         db.query(UploadedFile)
@@ -201,6 +204,7 @@ def resolve_turn_file_infos(
 
         snapshots.append(
             _TurnFileRecordSnapshot(
+                id=int(record.id),
                 user_id=int(record.user_id),
                 file_id=str(record.file_id),
                 filename=str(record.filename),
@@ -209,8 +213,16 @@ def resolve_turn_file_infos(
                     str(record.mime_type) if record.mime_type is not None else None
                 ),
                 storage_path=str(record.storage_path),
+                storage_backend=(
+                    str(record.storage_backend)
+                    if record.storage_backend is not None
+                    else None
+                ),
                 storage_key=(
                     str(record.storage_key) if record.storage_key is not None else None
+                ),
+                storage_uri=(
+                    str(record.storage_uri) if record.storage_uri is not None else None
                 ),
                 storage_status=(
                     str(record.storage_status)
@@ -220,6 +232,7 @@ def resolve_turn_file_infos(
                 checksum=(
                     str(record.checksum) if record.checksum is not None else None
                 ),
+                etag=str(record.etag) if record.etag is not None else None,
             )
         )
 
@@ -239,13 +252,45 @@ def resolve_turn_file_infos(
         else None
     )
 
+    return snapshots, missing, execution_scope
+
+
+def _turn_file_info(
+    snapshot: _TurnFileRecordSnapshot, source_path: Path
+) -> Dict[str, Any]:
+    original_name = Path(snapshot.filename).name
+    return {
+        "file_id": snapshot.file_id,
+        "name": normalize_filename(original_name),
+        "original_name": original_name,
+        "size": snapshot.file_size,
+        "type": snapshot.mime_type,
+        "path": str(source_path),
+        "workspace_path": None,
+    }
+
+
+def resolve_turn_file_infos(
+    *,
+    file_ids: List[str],
+    owner_user_id: int,
+    db: Session,
+    task_id: Optional[int] = None,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Resolve file ids to bindable file-info dicts without mutating them."""
+    snapshots, missing, execution_scope = _load_turn_file_snapshots(
+        file_ids=file_ids,
+        owner_user_id=owner_user_id,
+        db=db,
+        task_id=task_id,
+    )
     file_infos: List[Dict[str, Any]] = []
     for snapshot in snapshots:
         source_path = ensure_uploaded_file_local_path(
             snapshot,
             execution_scope=execution_scope,
         )
-        if not source_path.exists():
+        if source_path is None or not source_path.exists():
             logger.warning(
                 "Physical file not found for %s: %s",
                 snapshot.file_id,
@@ -254,18 +299,40 @@ def resolve_turn_file_infos(
             missing.append(snapshot.file_id)
             continue
 
-        original_name = Path(snapshot.filename).name
-        file_infos.append(
-            {
-                "file_id": snapshot.file_id,
-                "name": normalize_filename(original_name),
-                "original_name": original_name,
-                "size": snapshot.file_size,
-                "type": snapshot.mime_type,
-                "path": str(source_path),
-                "workspace_path": None,
-            }
+        file_infos.append(_turn_file_info(snapshot, source_path))
+
+    return file_infos, missing
+
+
+async def async_resolve_turn_file_infos(
+    *,
+    file_ids: List[str],
+    owner_user_id: int,
+    db: Session,
+    task_id: Optional[int] = None,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Async turn-file resolution with only detached storage work off-loop."""
+    snapshots, missing, execution_scope = _load_turn_file_snapshots(
+        file_ids=file_ids,
+        owner_user_id=owner_user_id,
+        db=db,
+        task_id=task_id,
+    )
+    file_infos: List[Dict[str, Any]] = []
+    for snapshot in snapshots:
+        source_path = await async_ensure_uploaded_file_local_path(
+            snapshot,
+            execution_scope=execution_scope,
         )
+        if source_path is None or not source_path.exists():
+            logger.warning(
+                "Physical file not found for %s: %s",
+                snapshot.file_id,
+                source_path,
+            )
+            missing.append(snapshot.file_id)
+            continue
+        file_infos.append(_turn_file_info(snapshot, source_path))
 
     return file_infos, missing
 

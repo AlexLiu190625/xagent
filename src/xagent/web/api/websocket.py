@@ -99,8 +99,8 @@ from ..services.file_reference_output_service import (
     reconcile_assistant_file_references,
 )
 from ..services.file_turn import (
+    async_resolve_turn_file_infos,
     bind_turn_files,
-    resolve_turn_file_infos,
 )
 from ..services.hot_path_cache import (
     cache_get,
@@ -1364,7 +1364,7 @@ async def handle_file_upload_for_task(
             return {"uploaded_files": [], "file_info_list": []}
 
         file_ids = [str(f.get("file_id")) for f in files if f.get("file_id")]
-        file_info_list, missing = resolve_turn_file_infos(
+        file_info_list, missing = await async_resolve_turn_file_infos(
             file_ids=file_ids,
             owner_user_id=int(authorized_owner_id),
             db=db,

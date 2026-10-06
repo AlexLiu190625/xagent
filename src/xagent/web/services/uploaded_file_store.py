@@ -657,6 +657,18 @@ def settle_uploaded_file_compensation_no_commit(
 
     if presence != "absent":
         return None
+    from .uploaded_file_cleanup import cleanup_complete
+
+    manifest = (
+        db.query(UploadedFile.cleanup_manifest)
+        .filter(
+            UploadedFile.id == row_id,
+            UploadedFile.updated_at == expected_updated_at,
+        )
+        .scalar()
+    )
+    if not cleanup_complete(manifest):
+        return None
     task_filter = (
         UploadedFile.task_id.is_(None)
         if task_id is None
@@ -1200,52 +1212,47 @@ def compensate_registered_uploads_sync(
     if not normalized_claims:
         return
 
+    from .uploaded_file_cleanup import run_uploaded_file_cleanup
+    from .uploaded_file_cleanup_resources import build_cleanup_manifest
+
     SessionLocal = get_session_local()
-    claimed: list[ClaimedRegisteredUploadCompensation] = []
+    planned = []
     with SessionLocal() as db:
         for registration_claim in normalized_claims:
-            claimed_at = datetime.now(timezone.utc)
-            task_filter = (
-                UploadedFile.task_id.is_(None)
-                if registration_claim.expected_task_id is None
-                else UploadedFile.task_id == registration_claim.expected_task_id
-            )
             row = (
-                db.query(UploadedFile.id)
+                db.query(UploadedFile)
                 .filter(
                     UploadedFile.user_id == registration_claim.user_id,
                     UploadedFile.file_id == registration_claim.file_id,
                     UploadedFile.storage_key == registration_claim.expected_storage_key,
                     UploadedFile.storage_status == "available",
-                    task_filter,
+                    UploadedFile.task_id == registration_claim.expected_task_id,
                 )
                 .first()
             )
-            if row is None:
-                continue
+            if row is not None:
+                planned.append(snapshot_uploaded_file_version(row))
+    manifests = [build_cleanup_manifest(snapshot) for snapshot in planned]
+    claimed: list[ClaimedRegisteredUploadCompensation] = []
+    with SessionLocal() as db:
+        for snapshot, manifest in zip(planned, manifests):
+            claimed_at = datetime.now(timezone.utc)
             claimed_count = (
                 db.query(UploadedFile)
-                .filter(
-                    UploadedFile.id == int(row[0]),
-                    UploadedFile.user_id == registration_claim.user_id,
-                    UploadedFile.file_id == registration_claim.file_id,
-                    UploadedFile.storage_key == registration_claim.expected_storage_key,
-                    UploadedFile.storage_status == "available",
-                    task_filter,
-                )
+                .filter(*_uploaded_file_version_match_predicates(snapshot))
                 .update(
                     {
                         UploadedFile.storage_status: "compensating",
                         UploadedFile.updated_at: claimed_at,
+                        UploadedFile.cleanup_manifest: manifest,
                     },
                     synchronize_session=False,
                 )
             )
             if claimed_count == 1:
-                record_cleanup_fence(db, registration_claim.file_id)
+                record_cleanup_fence(db, snapshot.file_id)
                 persisted_claimed_at = _load_uploaded_file_compensation_token_no_commit(
-                    db,
-                    row_id=int(row[0]),
+                    db, row_id=snapshot.row_id
                 )
                 if persisted_claimed_at is None:
                     raise RuntimeError(
@@ -1253,11 +1260,11 @@ def compensate_registered_uploads_sync(
                     )
                 claimed.append(
                     ClaimedRegisteredUploadCompensation(
-                        row_id=int(row[0]),
-                        user_id=registration_claim.user_id,
-                        file_id=registration_claim.file_id,
-                        expected_task_id=registration_claim.expected_task_id,
-                        expected_storage_key=(registration_claim.expected_storage_key),
+                        row_id=snapshot.row_id,
+                        user_id=snapshot.user_id,
+                        file_id=snapshot.file_id,
+                        expected_task_id=snapshot.task_id,
+                        expected_storage_key=cast(str, snapshot.storage_key),
                         claimed_at=persisted_claimed_at,
                     )
                 )
@@ -1266,37 +1273,28 @@ def compensate_registered_uploads_sync(
     if _release_claim_locks is not None:
         _release_claim_locks()
 
-    cleaned: list[ClaimedRegisteredUploadCompensation] = []
     unresolved: list[ClaimedRegisteredUploadCompensation] = []
-    for claimed_version in claimed:
-        presence = delete_uploaded_file_compensation_object(
-            user_id=claimed_version.user_id,
-            storage_key=claimed_version.expected_storage_key,
-        )
-        if presence == "absent":
-            cleaned.append(claimed_version)
-        else:
-            unresolved.append(claimed_version)
-
-    if cleaned:
-        cleaned_file_ids: list[str] = []
-        with SessionLocal() as db:
-            for claimed_version in cleaned:
-                settlement = settle_uploaded_file_compensation_no_commit(
-                    db,
-                    row_id=claimed_version.row_id,
-                    user_id=claimed_version.user_id,
-                    file_id=claimed_version.file_id,
-                    task_id=claimed_version.expected_task_id,
-                    storage_key=claimed_version.expected_storage_key,
-                    expected_updated_at=claimed_version.claimed_at,
-                    presence="absent",
-                )
-                if settlement == "deleted":
-                    cleaned_file_ids.append(claimed_version.file_id)
-            db.commit()
-        for file_id in cleaned_file_ids:
-            delete_registered_preview_caches(file_id)
+    first_error: Exception | None = None
+    for claim in claimed:
+        try:
+            outcome = run_uploaded_file_cleanup(
+                session_factory=SessionLocal,
+                row_id=claim.row_id,
+                user_id=claim.user_id,
+                file_id=claim.file_id,
+                task_id=claim.expected_task_id,
+                storage_key=claim.expected_storage_key,
+                expected_updated_at=claim.claimed_at,
+                compensation_delete=delete_uploaded_file_compensation_object,
+            )
+            if outcome not in {"deleted", "stale"}:
+                unresolved.append(claim)
+        except Exception as exc:
+            # Finish already-claimed siblings, then preserve the primary error.
+            if first_error is None:
+                first_error = exc
+    if first_error is not None:
+        raise first_error
 
     if unresolved:
         failed_ids = ", ".join(claim.file_id for claim in unresolved)
@@ -1915,28 +1913,55 @@ class UploadedFileStore:
         With ``after_commit``, the durable delete and local unlink are queued as
         ``(label, fn)`` for the caller to run after it commits; without it they run now.
         """
+        snapshot = snapshot_uploaded_file_version(file_record)
+        deletable = self.db.query(UploadedFile).filter(
+            *_uploaded_file_version_match_predicates(snapshot),
+            UploadedFile.storage_status != "compensating",
+        )
+        if deletable.with_for_update().first() is None:
+            raise UploadedFileVersionConflict(
+                "Uploaded file is unavailable for deletion"
+            )
         ref = ManagedFileRef(file_record)
         file_id = str(getattr(file_record, "file_id", "") or "")
+        deferred: list[tuple[str, Callable[[], None]]] = []
         if after_commit is None:
             ref.delete_durable()
         elif ref.has_durable_object:
             storage = get_user_file_storage(int(file_record.user_id))
             key = ref.storage_key
-            after_commit.append((key, lambda: storage.delete(key)))
+            deferred.append((key, lambda: storage.delete(key)))
+        unlink: Callable[[], None] | None = None
         if delete_local:
             unlink = functools.partial(
                 self._delete_local, str(file_record.storage_path), local_root=local_root
             )
             if after_commit is None:
                 unlink()
-            else:
-                after_commit.append((file_id, unlink))
         # Remove any server-side PDF preview cache so derived content doesn't
         # outlive the source upload.  Called here (not only in the HTTP route)
         # so reconcile / orphan-cleanup paths that go through this service also
         # clean up the cache.
-        delete_registered_preview_caches(file_id)
-        self.db.delete(file_record)
+        if after_commit is None:
+            delete_registered_preview_caches(file_id)
+        else:
+
+            def _delete_local_and_previews() -> None:
+                try:
+                    if unlink is not None:
+                        unlink()
+                finally:
+                    delete_registered_preview_caches(file_id)
+
+            deferred.append((file_id, _delete_local_and_previews))
+        if deletable.delete(synchronize_session=False) != 1:
+            raise UploadedFileVersionConflict(
+                "Uploaded file was claimed before deletion"
+            )
+        if after_commit is not None:
+            after_commit.extend(deferred)
+        if file_record in self.db:
+            self.db.expunge(file_record)
         self.db.flush()
 
     @staticmethod

@@ -20,6 +20,7 @@ from starlette.concurrency import run_in_threadpool
 
 from ...core.tools.core.RAG_tools.storage.file_reference import (
     clear_cleanup_fence,
+    file_cleanup_lock,
     file_reference_lock,
     has_cleanup_fence,
     persist_cleanup_fence,
@@ -176,7 +177,12 @@ def unreferenced_file(db: Session, file_id: str) -> Iterator[bool]:
 def guard_cleanup_claim(operation: _Operation) -> _Operation:
     @wraps(operation)
     def claim(db: Session, candidate: Any) -> Any:
-        with unreferenced_file(db, candidate.file_id) as eligible:
+        if not release_db_connection_if_clean(db):
+            raise RuntimeError("Cleanup requires a clean caller transaction")
+        with (
+            file_cleanup_lock(candidate.file_id),
+            unreferenced_file(db, candidate.file_id) as eligible,
+        ):
             if not eligible:
                 return None
             token = operation(db, candidate)
@@ -330,6 +336,7 @@ def guard_upload_compensation(operation: _Operation) -> _Operation:
         with ExitStack() as claim_locks:
             for file_id in sorted({claim.file_id for claim in unique}):
                 with ExitStack() as candidate_lock:
+                    candidate_lock.enter_context(file_cleanup_lock(file_id))
                     with get_session_local()() as db:
                         eligible = candidate_lock.enter_context(
                             unreferenced_file(db, file_id)

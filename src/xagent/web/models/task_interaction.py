@@ -153,8 +153,8 @@ class TaskInteractionRequest(Base):  # type: ignore
     historical wear); active rows make SET NULL collide with a CHECK, which
     behaves like RESTRICT.
 
-    ``JSON(none_as_null=True)`` is confined to this table, carried by both of
-    its JSON columns. ``response_payload`` uses it so a Python ``None`` lands
+    Both JSON columns use ``JSON(none_as_null=True)`` for their SQL NULL
+    contracts. ``response_payload`` uses it so a Python ``None`` lands
     as SQL NULL instead of the JSON scalar ``null``: consumers must test "has
     this request been answered" with SQL ``IS NULL``, never with
     ``payload is None`` in Python, since a legitimate JSON ``null`` answer
@@ -416,10 +416,8 @@ class TaskInteractionRequest(Base):  # type: ignore
     # before binding, so None would land as the JSON text 'null'. none_as_null
     # makes it a real SQL NULL, and the NOT NULL fires.
     request_payload = Column(JSON(none_as_null=True), nullable=False)
-    # The flag is confined to this table and carried by both of its JSON
-    # columns (see class docstring): response_payload uses it to tell "no
-    # answer yet" from "answered with JSON null", request_payload uses it so
-    # NOT NULL actually fires.
+    # SQL NULL distinguishes "no answer yet" from "answered with JSON null"
+    # (see class docstring).
     response_payload = Column(JSON(none_as_null=True), nullable=True)
 
     request_idempotency_key = Column(

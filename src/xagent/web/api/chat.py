@@ -67,7 +67,7 @@ from ..services.hot_path_cache import (
     web_task_status_key,
 )
 from ..services.llm_utils import AutoModelUnavailableError, resolve_llms_from_names
-from ..services.managed_file_ref import ensure_uploaded_file_local_path
+from ..services.managed_file_ref import async_ensure_uploaded_file_local_path
 from ..services.model_service import _get_visible_user_ids
 from ..services.public_trace_events import public_task_trace_filter
 from ..services.task_cleanup_obligations import (
@@ -294,6 +294,7 @@ async def create_task(
     user: User = Depends(get_current_user),
 ) -> TaskCreateResponse:
     """Create new chat task"""
+    authenticated_user_id = int(user.id)
     try:
         try:
             # Pre-flight only. ``create_task_extensions`` validates again below,
@@ -334,7 +335,7 @@ async def create_task(
                     db.query(UploadedFile)
                     .filter(
                         UploadedFile.file_id == file_id,
-                        UploadedFile.user_id == int(user.id),
+                        UploadedFile.user_id == authenticated_user_id,
                         UploadedFile.task_id.is_(None),
                         UploadedFile.storage_status != "compensating",
                     )
@@ -344,18 +345,18 @@ async def create_task(
                     file_info_list.append(f"File ID: {file_id} (File does not exist)")
                     continue
 
-                selected_file_ids.append(str(file_id))
+                uploaded_filename = str(uploaded_file.filename)
+                file_path = await async_ensure_uploaded_file_local_path(uploaded_file)
 
-                file_path = ensure_uploaded_file_local_path(uploaded_file)
-                file_paths.append(str(file_path))
-
-                if file_path.exists():
+                if file_path is not None and file_path.exists():
+                    selected_file_ids.append(str(file_id))
+                    file_paths.append(str(file_path))
                     file_info_list.append(
-                        f"File: {uploaded_file.filename} (Path: {file_path})"
+                        f"File: {uploaded_filename} (Path: {file_path})"
                     )
                 else:
                     file_info_list.append(
-                        f"File: {uploaded_file.filename} (File does not exist)"
+                        f"File: {uploaded_filename} (File does not exist)"
                     )
 
             if file_info_list:
@@ -394,14 +395,14 @@ async def create_task(
             own_model = (
                 db.query(UserModel)
                 .filter(
-                    UserModel.user_id == int(user.id),
+                    UserModel.user_id == authenticated_user_id,
                     UserModel.model_id == db_model.id,
                     UserModel.is_owner.is_(True),
                 )
                 .first()
             )
             if not own_model:
-                visible_ids = _get_visible_user_ids(db, int(user.id))
+                visible_ids = _get_visible_user_ids(db, authenticated_user_id)
                 own_model = (
                     db.query(UserModel)
                     .filter(
@@ -433,7 +434,7 @@ async def create_task(
                 db.query(UserDefaultModel)
                 .join(DBModel, UserDefaultModel.model_id == DBModel.id)
                 .filter(
-                    UserDefaultModel.user_id == int(user.id),
+                    UserDefaultModel.user_id == authenticated_user_id,
                     DBModel.is_active,
                     UserDefaultModel.config_type.in_(config_types),
                 )
@@ -443,13 +444,15 @@ async def create_task(
 
             for row in user_defaults:
                 if row.model:
-                    if _is_model_visible_to_user(db, row.model.id, int(user.id)):
+                    if _is_model_visible_to_user(
+                        db, row.model.id, authenticated_user_id
+                    ):
                         config_type = cast(str, row.config_type)
                         defaults[config_type] = str(row.model.model_id)
 
             # Fill missing defaults from visible users' shared defaults.
             if any(defaults[ct] is None for ct in config_types):
-                visible_ids = _get_visible_user_ids(db, int(user.id))
+                visible_ids = _get_visible_user_ids(db, authenticated_user_id)
                 shared_defaults = (
                     db.query(UserDefaultModel)
                     .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
@@ -512,7 +515,7 @@ async def create_task(
             llm_ids_to_use = _normalize_llm_refs(llm_ids_to_use)
 
         default_llm, fast_llm, vision_llm, compact_llm = resolve_llms_from_names(
-            llm_ids_to_use, db, int(user.id)
+            llm_ids_to_use, db, authenticated_user_id
         )
 
         # Extract provider model names from resolved LLM instances for database storage
@@ -585,7 +588,7 @@ async def create_task(
             task_title = task_title[:50] + "..."
 
         task = Task(
-            user_id=user.id,  # Use authenticated user ID
+            user_id=authenticated_user_id,
             title=task_title,
             description=task_description,
             status=TaskStatus.PENDING,
@@ -608,7 +611,7 @@ async def create_task(
             resolve_agent_runtime_requirements(
                 db=db,
                 agent=selected_agent,
-                connector_user_id=int(user.id),
+                connector_user_id=authenticated_user_id,
             )
         )
         bind_connector_runtime_selection_snapshot(
@@ -645,7 +648,7 @@ async def create_task(
                 db=db,
                 file_ids=selected_file_ids,
                 task_id=int(task.id),
-                owner_user_id=int(user.id),
+                owner_user_id=authenticated_user_id,
             ):
                 db.rollback()
                 raise HTTPException(
@@ -682,7 +685,7 @@ async def create_task(
             seeded_message = persist_assistant_message_no_commit(
                 db,
                 task_id=int(task.id),
-                user_id=int(user.id),
+                user_id=authenticated_user_id,
                 content=request.seed_assistant_message,
                 interactions=request.seed_interactions,
                 message_type=ASSISTANT_RESPONSE_MESSAGE_TYPE,
@@ -724,7 +727,7 @@ async def create_task(
                     task_id,
                 )
             agent_runtime_service.get_agent_manager(http_request).remove_agent(
-                task_id, int(user.id)
+                task_id, authenticated_user_id
             )
             if isinstance(exc.cause, TaskRuntimeClientError):
                 status_code = exc.cause.status_code

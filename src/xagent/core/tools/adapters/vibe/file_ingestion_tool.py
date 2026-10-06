@@ -22,13 +22,17 @@ if TYPE_CHECKING:
 class UploadedFileSnapshot:
     """Scalar upload metadata retained after closing the DB session."""
 
+    id: int | None
     user_id: int
     file_id: str
     filename: str
     storage_path: str
+    storage_backend: str | None
     storage_key: str | None
+    storage_uri: str | None
     storage_status: str | None
     checksum: str | None
+    etag: str | None
 
 
 class CreateKnowledgeBaseFromFileArgs(BaseModel):
@@ -97,13 +101,25 @@ def _get_tool_compatibility_facade() -> "KBToolCompatibilityFacade":
 
 def _snapshot_uploaded_file_record(record: Any) -> UploadedFileSnapshot:
     return UploadedFileSnapshot(
+        id=(int(record.id) if getattr(record, "id", None) is not None else None),
         user_id=int(record.user_id),
         file_id=str(record.file_id),
         filename=str(record.filename),
         storage_path=str(record.storage_path),
+        storage_backend=(
+            str(record.storage_backend)
+            if getattr(record, "storage_backend", None) is not None
+            else None
+        ),
         storage_key=getattr(record, "storage_key", None),
+        storage_uri=(
+            str(record.storage_uri)
+            if getattr(record, "storage_uri", None) is not None
+            else None
+        ),
         storage_status=getattr(record, "storage_status", None),
         checksum=getattr(record, "checksum", None),
+        etag=(str(record.etag) if getattr(record, "etag", None) is not None else None),
     )
 
 
@@ -121,7 +137,7 @@ async def _create_knowledge_base_from_file_impl(
         from .....web.services.managed_file_ref import (
             DurableObjectIntegrityError,
             DurableStorageOperationError,
-            ensure_uploaded_file_local_path,
+            async_ensure_uploaded_file_local_path,
             log_durable_storage_fault,
         )
         from ...core.RAG_tools.core.schemas import (
@@ -186,7 +202,7 @@ async def _create_knowledge_base_from_file_impl(
 
         for record in file_records:
             try:
-                source_path = ensure_uploaded_file_local_path(record)
+                source_path = await async_ensure_uploaded_file_local_path(record)
             except DurableObjectIntegrityError:
                 # Must precede the parent arm below, which this subclasses. A
                 # checksum mismatch is permanent corruption, already recorded
@@ -218,7 +234,7 @@ async def _create_knowledge_base_from_file_impl(
                     f"Failed to restore {record.filename} from durable storage"
                 )
                 continue
-            if not source_path.exists():
+            if source_path is None or not source_path.exists():
                 errors.append(
                     f"File not found on disk: {record.filename} (file_id={record.file_id})"
                 )

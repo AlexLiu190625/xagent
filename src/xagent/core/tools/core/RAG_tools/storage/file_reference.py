@@ -67,6 +67,18 @@ def set_file_reference_validator(
 
 
 @contextmanager
+def file_cleanup_lock(file_id: str) -> Iterator[None]:
+    """Serialize cleanup execution separately from reference publication.
+
+    This inode also survives settlement. Never unlink it while workers run.
+    """
+    path = _identity_path(file_id, "cleanup.lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with FileLock(path, timeout=15, thread_local=False):
+        yield
+
+
+@contextmanager
 def file_reference_lock(file_ids: Iterable[str]) -> Iterator[None]:
     """Hold process-owned locks in stable order, without a SQL connection.
 

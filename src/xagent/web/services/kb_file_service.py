@@ -23,7 +23,7 @@ from ...core.tools.core.RAG_tools.storage.factory import get_vector_index_store
 from ...core.tools.core.RAG_tools.utils.user_permissions import UserPermissions
 from ...core.tools.core.RAG_tools.utils.user_scope import resolve_user_scope
 from ..models.uploaded_file import UploadedFile
-from .uploaded_file_store import UploadedFileStore
+from .uploaded_file_store import UploadedFileStore, UploadedFileVersionConflict
 
 if TYPE_CHECKING:
     from ...core.tools.core.RAG_tools.kb import KBFileCompatibilityFacade
@@ -253,7 +253,14 @@ def _delete_uploaded_file_if_orphaned_impl(
     if not file_id or file_id in remaining_file_ids:
         return False
 
-    file_record = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
+    file_record = (
+        db.query(UploadedFile)
+        .filter(
+            UploadedFile.file_id == file_id,
+            UploadedFile.storage_status != "compensating",
+        )
+        .first()
+    )
     if file_record is None:
         return False
     retained_dir = Path(str(file_record.storage_path)).parent
@@ -265,6 +272,7 @@ def _delete_uploaded_file_if_orphaned_impl(
 
     uploads_root = get_uploads_dir().resolve()
     file_path = Path(str(file_record.storage_path))
+    delete_local = False
     try:
         resolved_path = file_path.resolve()
         resolved_path.relative_to(uploads_root)
@@ -274,20 +282,19 @@ def _delete_uploaded_file_if_orphaned_impl(
             file_path,
         )
     else:
+        delete_local = True
 
-        def _unlink() -> None:
-            if resolved_path.exists() and resolved_path.is_file():
-                resolved_path.unlink()
-                logger.info("Deleted orphaned physical file: %s", resolved_path)
-
-        if after_commit is None:
-            _unlink()
-        else:
-            after_commit.append((file_id, _unlink))
-
-    UploadedFileStore(db).delete(
-        file_record, delete_local=False, after_commit=after_commit
-    )
+    try:
+        UploadedFileStore(db).delete(
+            file_record,
+            delete_local=delete_local,
+            local_root=uploads_root if delete_local else None,
+            after_commit=after_commit,
+        )
+    except UploadedFileVersionConflict:
+        # A cleanup claimant or replacement generation won after the KB
+        # reference check. It owns the row and every resource from here.
+        return False
     # Invalidate cache for this user since file list changed
     _file_status_cache.invalidate_user(int(file_record.user_id))
     return True

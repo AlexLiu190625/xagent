@@ -89,7 +89,7 @@ timestamps. It deliberately has no upload/user foreign key. A corresponding
 `.claimed` marker, fsynced before the SQL claim commits, lets standalone RAG
 writers reject retired IDs even when no Web SQL factory is installed.
 Retired SQL fence rows, their `.claimed` markers, and per-ID `.lock` files grow
-monotonically in this slice. Safe compaction belongs to the 2B/2C follow-ups:
+monotonically in this slice. Safe compaction remains separate follow-up work:
 retired identities must remain fenced, and live lock inodes cannot be replaced.
 
 These are rejection fences, not reference pins: they cannot prevent subsequent
@@ -137,9 +137,9 @@ together when moving a deployment; backup replay reconciliation is #2781.
 
 ## Remaining delivery dependencies
 
-- #1086 **2B** owns durable/local/preview deletion and storage crash recovery.
-  This slice retains the task-less collector's existing local-first behavior
-  inside the reference gate; it does not claim complete storage reclamation.
+- #1086 **2B** now extends these claims with the
+  [complete cleanup protocol](complete-upload-cleanup.md). Claims commit before
+  local unlink, and recovery retains upload metadata until every phase succeeds.
 - #1086 **2C** owns the detached seven-day TTL, scan indexes, scheduler, and work
   budget. Future detached claims must use this gate and fence exact detachment
   provenance/version in their CAS; no detached sweep is added here.

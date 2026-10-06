@@ -47,6 +47,10 @@ def isolated_upload_storage(monkeypatch: pytest.MonkeyPatch, tmp_path):
     upload_root = tmp_path / "uploads"
     object_root = tmp_path / "objects"
     upload_root.mkdir()
+    monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(upload_root))
+    monkeypatch.setenv(
+        "XAGENT_FILE_MATERIALIZE_DIR", str(upload_root.parent / "materialized")
+    )
     monkeypatch.setenv(
         "XAGENT_FILE_STORAGE_URI",
         object_root.as_uri(),

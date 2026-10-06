@@ -11,6 +11,11 @@ from .types import StoredObject
 
 _SHA256_METADATA_KEY = "xagent-sha256"
 
+_MAX_FILE_NAME_BYTES = 255
+_TEMP_RANDOM_BYTES = 8
+_TEMP_SUFFIX = ".tmp"
+_NESTED_TEMP_OVERHEAD = 2 + _TEMP_RANDOM_BYTES + len(_TEMP_SUFFIX)
+
 _REJECTED_KEY_COMPONENTS = ("", ".", "..")
 
 
@@ -51,6 +56,54 @@ def _component_has_forbidden_characters(component: str) -> bool:
     return any(ch == "\\" or ord(ch) < 32 or ord(ch) == 127 for ch in component)
 
 
+def atomic_copy_temp_prefix(filename: str, *, owner: str | None = None) -> str:
+    """Return the producer prefix for a same-directory atomic copy.
+
+    Keep the established, readable prefix whenever it fits. Long basenames use
+    stable hashes so ``NamedTemporaryFile`` still has room for its random name
+    and suffix, while cleanup can prove which producer owns an interrupted copy.
+    """
+    owner_prefix = (
+        f"{hashlib.sha256(owner.encode('utf-8')).hexdigest()[:24]}."
+        if owner is not None
+        else ""
+    )
+    prefix = f".{owner_prefix}{filename}."
+    available = _MAX_FILE_NAME_BYTES - _TEMP_RANDOM_BYTES - len(_TEMP_SUFFIX)
+    if owner is not None:
+        # ``ensure_local`` publishes through ``copy_to_path``: its outer temp
+        # becomes the inner copy's target name. Leave enough room for the inner
+        # ``.<outer>.<random>.tmp`` so it keeps the owner-bearing namespace.
+        available -= _NESTED_TEMP_OVERHEAD
+    if len(prefix.encode("utf-8")) <= available:
+        return prefix
+    name_hash = hashlib.sha256(filename.encode("utf-8")).hexdigest()[:24]
+    return f".{owner_prefix}{name_hash}."
+
+
+def materialized_key_directory(materialize_dir: Path, storage_key: str) -> Path:
+    """Return the cache namespace owned by one normalized storage key."""
+    normalized_key = normalize_storage_key(storage_key, strict=False)
+    key_digest = hashlib.sha256(normalized_key.encode("utf-8")).hexdigest()[:16]
+    return materialize_dir / key_digest
+
+
+def materialized_file_path(
+    materialize_dir: Path,
+    storage_key: str,
+    content_hash: str,
+    filename: str | None = None,
+) -> Path:
+    """Return the exact cache locator used by ``materialize``."""
+    normalized_key = normalize_storage_key(storage_key, strict=False)
+    target_name = Path(filename or normalized_key).name or "file"
+    return (
+        materialized_key_directory(materialize_dir, normalized_key)
+        / content_hash
+        / target_name
+    )
+
+
 class FsspecFileStorage:
     """Small fsspec-backed storage wrapper using keys relative to a root URI.
 
@@ -77,6 +130,10 @@ class FsspecFileStorage:
     @property
     def backend(self) -> str:
         return self._backend
+
+    @property
+    def base_uri(self) -> str:
+        return self._base_uri
 
     def put_file(
         self, source: Path, key: str, content_type: str | None = None
@@ -190,19 +247,23 @@ class FsspecFileStorage:
             self._fs.rm(full_path)
 
     def materialize(self, key: str, filename: str | None = None) -> Path:
-        normalized_key = self._normalize_key(key, strict=False)
-        target_name = Path(filename or normalized_key).name or "file"
-        key_digest = hashlib.sha256(normalized_key.encode("utf-8")).hexdigest()[:16]
-        target_path = (
-            self._materialize_dir
-            / key_digest
-            / self.content_hash(normalized_key)
-            / target_name
-        )
-        if target_path.exists() and target_path.is_file():
+        target_path = self.materialized_path(key, filename)
+        if target_path.is_file():
             return target_path
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        return self._copy_to_path_atomic(normalized_key, target_path)
+        return self._copy_to_path_atomic(
+            self._normalize_key(key, strict=False), target_path
+        )
+
+    def materialized_path(self, key: str, filename: str | None = None) -> Path:
+        """Return the cache path for the durable object's current content."""
+        normalized_key = self._normalize_key(key, strict=False)
+        return materialized_file_path(
+            self._materialize_dir,
+            normalized_key,
+            self.content_hash(normalized_key),
+            filename,
+        )
 
     def copy_to_path(self, key: str, target_path: Path) -> Path:
         target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -213,8 +274,8 @@ class FsspecFileStorage:
     def _copy_to_path_atomic(self, key: str, target_path: Path) -> Path:
         temp_file = tempfile.NamedTemporaryFile(
             dir=target_path.parent,
-            prefix=f".{target_path.name}.",
-            suffix=".tmp",
+            prefix=atomic_copy_temp_prefix(target_path.name),
+            suffix=_TEMP_SUFFIX,
             delete=False,
         )
         temp_path = Path(temp_file.name)

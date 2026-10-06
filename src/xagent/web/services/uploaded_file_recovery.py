@@ -13,12 +13,10 @@ from sqlalchemy.orm import Session
 
 from ..models.uploaded_file import UploadedFile
 from .db_runtime import is_database_pool_timeout, run_db_io_cancellation_safe
+from .uploaded_file_cleanup import run_uploaded_file_cleanup
 from .uploaded_file_store import (
     StoragePresence,
-    delete_registered_preview_caches,
     delete_uploaded_file_compensation_object,
-    settle_uploaded_file_compensation_no_commit,
-    take_over_uploaded_file_compensation_no_commit,
 )
 
 logger = logging.getLogger(__name__)
@@ -139,20 +137,25 @@ def recover_stale_uploaded_file_compensations_batch_isolated(
     failed = 0
     for candidate in candidates:
         try:
-            with session_factory() as db:
-                takeover_token = take_over_uploaded_file_compensation_no_commit(
-                    db,
-                    row_id=candidate.row_id,
-                    user_id=candidate.user_id,
-                    file_id=candidate.file_id,
-                    task_id=candidate.task_id,
-                    storage_key=candidate.storage_key,
-                    expected_updated_at=candidate.updated_at,
-                )
-                if takeover_token is None:
-                    db.rollback()
-                else:
-                    db.commit()
+            outcome = run_uploaded_file_cleanup(
+                session_factory=session_factory,
+                row_id=candidate.row_id,
+                user_id=candidate.user_id,
+                file_id=candidate.file_id,
+                task_id=candidate.task_id,
+                storage_key=candidate.storage_key,
+                expected_updated_at=candidate.updated_at,
+                compensation_delete=compensation_delete,
+                take_over=True,
+            )
+            if outcome == "deleted":
+                deleted += 1
+            elif outcome == "exists":
+                deferred_exists += 1
+            elif outcome == "unknown":
+                deferred_unknown += 1
+            elif outcome == "pending":
+                failed += 1
         except Exception as exc:
             if is_database_pool_timeout(exc):
                 raise
@@ -161,59 +164,6 @@ def recover_stale_uploaded_file_compensations_batch_isolated(
                 "Uploaded-file compensation recovery failed for file %s",
                 candidate.file_id,
             )
-            continue
-
-        if takeover_token is None:
-            continue
-
-        try:
-            presence = compensation_delete(
-                user_id=candidate.user_id,
-                storage_key=candidate.storage_key,
-            )
-        except Exception:
-            failed += 1
-            logger.exception(
-                "Uploaded-file compensation delete failed for file %s",
-                candidate.file_id,
-            )
-            continue
-        if presence == "exists":
-            deferred_exists += 1
-            continue
-        if presence == "unknown":
-            deferred_unknown += 1
-            continue
-
-        try:
-            with session_factory() as db:
-                settlement = settle_uploaded_file_compensation_no_commit(
-                    db,
-                    row_id=candidate.row_id,
-                    user_id=candidate.user_id,
-                    file_id=candidate.file_id,
-                    task_id=candidate.task_id,
-                    storage_key=candidate.storage_key,
-                    expected_updated_at=takeover_token,
-                    presence="absent",
-                )
-                if settlement is None:
-                    db.rollback()
-                else:
-                    db.commit()
-        except Exception as exc:
-            if is_database_pool_timeout(exc):
-                raise
-            failed += 1
-            logger.exception(
-                "Uploaded-file compensation settlement failed for file %s",
-                candidate.file_id,
-            )
-            continue
-
-        if settlement == "deleted":
-            deleted += 1
-            delete_registered_preview_caches(candidate.file_id)
 
     return UploadedFileCompensationRecoveryBatch(
         scanned=len(candidates),

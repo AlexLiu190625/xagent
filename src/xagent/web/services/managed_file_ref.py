@@ -37,7 +37,13 @@ from ...core.file_storage.keys import (
     build_upload_storage_key as build_upload_storage_key,
 )
 from ...core.file_storage.keys import safe_storage_filename as safe_storage_filename
+from ...core.file_storage.storage import atomic_copy_temp_prefix
 from ..models.uploaded_file import UploadedFile
+from .uploaded_file_cleanup_publication import (
+    FilePublicationUnavailable,
+    async_managed_copy,
+    guard_managed_copy_publication,
+)
 
 logger = logging.getLogger(__name__)
 FILE_INTEGRITY_REUPLOAD_MESSAGE = (
@@ -512,6 +518,7 @@ class ManagedFileRef:
     def has_durable_object(self) -> bool:
         return bool(self.storage_key and self.record.storage_status == "available")
 
+    @guard_managed_copy_publication
     def ensure_local(self) -> Path:
         path = self.local_path
         if path.exists() and path.is_file():
@@ -523,7 +530,7 @@ class ManagedFileRef:
         path.parent.mkdir(parents=True, exist_ok=True)
         temp_file = tempfile.NamedTemporaryFile(
             dir=path.parent,
-            prefix=f".{path.name}.",
+            prefix=atomic_copy_temp_prefix(path.name, owner=str(self.record.file_id)),
             suffix=".tmp",
             delete=False,
         )
@@ -547,6 +554,7 @@ class ManagedFileRef:
                 storage_key=self.storage_key,
             ) from exc
 
+    @guard_managed_copy_publication
     def materialize(self, *, allow_existing_local: bool = True) -> Path:
         path = self.local_path
         if allow_existing_local and path.exists() and path.is_file():
@@ -831,14 +839,35 @@ def ensure_uploaded_file_local_path(
     file_record: UploadedFileLocalPathRecord,
     *,
     execution_scope: ExecutionScopeInput = EXECUTION_SCOPE_NOT_PROVIDED,
-) -> Path:
+) -> Path | None:
+    missing_path = Path(str(file_record.storage_path))
     try:
         return ManagedFileRef(
             file_record,
             execution_scope=execution_scope,
         ).ensure_local()
+    except FilePublicationUnavailable:
+        return None
     except DurableObjectMissingError:
-        return Path(str(file_record.storage_path))
+        return missing_path
+
+
+async def async_ensure_uploaded_file_local_path(
+    file_record: UploadedFileLocalPathRecord,
+    *,
+    execution_scope: ExecutionScopeInput = EXECUTION_SCOPE_NOT_PROVIDED,
+) -> Path | None:
+    """Resolve a readable path off-loop, or None for an unavailable publication."""
+    missing_path = Path(str(file_record.storage_path))
+    try:
+        return await async_managed_copy(
+            ManagedFileRef(file_record, execution_scope=execution_scope),
+            restore_local=True,
+        )
+    except FilePublicationUnavailable:
+        return None
+    except DurableObjectMissingError:
+        return missing_path
 
 
 def create_uploaded_file_from_local_path(

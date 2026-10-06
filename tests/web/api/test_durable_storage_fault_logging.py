@@ -490,6 +490,7 @@ _FAULT_SITES = (
     ("upload", ("user_id", "task_id")),
     ("download", ("file_id",)),
     ("preview", ("file_id",)),
+    ("svg preview", ("file_id",)),
     ("pptx preview", ("file_id",)),
     ("public download", ("file_id",)),
     ("public preview", ("file_id",)),
@@ -694,7 +695,7 @@ def test_the_binding_check_accepts_qualified_names_and_rejects_unrelated_ones(
 
 
 def test_every_fault_site_label_is_bounded_and_reaches_the_log() -> None:
-    """The nine labels are a closed set of bounded, aggregatable values.
+    """The labels are a closed set of bounded, aggregatable values.
 
     ``upload`` carries no ``file_id`` by design -- it is a batch-registration
     path, and any file in the batch may be the one that failed -- but it does

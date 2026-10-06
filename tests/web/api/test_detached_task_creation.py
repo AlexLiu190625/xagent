@@ -29,11 +29,15 @@ def test_create_with_detached_file_clears_markers_or_rolls_back(
         purge_task_rows(db, task_id=1, detached_reason="task_deleted")
         db.commit()
         owner = db.get(User, 1)
+        attached = db.query(UploadedFile).filter_by(file_id="attached").one()
+        Path(attached.storage_path).write_text("attached", encoding="utf-8")
         app.dependency_overrides[chat.get_current_user] = lambda: owner
         app.dependency_overrides[chat.get_db] = lambda: db
-        monkeypatch.setattr(
-            chat, "ensure_uploaded_file_local_path", lambda row: Path(row.storage_path)
-        )
+
+        async def local_path(row):
+            return Path(row.storage_path)
+
+        monkeypatch.setattr(chat, "async_ensure_uploaded_file_local_path", local_path)
         original_bind = file_turn.bind_turn_files_no_commit
 
         def bind_after_claim(**kwargs):

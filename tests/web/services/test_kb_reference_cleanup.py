@@ -1,6 +1,7 @@
 """References and cleanup claims serialize through the production boundaries."""
 
 import asyncio
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
@@ -45,6 +46,8 @@ def boundary(request, tmp_path, monkeypatch):
 
     previous = database._SessionLocal, database._engine
     monkeypatch.setenv("LANCEDB_DIR", str(tmp_path / "lance"))
+    monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(tmp_path / "uploads"))
+    monkeypatch.setenv("XAGENT_FILE_MATERIALIZE_DIR", str(tmp_path / "materialized"))
     clear_connection_cache()
     stack = ExitStack()
     if request.param == "sqlite":
@@ -58,7 +61,8 @@ def boundary(request, tmp_path, monkeypatch):
         install_file_reference_validator()
     Base.metadata.create_all(engine)
     sessions = get_session_local()
-    path = tmp_path / "source.txt"
+    path = tmp_path / "uploads" / "user_1" / "source.txt"
+    path.parent.mkdir(parents=True)
     path.write_text("retained source")
     with sessions.begin() as db:
         db.add_all(
@@ -74,7 +78,8 @@ def boundary(request, tmp_path, monkeypatch):
                 file_id="source",
                 filename=path.name,
                 storage_path=str(path),
-                storage_key="durable/source",
+                storage_key="users/1/uploads/source/source.txt",
+                checksum=hashlib.sha256(b"retained source").hexdigest(),
                 storage_status="available",
                 upload_source=TASKLESS_SHARE_UPLOAD_SOURCE,
                 created_at=datetime.now(UTC) - timedelta(days=10),
@@ -663,7 +668,7 @@ def test_registered_upload_compensation_also_protects_documents_and_targets(boun
         user_id=1,
         file_id="source",
         expected_task_id=None,
-        expected_storage_key="durable/source",
+        expected_storage_key="users/1/uploads/source/source.txt",
     )
     compensate_registered_uploads_sync([compensation])
     store.delete_document_record(

@@ -12,27 +12,10 @@ coarse "NULL + aged" sweep would delete logged-in users' un-sent draft
 attachments. The ``upload_source`` marker (stamped only on the task-less
 public-share path) scopes GC to exactly those uploads.
 
-Deletion rides the existing uploaded-file compensation protocol rather than
-a bespoke one, so every crash window is already owned by shipped machinery:
-
-1. **Local file first**, before any claim. At that point the row is still
-   ``available`` and durable-backed, so a consumer that wins the bind can
-   re-materialize the bytes from the durable object (``ensure_local``) — a
-   crash here leaves a fully consistent row that the next sweep retries.
-2. **Exact claim** — the same CAS as ``compensate_registered_uploads_sync``:
-   ``SET storage_status='compensating', updated_at=<token> WHERE id/user/
-   file_id/storage_key match AND storage_status='available' AND task_id IS
-   NULL``. Requiring the exact prior status makes overlapping sweeps
-   mutually exclusive (the loser matches zero rows), and the ``task_id IS
-   NULL`` predicate serializes against binders. The persisted ``updated_at``
-   is the generation token fencing the later settlement.
-3. **Durable delete + settle** via the compensation helpers
-   (:func:`delete_uploaded_file_compensation_object` /
-   :func:`settle_uploaded_file_compensation_no_commit`). A crash or deferred
-   presence after the claim leaves an aged ``compensating`` row that the
-   stale-compensation recovery loop (``uploaded_file_recovery``) takes over
-   and finishes — the local file is already gone by step 1, so that generic
-   path (which knows no ``storage_path``) never leaks anything.
+Cleanup commits an exact compensation claim and resource manifest before any
+unlink or object deletion. The common phase runner retains that row until the
+durable object, disposable managed copies, and owned previews are all gone.
+Interrupted work is resumed by the existing compensation recovery loop.
 """
 
 from __future__ import annotations
@@ -41,7 +24,6 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Callable, cast
 
 from sqlalchemy import and_, or_
@@ -50,11 +32,14 @@ from sqlalchemy.orm import Session
 from ..models.uploaded_file import UploadedFile
 from .db_runtime import is_database_pool_timeout, run_db_io_cancellation_safe
 from .kb_reference_protection import guard_cleanup_claim
+from .uploaded_file_cleanup import run_uploaded_file_cleanup
+from .uploaded_file_cleanup_resources import build_cleanup_manifest
 from .uploaded_file_store import (
     _load_uploaded_file_compensation_token_no_commit,
-    delete_registered_preview_caches,
+    _session_factory_from_reference,
+    _uploaded_file_version_match_predicates,
     delete_uploaded_file_compensation_object,
-    settle_uploaded_file_compensation_no_commit,
+    snapshot_uploaded_file_version,
 )
 
 logger = logging.getLogger(__name__)
@@ -171,36 +156,34 @@ def _orphan_candidates(
     )
 
 
-def _delete_local_file(storage_path: str) -> None:
-    """Remove the staged local copy (mirrors ``UploadedFileStore._delete_local``)."""
-    local_path = Path(storage_path)
-    if local_path.exists() and local_path.is_file():
-        local_path.unlink()
-
-
 @guard_cleanup_claim
 def _claim_orphan(db: Session, candidate: _OrphanUploadCandidate) -> datetime | None:
-    """CAS-claim one still-unbound row; return its persisted generation token.
-
-    Identical shape to the ``compensate_registered_uploads_sync`` claim: the
-    exact expected status makes concurrent claimers (an overlapping sweep, a
-    request compensation) mutually exclusive, and ``task_id IS NULL`` makes
-    the claim lose to any bind that committed first. Binders in turn use
-    conditional updates excluding ``compensating`` rows, so whichever side
-    commits first wins outright. After the reference guard admits this file,
-    unlink its local cache before the CAS; the guard commits the claim and
-    cleanup fence before durable-object deletion starts.
-    """
-    _delete_local_file(candidate.storage_path)
-    claimed_at = datetime.now(timezone.utc)
-    claimed = (
+    """Commit only the exact available candidate, with its cleanup resources."""
+    record = (
         db.query(UploadedFile)
         .filter(
             UploadedFile.id == candidate.row_id,
             UploadedFile.user_id == candidate.user_id,
             UploadedFile.file_id == candidate.file_id,
             UploadedFile.storage_key == candidate.storage_key,
+            UploadedFile.storage_path == candidate.storage_path,
             UploadedFile.storage_status == "available",
+        )
+        .first()
+    )
+    if record is None:
+        db.rollback()
+        return None
+    snapshot = snapshot_uploaded_file_version(record)
+    db.rollback()
+    manifest = build_cleanup_manifest(snapshot)
+    claimed_at = datetime.now(timezone.utc)
+    claimed = (
+        db.query(UploadedFile)
+        .filter(
+            *_uploaded_file_version_match_predicates(snapshot),
+            UploadedFile.created_at == candidate.created_at,
+            UploadedFile.upload_source == TASKLESS_SHARE_UPLOAD_SOURCE,
             UploadedFile.task_id.is_(None),
             UploadedFile.detached_reason.is_(None),
             UploadedFile.detached_at.is_(None),
@@ -209,6 +192,7 @@ def _claim_orphan(db: Session, candidate: _OrphanUploadCandidate) -> datetime | 
             {
                 UploadedFile.storage_status: "compensating",
                 UploadedFile.updated_at: claimed_at,
+                UploadedFile.cleanup_manifest: manifest,
             },
             synchronize_session=False,
         )
@@ -228,46 +212,23 @@ def _claim_orphan(db: Session, candidate: _OrphanUploadCandidate) -> datetime | 
 
 
 def _reap_orphan(db: Session, candidate: _OrphanUploadCandidate) -> bool:
-    """Reap one candidate; True only when its metadata row was deleted."""
-    # The guarded claim unlinks local bytes while the row is available: a consumer that
-    # binds after this re-materializes from the durable object, and the
-    # generic stale-compensation recovery (which owns every post-claim crash
-    # window but knows no storage_path) then never has a local file to leak.
+    """Report completion only after all resources and exact settlement succeed."""
     token = _claim_orphan(db, candidate)
     if token is None:
-        return False  # bound, or claimed by another owner — spared
-
-    presence = delete_uploaded_file_compensation_object(
-        user_id=candidate.user_id,
-        storage_key=candidate.storage_key,
-    )
-    if presence != "absent":
-        # Durable state unresolved: leave the claimed row to the stale-
-        # compensation recovery loop, which retries the delete under a
-        # takeover token. Deleting metadata now could strand a live object.
-        logger.warning(
-            "Deferred orphan upload GC for file %s (durable presence: %s)",
-            candidate.file_id,
-            presence,
+        return False
+    return (
+        run_uploaded_file_cleanup(
+            session_factory=_session_factory_from_reference(db),
+            row_id=candidate.row_id,
+            user_id=candidate.user_id,
+            file_id=candidate.file_id,
+            task_id=None,
+            storage_key=candidate.storage_key,
+            expected_updated_at=token,
+            compensation_delete=delete_uploaded_file_compensation_object,
         )
-        return False
-
-    settlement = settle_uploaded_file_compensation_no_commit(
-        db,
-        row_id=candidate.row_id,
-        user_id=candidate.user_id,
-        file_id=candidate.file_id,
-        task_id=None,
-        storage_key=candidate.storage_key,
-        expected_updated_at=token,
-        presence=presence,
+        == "deleted"
     )
-    if settlement is None:
-        db.rollback()
-        return False
-    db.commit()
-    delete_registered_preview_caches(candidate.file_id)
-    return True
 
 
 def cleanup_orphaned_taskless_uploads(

@@ -751,8 +751,8 @@ async def test_create_kb_from_file_failed_ingest_records_operation_outcome(
     with (
         patch("xagent.web.models.database.get_db", side_effect=fake_get_db),
         patch(
-            "xagent.web.services.managed_file_ref.ensure_uploaded_file_local_path",
-            return_value=source_file,
+            "xagent.web.services.managed_file_ref.async_ensure_uploaded_file_local_path",
+            new=AsyncMock(return_value=source_file),
         ),
     ):
         tool = CreateKnowledgeBaseFromFileTool(user_id=71, is_admin=False)
@@ -842,8 +842,8 @@ async def test_create_kb_from_file_preserves_storage_context_in_executor(
     with (
         patch("xagent.web.models.database.get_db", side_effect=fake_get_db),
         patch(
-            "xagent.web.services.managed_file_ref.ensure_uploaded_file_local_path",
-            return_value=source_file,
+            "xagent.web.services.managed_file_ref.async_ensure_uploaded_file_local_path",
+            new=AsyncMock(return_value=source_file),
         ),
     ):
         tool = CreateKnowledgeBaseFromFileTool(user_id=71, is_admin=False)
@@ -880,7 +880,7 @@ async def test_create_kb_from_file_restores_durable_only_upload_before_ingestion
     def fake_get_db():
         yield from _fake_db_generator(db)
 
-    def fake_ensure_local(record):
+    async def fake_ensure_local(record):
         db.close.assert_called_once()
         assert isinstance(record, UploadedFileSnapshot)
         assert record.filename == file_record.filename
@@ -916,7 +916,7 @@ async def test_create_kb_from_file_restores_durable_only_upload_before_ingestion
             return_value=service,
         ),
         patch(
-            "xagent.web.services.managed_file_ref.ensure_uploaded_file_local_path",
+            "xagent.web.services.managed_file_ref.async_ensure_uploaded_file_local_path",
             side_effect=fake_ensure_local,
         ) as ensure_local,
         patch(
@@ -1469,7 +1469,7 @@ async def test_create_kb_from_file_durable_fault_logs_cause_and_hides_storage_ke
     class _ProviderThrottled(RuntimeError):
         pass
 
-    def fail_restore(_record):
+    async def fail_restore(_record):
         provider_exc = _ProviderThrottled(provider_message)
         raise DurableStorageOperationError(
             "Failed to restore durable object", storage_key=storage_key
@@ -1508,7 +1508,7 @@ async def test_create_kb_from_file_durable_fault_logs_cause_and_hides_storage_ke
     with (
         patch("xagent.web.models.database.get_db", side_effect=fake_get_db),
         patch(
-            "xagent.web.services.managed_file_ref.ensure_uploaded_file_local_path",
+            "xagent.web.services.managed_file_ref.async_ensure_uploaded_file_local_path",
             side_effect=fail_restore,
         ),
         caplog.at_level(logging.WARNING, logger=logger_name),
@@ -1564,7 +1564,7 @@ async def test_create_kb_from_file_integrity_failure_is_not_an_outage_warning(
         DurableObjectIntegrityError,
     )
 
-    def fail_restore(_record):
+    async def fail_restore(_record):
         raise DurableObjectIntegrityError(
             FILE_INTEGRITY_REUPLOAD_MESSAGE,
             storage_key="users/7/uploads/8ac1f2/corrupt.txt",
@@ -1598,7 +1598,7 @@ async def test_create_kb_from_file_integrity_failure_is_not_an_outage_warning(
     with (
         patch("xagent.web.models.database.get_db", side_effect=fake_get_db),
         patch(
-            "xagent.web.services.managed_file_ref.ensure_uploaded_file_local_path",
+            "xagent.web.services.managed_file_ref.async_ensure_uploaded_file_local_path",
             side_effect=fail_restore,
         ),
         caplog.at_level(logging.WARNING, logger=logger_name),

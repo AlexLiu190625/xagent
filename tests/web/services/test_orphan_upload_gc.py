@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -42,7 +43,9 @@ DAY = 24 * 60 * 60
 
 
 @pytest.fixture()
-def db_session(tmp_path):
+def db_session(tmp_path, monkeypatch):
+    monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(tmp_path / "uploads"))
+    monkeypatch.setenv("XAGENT_FILE_MATERIALIZE_DIR", str(tmp_path / "materialized"))
     init_db(db_url=f"sqlite:///{tmp_path / 'orphan_gc.db'}")
     db = next(get_db())
     try:
@@ -73,7 +76,8 @@ def _mk_upload(
     """One registered upload in the exact shape the public path leaves it:
     ``available`` with a durable storage key (the only state a marked row can
     exist in — the registration pipeline never commits anything else)."""
-    path = tmp_path / name
+    path = tmp_path / "uploads" / f"user_{int(owner.id)}" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"payload")
     now = datetime.now(timezone.utc)
     file_id = str(uuid4())
@@ -85,6 +89,7 @@ def _mk_upload(
         storage_path=str(path),
         storage_key=f"users/{int(owner.id)}/uploads/{file_id}/{name}",
         storage_status="available",
+        checksum=hashlib.sha256(b"payload").hexdigest(),
         file_size=path.stat().st_size,
         upload_source=marker,
         created_at=now - timedelta(days=age_days),
@@ -332,9 +337,8 @@ def test_row_bound_between_fetch_and_claim_is_spared(
 ) -> None:
     """A run-start bind that commits after the batch query but before the
     claim must win: the claim's predicate no longer matches, so the metadata
-    row and durable object survive. (The local staging copy is deleted before
-    the claim by design — the bound consumer re-materializes it from the
-    durable object.)"""
+    row and every stored copy survive because no destructive work occurs
+    until the exact claim commits."""
     task_id = _make_task(db_session, owner)
     row, path = _mk_upload(
         db_session,
@@ -365,7 +369,7 @@ def test_row_bound_between_fetch_and_claim_is_spared(
     survivor = db_session.query(UploadedFile).filter_by(id=row_id).one()
     assert survivor.task_id == task_id
     assert survivor.storage_status == "available"  # never claimed
-    assert not path.exists()  # local copy gone; durable object is the source
+    assert path.exists()  # the failed claim cannot remove local bytes
 
 
 def test_pages_thread_the_cursor_and_drain_the_backlog(
@@ -593,7 +597,7 @@ def test_unresolved_durable_delete_hands_off_to_stale_recovery(
     assert result.deleted == 0
     survivor = db_session.query(UploadedFile).filter_by(id=row_id).one()
     assert survivor.storage_status == "compensating"
-    assert not path.exists()  # local copy already removed pre-claim
+    assert path.exists()  # the unresolved durable phase preserves local bytes
 
     # The claimed row is exactly what the generic recovery loop scans for.
     candidates = get_stale_uploaded_file_compensation_candidates(
