@@ -26,6 +26,7 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.shared.execution_scope import register_scope_resolver
 from tests.web.services.active_interaction_read_shared import PRE_CHANGE_EQUIVALENT
 from tests.web.services.task_lease_shared import (
@@ -321,7 +322,7 @@ async def test_chat_admin_append_to_other_users_task_claims_as_owner(
                 "files": [],
             },
         )
-        for _ in range(100):
+        for _ in range(int(DB_PROGRESS_TIMEOUT / 0.01)):
             if begin_turn.await_count:
                 break
             await asyncio.sleep(0.01)
@@ -1280,7 +1281,7 @@ async def test_chat_without_client_id_uses_durable_command_id_as_turn_id(
             int(task.id),
             {"message": "server generated identity", "user": owner, "files": []},
         )
-        for _ in range(100):
+        for _ in range(int(DB_PROGRESS_TIMEOUT / 0.01)):
             if begin_turn.await_count:
                 break
             await asyncio.sleep(0.01)
@@ -1349,7 +1350,7 @@ async def test_running_chat_message_is_persisted_before_resume(
                 "files": [],
             },
         )
-        for _ in range(100):
+        for _ in range(int(DB_PROGRESS_TIMEOUT / 0.01)):
             if bg_mgr.register_reserved_resume.call_count:
                 break
             await asyncio.sleep(0.01)
@@ -1629,7 +1630,7 @@ async def test_deferred_chat_message_is_acked_after_durable_command_commit(
                 "files": [],
             },
         )
-        for _ in range(100):
+        for _ in range(int(DB_PROGRESS_TIMEOUT / 0.01)):
             db_session.expire_all()
             stored_command = (
                 db_session.query(TaskExecutionCommand)
@@ -1715,7 +1716,7 @@ async def test_live_lease_injection_degrades_to_deferred_on_checkpoint_unavailab
                 "files": [],
             },
         )
-        for _ in range(100):
+        for _ in range(int(DB_PROGRESS_TIMEOUT / 0.01)):
             db_session.expire_all()
             stored_command = (
                 db_session.query(TaskExecutionCommand)
@@ -2039,7 +2040,7 @@ async def test_resume_registration_failure_keeps_injected_delivery_pending(
                 "files": [],
             },
         )
-        for _ in range(100):
+        for _ in range(int(DB_PROGRESS_TIMEOUT / 0.01)):
             if bg_handle.cancel.called:
                 break
             await asyncio.sleep(0.01)
@@ -3422,7 +3423,7 @@ async def test_pause_admin_on_other_users_task_runs_as_owner(db_session) -> None
         patch("xagent.web.api.websocket.manager", ws_manager),
     ):
         await handle_pause_task(MagicMock(), int(task.id), {"user": admin})
-        for _ in range(100):
+        for _ in range(int(DB_PROGRESS_TIMEOUT / 0.01)):
             if "task_owner_user_id" in captured:
                 break
             await asyncio.sleep(0.01)
@@ -3767,7 +3768,7 @@ async def test_resume_admin_on_other_users_task_runs_as_owner(db_session) -> Non
         # command after its 50ms deadline, so the captured agent build can
         # land after handle_resume_task returns (same pattern as the pause
         # test above).
-        for _ in range(100):
+        for _ in range(int(DB_PROGRESS_TIMEOUT / 0.01)):
             if "task_owner_user_id" in captured:
                 break
             await asyncio.sleep(0.01)
@@ -3777,7 +3778,7 @@ async def test_resume_admin_on_other_users_task_runs_as_owner(db_session) -> Non
         # Command dispatch may detach after its short prompt deadline. Wait for
         # the worker to reach agent construction instead of racing that
         # documented durable-dispatch boundary.
-        for _ in range(100):
+        for _ in range(int(DB_PROGRESS_TIMEOUT / 0.01)):
             if "task_owner_user_id" in captured:
                 break
             await asyncio.sleep(0.01)
@@ -3812,7 +3813,7 @@ async def test_running_resume_completes_as_explicit_idempotent_success(
         await handle_resume_task(MagicMock(), int(task.id), {"user": owner})
 
         command = None
-        for _ in range(100):
+        for _ in range(int(DB_PROGRESS_TIMEOUT / 0.01)):
             db_session.expire_all()
             command = (
                 db_session.query(TaskExecutionCommand)
@@ -3837,7 +3838,7 @@ async def test_running_resume_completes_as_explicit_idempotent_success(
     # completion would leave a stale client clicking resume forever. This is
     # the payload shape a resume correction has always carried.
     payload = None
-    for _ in range(100):
+    for _ in range(int(DB_PROGRESS_TIMEOUT / 0.01)):
         for call in ws_manager.send_personal_message.await_args_list:
             if call.args and "task" in call.args[0]:
                 payload = call.args[0]
@@ -3899,7 +3900,7 @@ async def test_resume_live_control_admin_runs_background_as_owner(db_session) ->
         # command after its 50ms deadline, so the captured agent build and
         # the background-resume scheduling can land after handle_resume_task
         # returns (same pattern as the pause test above).
-        for _ in range(100):
+        for _ in range(int(DB_PROGRESS_TIMEOUT / 0.01)):
             if "task_owner_user_id" in captured and resume_bg.call_count:
                 break
             await asyncio.sleep(0.01)
@@ -3910,7 +3911,7 @@ async def test_resume_live_control_admin_runs_background_as_owner(db_session) ->
         # deadline. Keep the patched runtime owners in place until the command
         # reaches agent construction instead of racing that boundary under
         # parallel test load.
-        for _ in range(100):
+        for _ in range(int(DB_PROGRESS_TIMEOUT / 0.01)):
             if "task_owner_user_id" in captured:
                 break
             await asyncio.sleep(0.01)
@@ -3958,7 +3959,7 @@ async def test_resume_registration_failure_cancels_coordinator(db_session) -> No
         patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
     ):
         await handle_resume_task(MagicMock(), int(task.id), {"user": owner})
-        for _ in range(100):
+        for _ in range(int(DB_PROGRESS_TIMEOUT / 0.01)):
             if bg_handle.cancel.called:
                 break
             await asyncio.sleep(0.01)
@@ -6221,7 +6222,7 @@ async def test_live_committed_write_cancellation_preserves_unknown(
             )
         )
         try:
-            await asyncio.wait_for(store.committed.wait(), 5)
+            await asyncio.wait_for(store.committed.wait(), DB_PROGRESS_TIMEOUT)
             operation.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await operation
@@ -6259,7 +6260,7 @@ async def test_deferred_lease_loss_keeps_committed_write_unknown(db_session):
         return (await runner.post_user_message(execution_id, **kwargs)).outcome
 
     async def lose_lease(*args):
-        await asyncio.wait_for(store.committed.wait(), 3)
+        await asyncio.wait_for(store.committed.wait(), DB_PROGRESS_TIMEOUT)
         db_session.refresh(task)
         task.runner_id = "replacement-owner"
         db_session.commit()
@@ -6294,7 +6295,7 @@ async def test_deferred_lease_loss_keeps_committed_write_unknown(db_session):
                     delivery_turn_id=turn_id,
                     delivery_notifier=notify,
                 ),
-                5,
+                DB_PROGRESS_TIMEOUT,
             )
         assert context.messages == []
         assert _delivery_status(db_session, turn_id) == DELIVERY_OUTCOME_UNKNOWN
@@ -6525,7 +6526,7 @@ async def test_explicit_cancel_wins_over_uncertain_deferred_injection(
             )
             manager.register_reserved_resume(int(task.id), operation, run_id=None)
             # The write committed and has not been acknowledged: uncertain.
-            await asyncio.wait_for(store.committed.wait(), 5)
+            await asyncio.wait_for(store.committed.wait(), DB_PROGRESS_TIMEOUT)
             db_session.refresh(task)
             assert task.status == TaskStatus.RUNNING
             run_id, version = task.run_id, int(task.state_version or 0)

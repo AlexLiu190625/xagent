@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy import event
 from sqlalchemy.orm import sessionmaker
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.web.services.task_database_shared import engine as engine_fixture
 from tests.web.services.task_database_shared import task_id as task_id_fixture
 from xagent.web.models import database
@@ -81,9 +82,9 @@ async def test_duplicate_wakes_apply_once_and_hold_owner_through_receipt(
         asyncio.create_task(transport.dispatch_one_task_command(execute))
         for _ in range(3)
     ]
-    await asyncio.wait_for(entered.wait(), 3)
+    await asyncio.wait_for(entered.wait(), DB_PROGRESS_TIMEOUT)
     finish.set()
-    await asyncio.wait_for(asyncio.gather(*dispatches), 3)
+    await asyncio.wait_for(asyncio.gather(*dispatches), DB_PROGRESS_TIMEOUT)
     assert applied == [1]
     with factory() as db:
         row = db.get(TaskExecutionCommand, cid)
@@ -185,7 +186,7 @@ async def test_registry_renews_while_handler_runs_without_command_updates(host, 
                     await asyncio.sleep(0.01)
 
             # Wait for a renewal, not a fixed number of heartbeat intervals.
-            await asyncio.wait_for(wait_for_renewal(), 5)
+            await asyncio.wait_for(wait_for_renewal(), DB_PROGRESS_TIMEOUT)
             assert not any("task_execution_commands" in sql for sql in statements)
             return {}
 
@@ -219,8 +220,10 @@ async def test_busy_queue_head_does_not_starve_another_task(host):
 
     first = asyncio.create_task(transport.dispatch_one_task_command(execute))
     try:
-        await asyncio.wait_for(entered.wait(), 3)
-        assert await asyncio.wait_for(transport.dispatch_one_task_command(execute), 3)
+        await asyncio.wait_for(entered.wait(), DB_PROGRESS_TIMEOUT)
+        assert await asyncio.wait_for(
+            transport.dispatch_one_task_command(execute), DB_PROGRESS_TIMEOUT
+        )
         assert seen == [first_id, other_id]
     finally:
         release.set()
@@ -269,9 +272,9 @@ async def test_shutdown_drains_command_while_registry_retains_lease(host):
             await release.wait()
 
     dispatch = asyncio.create_task(transport.dispatch_one_task_command(execute))
-    await asyncio.wait_for(entered.wait(), 3)
+    await asyncio.wait_for(entered.wait(), DB_PROGRESS_TIMEOUT)
     closing = asyncio.create_task(registry.close())
-    await asyncio.wait_for(cleanup.wait(), 3)
+    await asyncio.wait_for(cleanup.wait(), DB_PROGRESS_TIMEOUT)
     try:
         with factory() as db:
             before = db.get(Task, tid).last_heartbeat_at
@@ -286,11 +289,11 @@ async def test_shutdown_drains_command_while_registry_retains_lease(host):
                 await asyncio.sleep(0.01)
 
         # Wait for a committed renewal, not a fixed database/scheduler latency.
-        await asyncio.wait_for(wait_for_renewal(), 5)
+        await asyncio.wait_for(wait_for_renewal(), DB_PROGRESS_TIMEOUT)
         assert not closing.done()
     finally:
         release.set()
-        await asyncio.wait_for(closing, 3)
+        await asyncio.wait_for(closing, DB_PROGRESS_TIMEOUT)
         await asyncio.gather(dispatch, return_exceptions=True)
 
 

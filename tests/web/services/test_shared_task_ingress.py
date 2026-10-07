@@ -5,6 +5,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from xagent.web.models.agent import Agent
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_engine, get_session_local, init_db
@@ -132,7 +133,7 @@ async def test_legacy_existing_execution_returns_after_durable_acceptance(ingres
             context={},
             actor_user_id=owner,
         ),
-        5,
+        DB_PROGRESS_TIMEOUT,
     )
     with get_session_local()() as db:
         command = db.query(TaskExecutionCommand).filter_by(task_id=task_id).one()

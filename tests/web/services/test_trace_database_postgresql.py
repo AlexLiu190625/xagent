@@ -12,6 +12,7 @@ from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from xagent.core.agent.checkpoint import CHECKPOINT_EVENT_TYPE, CHECKPOINT_TYPE
 from xagent.core.agent.trace import TASK_START_GENERAL
 from xagent.core.agent.trace import TraceEvent as CoreTraceEvent
@@ -302,7 +303,7 @@ async def test_cancel_during_database_wait_drains_transaction_before_next_write(
             while not entered.is_set():
                 await asyncio.sleep(0.001)
 
-        await asyncio.wait_for(wait_entered(), 3)
+        await asyncio.wait_for(wait_entered(), DB_PROGRESS_TIMEOUT)
         callers[0].cancel()
         await asyncio.sleep(0.01)
         callers[0].cancel()
@@ -313,7 +314,7 @@ async def test_cancel_during_database_wait_drains_transaction_before_next_write(
         blocker.rollback()
         blocker.close()
         outcomes = await asyncio.wait_for(
-            asyncio.gather(*callers, return_exceptions=True), 5
+            asyncio.gather(*callers, return_exceptions=True), DB_PROGRESS_TIMEOUT
         )
     assert isinstance(outcomes[0], asyncio.CancelledError)
     assert outcomes[1] is None

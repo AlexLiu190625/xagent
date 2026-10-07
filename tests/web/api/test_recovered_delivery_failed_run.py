@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from sqlalchemy.exc import OperationalError
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.web.api.test_durable_message_resume_contention import (
     _live_control_environment,
     _live_task,
@@ -364,7 +365,7 @@ async def test_run_ended_after_the_transition_is_caught_by_the_lease_claim(
         assert resume_spy.await_count == 1
         assert resume_spy.await_args.kwargs["refuse_terminal_status"] is True
         assert resume_spy.await_args.kwargs["delivery_claimed_fresh"] is False
-        for _ in range(200):
+        for _ in range(int(DB_PROGRESS_TIMEOUT / 0.01)):
             if task_id not in background_manager.running_tasks:
                 break
             await asyncio.sleep(0.01)
@@ -658,7 +659,7 @@ def _real_resume_environment(agent: MagicMock, background_manager: Any):
 
 
 async def _wait_for_resume_to_finish(background_manager: Any, task_id: int) -> None:
-    for _ in range(300):
+    for _ in range(int(DB_PROGRESS_TIMEOUT / 0.01)):
         if task_id not in background_manager.running_tasks:
             return
         await asyncio.sleep(0.01)

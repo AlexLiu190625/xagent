@@ -40,6 +40,7 @@ import sqlalchemy as sa
 from fastapi import HTTPException
 from sqlalchemy.orm import sessionmaker
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.shared.postgres_disposable import disposable_database_factory
 from xagent.web.models.custom_api import CustomApi, UserCustomApi
 from xagent.web.models.database import Base
@@ -200,7 +201,7 @@ def test_a_second_editor_blocks_until_the_first_editors_transaction_finishes(
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             first = executor.submit(run_first)
-            assert lock_acquired.wait(timeout=5), (
+            assert lock_acquired.wait(timeout=DB_PROGRESS_TIMEOUT), (
                 "the first editor never reached the lock"
             )
 
@@ -323,7 +324,7 @@ def test_the_second_editors_rename_reports_the_first_editors_committed_name_as_o
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             first = executor.submit(run_first)
-            assert lock_acquired.wait(timeout=5), (
+            assert lock_acquired.wait(timeout=DB_PROGRESS_TIMEOUT), (
                 "the first editor never reached the lock"
             )
 
@@ -498,7 +499,9 @@ def test_a_delete_blocks_until_a_concurrent_edits_transaction_finishes(
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             editor = executor.submit(run_edit)
-            assert lock_acquired.wait(timeout=5), "the editor never reached the lock"
+            assert lock_acquired.wait(timeout=DB_PROGRESS_TIMEOUT), (
+                "the editor never reached the lock"
+            )
 
             deleter = executor.submit(run_delete)
             # The delete's own lock statement should still be blocked on
@@ -681,7 +684,7 @@ def test_an_activation_only_edit_does_not_wait_on_a_concurrent_definition_edit(
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             holder = executor.submit(run_definition_edit)
-            assert lock_acquired.wait(timeout=5), (
+            assert lock_acquired.wait(timeout=DB_PROGRESS_TIMEOUT), (
                 "the definition editor never reached the lock"
             )
 
@@ -691,7 +694,7 @@ def test_an_activation_only_edit_does_not_wait_on_a_concurrent_definition_edit(
             # on the holder's lock, and leaving the holder paused would
             # hang this executor's shutdown instead of failing the test.
             try:
-                finished_while_held = second_finished.wait(timeout=5.0)
+                finished_while_held = second_finished.wait(timeout=DB_PROGRESS_TIMEOUT)
             finally:
                 release_lock.set()
             holder.result(timeout=10)

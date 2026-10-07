@@ -9,6 +9,7 @@ import pytest
 from aiogram import Dispatcher, types
 from sqlalchemy.orm import sessionmaker
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.web.services.task_database_shared import engine as engine_fixture
 from xagent.web.channels.telegram import bot as module
 from xagent.web.models.database import Base
@@ -455,13 +456,13 @@ async def test_cancel_during_commit_drains_and_honors_explicit_controls(
     def accept(*args, **kwargs):
         accepted = original(*args, **kwargs)
         entered.set()
-        assert release.wait(10)
+        assert release.wait(DB_PROGRESS_TIMEOUT)
         return accepted
 
     monkeypatch.setattr(module, "accept_channel_input", accept)
     pending = asyncio.create_task(run(bot, message()))
     try:
-        assert await asyncio.to_thread(entered.wait, 5)
+        assert await asyncio.to_thread(entered.wait, DB_PROGRESS_TIMEOUT)
         if control == "new":
             await bot._reset_conversation(123)
         elif control == "stop":
@@ -505,7 +506,7 @@ async def test_control_during_file_preparation_leaves_no_acceptance(
     bot._download_telegram_file.side_effect = download
     pending = asyncio.create_task(run(bot, message(None, voice=voice())))
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await asyncio.wait_for(entered.wait(), DB_PROGRESS_TIMEOUT)
         if control == "new":
             await bot._reset_conversation(123)
         else:
@@ -620,7 +621,7 @@ async def test_historical_replay_cannot_replace_newer_pending_handle(
     monkeypatch.setattr(shared_channel_execution.SharedChannelTurn, "deliver", deliver)
     replay = asyncio.create_task(run(bot, message("first", 1)))
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await asyncio.wait_for(entered.wait(), DB_PROGRESS_TIMEOUT)
         assert bot.user_active_executions[123] == newer
         bot._stop_current_conversation(123)
         await newer[1].stop_task
@@ -691,13 +692,13 @@ async def test_controls_during_replay_lookup_settle_accepted_work(
     def held(incoming):
         result = lookup(incoming)
         entered.set()
-        assert release.wait(10)
+        assert release.wait(DB_PROGRESS_TIMEOUT)
         return result
 
     monkeypatch.setattr(module, "lookup_channel_inputs", held)
     task = asyncio.create_task(run(bot, message()))
     try:
-        assert await asyncio.to_thread(entered.wait, 5)
+        assert await asyncio.to_thread(entered.wait, DB_PROGRESS_TIMEOUT)
         if control == "stop":
             assert bot._stop_current_conversation(123)
         elif control == "new":
@@ -743,7 +744,7 @@ async def test_stop_during_conflict_notice_pauses_unobserved_replay(
     monkeypatch.setattr(types.Message, "answer", held)
     task = asyncio.create_task(run(bot, message("changed", 1), message("second", 2)))
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await asyncio.wait_for(entered.wait(), DB_PROGRESS_TIMEOUT)
         assert bot._stop_current_conversation(123)
     finally:
         release.set()

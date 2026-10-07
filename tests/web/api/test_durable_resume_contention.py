@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from xagent.web.api import websocket as websocket_api
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
@@ -419,7 +420,7 @@ async def test_reserved_resume_records_scheduled_result(db_session) -> None:
         result = await _execute_durable_task_command(
             _command(task, owner, "resume-scheduled")
         )
-        await asyncio.wait_for(resume_started.wait(), timeout=1)
+        await asyncio.wait_for(resume_started.wait(), timeout=DB_PROGRESS_TIMEOUT)
 
     assert result is not None
     assert result["resume_outcome"] == ResumeCommandOutcome.SCHEDULED.value
@@ -471,7 +472,7 @@ async def test_held_reservation_can_schedule_after_the_holder_releases(
         result = await _execute_durable_task_command(
             _command(task, owner, "resume-held-second-attempt")
         )
-        await asyncio.wait_for(resume_started.wait(), timeout=1)
+        await asyncio.wait_for(resume_started.wait(), timeout=DB_PROGRESS_TIMEOUT)
 
     assert result is not None
     assert result["resume_outcome"] == ResumeCommandOutcome.SCHEDULED.value
@@ -586,7 +587,7 @@ async def test_expired_foreign_lease_does_not_defer_a_settled_resume(
         result = await _execute_durable_task_command(
             _command(task, owner, "resume-after-lease-expiry")
         )
-        await asyncio.wait_for(resume_started.wait(), timeout=1)
+        await asyncio.wait_for(resume_started.wait(), timeout=DB_PROGRESS_TIMEOUT)
 
     assert result is not None
     assert result["resume_outcome"] == ResumeCommandOutcome.SCHEDULED.value

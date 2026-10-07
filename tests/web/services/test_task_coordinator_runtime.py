@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy.exc import TimeoutError as PoolTimeout
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.web.services.task_database_shared import engine as engine_fixture
 from tests.web.services.task_database_shared import task_id as task_id_fixture
 from tests.web.services.test_task_coordinator_service import (
@@ -57,7 +58,7 @@ def settle(db, context, error):
 
 
 async def wait_thread_event(event):
-    assert await asyncio.to_thread(event.wait, 5)
+    assert await asyncio.to_thread(event.wait, DB_PROGRESS_TIMEOUT)
 
 
 async def test_repeated_wake_shares_acquisition_and_heartbeat(registry, database):
@@ -98,7 +99,7 @@ async def test_wake_during_release_waits_for_cleanup(
     def blocked_release():
         result = original()
         committed.set()
-        assert unblock.wait(5)
+        assert unblock.wait(DB_PROGRESS_TIMEOUT)
         return result
 
     monkeypatch.setattr(owner, "_release", blocked_release)
@@ -146,7 +147,7 @@ async def test_cancelled_acquisition_drains_commit_and_cleans_slot(
     def blocked(coordinator):
         lease = original(coordinator)
         committed.set()
-        assert unblock.wait(5)
+        assert unblock.wait(DB_PROGRESS_TIMEOUT)
         return lease
 
     monkeypatch.setattr(runtime.TaskCoordinator, "_acquire", blocked)
@@ -174,7 +175,7 @@ async def test_one_cancelled_waiter_does_not_cancel_shared_acquisition(
 
     def blocked(coordinator):
         entered.set()
-        assert unblock.wait(5)
+        assert unblock.wait(DB_PROGRESS_TIMEOUT)
         return original(coordinator)
 
     monkeypatch.setattr(runtime.TaskCoordinator, "_acquire", blocked)
@@ -217,7 +218,7 @@ async def test_close_during_acquisition_cannot_start_heartbeat(
 
     def blocked(coordinator):
         entered.set()
-        assert unblock.wait(5)
+        assert unblock.wait(DB_PROGRESS_TIMEOUT)
         return original(coordinator)
 
     monkeypatch.setattr(runtime.TaskCoordinator, "_acquire", blocked)
@@ -254,7 +255,7 @@ async def test_two_entry_admissions_share_one_handle_and_one_lease(registry, dat
         coordinator.submit_execution(admit=admit, execute=execute, settle=settle)
         is None
     )
-    await asyncio.wait_for(started.wait(), 5)
+    await asyncio.wait_for(started.wait(), DB_PROGRESS_TIMEOUT)
     # A long Runner does not prevent another entry from waking the coordinator.
     coordinator.wakeup.clear()
     assert await registry.ensure(database[1]) is coordinator
@@ -296,7 +297,7 @@ async def test_cancel_during_admission_settles_late_committed_run(registry, data
     def blocked(db, lease):
         context = admit(db, lease)
         entered.set()
-        assert unblock.wait(5)
+        assert unblock.wait(DB_PROGRESS_TIMEOUT)
         return context
 
     handle = coordinator.submit_execution(admit=blocked, execute=execute, settle=settle)
@@ -340,10 +341,10 @@ async def test_close_keeps_heartbeat_until_execution_cleanup_settles(
             await finish.wait()
 
     coordinator.submit_execution(admit=admit, execute=execute, settle=settle)
-    await asyncio.wait_for(started.wait(), 5)
+    await asyncio.wait_for(started.wait(), DB_PROGRESS_TIMEOUT)
     closer = asyncio.create_task(coordinator.close())
     try:
-        await asyncio.wait_for(draining.wait(), 5)
+        await asyncio.wait_for(draining.wait(), DB_PROGRESS_TIMEOUT)
         renewed.clear()
         closer.cancel()
         await asyncio.sleep(0)
@@ -381,12 +382,12 @@ async def test_lost_owner_drains_runner_and_cannot_settle_successor(registry, da
             drained.set()
 
     handle = coordinator.submit_execution(admit=admit, execute=execute, settle=settle)
-    await asyncio.wait_for(started.wait(), 5)
+    await asyncio.wait_for(started.wait(), DB_PROGRESS_TIMEOUT)
     with database[0]() as db, db.begin():
         task = db.get(Task, database[1])
         task.lease_attempt_id = "successor"
         task.output = "successor output"
-    await asyncio.wait_for(drained.wait(), 5)
+    await asyncio.wait_for(drained.wait(), DB_PROGRESS_TIMEOUT)
     await coordinator.close()
     assert handle.cancelled()
     with database[0]() as db:
@@ -444,13 +445,13 @@ async def test_heartbeat_crash_closes_and_drains_execution(
             drained.set()
 
     coordinator.submit_execution(admit=admit, execute=execute, settle=settle)
-    await asyncio.wait_for(started.wait(), 5)
+    await asyncio.wait_for(started.wait(), DB_PROGRESS_TIMEOUT)
 
     def crash(leases):
         raise RuntimeError("connection failed")
 
     monkeypatch.setattr(registry, "_renew", crash)
-    await asyncio.wait_for(drained.wait(), 5)
+    await asyncio.wait_for(drained.wait(), DB_PROGRESS_TIMEOUT)
     await coordinator.close()
     assert coordinator._heartbeat_done.done()
     with database[0]() as db:
@@ -469,7 +470,7 @@ async def test_shutdown_releases_successful_inflight_settlement(
     def blocked_settlement(db, context, error):
         assert error is None
         entered.set()
-        assert unblock.wait(5)
+        assert unblock.wait(DB_PROGRESS_TIMEOUT)
         settle(db, context, error)
 
     handle = coordinator.submit_execution(
@@ -516,7 +517,7 @@ async def test_unknown_commit_stops_heartbeat_and_retains_recovery_evidence(
         original(*args)
         if cancelled:
             committed.set()
-            assert unblock.wait(5)
+            assert unblock.wait(DB_PROGRESS_TIMEOUT)
         raise RuntimeError("commit acknowledgement lost")
 
     monkeypatch.setattr(coordinator, method, uncertain)

@@ -17,6 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 from starlette.requests import Request
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRef
 from xagent.core.tools.adapters.vibe.mcp_adapter import (
     MCPFailurePhase,
@@ -848,7 +849,7 @@ def test_connect_producer_first_blocks_disconnect_until_flow_commit(
     )
     assert persisted is not None
     assert disconnect_thread is not None
-    disconnect_thread.join(timeout=2)
+    disconnect_thread.join(timeout=DB_PROGRESS_TIMEOUT)
 
     assert disconnect_finished.is_set()
     assert disconnect_errors == []
@@ -964,7 +965,7 @@ def test_callback_producer_first_blocks_real_disconnect_until_grant_commit(
     )
     disconnect_thread.start()
     assert disconnect_started.wait(timeout=2)
-    assert disconnect_lock_attempted.wait(timeout=2)
+    assert disconnect_lock_attempted.wait(timeout=DB_PROGRESS_TIMEOUT)
     assert not disconnect_finished.wait(timeout=0.2)
     mcp_api._upsert_mcp_oauth_grant(
         db,
@@ -977,7 +978,7 @@ def test_callback_producer_first_blocks_real_disconnect_until_grant_commit(
     )
     db.commit()
 
-    disconnect_thread.join(timeout=5)
+    disconnect_thread.join(timeout=DB_PROGRESS_TIMEOUT)
     assert disconnect_finished.is_set()
     assert disconnect_errors == []
     db.expire_all()
@@ -1036,7 +1037,7 @@ def test_real_disconnect_first_rejects_stale_callback_and_preserves_replacement(
 
     def gated_team_delete(*args, **kwargs):
         teardown_locked.set()
-        assert allow_teardown.wait(timeout=5)
+        assert allow_teardown.wait(timeout=DB_PROGRESS_TIMEOUT)
         return SimpleNamespace(
             blocked_reason=None,
             team_owned=False,
@@ -1080,14 +1081,14 @@ def test_real_disconnect_first_rejects_stale_callback_and_preserves_replacement(
 
     disconnect_thread = threading.Thread(target=disconnect)
     disconnect_thread.start()
-    assert teardown_locked.wait(timeout=2)
+    assert teardown_locked.wait(timeout=DB_PROGRESS_TIMEOUT)
     producer_thread = threading.Thread(target=producer)
     producer_thread.start()
     assert producer_started.wait(timeout=2)
     assert not producer_finished.wait(timeout=0.2)
     allow_teardown.set()
-    disconnect_thread.join(timeout=5)
-    producer_thread.join(timeout=5)
+    disconnect_thread.join(timeout=DB_PROGRESS_TIMEOUT)
+    producer_thread.join(timeout=DB_PROGRESS_TIMEOUT)
     assert errors == []
     assert producer_finished.is_set()
     assert producer_results == [None]
@@ -3324,7 +3325,7 @@ async def test_callback_uses_cached_redirect_when_real_delete_removes_claimed_fl
 
         delete_thread = threading.Thread(target=delete)
         delete_thread.start()
-        delete_thread.join(timeout=5)
+        delete_thread.join(timeout=DB_PROGRESS_TIMEOUT)
         assert not delete_thread.is_alive()
         assert delete_errors == []
         return claim_result
@@ -5275,7 +5276,7 @@ def test_app_teardown_serializes_later_sqlite_replacement(
     def hold_identity(*args, **kwargs):
         result = real_owner_check(*args, **kwargs)
         identity_locked.set()
-        assert release_teardown.wait(timeout=5)
+        assert release_teardown.wait(timeout=DB_PROGRESS_TIMEOUT)
         return result
 
     def observe_mutation(_conn, _cursor, statement, _params, _context, _many):
@@ -5335,13 +5336,13 @@ def test_app_teardown_serializes_later_sqlite_replacement(
     mutation_thread = threading.Thread(target=replace)
     try:
         teardown_thread.start()
-        assert identity_locked.wait(timeout=5)
+        assert identity_locked.wait(timeout=DB_PROGRESS_TIMEOUT)
         mutation_thread.start()
-        assert mutation_sent.wait(timeout=5)
+        assert mutation_sent.wait(timeout=DB_PROGRESS_TIMEOUT)
         assert not mutation_done.wait(timeout=0.2)
         release_teardown.set()
-        teardown_thread.join(timeout=5)
-        mutation_thread.join(timeout=5)
+        teardown_thread.join(timeout=DB_PROGRESS_TIMEOUT)
+        mutation_thread.join(timeout=DB_PROGRESS_TIMEOUT)
     finally:
         release_teardown.set()
         event.remove(db.get_bind(), "before_cursor_execute", observe_mutation)

@@ -147,8 +147,22 @@ def _live_control_environment(
             "xagent.web.services.task_execution.background_task_manager",
             background_manager,
         ),
+        # A message that opens a new turn schedules a real background run.
+        # Against the stub agent that run fails the task, racing the test's
+        # assertions on the turn it just started, so never start it here.
+        patch(
+            "xagent.web.services.task_orchestrator._schedule_bg",
+            side_effect=_unstarted_background_turn,
+        ),
     ):
         yield agent, background_manager
+
+
+def _unstarted_background_turn(**_kwargs: object) -> "asyncio.Task[None]":
+    async def unstarted() -> None:
+        return None
+
+    return asyncio.create_task(unstarted())
 
 
 @pytest.mark.asyncio

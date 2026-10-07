@@ -23,6 +23,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.orm import Session, sessionmaker
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.web.services.task_database_shared import engine as engine_fixture
 from tests.web.services.task_interaction_schema_shared import (
     make_row as make_interaction_row,
@@ -1085,7 +1086,9 @@ async def test_the_loop_gives_up_on_an_unsupported_store(sessions, engine) -> No
     if engine.dialect.name == "postgresql":
         pytest.skip("the refusal is what is under test")
 
-    await asyncio.wait_for(run_retention_purge_loop(sessions), timeout=5)
+    await asyncio.wait_for(
+        run_retention_purge_loop(sessions), timeout=DB_PROGRESS_TIMEOUT
+    )
 
 
 @pytest.mark.asyncio
@@ -1110,7 +1113,8 @@ async def test_the_loop_stops_when_signalled(sessions, monkeypatch) -> None:
     monkeypatch.setattr(purge_module, "run_retention_purge_batch", counting_batch)
 
     await asyncio.wait_for(
-        run_retention_purge_loop(sessions, stop_event=stop_event), timeout=5
+        run_retention_purge_loop(sessions, stop_event=stop_event),
+        timeout=DB_PROGRESS_TIMEOUT,
     )
 
     assert batches["n"] == 1, "the loop must not start another sweep after stopping"

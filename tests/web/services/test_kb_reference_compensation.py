@@ -12,6 +12,7 @@ from threading import Event, get_ident
 import pytest
 from sqlalchemy import event
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.web.services.test_kb_reference_cleanup import boundary as _boundary
 from tests.web.services.test_kb_reference_cleanup import (
     document,
@@ -89,7 +90,7 @@ def test_compensation_releases_reference_lock_before_durable_delete(
 
     def blocked_delete(**_kwargs):
         delete_started.set()
-        assert finish_delete.wait(5)
+        assert finish_delete.wait(DB_PROGRESS_TIMEOUT)
         return "absent"
 
     monkeypatch.setattr(
@@ -101,14 +102,14 @@ def test_compensation_releases_reference_lock_before_durable_delete(
         compensation = pool.submit(
             compensate_registered_uploads_sync, [_claim("source")]
         )
-        assert delete_started.wait(5)
+        assert delete_started.wait(DB_PROGRESS_TIMEOUT)
         publication = pool.submit(store.upsert_documents, [document()])
         try:
             with pytest.raises(FileReferenceConflict):
-                publication.result(timeout=2)
+                publication.result(timeout=DB_PROGRESS_TIMEOUT)
         finally:
             finish_delete.set()
-        compensation.result(timeout=5)
+        compensation.result(timeout=DB_PROGRESS_TIMEOUT)
 
 
 def test_async_admission_drains_worker_owned_session_before_cancellation_returns(
@@ -126,7 +127,7 @@ def test_async_admission_drains_worker_owned_session_before_cancellation_returns
     def blocked_lock(_file_ids):
         lock_threads.append(get_ident())
         lock_started.set()
-        assert release_lock.wait(5)
+        assert release_lock.wait(DB_PROGRESS_TIMEOUT)
         yield
 
     monkeypatch.setattr(kb_reference_protection, "file_reference_lock", blocked_lock)

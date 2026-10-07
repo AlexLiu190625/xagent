@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.web.services.active_interaction_read_shared import PRE_CHANGE_EQUIVALENT
 from tests.web.services.admission_capacity_shared import (
     release_bucket,
@@ -1460,7 +1461,7 @@ async def test_reply_queued_behind_capacity_is_acknowledged_promptly(
 
             release_bucket(holding)
             # Opening capacity lets the worker run the exact continuation.
-            async with asyncio.timeout(5):
+            async with asyncio.timeout(DB_PROGRESS_TIMEOUT):
                 while not await dispatch_one_task_command(
                     execute_durable_task_command, command_db_id=command_db_id
                 ):
@@ -1527,7 +1528,7 @@ async def test_reply_rejected_by_the_worker_handoff_replays_as_not_accepted(
             db.close()
         prepare = AsyncMock()
         with patch.object(task_resume, "resume_task_reply", prepare):
-            async with asyncio.timeout(5):
+            async with asyncio.timeout(DB_PROGRESS_TIMEOUT):
                 while not await dispatch_one_task_command(execute_durable_task_command):
                     await asyncio.sleep(0.05)
         prepare.assert_not_awaited()

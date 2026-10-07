@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.web.services.channel_delivery_shared import accepted as accepted
 from tests.web.services.channel_delivery_shared import (
     complete,
@@ -291,7 +292,7 @@ async def test_lost_delivery_claim_cancels_inflight_sender(accepted, monkeypatch
             cancelled.set()
 
     assert not await asyncio.wait_for(
-        delivery.deliver_channel_result(accepted, send), 1
+        delivery.deliver_channel_result(accepted, send), DB_PROGRESS_TIMEOUT
     )
     assert cancelled.is_set()
     with get_session_local()() as db:
@@ -588,7 +589,7 @@ async def test_feishu_new_fences_already_claimed_recovery(
     def claim(*args, **kwargs):
         result = original(*args, **kwargs)
         entered.set()
-        assert release.wait(timeout=5)
+        assert release.wait(timeout=DB_PROGRESS_TIMEOUT)
         return result
 
     monkeypatch.setattr(delivery, "_claim", claim)
@@ -596,7 +597,7 @@ async def test_feishu_new_fences_already_claimed_recovery(
         delivery.recover_channel_results(bot.channel_id, bot._deliver_shared_result)
     )
     try:
-        assert await asyncio.to_thread(entered.wait, 5)
+        assert await asyncio.to_thread(entered.wait, DB_PROGRESS_TIMEOUT)
         await bot._handle_control(
             "sender",
             SimpleNamespace(

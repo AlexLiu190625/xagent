@@ -12,6 +12,7 @@ import sqlalchemy as sa
 from filelock import FileLock
 from sqlalchemy.orm import sessionmaker
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from xagent.core.tools.core.RAG_tools.storage.lancedb_stores import (
     LanceDBVectorIndexStore,
 )
@@ -401,7 +402,7 @@ def test_independent_connections_race_with_both_winners(
         validator(ids)
         if first == "reference":
             entered.set()
-            assert proceed.wait(5)
+            assert proceed.wait(DB_PROGRESS_TIMEOUT)
 
     monkeypatch.setattr(file_reference, "_validator", pause_reference)
 
@@ -416,7 +417,7 @@ def test_independent_connections_race_with_both_winners(
             and statement.startswith("INSERT INTO kb_ingest_targets")
         ):
             entered.set()
-            assert proceed.wait(5)
+            assert proceed.wait(DB_PROGRESS_TIMEOUT)
 
     def establish():
         if mode == "target":
@@ -434,11 +435,11 @@ def test_independent_connections_race_with_both_winners(
     with ThreadPoolExecutor(max_workers=2) as executor:
         winner = executor.submit(winning)
         try:
-            assert entered.wait(5)
+            assert entered.wait(DB_PROGRESS_TIMEOUT)
             loser = executor.submit(
                 actions["claim" if first == "reference" else "reference"]
             )
-            assert blocked.wait(5), (
+            assert blocked.wait(DB_PROGRESS_TIMEOUT), (
                 "Contender did not actually wait on the winner's lock"
             )
         finally:
@@ -534,7 +535,7 @@ def test_async_cancellation_waits_for_native_publication(boundary, monkeypatch):
 
         monkeypatch.setattr(store, "_get_async_connection", connection)
         publication = asyncio.create_task(store.upsert_documents_async([document()]))
-        await asyncio.wait_for(started.wait(), 5)
+        await asyncio.wait_for(started.wait(), DB_PROGRESS_TIMEOUT)
         publication.cancel()
         await asyncio.sleep(0)
         cleanup = asyncio.create_task(asyncio.to_thread(claim, sessions))

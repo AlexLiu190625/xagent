@@ -7,6 +7,7 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.web.services import test_trace_database_postgresql as contracts
 from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
 from xagent.web.services.db_runtime import drain_async_task_cancellation_safe
@@ -133,7 +134,7 @@ async def test_lock_wait_cancellation_and_loop_responsiveness(tmp_path):
 
     caller = asyncio.create_task(owned_write())
     try:
-        await asyncio.wait_for(started.wait(), 2)
+        await asyncio.wait_for(started.wait(), DB_PROGRESS_TIMEOUT)
         caller.cancel()
         await asyncio.sleep(0.03)
         caller.cancel()

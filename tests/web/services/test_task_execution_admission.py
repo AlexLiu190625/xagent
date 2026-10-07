@@ -11,6 +11,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.web.services.task_database_shared import engine as engine_fixture
 from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
 from xagent.web.models.database import Base
@@ -22,6 +23,7 @@ from xagent.web.services import task_command_transport as transport
 from xagent.web.services import task_coordinator_runtime as runtime
 from xagent.web.services import task_coordinator_service as ownership
 from xagent.web.services import task_execution_admission as admission
+from xagent.web.services.task_admission_observation import read_admission_snapshot
 from xagent.web.services.task_execution_controller import task_control_snapshot
 
 engine = engine_fixture
@@ -34,7 +36,9 @@ async def host(engine, monkeypatch):
     Base.metadata.create_all(engine)
     sessions = sessionmaker(engine, expire_on_commit=False)
     monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
-    monkeypatch.setattr(runtime, "get_task_lease_heartbeat_seconds", lambda: 0.05)
+    # Each renewal is a SQLite write; leave the write lock idle between them
+    # for longer than the busy handler's 100ms poll gap (see #2819).
+    monkeypatch.setattr(runtime, "get_task_lease_heartbeat_seconds", lambda: 0.5)
     monkeypatch.setattr(transport, "get_runner_id", lambda: "worker-1")
     registry = runtime.TaskCoordinatorRegistry(sessions)
     registry.runner_id = "worker-1"
@@ -78,15 +82,23 @@ def enqueue(
         )
 
 
+def active_executions(host, bucket):
+    with host.sessions() as db:
+        rows = read_admission_snapshot(db, [bucket])
+    return rows[0].active if rows else 0
+
+
 async def eventually(predicate):
-    async with asyncio.timeout(5):
+    async with asyncio.timeout(DB_PROGRESS_TIMEOUT):
         while not predicate():
             await asyncio.sleep(0.01)
 
 
-async def dispatch_next(execute):
-    async with asyncio.timeout(5):
-        while not await transport.dispatch_one_task_command(execute):
+async def dispatch_next(execute, command_db_id=None):
+    async with asyncio.timeout(DB_PROGRESS_TIMEOUT):
+        while not await transport.dispatch_one_task_command(
+            execute, command_db_id=command_db_id
+        ):
             await asyncio.sleep(0.01)
 
 
@@ -183,15 +195,18 @@ async def test_failed_command_retry_keeps_admission_and_pending_budget(host):
     execute.finish.set()
     execute.cleanup.set()
     await dispatch_next(execute)
-    await asyncio.sleep(0.1)
+    # The drained execution frees its slot after the dispatch returns; wait
+    # for the release instead of a fixed sleep before retrying into it.
+    await eventually(lambda: active_executions(host, "retry") == 0)
     with host.sessions() as db:
         assert transport.retry_failed_task_command(db, first.command_id)
     with host.sessions() as db:
         assert not transport.retry_failed_task_command(db, first.command_id)
     blocker = Execution(host)
-    assert await transport.dispatch_one_task_command(
-        blocker, command_db_id=first.command_id
-    )
+    # The rejected attempt's owner may still be retiring; a scan skips a
+    # quiescing owner without spending the command's budget, and the next
+    # scan serves it.
+    await dispatch_next(blocker, command_db_id=first.command_id)
     other = enqueue(host)
     assert not await transport.dispatch_one_task_command(
         blocker, command_db_id=other.command_id
@@ -257,7 +272,7 @@ async def test_terminal_status_does_not_release_capacity_before_cleanup(host):
     execute = Execution(host)
     assert await transport.dispatch_one_task_command(execute)
     execute.finish.set()
-    await asyncio.wait_for(execute.terminal.wait(), 5)
+    await asyncio.wait_for(execute.terminal.wait(), DB_PROGRESS_TIMEOUT)
     assert not await transport.dispatch_one_task_command(execute)
     assert execute.started == [first.command_id]
     execute.cleanup.set()
@@ -397,7 +412,7 @@ async def test_next_turn_on_same_owner_does_not_retain_previous_turn_slot(host):
     assert not next_dispatch.done()
     first_execution.finish.set()
     first_execution.cleanup.set()
-    assert await asyncio.wait_for(next_dispatch, 5)
+    assert await asyncio.wait_for(next_dispatch, DB_PROGRESS_TIMEOUT)
     assert await transport.dispatch_one_task_command(
         execute, command_db_id=third.command_id
     )
@@ -451,7 +466,13 @@ def _dispatch_process(url, barrier, release, results):
     from xagent.web.models import database
 
     engine = create_engine(url)
-    apply_sqlite_concurrency_pragmas(engine)
+    # Three processes contend for one SQLite write lock on purpose. A writer
+    # that outwaits the production busy timeout raises "database is locked",
+    # which the real dispatcher loop logs and retries but this direct loop
+    # would report as a failure; bound the wait as a hang detector instead.
+    apply_sqlite_concurrency_pragmas(
+        engine, busy_timeout_ms=int(DB_PROGRESS_TIMEOUT * 1000)
+    )
     sessions = sessionmaker(engine, expire_on_commit=False)
     database.get_session_local = lambda: sessions
     worker = f"process-{os.getpid()}"

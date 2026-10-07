@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from sqlalchemy.orm import sessionmaker
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.web.services.task_database_shared import engine as engine_fixture
 from xagent.web.channels.feishu import bot as module
 from xagent.web.models.database import Base
@@ -275,7 +276,7 @@ async def test_control_during_lookup_prevents_acceptance(ingress, monkeypatch, c
         await bot._handle_control("sender", message(command), command)
     finally:
         release.set()
-    await asyncio.wait_for(task, 5)
+    await asyncio.wait_for(task, DB_PROGRESS_TIMEOUT)
     with sessions() as db:
         assert db.query(TaskExecutionCommand).count() == 0
     assert bot.active_tasks == ({"sender": "-1"} if command == "/new" else {})
@@ -306,7 +307,7 @@ async def test_control_during_commit_stops_late_accepted_turn(
         await bot._handle_control("sender", message(command), command)
     finally:
         release.set()
-    await asyncio.wait_for(task, 5)
+    await asyncio.wait_for(task, DB_PROGRESS_TIMEOUT)
     with sessions() as db:
         assert db.query(TaskInputReceipt).count() == 1
         assert {row.kind for row in db.query(TaskExecutionCommand)} == {
@@ -518,13 +519,13 @@ async def test_historical_replay_keeps_newer_pending_turn_controllable(
     monkeypatch.setattr(shared_channel_execution.SharedChannelTurn, "deliver", deliver)
     replay = asyncio.create_task(run(bot, message("A", "a")))
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await asyncio.wait_for(entered.wait(), DB_PROGRESS_TIMEOUT)
         assert bot.user_active_executions["sender"] == newer
         await bot._handle_control("sender", message(command), command)
         await newer[1].stop_task
     finally:
         release.set()
-    await asyncio.wait_for(replay, 5)
+    await asyncio.wait_for(replay, DB_PROGRESS_TIMEOUT)
     assert bot.user_active_executions["sender"] == newer
     assert observe.await_count == 2
     with sessions() as db:
@@ -547,7 +548,7 @@ async def test_cancel_during_save_warning_preserves_owned_accepted_turn(ingress)
 
     bot._send_text = send
     task = asyncio.create_task(bot._process_messages_batch("sender", [message()]))
-    await asyncio.wait_for(entered.wait(), 5)
+    await asyncio.wait_for(entered.wait(), DB_PROGRESS_TIMEOUT)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -594,9 +595,9 @@ async def test_shutdown_detaches_observer_and_recovery_delivers(ingress):
 
     observe.side_effect = blocked
     bot._handle_message_sync(message())
-    await asyncio.wait_for(entered.wait(), 5)
+    await asyncio.wait_for(entered.wait(), DB_PROGRESS_TIMEOUT)
     turn = bot.user_active_executions["sender"][1]
-    await asyncio.wait_for(bot.stop(), 5)
+    await asyncio.wait_for(bot.stop(), DB_PROGRESS_TIMEOUT)
     assert not bot.user_message_tasks
     assert not bot.user_active_executions
     with sessions() as db:

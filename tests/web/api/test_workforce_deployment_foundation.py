@@ -14,6 +14,7 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
@@ -911,7 +912,7 @@ async def test_ws_append_rejection_surfaces_workforce_code() -> None:
             )
             # The durable command may detach past the 50ms dispatch window;
             # wait for the agent_error broadcast like the owner-actor tests.
-            for _ in range(200):
+            for _ in range(int(DB_PROGRESS_TIMEOUT / 0.01)):
                 errors = [
                     call.args[0]
                     for call in ws_manager.broadcast_to_task.await_args_list

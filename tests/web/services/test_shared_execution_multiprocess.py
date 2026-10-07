@@ -13,6 +13,8 @@ from uuid import uuid4
 
 import pytest
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
+
 
 def _web_host(pipe, env, task_id, command_id):
     os.environ.update(env)
@@ -268,12 +270,18 @@ async def test_two_web_two_worker_delivery_and_single_execution(
         results = await asyncio.gather(*(recv(pipe) for pipe in workers))
         assert sum(item["executed"] for item in results) == 1
         first = (
-            [json.loads(await asyncio.wait_for(sockets[0].recv(), 5)) for _ in range(2)]
+            [
+                json.loads(
+                    await asyncio.wait_for(sockets[0].recv(), DB_PROGRESS_TIMEOUT)
+                )
+                for _ in range(2)
+            ]
             if not ingress_exits
             else []
         )
         second = [
-            json.loads(await asyncio.wait_for(sockets[1].recv(), 5)) for _ in range(2)
+            json.loads(await asyncio.wait_for(sockets[1].recv(), DB_PROGRESS_TIMEOUT))
+            for _ in range(2)
         ]
         if not ingress_exits:
             assert [item["text"] for item in first if item["type"] == "delta"] == [
@@ -287,7 +295,9 @@ async def test_two_web_two_worker_delivery_and_single_execution(
         sockets[1] = await connect(f"ws://127.0.0.1:{addresses[1]['port']}")
         await sockets[1].recv()  # new, distinct origin registration
         await sockets[1].send("snapshot")
-        snapshot = json.loads(await asyncio.wait_for(sockets[1].recv(), 5))
+        snapshot = json.loads(
+            await asyncio.wait_for(sockets[1].recv(), DB_PROGRESS_TIMEOUT)
+        )
         assert snapshot["output"] == "hello world"
         assert snapshot["run_id"] == accepted.run_id
         with get_session_local()() as db:

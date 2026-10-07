@@ -18,6 +18,7 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT, eventually
 from tests.web.pool_contention_shared import (
     GUARD_TIMEOUT,
     LOOP_LIVENESS_TICKS,
@@ -1155,17 +1156,17 @@ async def test_dispatcher_recovers_command_that_predates_worker_start(
         applied.set()
         return None
 
+    def completed() -> bool:
+        db_session.expire_all()
+        stored = db_session.get(TaskExecutionCommand, enqueued.command_id)
+        return stored is not None and stored.status == COMMAND_COMPLETED
+
     start_task_command_dispatcher(execute)
     try:
-        await asyncio.wait_for(applied.wait(), timeout=2)
-        for _ in range(100):
-            db_session.expire_all()
-            stored = db_session.get(TaskExecutionCommand, enqueued.command_id)
-            if stored is not None and stored.status == COMMAND_COMPLETED:
-                break
-            await asyncio.sleep(0.01)
-        else:
-            raise AssertionError("dispatcher did not complete recovered command")
+        # Anti-hang bounds: the claim and completion each wait on a real
+        # SQLite commit, which a loaded CI runner can stall for seconds.
+        await asyncio.wait_for(applied.wait(), timeout=DB_PROGRESS_TIMEOUT)
+        await eventually(completed)
     finally:
         await stop_task_command_dispatcher()
     db_session.expire_all()
@@ -1833,7 +1834,7 @@ async def test_dispatch_cancellation_drains_inflight_completion_worker(
 
     def blocking_finish(*_args, **_kwargs) -> bool:
         finish_started.set()
-        assert allow_finish.wait(timeout=2)
+        assert allow_finish.wait(timeout=DB_PROGRESS_TIMEOUT)
         finish_completed.set()
         return True
 
@@ -1849,7 +1850,11 @@ async def test_dispatch_cancellation_drains_inflight_completion_worker(
         dispatch_one_task_command(execute, command_db_id=enqueued.command_id)
     )
     try:
-        await asyncio.wait_for(asyncio.to_thread(finish_started.wait, 1), timeout=1)
+        # The claim before this point commits through SQLite; bound only a hang.
+        await asyncio.wait_for(
+            asyncio.to_thread(finish_started.wait, DB_PROGRESS_TIMEOUT),
+            timeout=DB_PROGRESS_TIMEOUT,
+        )
     except TimeoutError:
         pytest.fail(
             _dispatch_diagnostics(db_session, dispatch_task, enqueued.command_id)
@@ -1862,7 +1867,7 @@ async def test_dispatch_cancellation_drains_inflight_completion_worker(
         allow_finish.set()
 
     with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(dispatch_task, timeout=1)
+        await asyncio.wait_for(dispatch_task, timeout=DB_PROGRESS_TIMEOUT)
     assert finish_completed.is_set()
 
 

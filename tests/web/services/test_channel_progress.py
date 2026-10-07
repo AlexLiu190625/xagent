@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.web.services.channel_delivery_shared import accepted as accepted
 from tests.web.services.channel_delivery_shared import (
     complete,
@@ -75,7 +76,7 @@ async def test_final_and_progress_cannot_overtake_loading_send(accepted, plain_f
     observer = DurableChannelProgress(accepted, progress, final)
     pending = asyncio.create_task(observer.send())
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await asyncio.wait_for(entered.wait(), DB_PROGRESS_TIMEOUT)
         complete(accepted)
         await observer.send()
         await delivery.deliver_channel_result(accepted, final)

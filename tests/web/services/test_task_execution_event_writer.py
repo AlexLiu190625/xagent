@@ -7,6 +7,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.orm import sessionmaker
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.web.services.test_task_execution_event_store import engine as engine_fixture
 from tests.web.services.test_task_execution_event_store import (
     task_id as task_id_fixture,
@@ -698,10 +699,12 @@ def test_racing_message_claim_has_only_one_delivery_owner(canonical, engine):
 
             future = pool.submit(second_claim)
             try:
-                assert waiting.wait(5), "second claimant did not reach the task lock"
+                assert waiting.wait(DB_PROGRESS_TIMEOUT), (
+                    "second claimant did not reach the task lock"
+                )
             finally:
                 winner.commit()
-            assert future.result(timeout=5) == (False, True)
+            assert future.result(timeout=DB_PROGRESS_TIMEOUT) == (False, True)
         with factory() as db:
             assert db.query(TaskChatMessage).count() == 1
             assert (
@@ -783,7 +786,7 @@ def test_trace_fact_and_command_acceptance_do_not_deadlock(canonical, engine):
             and not trace_locked.is_set()
         ):
             trace_locked.set()
-            assert command_waiting.wait(5)
+            assert command_waiting.wait(DB_PROGRESS_TIMEOUT)
 
     def before_execute(connection, cursor, statement, parameters, context, many):
         if (
@@ -809,7 +812,7 @@ def test_trace_fact_and_command_acceptance_do_not_deadlock(canonical, engine):
             db.commit()
 
     def accept_command():
-        assert trace_locked.wait(5)
+        assert trace_locked.wait(DB_PROGRESS_TIMEOUT)
         with factory() as db:
             db.execute(sa.text("SET LOCAL lock_timeout = '5s'"))
             enqueue_task_command(

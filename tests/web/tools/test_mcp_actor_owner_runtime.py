@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from xagent.core.execution_scope import ExecutionScope
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web import mcp_apps
@@ -1191,7 +1192,7 @@ async def test_concurrent_actor_refresh_keeps_rotated_credential(
                     },
                 )
 
-            for _ in range(100):
+            for _ in range(int(DB_PROGRESS_TIMEOUT / 0.01)):
                 with db_session.session_factory() as check_db:
                     current = check_db.get(UserOAuth, int(account.id))
                     if current is not None and current.access_token == "winner-token":

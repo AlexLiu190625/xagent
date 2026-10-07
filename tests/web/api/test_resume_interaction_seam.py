@@ -31,6 +31,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.web.services.task_interaction_schema_shared import (
     make_row,
     make_task,
@@ -459,7 +460,7 @@ async def test_legacy_resume_is_not_refused_when_the_task_marker_is_null(
         )
 
         agent_manager.get_agent_for_task.assert_awaited()
-        await asyncio.wait_for(resume_scheduled.wait(), timeout=1)
+        await asyncio.wait_for(resume_scheduled.wait(), timeout=DB_PROGRESS_TIMEOUT)
 
     assert resume_scheduled.is_set()
     refusals = [
@@ -740,7 +741,7 @@ async def test_resume_with_a_matching_receipt_is_not_refused(
                 "responder_identity": f"user:{OWNER_ID}",
             },
         )
-        await asyncio.wait_for(resume_scheduled.wait(), timeout=1)
+        await asyncio.wait_for(resume_scheduled.wait(), timeout=DB_PROGRESS_TIMEOUT)
 
     transition.assert_awaited()
     assert resume_scheduled.is_set()
@@ -836,7 +837,7 @@ async def test_stale_run_active_row_does_not_trip_the_seam(
             _seeded_task,
             {"user": SimpleNamespace(id=OWNER_ID, is_admin=False)},
         )
-        await asyncio.wait_for(resume_scheduled.wait(), timeout=1)
+        await asyncio.wait_for(resume_scheduled.wait(), timeout=DB_PROGRESS_TIMEOUT)
 
     assert resume_scheduled.is_set()
 
@@ -956,7 +957,7 @@ async def test_legacy_resume_is_not_refused_when_the_active_interaction_read_is_
         )
 
         agent_manager.get_agent_for_task.assert_awaited()
-        await asyncio.wait_for(resume_scheduled.wait(), timeout=1)
+        await asyncio.wait_for(resume_scheduled.wait(), timeout=DB_PROGRESS_TIMEOUT)
 
     assert resume_scheduled.is_set()
     transition.assert_awaited()

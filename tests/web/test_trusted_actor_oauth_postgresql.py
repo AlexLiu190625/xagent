@@ -14,6 +14,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.orm import sessionmaker
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.shared.postgres_disposable import disposable_database_factory
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web import mcp_apps
@@ -559,12 +560,12 @@ async def test_actor_refresh_row_lock_wait_keeps_event_loop_responsive(
                 UserOAuth.id == account_id
             ).with_for_update().one()
             lock_acquired.set()
-            assert release_lock.wait(timeout=5)
+            assert release_lock.wait(timeout=DB_PROGRESS_TIMEOUT)
             db.rollback()
 
     lock_thread = threading.Thread(target=hold_credential_lock)
     lock_thread.start()
-    assert lock_acquired.wait(timeout=5)
+    assert lock_acquired.wait(timeout=DB_PROGRESS_TIMEOUT)
 
     async def refresh_exact_actor(_db, account, _provider_name):
         account.access_token = "refreshed-token"
@@ -601,7 +602,7 @@ async def test_actor_refresh_row_lock_wait_keeps_event_loop_responsive(
         release_timer.cancel()
         if resolver is not None and not resolver.done():
             await resolver
-        lock_thread.join(timeout=5)
+        lock_thread.join(timeout=DB_PROGRESS_TIMEOUT)
 
     assert not lock_thread.is_alive()
     assert loop_remained_responsive
@@ -697,7 +698,7 @@ async def test_concurrent_postgresql_actor_refresh_uses_one_rotating_token(
             resource_owner_key=resource_owner_key,
         )
         if resource_owner_key is not None:
-            query_barrier.wait(timeout=5)
+            query_barrier.wait(timeout=DB_PROGRESS_TIMEOUT)
         return query
 
     monkeypatch.setattr(

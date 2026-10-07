@@ -11,6 +11,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.orm import sessionmaker
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.shared.postgres_disposable import psycopg2_kwargs
 from tests.web.services.task_database_shared import engine as engine_fixture
 from tests.web.services.task_database_shared import task_id as task_id_fixture
@@ -137,7 +138,7 @@ def test_postgresql_skips_locked_owner_without_rolling_back_healthy_rows(
 
 
 async def until(predicate):
-    async with asyncio.timeout(5):
+    async with asyncio.timeout(DB_PROGRESS_TIMEOUT):
         while not predicate():
             await asyncio.sleep(0.005)
 
@@ -241,7 +242,7 @@ async def test_close_waits_for_inflight_batch_without_cancelling_other_owner(
         result = original(leases)
         if calls == 1:
             entered.set()
-            assert unblock.wait(5)
+            assert unblock.wait(DB_PROGRESS_TIMEOUT)
         elif any(lease.task_id == second_id for lease in leases):
             loop.call_soon_threadsafe(survivor_renewed.set)
         return result
@@ -252,7 +253,7 @@ async def test_close_waits_for_inflight_batch_without_cancelling_other_owner(
         first = await registry.ensure(task_id)
         second = await registry.ensure(second_id)
         start_batch.set()
-        assert await asyncio.to_thread(entered.wait, 5)
+        assert await asyncio.to_thread(entered.wait, DB_PROGRESS_TIMEOUT)
         closing = asyncio.create_task(first.close())
         await until(lambda: first.lease not in registry._heartbeats)
         assert not first._heartbeat_done.done()
@@ -264,7 +265,7 @@ async def test_close_waits_for_inflight_batch_without_cancelling_other_owner(
         with pytest.raises(asyncio.CancelledError):
             await closing
         await first.close()
-        await asyncio.wait_for(survivor_renewed.wait(), 5)
+        await asyncio.wait_for(survivor_renewed.wait(), DB_PROGRESS_TIMEOUT)
         assert second._healthy
         with factory() as db:
             assert db.get(Task, task_id).runner_id is None

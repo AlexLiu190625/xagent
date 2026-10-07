@@ -57,6 +57,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import sessionmaker
 
 import xagent.web.models.database as database_module
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.web.services.task_interaction_schema_shared import (
     anchor_event_id,
     assert_rejected,
@@ -1067,7 +1068,7 @@ def test_respond_vs_staging_reclaim_does_not_deadlock(_respond_pg, engine) -> No
             conn.close()
 
     def respond_call() -> None:
-        update_issued.wait(timeout=5)
+        update_issued.wait(timeout=DB_PROGRESS_TIMEOUT)
         try:
             outcome = svc.respond(
                 interaction_id=interaction_id,
@@ -1157,7 +1158,7 @@ def test_respond_vs_concurrent_purge_does_not_deadlock(_respond_pg, engine) -> N
             conn.close()
 
     def respond_call() -> None:
-        update_issued.wait(timeout=5)
+        update_issued.wait(timeout=DB_PROGRESS_TIMEOUT)
         try:
             outcome = svc.respond(
                 interaction_id=interaction_id,

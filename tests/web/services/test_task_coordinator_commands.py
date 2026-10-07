@@ -15,6 +15,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.shared.postgres_disposable import disposable_database_factory
 from tests.web.services.coordinator_command_shared import claim_task_command
 from xagent.web.models.agent import Agent
@@ -69,8 +70,10 @@ async def host(tmp_path, monkeypatch, database_url):
         task_lease_service,
     ):
         monkeypatch.setattr(module, "get_runner_id", lambda: "worker-1")
+    # Each renewal is a SQLite write; leave the write lock idle between them
+    # for longer than the busy handler's 100ms poll gap (see #2819).
     monkeypatch.setattr(
-        task_coordinator_runtime, "get_task_lease_heartbeat_seconds", lambda: 0.05
+        task_coordinator_runtime, "get_task_lease_heartbeat_seconds", lambda: 0.5
     )
     monkeypatch.setattr(task_event_bridge, "_bridge", Mock())
     monkeypatch.setattr(
@@ -635,7 +638,7 @@ async def test_controls_apply_while_execution_is_running(host, monkeypatch):
     await task_command_execution.execute_durable_task_command(
         await claim(first.task_id)
     )
-    await asyncio.wait_for(started.wait(), 5)
+    await asyncio.wait_for(started.wait(), DB_PROGRESS_TIMEOUT)
     with get_session_local()() as db:
         task_command_transport.stage_task_command(
             db,
@@ -655,7 +658,7 @@ async def test_controls_apply_while_execution_is_running(host, monkeypatch):
             task_command_execution.execute_durable_task_command(
                 await claim(first.task_id)
             ),
-            2,
+            DB_PROGRESS_TIMEOUT,
         )
         control.assert_awaited_once()
         assert not finish.is_set()
@@ -687,7 +690,7 @@ async def test_shutdown_drains_command_waiting_for_execution_cleanup(host):
     apply = AsyncMock()
     pending = asyncio.create_task(coordinator.execute_command(command, apply))
     await eventually(coordinator._command_lock.locked)
-    await asyncio.wait_for(coordinator.close(), 5)
+    await asyncio.wait_for(coordinator.close(), DB_PROGRESS_TIMEOUT)
     await asyncio.gather(pending, return_exceptions=True)
     assert cleanup_done.is_set()
     assert pending.cancelled()
@@ -703,10 +706,15 @@ async def test_shutdown_drains_command_waiting_for_execution_cleanup(host):
 async def test_real_claim_during_committed_handoff_keeps_lease_and_waits(
     host, monkeypatch, kind
 ):
-    from xagent.web.services import task_command_execution
+    from xagent.web.services import (
+        task_command_execution,
+    )
     from xagent.web.services import task_command_transport as transport
     from xagent.web.services import task_coordinator_runtime as runtime
-    from xagent.web.services import task_resume_command, task_start_consumer
+    from xagent.web.services import (
+        task_resume_command,
+        task_start_consumer,
+    )
 
     first = await create(host)
     coordinator = await runtime.get_task_coordinator_registry().ensure(first.task_id)
@@ -723,7 +731,7 @@ async def test_real_claim_during_committed_handoff_keeps_lease_and_waits(
         coordinator.track_execution(asyncio.create_task(child_end.wait()))
 
     original = asyncio.create_task(coordinator.execute_command(initial, handoff))
-    await asyncio.wait_for(committed.wait(), 5)
+    await asyncio.wait_for(committed.wait(), DB_PROGRESS_TIMEOUT)
     with get_session_local()() as db:
         row = db.get(Task, first.task_id)
         before = (row.run_id, row.runner_id, row.lease_attempt_id)
@@ -763,7 +771,7 @@ async def test_real_claim_during_committed_handoff_keeps_lease_and_waits(
         await asyncio.sleep(0.05)
         assert not applied.is_set()
         child_end.set()
-        await asyncio.wait_for(competing, 5)
+        await asyncio.wait_for(competing, DB_PROGRESS_TIMEOUT)
         assert applied.is_set()
     finally:
         register.set()

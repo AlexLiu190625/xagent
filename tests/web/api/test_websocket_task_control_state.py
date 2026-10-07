@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from anyio import BrokenResourceError, ClosedResourceError
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from xagent.web.api import public_chat_access
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api.websocket import (
@@ -661,7 +662,7 @@ async def test_shared_reconciliation_reads_persisted_state_and_stops(
     manager.start_stream_reconciliation()
     reconciler = manager._stream_reconciler
     try:
-        await asyncio.wait_for(received.wait(), timeout=2)
+        await asyncio.wait_for(received.wait(), timeout=DB_PROGRESS_TIMEOUT)
         frame = json.loads(socket.messages[0])
         assert frame["type"] == "task_stream_snapshot"
         assert frame["task_id"] == current_task.id
@@ -676,7 +677,9 @@ async def test_shared_reconciliation_reads_persisted_state_and_stops(
             assert "question" in frame and "interactions" in frame
         assert read_threads and loop_thread not in read_threads
     finally:
-        await asyncio.wait_for(manager.stop_stream_reconciliation(), timeout=2)
+        await asyncio.wait_for(
+            manager.stop_stream_reconciliation(), timeout=DB_PROGRESS_TIMEOUT
+        )
         manager.disconnect(socket)
         await asyncio.wait_for(
             asyncio.gather(writer.task, return_exceptions=True), timeout=2

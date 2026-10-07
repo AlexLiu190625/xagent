@@ -30,6 +30,7 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.shared.db_teardown import drop_all_tables
 from tests.web.pool_contention_shared import (
     CONTENTION_POOL_TIMEOUT,
@@ -2792,9 +2793,25 @@ async def test_schedule_bg_settles_owned_terminal_task_observed_by_heartbeat(
         terminal_committed.set()
         await allow_execution_return.wait()
 
+    from xagent.web.services import task_lease_service
+
+    # Every refresh is a SQLite write. A sub-commit interval keeps the write
+    # lock busy back to back and starves settlement's own writes, so leave
+    # the lock idle between refreshes and wait for the observed refresh.
     monkeypatch.setattr(
-        "xagent.web.services.task_lease_service.get_task_lease_heartbeat_seconds",
-        lambda: 0.001,
+        task_lease_service, "get_task_lease_heartbeat_seconds", lambda: 0.2
+    )
+    refresh = task_lease_service.refresh_task_leases_isolated
+    settlement_observed = Event()
+
+    def observe_refresh(leases):
+        states = refresh(leases)
+        if TaskLeaseRefreshState.SETTLEMENT_READY in states.values():
+            settlement_observed.set()
+        return states
+
+    monkeypatch.setattr(
+        task_lease_service, "refresh_task_leases_isolated", observe_refresh
     )
 
     with (
@@ -2831,10 +2848,12 @@ async def test_schedule_bg_settles_owned_terminal_task_observed_by_heartbeat(
             force_fresh=False,
             context=None,
         )
-        await asyncio.wait_for(terminal_committed.wait(), timeout=1)
-        await asyncio.sleep(0.02)
+        await asyncio.wait_for(terminal_committed.wait(), timeout=DB_PROGRESS_TIMEOUT)
+        # The heartbeat must see the terminal commit while execution still
+        # runs; wait for that refresh instead of a fixed sleep.
+        assert await asyncio.to_thread(settlement_observed.wait, DB_PROGRESS_TIMEOUT)
         allow_execution_return.set()
-        await asyncio.wait_for(bg_task, timeout=1)
+        await asyncio.wait_for(bg_task, timeout=DB_PROGRESS_TIMEOUT)
 
     db_session.expire_all()
     persisted_task = db_session.query(Task).filter(Task.id == task_id).one()
@@ -4911,7 +4930,7 @@ async def test_cancelled_runner_drains_persistence_before_settlement(
         )
         bg_task = _spawn_finalize_runner(task, user, payload)
         try:
-            async with asyncio.timeout(5):
+            async with asyncio.timeout(DB_PROGRESS_TIMEOUT):
                 while not started.is_set():
                     await asyncio.sleep(0.001)
             for _ in range(2):
@@ -4928,7 +4947,7 @@ async def test_cancelled_runner_drains_persistence_before_settlement(
             release.set()
             async_release.set()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(bg_task, 5)
+            await asyncio.wait_for(bg_task, DB_PROGRESS_TIMEOUT)
 
     assert settlement_started.is_set()
     db_session.expire_all()

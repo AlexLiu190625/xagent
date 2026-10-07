@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from xagent.web.api import websocket as websocket_api
 from xagent.web.models.agent import Agent
 from xagent.web.models.chat_message import TaskChatMessage
@@ -334,7 +335,7 @@ async def test_settlement_text_by_task_source(
         context=None,
     )
     try:
-        await asyncio.wait_for(execution_started.wait(), timeout=5)
+        await asyncio.wait_for(execution_started.wait(), timeout=DB_PROGRESS_TIMEOUT)
         bg_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await bg_task
@@ -443,7 +444,7 @@ async def test_interrupted_transcript_settlement_wins(
         context=None,
     )
     try:
-        await asyncio.wait_for(execution_started.wait(), timeout=5)
+        await asyncio.wait_for(execution_started.wait(), timeout=DB_PROGRESS_TIMEOUT)
         before_cancel = _load_task(task_id)
         bg_task.cancel()
         with pytest.raises(asyncio.CancelledError):

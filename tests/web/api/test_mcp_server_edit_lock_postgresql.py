@@ -47,6 +47,7 @@ import sqlalchemy as sa
 from fastapi import HTTPException
 from sqlalchemy.orm import sessionmaker
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.shared.postgres_disposable import disposable_database_factory
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
@@ -223,7 +224,7 @@ def test_a_second_editor_blocks_until_the_first_editors_transaction_finishes(
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             first = executor.submit(run_first)
-            assert lock_acquired.wait(timeout=5), (
+            assert lock_acquired.wait(timeout=DB_PROGRESS_TIMEOUT), (
                 "the first editor never reached the lock"
             )
 
@@ -348,7 +349,7 @@ def test_the_second_editors_rename_reports_the_first_editors_committed_name_as_o
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             first = executor.submit(run_first)
-            assert lock_acquired.wait(timeout=5), (
+            assert lock_acquired.wait(timeout=DB_PROGRESS_TIMEOUT), (
                 "the first editor never reached the lock"
             )
 

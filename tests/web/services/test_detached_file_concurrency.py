@@ -10,6 +10,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.orm import sessionmaker
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.shared.postgres_disposable import disposable_database_factory
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TraceEvent
@@ -91,7 +92,7 @@ def test_task_delete_and_bind_serialize_both_winners(sessions, first):
         operations[first](winner)
         future = executor.submit(contender)
         try:
-            assert ready.wait(3)
+            assert ready.wait(DB_PROGRESS_TIMEOUT)
             wait_for_block(sessions, pid[0])
             winner.commit()
         finally:
@@ -229,7 +230,7 @@ def test_upsert_batch_locks_task_before_same_task_upload_update(sessions):
         store.upsert_already_durable(first_staged, expected=first_expected)
         future = executor.submit(purge)
         try:
-            assert ready.wait(3)
+            assert ready.wait(DB_PROGRESS_TIMEOUT)
             wait_for_block(sessions, pid[0])
             store.upsert_already_durable(
                 second_staged,

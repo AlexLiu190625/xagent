@@ -13,6 +13,7 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.web.pool_contention_shared import CONTENTION_POOL_TIMEOUT
 from xagent.web.models.database import Base
 from xagent.web.models.uploaded_file import UploadedFile
@@ -249,7 +250,7 @@ def test_recovery_never_restores_while_original_delete_is_in_flight(
     def original_delete(*, user_id: int, storage_key: str) -> str:
         del user_id, storage_key
         original_delete_started.set()
-        assert allow_original_delete_to_return.wait(timeout=5)
+        assert allow_original_delete_to_return.wait(timeout=DB_PROGRESS_TIMEOUT)
         return "absent"
 
     monkeypatch.setattr(
@@ -269,7 +270,7 @@ def test_recovery_never_restores_while_original_delete_is_in_flight(
 
     original_thread = Thread(target=run_original)
     original_thread.start()
-    assert original_delete_started.wait(timeout=5)
+    assert original_delete_started.wait(timeout=DB_PROGRESS_TIMEOUT)
 
     try:
         from filelock import FileLock, Timeout
@@ -293,16 +294,16 @@ def test_recovery_never_restores_while_original_delete_is_in_flight(
                 session_factory=SessionLocal,
                 compensation_delete=lambda **_kwargs: "exists",
             )
-            assert blocked.wait(5)
+            assert blocked.wait(DB_PROGRESS_TIMEOUT)
             with SessionLocal() as db:
                 assert (
                     db.query(UploadedFile).filter_by(id=row_id).one().storage_status
                     == "compensating"
                 )
             allow_original_delete_to_return.set()
-            original_thread.join(timeout=5)
+            original_thread.join(timeout=DB_PROGRESS_TIMEOUT)
             assert original_errors == []
-            result = recovery.result(timeout=5)
+            result = recovery.result(timeout=DB_PROGRESS_TIMEOUT)
             assert result.deleted == 0
             assert result.deferred_exists == 0
         with SessionLocal() as db:
@@ -346,7 +347,7 @@ def test_storage_path_upsert_cannot_revive_an_inflight_compensation(
     def original_delete(*, user_id: int, storage_key: str) -> str:
         del user_id, storage_key
         original_delete_started.set()
-        assert allow_original_delete_to_return.wait(timeout=5)
+        assert allow_original_delete_to_return.wait(timeout=DB_PROGRESS_TIMEOUT)
         return "absent"
 
     def unexpected_sync(self, *, storage_key=None, mime_type=None):
@@ -376,7 +377,7 @@ def test_storage_path_upsert_cannot_revive_an_inflight_compensation(
 
     original_thread = Thread(target=run_original)
     original_thread.start()
-    assert original_delete_started.wait(timeout=5)
+    assert original_delete_started.wait(timeout=DB_PROGRESS_TIMEOUT)
 
     try:
         with SessionLocal() as db:
@@ -395,7 +396,7 @@ def test_storage_path_upsert_cannot_revive_an_inflight_compensation(
         assert sync_calls == []
 
         allow_original_delete_to_return.set()
-        original_thread.join(timeout=5)
+        original_thread.join(timeout=DB_PROGRESS_TIMEOUT)
         assert not original_thread.is_alive()
         assert original_errors == []
         with SessionLocal() as db:

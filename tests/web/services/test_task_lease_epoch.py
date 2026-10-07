@@ -6,6 +6,7 @@ from datetime import timedelta
 import pytest
 from sqlalchemy.orm import sessionmaker
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.web.services.task_database_shared import engine as engine_fixture
 from tests.web.services.task_database_shared import task_id as task_id_fixture
 from xagent.web.models.task import Task, TaskStatus
@@ -100,7 +101,7 @@ async def test_heartbeat_sharing_requires_epoch_key(lease_database, monkeypatch)
     old = manager.register(first)
     new = manager.register(second)
     try:
-        await asyncio.wait_for(old.terminal_event.wait(), timeout=5)
+        await asyncio.wait_for(old.terminal_event.wait(), timeout=DB_PROGRESS_TIMEOUT)
         assert old._entry.outcome.lease_lost
         assert old._entry is not new._entry
         assert not new.terminal_event.is_set()
@@ -150,10 +151,10 @@ async def test_same_epoch_handoff_keeps_shared_heartbeat(lease_database, monkeyp
     successor = manager.register(lease)
     try:
         assert first._entry is successor._entry
-        await asyncio.wait_for(refreshed.wait(), timeout=5)
+        await asyncio.wait_for(refreshed.wait(), timeout=DB_PROGRESS_TIMEOUT)
         assert not (await first.close()).lease_lost
         refreshed.clear()
-        await asyncio.wait_for(refreshed.wait(), timeout=5)
+        await asyncio.wait_for(refreshed.wait(), timeout=DB_PROGRESS_TIMEOUT)
         assert not successor.terminal_event.is_set()
         assert not (await successor.close()).lease_lost
     finally:
@@ -438,7 +439,7 @@ async def test_cancelled_acquisition_cleanup_cannot_release_its_successor(
             lease = leases.acquire_task_lease(db, tid, runner_id="worker", new_run=True)
         holder.append(lease)
         acquired.set()
-        assert return_lease.wait(timeout=5)
+        assert return_lease.wait(timeout=DB_PROGRESS_TIMEOUT)
         return lease
 
     def cleanup(lease):
@@ -451,7 +452,7 @@ async def test_cancelled_acquisition_cleanup_cannot_release_its_successor(
         leases.acquire_task_lease_cancellation_safe(acquire, cleanup)
     )
     try:
-        assert await asyncio.to_thread(acquired.wait, 5)
+        assert await asyncio.to_thread(acquired.wait, DB_PROGRESS_TIMEOUT)
         operation.cancel()
         with factory() as db:
             current = leases.acquire_task_lease(
@@ -489,7 +490,7 @@ async def test_delayed_old_heartbeat_batch_cannot_renew_or_cancel_new_registrati
         calls += 1
         if calls == 1:
             batch_ready.set()
-            assert deliver_batch.wait(timeout=5)
+            assert deliver_batch.wait(timeout=DB_PROGRESS_TIMEOUT)
         return states
 
     monkeypatch.setattr(leases, "refresh_task_leases_isolated", delayed_refresh)
@@ -498,14 +499,14 @@ async def test_delayed_old_heartbeat_batch_cannot_renew_or_cancel_new_registrati
     old = manager.register(old_lease)
     new = None
     try:
-        assert await asyncio.to_thread(batch_ready.wait, 5)
+        assert await asyncio.to_thread(batch_ready.wait, DB_PROGRESS_TIMEOUT)
         with factory() as db:
             current = leases.acquire_task_lease(
                 db, tid, runner_id="worker", expected_run_id=old_lease.run_id
             )
         new = manager.register(current)
         deliver_batch.set()
-        await asyncio.wait_for(old.terminal_event.wait(), timeout=5)
+        await asyncio.wait_for(old.terminal_event.wait(), timeout=DB_PROGRESS_TIMEOUT)
         assert not new.terminal_event.is_set()
         assert not new._entry.outcome.lease_lost
         with factory() as db:
@@ -562,7 +563,7 @@ def test_settlement_lock_serializes_same_process_reacquisition(lease_database):
             db.commit()
         finally:
             db.rollback()
-        current = future.result(timeout=5)
+        current = future.result(timeout=DB_PROGRESS_TIMEOUT)
     with factory() as db:
         assert db.get(Task, tid).output == "committed by original owner"
         assert db.get(Task, tid).lease_attempt_id == current.attempt_id

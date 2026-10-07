@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from sqlalchemy import literal
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.web.services.test_task_execution_admission import (
     Execution,
     dispatch_next,
@@ -103,7 +104,7 @@ async def test_resume_during_prior_cleanup_holds_one_slot(host, capacity):
     paused = RunExecution(host, settled=TaskStatus.PAUSED)
     assert await transport.dispatch_one_task_command(paused)
     paused.finish.set()
-    await asyncio.wait_for(paused.terminal.wait(), 5)
+    await asyncio.wait_for(paused.terminal.wait(), DB_PROGRESS_TIMEOUT)
     # PAUSED is published while the previous execution's cleanup is still held.
     resume = enqueue(host, task_id=task_id, kind=transport.TaskCommandKind.RESUME)
     resumed = RunExecution(host, new_run=False)
@@ -225,7 +226,7 @@ async def test_guidance_that_becomes_a_new_turn_acquires_its_own_lane(
         # handler; its new-turn path must then refuse without a held ticket.
         attempts.append(command.id)
         original.finish.set()
-        await asyncio.wait_for(original.terminal.wait(), 5)
+        await asyncio.wait_for(original.terminal.wait(), DB_PROGRESS_TIMEOUT)
         original.cleanup.set()
         return await execute_durable_task_command(command)
 
@@ -257,9 +258,9 @@ async def test_guidance_that_becomes_a_new_turn_acquires_its_own_lane(
     assert snapshot(host, "other-lane").delay_reason == "capacity"
     occupied.finish.set()
     occupied.cleanup.set()
-    await asyncio.wait_for(occupied.terminal.wait(), 5)
+    await asyncio.wait_for(occupied.terminal.wait(), DB_PROGRESS_TIMEOUT)
     # ... and, once capacity opens, for that lane's startup allowance.
-    async with asyncio.timeout(5):
+    async with asyncio.timeout(DB_PROGRESS_TIMEOUT):
         while snapshot(host, "other-lane").active:
             await asyncio.sleep(0.01)
     assert not await transport.dispatch_one_task_command(

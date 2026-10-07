@@ -12,6 +12,7 @@ import pytest
 from fastapi import HTTPException
 from fastapi.datastructures import UploadFile
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.shared.execution_scope import register_scope_resolver
 from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.core.file_storage.storage import FsspecFileStorage
@@ -183,7 +184,7 @@ async def test_concurrent_same_name_uploads_reserve_distinct_paths_and_contents(
                 workers_started += 1
             # Both workers finish the pre-check before either can reserve the
             # candidate. Exclusive creation must resolve the actual race.
-            workers_ready.wait(timeout=5)
+            workers_ready.wait(timeout=DB_PROGRESS_TIMEOUT)
         return registered
 
     monkeypatch.setattr(

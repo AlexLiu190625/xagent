@@ -24,6 +24,7 @@ from fastapi import FastAPI
 from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.testclient import TestClient
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from xagent.core.agent.trace import (
     ACTION_END_TOOL,
     ACTION_START_TOOL,
@@ -499,7 +500,9 @@ async def test_events_paused_attach_does_not_take_a_fast_path():
         read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(),
     )
-    first = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+    first = await asyncio.wait_for(
+        resp.body_iterator.__anext__(), timeout=DB_PROGRESS_TIMEOUT
+    )
     assert json.loads(first.split("data: ", 1)[1]) == {"status": "paused"}
     assert es.count_task_sinks(task_id) == 1
 
@@ -740,7 +743,9 @@ async def test_generator_read_path_keeps_queued_wire_bytes_at_zero_between_frame
         read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(),
     )
-    first = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+    first = await asyncio.wait_for(
+        resp.body_iterator.__anext__(), timeout=DB_PROGRESS_TIMEOUT
+    )
     assert "event: task.status" in first
 
     sink = next(
@@ -751,7 +756,9 @@ async def test_generator_read_path_keeps_queued_wire_bytes_at_zero_between_frame
     frame, fits = _budget_sized_frame()
     for _ in range(fits + 4):
         sink._put_or_overflow(frame)
-        delivered = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+        delivered = await asyncio.wait_for(
+            resp.body_iterator.__anext__(), timeout=DB_PROGRESS_TIMEOUT
+        )
         assert delivered == frame
         assert sink.queued_wire_bytes == 0
     assert sink.closing is False
@@ -969,7 +976,9 @@ async def test_real_delete_route_closes_stream_with_task_deleted():
         read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(watchdog_interval_seconds=0.01),
     )
-    first = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+    first = await asyncio.wait_for(
+        resp.body_iterator.__anext__(), timeout=DB_PROGRESS_TIMEOUT
+    )
     assert "event: task.status" in first
 
     delete_resp = _chat_delete_client.delete(
@@ -983,7 +992,7 @@ async def test_real_delete_route_closes_stream_with_task_deleted():
         async for frame in resp.body_iterator:
             frames.append(frame)
 
-    await asyncio.wait_for(_drain(), timeout=2)
+    await asyncio.wait_for(_drain(), timeout=DB_PROGRESS_TIMEOUT)
     assert "event: stream.error" in frames[-1]
     assert "task_deleted" in frames[-1]
     assert es.count_task_sinks(task_id) == 0
@@ -1023,7 +1032,9 @@ async def test_watchdog_survives_transient_check_failure_and_still_closes():
         read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(watchdog_interval_seconds=0.01),
     )
-    first = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+    first = await asyncio.wait_for(
+        resp.body_iterator.__anext__(), timeout=DB_PROGRESS_TIMEOUT
+    )
     assert "event: task.status" in first
 
     _set_task_status(task_id, TaskStatus.COMPLETED, output="done")
@@ -1034,7 +1045,7 @@ async def test_watchdog_survives_transient_check_failure_and_still_closes():
         async for frame in resp.body_iterator:
             frames.append(frame)
 
-    await asyncio.wait_for(_drain(), timeout=2)
+    await asyncio.wait_for(_drain(), timeout=DB_PROGRESS_TIMEOUT)
     assert call_count >= 2  # the first (failing) cycle and the retry
     assert any("event: task.completed" in f for f in frames)
     assert es.count_task_sinks(task_id) == 0
@@ -1738,13 +1749,17 @@ async def test_broadcast_frame_reaches_generator_output_as_task_status():
         read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(),
     )
-    first = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+    first = await asyncio.wait_for(
+        resp.body_iterator.__anext__(), timeout=DB_PROGRESS_TIMEOUT
+    )
     assert json.loads(first.split("data: ", 1)[1]) == {"status": "running"}
 
     _set_task_status(task_id, TaskStatus.PAUSED)
     await es.manager.broadcast_to_task({"type": "task_paused"}, task_id)
 
-    second = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+    second = await asyncio.wait_for(
+        resp.body_iterator.__anext__(), timeout=DB_PROGRESS_TIMEOUT
+    )
     assert "event: task.status" in second
     assert json.loads(second.split("data: ", 1)[1]) == {"status": "paused"}
 
@@ -1793,7 +1808,9 @@ async def test_broadcast_content_frames_reach_generator_output_as_step_and_messa
         read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(),
     )
-    first = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+    first = await asyncio.wait_for(
+        resp.body_iterator.__anext__(), timeout=DB_PROGRESS_TIMEOUT
+    )
     assert "event: task.status" in first
     assert es.count_task_sinks(task_id) == 1  # the sink really did register
 
@@ -1810,7 +1827,9 @@ async def test_broadcast_content_frames_reach_generator_output_as_step_and_messa
     await es.manager.broadcast_to_task(
         json.loads(_broadcast_frame_for(start_event, task_id=task_id)), task_id
     )
-    step_frame = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+    step_frame = await asyncio.wait_for(
+        resp.body_iterator.__anext__(), timeout=DB_PROGRESS_TIMEOUT
+    )
     assert step_frame.startswith("event: step.started\n")
     step = json.loads(step_frame.split("data: ", 1)[1])["step"]
     assert step["id"] == "tool_call:call-1"
@@ -1825,7 +1844,9 @@ async def test_broadcast_content_frames_reach_generator_output_as_step_and_messa
         },
         task_id,
     )
-    message_frame = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+    message_frame = await asyncio.wait_for(
+        resp.body_iterator.__anext__(), timeout=DB_PROGRESS_TIMEOUT
+    )
     assert message_frame.startswith("event: message.delta\n")
     assert json.loads(message_frame.split("data: ", 1)[1]) == {
         "message_id": "final_answer_e2e",
@@ -1922,7 +1943,7 @@ async def test_completion_hint_wakes_watchdog_before_its_next_periodic_tick():
     instead of waiting out its normal interval. This pins that it's a
     genuine early wake, not something that happens to work because the
     interval is already short: the watchdog interval here is 1000s, so
-    the only way this test can finish inside its 2s bound is if the
+    the only way this test can finish inside the bound is if the
     hint actually woke it early. If the hint stopped working, this
     would hang until the bound trips and the test would fail instead of
     silently passing."""
@@ -1940,7 +1961,7 @@ async def test_completion_hint_wakes_watchdog_before_its_next_periodic_tick():
         read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(),
     )
-    await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+    await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=DB_PROGRESS_TIMEOUT)
 
     _set_task_status(task_id, TaskStatus.COMPLETED, output="done")
     sink = next(
@@ -1958,7 +1979,7 @@ async def test_completion_hint_wakes_watchdog_before_its_next_periodic_tick():
         async for frame in resp.body_iterator:
             frames.append(frame)
 
-    await asyncio.wait_for(_drain(), timeout=2)
+    await asyncio.wait_for(_drain(), timeout=DB_PROGRESS_TIMEOUT)
     assert any("event: task.completed" in f for f in frames)
 
 
@@ -5844,7 +5865,9 @@ async def test_live_stream_closes_with_task_expired_when_retention_expires_it():
         read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
         **_long_intervals(watchdog_interval_seconds=0.01),
     )
-    first = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+    first = await asyncio.wait_for(
+        resp.body_iterator.__anext__(), timeout=DB_PROGRESS_TIMEOUT
+    )
     assert "event: task.status" in first
 
     _expire_task_row(task_id, agent_id=agent_id)
@@ -5855,7 +5878,7 @@ async def test_live_stream_closes_with_task_expired_when_retention_expires_it():
         async for frame in resp.body_iterator:
             frames.append(frame)
 
-    await asyncio.wait_for(_drain(), timeout=2)
+    await asyncio.wait_for(_drain(), timeout=DB_PROGRESS_TIMEOUT)
     assert _parse_error_frame(frames[-1])["code"] == "task_expired"
     assert es.count_task_sinks(task_id) == 0
 

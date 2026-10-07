@@ -11,6 +11,7 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.web.pool_contention_shared import (
     GUARD_TIMEOUT,
     LOOP_LIVENESS_TICKS,
@@ -88,7 +89,7 @@ def _run_tracker_ownership_race(
                 return
             paused = True
         fence_ready.set()
-        assert takeover_done.wait(timeout=5)
+        assert takeover_done.wait(timeout=DB_PROGRESS_TIMEOUT)
 
     def pause_before_usage_update(
         _connection,
@@ -130,7 +131,7 @@ def _run_tracker_ownership_race(
     worker = threading.Thread(target=run_as_old_runner)
     worker.start()
     try:
-        assert fence_ready.wait(timeout=5)
+        assert fence_ready.wait(timeout=DB_PROGRESS_TIMEOUT)
         with session_factory() as takeover_db:
             replacement = takeover_db.get(Task, 123)
             assert replacement is not None
@@ -141,7 +142,7 @@ def _run_tracker_ownership_race(
             takeover_db.commit()
     finally:
         takeover_done.set()
-        worker.join(timeout=5)
+        worker.join(timeout=DB_PROGRESS_TIMEOUT)
         event.remove(engine, "before_cursor_execute", pause_before_usage_update)
 
     assert not worker.is_alive()

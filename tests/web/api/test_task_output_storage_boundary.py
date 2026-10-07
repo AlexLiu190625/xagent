@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.core.file_storage.storage import FsspecFileStorage
 from xagent.web.api import websocket as websocket_api
@@ -153,7 +154,9 @@ async def test_output_path_resolution_releases_pool_between_multiple_outputs(
                 resolved_scope_segments=(),
             )
         )
-        assert await asyncio.to_thread(second_resolution_started.wait, 2)
+        assert await asyncio.to_thread(
+            second_resolution_started.wait, DB_PROGRESS_TIMEOUT
+        )
         assert engine.pool.checkedout() == 0
         allow_second_resolution.set()
         prepared = await worker
@@ -214,7 +217,7 @@ async def test_output_path_resolution_releases_pool_after_owner_lookup(
                 resolved_scope_segments=(),
             )
         )
-        assert await asyncio.to_thread(resolution_started.wait, 2)
+        assert await asyncio.to_thread(resolution_started.wait, DB_PROGRESS_TIMEOUT)
         assert engine.pool.checkedout() == 0
         allow_resolution.set()
         prepared = await worker
@@ -258,7 +261,7 @@ async def test_output_staging_holds_no_pool_slot_or_task_lock(
     ):
         assert engine.pool.checkedout() == 0
         put_started.set()
-        assert allow_put.wait(timeout=3)
+        assert allow_put.wait(timeout=DB_PROGRESS_TIMEOUT)
         return original_put_file(self, source, key, content_type)
 
     monkeypatch.setattr(FsspecFileStorage, "put_file", blocking_put_file)
@@ -272,7 +275,7 @@ async def test_output_staging_holds_no_pool_slot_or_task_lock(
                 resolved_scope_segments=(),
             )
         )
-        assert await asyncio.to_thread(put_started.wait, 2)
+        assert await asyncio.to_thread(put_started.wait, DB_PROGRESS_TIMEOUT)
         assert engine.pool.checkedout() == 0
 
         def read_and_lock_task() -> tuple[str, str]:
@@ -352,7 +355,7 @@ async def test_takeover_during_output_upload_cannot_commit_old_run_metadata(
     ):
         assert engine.pool.checkedout() == 0
         put_started.set()
-        assert allow_put.wait(timeout=3)
+        assert allow_put.wait(timeout=DB_PROGRESS_TIMEOUT)
         return original_put_file(self, source, key, content_type)
 
     monkeypatch.setattr(FsspecFileStorage, "put_file", blocking_put_file)
@@ -366,7 +369,7 @@ async def test_takeover_during_output_upload_cannot_commit_old_run_metadata(
                 resolved_scope_segments=(),
             )
         )
-        assert await asyncio.to_thread(put_started.wait, 2)
+        assert await asyncio.to_thread(put_started.wait, DB_PROGRESS_TIMEOUT)
 
         takeover_db = _direct_db_session()
         try:
@@ -1390,14 +1393,14 @@ async def test_cancelled_legacy_preview_drains_failed_registration_compensation(
         websocket_api.redirect_legacy_preview(relative_path, request_db)
     )
     try:
-        assert await asyncio.to_thread(metadata_started.wait, 2)
+        assert await asyncio.to_thread(metadata_started.wait, DB_PROGRESS_TIMEOUT)
         registration.cancel()
         await asyncio.sleep(0)
         assert not registration.done()
 
         allow_metadata_failure.set()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(registration, timeout=3)
+            await asyncio.wait_for(registration, timeout=DB_PROGRESS_TIMEOUT)
 
         check_db = _direct_db_session()
         try:

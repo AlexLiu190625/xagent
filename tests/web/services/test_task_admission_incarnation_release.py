@@ -11,6 +11,7 @@ the execution handle that finished, keeping the idle release as the backstop.
 import asyncio
 import logging
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.web.services.test_task_admission_execution_slots import (
     RunExecution,
     enqueue,
@@ -45,7 +46,7 @@ def active(host, bucket):
 
 
 async def eventually_active(host, bucket, expected):
-    async with asyncio.timeout(5):
+    async with asyncio.timeout(DB_PROGRESS_TIMEOUT):
         while active(host, bucket) != expected:
             await asyncio.sleep(0.01)
 
@@ -62,7 +63,7 @@ async def pause_then_resume_across_buckets(host):
     paused = RunExecution(host, settled=TaskStatus.PAUSED)
     assert await transport.dispatch_one_task_command(paused)
     paused.finish.set()
-    await asyncio.wait_for(paused.terminal.wait(), 5)
+    await asyncio.wait_for(paused.terminal.wait(), DB_PROGRESS_TIMEOUT)
     resume = enqueue(host, task_id=task_id, kind=transport.TaskCommandKind.RESUME)
     resumed = RunExecution(host, new_run=False)
     assert await transport.dispatch_one_task_command(
@@ -129,9 +130,9 @@ async def test_joined_guidance_continuation_keeps_the_original_ticket_charged(ho
     assert stamped_tickets(host, task_id) == [first.command_id]
 
     original.finish.set()
-    await asyncio.wait_for(original.terminal.wait(), 5)
+    await asyncio.wait_for(original.terminal.wait(), DB_PROGRESS_TIMEOUT)
     original.cleanup.set()
-    await asyncio.wait_for(original.handles[0], 5)
+    await asyncio.wait_for(original.handles[0], DB_PROGRESS_TIMEOUT)
 
     # Any release H1's drain scheduled has landed once these are awaited.
     await asyncio.gather(*original.owner._admission_releases, return_exceptions=True)
@@ -144,7 +145,7 @@ async def test_joined_guidance_continuation_keeps_the_original_ticket_charged(ho
     )
 
     h2_finish.set()
-    await asyncio.wait_for(h2s[0], 5)
+    await asyncio.wait_for(h2s[0], DB_PROGRESS_TIMEOUT)
     await eventually_active(host, "batch", 0)
     assert await transport.dispatch_one_task_command(
         other_execution, command_db_id=other.command_id
@@ -224,7 +225,7 @@ async def test_joined_guidance_registered_after_the_original_drains_keeps_the_ti
     )
 
     h2_finish.set()
-    await asyncio.wait_for(h2s[0], 5)
+    await asyncio.wait_for(h2s[0], DB_PROGRESS_TIMEOUT)
     await eventually_active(host, "batch", 0)
     assert await transport.dispatch_one_task_command(
         other_execution, command_db_id=other.command_id
@@ -292,7 +293,7 @@ async def test_same_bucket_resume_keeps_one_slot_after_the_predecessor_drains(ho
     paused = RunExecution(host, settled=TaskStatus.PAUSED)
     assert await transport.dispatch_one_task_command(paused)
     paused.finish.set()
-    await asyncio.wait_for(paused.terminal.wait(), 5)
+    await asyncio.wait_for(paused.terminal.wait(), DB_PROGRESS_TIMEOUT)
     resume = enqueue(host, task_id=task_id, kind=transport.TaskCommandKind.RESUME)
     resumed = RunExecution(host, new_run=False)
     assert await transport.dispatch_one_task_command(
@@ -301,7 +302,7 @@ async def test_same_bucket_resume_keeps_one_slot_after_the_predecessor_drains(ho
     assert active(host, "turns") == 1
 
     paused.cleanup.set()
-    async with asyncio.timeout(5):
+    async with asyncio.timeout(DB_PROGRESS_TIMEOUT):
         while stamped_tickets(host, task_id) != [resume.command_id]:
             await asyncio.sleep(0.01)
     # Releasing the drained START ticket leaves the RESUME ticket holding the slot.
@@ -330,7 +331,7 @@ async def test_drained_handle_of_a_superseded_owner_releases_nothing(host):
     paused = RunExecution(host, settled=TaskStatus.PAUSED)
     assert await transport.dispatch_one_task_command(paused)
     paused.finish.set()
-    await asyncio.wait_for(paused.terminal.wait(), 5)
+    await asyncio.wait_for(paused.terminal.wait(), DB_PROGRESS_TIMEOUT)
     # Another worker takes the task over and admits its own RESUME while the
     # previous owner's cleanup is still held.
     successor = ownership.TaskLease(
@@ -350,7 +351,7 @@ async def test_drained_handle_of_a_superseded_owner_releases_nothing(host):
     await asyncio.gather(paused.handles[0], return_exceptions=True)
     # `_close` drains pending admission releases before finishing, so waiting
     # for the superseded owner to fully close makes the assertion deterministic.
-    async with asyncio.timeout(5):
+    async with asyncio.timeout(DB_PROGRESS_TIMEOUT):
         while paused.owner.state is not runtime.CoordinatorState.CLOSED:
             await asyncio.sleep(0.01)
     assert stamped_tickets(host, task_id) == [first.command_id, resume.command_id]
@@ -396,7 +397,7 @@ async def test_handle_that_ends_without_settling_frees_its_slot(host):
     await eventually_active(host, "batch", 0)
     assert stamped_tickets(host, task_id) == []
     # The row never settled, so the owner ends in recovery, not a clean release.
-    async with asyncio.timeout(5):
+    async with asyncio.timeout(DB_PROGRESS_TIMEOUT):
         while execute.owner.state is not runtime.CoordinatorState.CLOSED:
             await asyncio.sleep(0.01)
     with host.sessions() as db:
@@ -422,7 +423,7 @@ async def test_failed_release_is_retried_on_the_next_drained_handle(
 
     paused.cleanup.set()
     await asyncio.gather(paused.handles[0], return_exceptions=True)
-    async with asyncio.timeout(5):
+    async with asyncio.timeout(DB_PROGRESS_TIMEOUT):
         while not any(
             "could not release admission" in record.getMessage()
             for record in caplog.records
@@ -439,7 +440,7 @@ async def test_failed_release_is_retried_on_the_next_drained_handle(
     ):
         extra = asyncio.create_task(asyncio.sleep(0))
         paused.owner.track_execution(extra)
-    await asyncio.wait_for(extra, 5)
+    await asyncio.wait_for(extra, DB_PROGRESS_TIMEOUT)
 
     # The resumed run is still live, so the idle backstop cannot be what
     # freed the stashed batch ticket.
@@ -479,7 +480,7 @@ async def test_close_waits_for_a_pending_release(host, monkeypatch):
     closing = asyncio.create_task(owner.close())
     closing.add_done_callback(lambda _: order.append("close"))
     # close() cancels its remaining child before it drains pending releases.
-    async with asyncio.timeout(5):
+    async with asyncio.timeout(DB_PROGRESS_TIMEOUT):
         while not resumed.handles[0].done():
             await asyncio.sleep(0.01)
     # Give a close that skipped the drain every chance to finish first.
@@ -487,7 +488,7 @@ async def test_close_waits_for_a_pending_release(host, monkeypatch):
     assert not closing.done()
 
     gate.set()
-    await asyncio.wait_for(closing, 5)
+    await asyncio.wait_for(closing, DB_PROGRESS_TIMEOUT)
     assert order == ["release", "close"]
     assert active(host, "batch") == 0
 
@@ -522,11 +523,11 @@ async def test_handle_tracked_outside_an_admission_context_is_not_mapped(host):
     # handle is still live: that handle holds nothing.
     execute.finish.set()
     execute.cleanup.set()
-    await asyncio.wait_for(execute.handles[0], 5)
+    await asyncio.wait_for(execute.handles[0], DB_PROGRESS_TIMEOUT)
     await eventually_active(host, "batch", 0)
     assert not extras[0].done()
     extra_finish.set()
-    await asyncio.wait_for(extras[0], 5)
+    await asyncio.wait_for(extras[0], DB_PROGRESS_TIMEOUT)
     assert stamped_tickets(host, task_id) == []
 
 

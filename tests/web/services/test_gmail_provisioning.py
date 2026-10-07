@@ -13,6 +13,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import QueuePool
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.database import (
     Base,
@@ -1952,7 +1953,7 @@ def test_mark_gmail_oauth_reconnect_required_serializes_with_the_transition_lock
     holder = threading.Thread(target=hold_lock, name="lock-holder")
     holder.start()
     try:
-        assert lock_acquired.wait(timeout=5)
+        assert lock_acquired.wait(timeout=DB_PROGRESS_TIMEOUT)
 
         finished = threading.Event()
 
@@ -1969,7 +1970,7 @@ def test_mark_gmail_oauth_reconnect_required_serializes_with_the_transition_lock
             assert not finished.wait(timeout=0.3)
         finally:
             release_lock.set()
-            caller.join(timeout=5)
+            caller.join(timeout=DB_PROGRESS_TIMEOUT)
         assert finished.is_set()
     finally:
         holder.join(timeout=5)
@@ -4835,7 +4836,7 @@ def test_release_locks_oauth_before_watch_delete(
         assert delete_started.wait(timeout=30)
         # A delete must time out on the OAuth lock, rather than acquire it
         # while release holds the watch row and form a W-to-U/U-to-W cycle.
-        assert first_delete_attempt_finished.wait(timeout=2)
+        assert first_delete_attempt_finished.wait(timeout=DB_PROGRESS_TIMEOUT)
     finally:
         release_may_continue.set()
         releaser.join(timeout=30)

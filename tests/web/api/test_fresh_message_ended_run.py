@@ -34,6 +34,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from sqlalchemy.exc import OperationalError
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.web.api.test_durable_message_resume_contention import (
     _live_control_environment,
     _live_task,
@@ -305,7 +306,7 @@ def _end_after_transition(task_id: int, end: Any):
 async def _wait_for_resume_to_finish(background_manager: Any, task_id: int) -> None:
     """Wait for the handed-off resume, including one not yet promoted."""
 
-    for _ in range(300):
+    for _ in range(int(DB_PROGRESS_TIMEOUT / 0.01)):
         coordinator = background_manager.resume_tasks.get(task_id)
         if task_id not in background_manager.running_tasks and (
             coordinator is None or coordinator.done()
@@ -1090,7 +1091,7 @@ async def test_posted_message_whose_marker_is_missing_at_the_claim_is_not_withdr
         if marker == "fails":
             raise OperationalError("UPDATE", {}, Exception("connection reset"))
         # Commit only once the resume has settled its refused claim.
-        assert resume_settled.wait(timeout=5)
+        assert resume_settled.wait(timeout=DB_PROGRESS_TIMEOUT)
         return real_mark(task_id_arg, turn_id, status)
 
     def recording_withdraw(task_id_arg: int, turn_id: str) -> bool:

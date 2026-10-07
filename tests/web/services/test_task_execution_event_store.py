@@ -11,6 +11,7 @@ import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.web.services.task_database_shared import engine as engine_fixture
 from tests.web.services.task_database_shared import task_id as task_id_fixture
 from xagent.web.models.task import Task
@@ -178,7 +179,7 @@ def test_concurrent_append_cannot_commit_past_pending_event(
         first_id = row.event_id
         future = pool.submit(second_writer)
         try:
-            assert reached_update.wait(5)
+            assert reached_update.wait(DB_PROGRESS_TIMEOUT)
             with pytest.raises(TimeoutError):
                 future.result(timeout=0.1)
         finally:

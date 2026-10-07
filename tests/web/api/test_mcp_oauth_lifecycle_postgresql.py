@@ -16,6 +16,7 @@ from sqlalchemy import event, text
 from sqlalchemy.orm import sessionmaker
 from starlette.requests import Request
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.shared.postgres_disposable import disposable_database_factory
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web.api import mcp as mcp_api
@@ -190,7 +191,7 @@ def test_disconnect_first_replacement_cannot_receive_stale_callback_grant(
 
     def gated_team_delete(*args, **kwargs):
         teardown_locked.set()
-        assert allow_teardown.wait(timeout=5)
+        assert allow_teardown.wait(timeout=DB_PROGRESS_TIMEOUT)
         return SimpleNamespace(
             blocked_reason=None,
             team_owned=False,
@@ -230,14 +231,14 @@ def test_disconnect_first_replacement_cannot_receive_stale_callback_grant(
 
     disconnect_thread = threading.Thread(target=disconnect)
     disconnect_thread.start()
-    assert teardown_locked.wait(timeout=5)
+    assert teardown_locked.wait(timeout=DB_PROGRESS_TIMEOUT)
     producer_thread = threading.Thread(target=producer)
     producer_thread.start()
-    assert producer_started.wait(timeout=2)
+    assert producer_started.wait(timeout=DB_PROGRESS_TIMEOUT)
     assert not producer_finished.wait(timeout=0.2)
     allow_teardown.set()
-    disconnect_thread.join(timeout=5)
-    producer_thread.join(timeout=5)
+    disconnect_thread.join(timeout=DB_PROGRESS_TIMEOUT)
+    producer_thread.join(timeout=DB_PROGRESS_TIMEOUT)
     assert disconnect_errors == []
     assert producer_finished.is_set()
     assert producer_results == [None]
@@ -353,8 +354,8 @@ def test_producer_first_holds_lifecycle_locks_until_grant_commit(
         )
         disconnect_thread = threading.Thread(target=disconnect)
         disconnect_thread.start()
-        assert disconnect_started.wait(timeout=2)
-        assert disconnect_lock_attempted.wait(timeout=2)
+        assert disconnect_started.wait(timeout=DB_PROGRESS_TIMEOUT)
+        assert disconnect_lock_attempted.wait(timeout=DB_PROGRESS_TIMEOUT)
         assert not disconnect_finished.wait(timeout=0.2)
         mcp_api._upsert_mcp_oauth_grant(
             producer_db,
@@ -367,7 +368,7 @@ def test_producer_first_holds_lifecycle_locks_until_grant_commit(
         )
         producer_db.commit()
 
-    disconnect_thread.join(timeout=5)
+    disconnect_thread.join(timeout=DB_PROGRESS_TIMEOUT)
     assert disconnect_finished.is_set()
     assert disconnect_errors == []
     with factory() as verify_db:
@@ -603,7 +604,7 @@ def test_real_callback_producer_blocks_disconnect_until_grant_commit(
 
     def gated_upsert(*args, **kwargs):
         producer_at_upsert.set()
-        assert allow_producer_commit.wait(timeout=5)
+        assert allow_producer_commit.wait(timeout=DB_PROGRESS_TIMEOUT)
         return original_upsert(*args, **kwargs)
 
     original_lock = mcp_api._lock_active_mcp_oauth_lifecycle
@@ -661,16 +662,16 @@ def test_real_callback_producer_blocks_disconnect_until_grant_commit(
 
     callback_thread = threading.Thread(target=callback, name="postgres-real-callback")
     callback_thread.start()
-    assert producer_at_upsert.wait(timeout=5)
+    assert producer_at_upsert.wait(timeout=DB_PROGRESS_TIMEOUT)
     disconnect_thread = threading.Thread(
         target=disconnect, name="postgres-real-disconnect"
     )
     disconnect_thread.start()
-    assert disconnect_lock_attempted.wait(timeout=5)
+    assert disconnect_lock_attempted.wait(timeout=DB_PROGRESS_TIMEOUT)
     assert not disconnect_finished.wait(timeout=0.2)
     allow_producer_commit.set()
-    callback_thread.join(timeout=5)
-    disconnect_thread.join(timeout=5)
+    callback_thread.join(timeout=DB_PROGRESS_TIMEOUT)
+    disconnect_thread.join(timeout=DB_PROGRESS_TIMEOUT)
 
     assert not callback_thread.is_alive()
     assert not disconnect_thread.is_alive()
@@ -713,7 +714,7 @@ def test_connect_rejects_delete_during_discovery(
 
     def gated_team_delete(*args, **kwargs):
         delete_locked.set()
-        assert allow_delete.wait(timeout=5)
+        assert allow_delete.wait(timeout=DB_PROGRESS_TIMEOUT)
         return SimpleNamespace(
             blocked_reason=None,
             team_owned=False,
@@ -777,14 +778,14 @@ def test_connect_rejects_delete_during_discovery(
 
     delete_thread = threading.Thread(target=delete, name="postgres-delete")
     delete_thread.start()
-    assert delete_locked.wait(timeout=5)
+    assert delete_locked.wait(timeout=DB_PROGRESS_TIMEOUT)
     connect_thread = threading.Thread(target=connect, name="postgres-connect")
     connect_thread.start()
-    assert connect_lock_attempted.wait(timeout=5)
+    assert connect_lock_attempted.wait(timeout=DB_PROGRESS_TIMEOUT)
     assert not connect_finished.wait(timeout=0.2)
     allow_delete.set()
-    delete_thread.join(timeout=5)
-    connect_thread.join(timeout=5)
+    delete_thread.join(timeout=DB_PROGRESS_TIMEOUT)
+    connect_thread.join(timeout=DB_PROGRESS_TIMEOUT)
 
     assert not delete_thread.is_alive()
     assert not connect_thread.is_alive()
@@ -820,7 +821,7 @@ def test_callback_rejects_deactivation_during_exchange(
 
     async def exchange_code(**kwargs):
         exchange_started.set()
-        assert allow_exchange.wait(timeout=5)
+        assert allow_exchange.wait(timeout=DB_PROGRESS_TIMEOUT)
         return {
             "access_token": "deactivated-callback-token",
             "token_type": "Bearer",
@@ -844,7 +845,7 @@ def test_callback_rejects_deactivation_during_exchange(
 
     callback_thread = threading.Thread(target=callback, name="postgres-callback")
     callback_thread.start()
-    assert exchange_started.wait(timeout=5)
+    assert exchange_started.wait(timeout=DB_PROGRESS_TIMEOUT)
     with factory() as deactivate_db:
         response = mcp_api.update_mcp_server(
             seed["server_id"],
@@ -854,7 +855,7 @@ def test_callback_rejects_deactivation_during_exchange(
         )
         assert response.is_active is False
     allow_exchange.set()
-    callback_thread.join(timeout=5)
+    callback_thread.join(timeout=DB_PROGRESS_TIMEOUT)
 
     assert not callback_thread.is_alive()
     assert callback_errors == []

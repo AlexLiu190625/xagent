@@ -14,6 +14,7 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.shared.auth_database import auth_db_override
 from xagent.web.api import auth as auth_api
 from xagent.web.api.auth import RefreshTokenResponse, auth_router, hash_password
@@ -969,7 +970,7 @@ class TestAuthAPI:
             try:
                 auth_api._lock_user_row_for_preferences_update(db, user_id)
                 holder_acquired.set()
-                assert release_holder.wait(timeout=5)
+                assert release_holder.wait(timeout=DB_PROGRESS_TIMEOUT)
             except BaseException as exc:  # noqa: BLE001
                 errors.append(exc)
             finally:
@@ -977,7 +978,7 @@ class TestAuthAPI:
                 db.close()
 
         def acquire_second() -> None:
-            assert holder_acquired.wait(timeout=5)
+            assert holder_acquired.wait(timeout=DB_PROGRESS_TIMEOUT)
             db = SessionForLock()
             try:
                 auth_api._lock_user_row_for_preferences_update(db, user_id)
@@ -991,7 +992,7 @@ class TestAuthAPI:
         holder_thread = threading.Thread(target=hold_the_lock)
         second_thread = threading.Thread(target=acquire_second)
         holder_thread.start()
-        assert holder_acquired.wait(timeout=5)
+        assert holder_acquired.wait(timeout=DB_PROGRESS_TIMEOUT)
         second_thread.start()
 
         try:
@@ -1009,8 +1010,8 @@ class TestAuthAPI:
             # raise its own confusing "database is locked" error on top
             # of the real AssertionError.
             release_holder.set()
-            holder_thread.join(timeout=5)
-            second_thread.join(timeout=5)
+            holder_thread.join(timeout=DB_PROGRESS_TIMEOUT)
+            second_thread.join(timeout=DB_PROGRESS_TIMEOUT)
         assert not errors, errors
         assert second_acquired.is_set(), (
             "the second writer never acquired the lock after the first released it"
@@ -1250,7 +1251,7 @@ class TestAuthAPI:
 
         def blocking_normalize(worker_user):
             merge_started.set()
-            assert allow_merge.wait(timeout=2)
+            assert allow_merge.wait(timeout=DB_PROGRESS_TIMEOUT)
             result = original_normalize(worker_user)
             merge_completed.set()
             return result
@@ -1278,7 +1279,10 @@ class TestAuthAPI:
             )
         )
         try:
-            await asyncio.wait_for(asyncio.to_thread(merge_started.wait, 2), timeout=2)
+            await asyncio.wait_for(
+                asyncio.to_thread(merge_started.wait, DB_PROGRESS_TIMEOUT),
+                timeout=DB_PROGRESS_TIMEOUT,
+            )
             request_task.cancel()
             await asyncio.sleep(0.02)
             assert not request_task.done()
@@ -1287,7 +1291,7 @@ class TestAuthAPI:
             request_db.close()
 
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(request_task, timeout=2)
+            await asyncio.wait_for(request_task, timeout=DB_PROGRESS_TIMEOUT)
         assert merge_completed.is_set()
 
         # Drained, not abandoned: the merge that was already in flight
@@ -1335,7 +1339,7 @@ class TestAuthAPI:
 
         def delayed_merge(merge_user_id, merge_updates):
             result = original_merge(merge_user_id, merge_updates)
-            assert allow_return.wait(timeout=2)
+            assert allow_return.wait(timeout=DB_PROGRESS_TIMEOUT)
             return result
 
         monkeypatch.setattr(auth_api, "_merge_user_preferences_locked", delayed_merge)
@@ -1356,7 +1360,10 @@ class TestAuthAPI:
                     user=user,
                 )
             )
-            await asyncio.wait_for(asyncio.to_thread(committed.wait, 2), timeout=2)
+            await asyncio.wait_for(
+                asyncio.to_thread(committed.wait, DB_PROGRESS_TIMEOUT),
+                timeout=DB_PROGRESS_TIMEOUT,
+            )
             request_task.cancel()
             await asyncio.sleep(0.02)
             assert not request_task.done()
@@ -1366,7 +1373,7 @@ class TestAuthAPI:
             request_db.close()
 
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(request_task, timeout=2)
+            await asyncio.wait_for(request_task, timeout=DB_PROGRESS_TIMEOUT)
 
         mock_manager.invalidate_cached_agents_for_owner.assert_called_once_with(user_id)
 

@@ -7,6 +7,7 @@ from sqlalchemy import select, text, update
 from sqlalchemy.exc import DataError, OperationalError
 from sqlalchemy.orm import sessionmaker
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.web.pool_contention_shared import GUARD_TIMEOUT
 from tests.web.services.task_database_shared import engine as engine_fixture
 from tests.web.services.task_database_shared import task_id as task_id_fixture
@@ -466,9 +467,9 @@ def test_preexecution_validation_waits_for_definitive_ownership(scenario, monkey
         )
         future = pool.submit(ls.validate_preacquired_task_lease_isolated, lease)
         try:
-            assert ready.wait(2)
+            assert ready.wait(DB_PROGRESS_TIMEOUT)
             with factory() as observer:
-                deadline = time.monotonic() + 2
+                deadline = time.monotonic() + DB_PROGRESS_TIMEOUT
                 while not observer.scalar(
                     text("select pg_blocking_pids(:pid)"), {"pid": pids[0]}
                 ):
@@ -479,7 +480,9 @@ def test_preexecution_validation_waits_for_definitive_ownership(scenario, monkey
                     time.sleep(0.005)
         finally:
             blocker.commit()
-        assert future.result(timeout=5) == ls.TaskLeaseRefreshState.LOST
+        assert (
+            future.result(timeout=DB_PROGRESS_TIMEOUT) == ls.TaskLeaseRefreshState.LOST
+        )
 
 
 @pytest.mark.asyncio

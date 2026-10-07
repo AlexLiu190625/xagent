@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.web.services.admission_capacity_shared import (
     release_bucket,
     saturate_bucket,
@@ -524,7 +525,7 @@ async def test_following_command_waits_for_reply_registration(
     def slow_handoff(command, lease):
         handoff = original(command, lease)
         committed.set()
-        assert release.wait(5)
+        assert release.wait(DB_PROGRESS_TIMEOUT)
         return handoff
 
     async def prepare(*args, **kwargs):
@@ -571,7 +572,7 @@ async def test_following_command_waits_for_reply_registration(
         await asyncio.sleep(0.05)
         effects.assert_not_awaited()
         release.set()
-        await asyncio.wait_for(asyncio.gather(resume, next_task), 5)
+        await asyncio.wait_for(asyncio.gather(resume, next_task), DB_PROGRESS_TIMEOUT)
         effects.assert_awaited_once()
     finally:
         release.set()

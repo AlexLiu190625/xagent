@@ -19,6 +19,7 @@ from tests.e2e.app_harness import (
     seed_registered_local_file,
 )
 from tests.e2e.minio_harness import MinioStorage, run_minio_storage
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.web.models.uploaded_file import UploadedFile
 
@@ -223,7 +224,7 @@ def test_startup_file_storage_sync_runs_after_startup_but_gates_client_service(
 
     try:
         app = app_queue.get(timeout=5)
-        assert sync_started.wait(timeout=5)
+        assert sync_started.wait(timeout=DB_PROGRESS_TIMEOUT)
 
         health_response = app.client.get("/health")
         assert health_response.status_code == 200
@@ -344,7 +345,7 @@ def test_startup_file_storage_sync_recovers_after_initial_storage_failure(
 
     try:
         app = app_queue.get(timeout=5)
-        assert first_attempt_failed.wait(timeout=5)
+        assert first_attempt_failed.wait(timeout=DB_PROGRESS_TIMEOUT)
 
         ready_response = app.client.get("/ready")
         assert ready_response.status_code == 503
@@ -356,7 +357,7 @@ def test_startup_file_storage_sync_recovers_after_initial_storage_failure(
             "Startup file storage sync failed"
         )
 
-        assert sync_completed.wait(timeout=5)
+        assert sync_completed.wait(timeout=DB_PROGRESS_TIMEOUT)
 
         recovered_client_response = app.client.get("/api/auth/setup-status")
         assert recovered_client_response.status_code == 200
