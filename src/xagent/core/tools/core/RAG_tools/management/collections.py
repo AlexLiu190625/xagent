@@ -23,6 +23,7 @@ from ..core.config import (
     DEFAULT_LANCEDB_SCAN_BATCH_SIZE,
     DEFAULT_VECTOR_STORE_EXTENDED_SCAN_LIMIT,
 )
+from ..core.exceptions import DatabaseOperationError
 from ..core.schemas import (
     CollectionDocumentMetadata,
     CollectionInfo,
@@ -53,7 +54,7 @@ from ..utils.user_scope import resolve_user_scope
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from ..kb import KBCoreManagementCompatibilityFacade
+    from ..kb import KBCoordinator, KBCoreManagementCompatibilityFacade
 
 DEFAULT_BATCH_SIZE = DEFAULT_LANCEDB_SCAN_BATCH_SIZE
 
@@ -1354,7 +1355,12 @@ def delete_document(
 
 
 def _delete_document_impl(
-    collection: str, doc_id: str, user_id: int, is_admin: bool = False
+    collection: str,
+    doc_id: str,
+    user_id: int,
+    is_admin: bool = False,
+    *,
+    coordinator: "KBCoordinator",
 ) -> DocumentOperationResult:
     """Delete a document and all its associated data.
 
@@ -1429,12 +1435,8 @@ def _delete_document_impl(
         authorized_via_legacy_source_path = owner_context.get("owner_user_id") is None
 
     try:
-        vector_store = get_vector_index_store()
-        counts = vector_store.delete_document_data(
-            collection_name=collection,
-            doc_id=doc_id,
-            user_id=user_id,
-            is_admin=is_admin,
+        counts = coordinator.delete_documents_data_sync(
+            collection, [doc_id], user_id=user_id, is_admin=is_admin
         )
         _clear_ingestion_status_impl(
             collection,
@@ -1443,13 +1445,25 @@ def _delete_document_impl(
             is_admin=is_admin or authorized_via_legacy_source_path,
         )
     except Exception as exc:  # noqa: BLE001
-        logger.error("Failed to delete document %s/%s: %s", collection, doc_id, exc)
+        # The store wraps delete failures; report the root cause as before.
+        cause = (
+            exc.__cause__
+            if isinstance(exc, DatabaseOperationError) and exc.__cause__ is not None
+            else exc
+        )
+        logger.error(
+            "Failed to delete document %s/%s: %s",
+            collection,
+            doc_id,
+            cause,
+            exc_info=True,
+        )
         return DocumentOperationResult(
             status="error",
             collection=collection,
             doc_id=doc_id,
             new_status=DocumentProcessingStatus.FAILED,
-            message=f"Failed to delete document: {exc}",
+            message=f"Failed to delete document: {cause}",
             warnings=[],
             details={},
         )

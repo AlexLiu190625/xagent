@@ -933,6 +933,25 @@ class KBCoordinator:
             )
         )
 
+    def delete_documents_data_sync(
+        self,
+        collection: str,
+        doc_ids: list[str],
+        *,
+        user_id: int | None,
+        is_admin: bool,
+    ) -> dict[str, int]:
+        """Open the collection handle and delete the documents' data."""
+        handle = self.open_collection_sync(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                hide_missing=True,
+            )
+        )
+        return handle.delete_documents_data(doc_ids, user_id=user_id, is_admin=is_admin)
+
     async def delete_collection(
         self,
         collection: str,

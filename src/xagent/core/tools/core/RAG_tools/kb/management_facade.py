@@ -136,6 +136,7 @@ class KBCoreManagementCompatibilityFacade:
                 doc_id=doc_id,
                 user_id=user_id,
                 is_admin=is_admin,
+                coordinator=self._active_coordinator(),
             )
 
     def delete_collection(

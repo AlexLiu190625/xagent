@@ -2314,7 +2314,7 @@ def test_document_and_status_compensation_without_ingestion_result() -> None:
         generate_deterministic_doc_id,
     )
 
-    vector_store = MagicMock()
+    coordinator = MagicMock()
     with (
         patch(
             "xagent.web.api.kb.get_session_local",
@@ -2324,7 +2324,7 @@ def test_document_and_status_compensation_without_ingestion_result() -> None:
             "xagent.web.api.kb._list_document_refs_for_uploaded_file",
             return_value=[],
         ),
-        patch("xagent.web.api.kb.get_vector_index_store", return_value=vector_store),
+        patch("xagent.web.api.kb.get_kb_coordinator", return_value=coordinator),
         patch("xagent.web.api.kb.clear_ingestion_status") as mock_clear_status,
     ):
         _create_document_compensation(
@@ -2334,11 +2334,8 @@ def test_document_and_status_compensation_without_ingestion_result() -> None:
             file_record_id="file-1",
         )(None)()
         doc_id = generate_deterministic_doc_id("test_collection", "file-1")
-        vector_store.delete_document_data.assert_called_once_with(
-            collection_name="test_collection",
-            doc_id=doc_id,
-            user_id=1,
-            is_admin=False,
+        coordinator.delete_documents_data_sync.assert_called_once_with(
+            "test_collection", [doc_id], user_id=1, is_admin=False
         )
         mock_clear_status.assert_called_once_with(
             "test_collection", doc_id, user_id=1, is_admin=False

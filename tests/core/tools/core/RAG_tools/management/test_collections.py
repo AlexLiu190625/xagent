@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,6 +13,7 @@ import pytest
 
 from src.xagent.core.tools.core.RAG_tools.core.exceptions import DatabaseOperationError
 from src.xagent.core.tools.core.RAG_tools.core.schemas import DocumentProcessingStatus
+from src.xagent.core.tools.core.RAG_tools.kb import KBCoordinator
 from src.xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils import (
     embeddings_table_name,
     to_model_tag,
@@ -1041,7 +1043,7 @@ def test_delete_document_authorizes_before_cascade() -> None:
         patch.object(
             collections_module, "get_vector_index_store", return_value=vector_store
         ),
-        patch.object(vector_store, "delete_document_data") as mock_delete_data,
+        patch.object(KBCoordinator, "delete_documents_data_sync") as mock_delete_data,
         patch.object(collections_module, "_clear_ingestion_status_impl") as mock_clear,
     ):
         result = delete_document("demo", "doc-1", user_id=7, is_admin=False)
@@ -1079,8 +1081,8 @@ def test_delete_document_allows_legacy_owner_recovered_from_source_path() -> Non
             collections_module, "get_vector_index_store", return_value=vector_store
         ),
         patch.object(
-            vector_store,
-            "delete_document_data",
+            KBCoordinator,
+            "delete_documents_data_sync",
             return_value={"documents": 1, "main_pointers": 1},
         ) as mock_delete_data,
         patch.object(collections_module, "_clear_ingestion_status_impl") as mock_clear,
@@ -1089,10 +1091,7 @@ def test_delete_document_allows_legacy_owner_recovered_from_source_path() -> Non
 
     assert result.status == "success"
     mock_delete_data.assert_called_once_with(
-        collection_name="demo",
-        doc_id="doc-legacy",
-        user_id=7,
-        is_admin=False,
+        "demo", ["doc-legacy"], user_id=7, is_admin=False
     )
     mock_clear.assert_called_once_with(
         "demo",
@@ -1130,7 +1129,7 @@ def test_delete_document_rejects_legacy_row_owned_by_another_user() -> None:
         patch.object(
             collections_module, "get_vector_index_store", return_value=vector_store
         ),
-        patch.object(vector_store, "delete_document_data") as mock_delete_data,
+        patch.object(KBCoordinator, "delete_documents_data_sync") as mock_delete_data,
         patch.object(collections_module, "_clear_ingestion_status_impl") as mock_clear,
     ):
         result = delete_document("demo", "doc-foreign", user_id=7, is_admin=False)
@@ -1150,8 +1149,8 @@ def test_delete_document_clears_status_with_caller_scope() -> None:
             collections_module, "get_vector_index_store", return_value=vector_store
         ),
         patch.object(
-            vector_store,
-            "delete_document_data",
+            KBCoordinator,
+            "delete_documents_data_sync",
             return_value={"documents": 1, "main_pointers": 1},
         ) as mock_delete_data,
         patch.object(collections_module, "_clear_ingestion_status_impl") as mock_clear,
@@ -1161,10 +1160,7 @@ def test_delete_document_clears_status_with_caller_scope() -> None:
     assert result.status == "success"
     assert result.details == {"documents": 1, "main_pointers": 1}
     mock_delete_data.assert_called_once_with(
-        collection_name="demo",
-        doc_id="doc-1",
-        user_id=9,
-        is_admin=True,
+        "demo", ["doc-1"], user_id=9, is_admin=True
     )
     mock_clear.assert_called_once_with(
         "demo",
@@ -1245,6 +1241,144 @@ def test_delete_document_cleans_failed_ingest_status_by_doc_id(
             is_admin=False,
         )
         == []
+    )
+
+
+def _seed_shared_doc_id(collection: str) -> None:
+    """Users 7 and 8 both own a ``doc`` row; user 7 also owns ``doc2``."""
+    now = datetime.now(timezone.utc)
+    owners = [("doc", 7), ("doc", 8), ("doc2", 7)]
+    _insert_documents(
+        [
+            {
+                "collection": collection,
+                "doc_id": doc_id,
+                "source_path": f"/uploads/user_{user_id}/{doc_id}.pdf",
+                "file_type": "pdf",
+                "content_hash": f"{doc_id}-{user_id}",
+                "uploaded_at": now,
+                "title": doc_id,
+                "language": "en",
+                "user_id": user_id,
+            }
+            for doc_id, user_id in owners
+        ]
+    )
+    _insert_embeddings(
+        "text-embedding-v3",
+        [
+            {
+                "collection": collection,
+                "doc_id": doc_id,
+                "chunk_id": f"{doc_id}-{user_id}",
+                "parse_hash": "ph",
+                "model": "text-embedding-v3",
+                "vector": [0.1, 0.2, 0.3],
+                "vector_dimension": 3,
+                "text": doc_id,
+                "chunk_hash": f"h-{doc_id}-{user_id}",
+                "created_at": now,
+                "metadata": "{}",
+                "user_id": user_id,
+            }
+            for doc_id, user_id in owners
+        ],
+    )
+    write_ingestion_status(collection, "doc", status="failed", user_id=7)
+
+
+def _remaining_rows(collection: str) -> dict[str, list[tuple[object, object]]]:
+    conn = get_vector_index_store().get_raw_connection()
+    tables = ["documents", "ingestion_runs", embeddings_table_name("text-embedding-v3")]
+    return {
+        table: sorted(
+            (row["doc_id"], row["user_id"])
+            for row in conn.open_table(table).to_arrow().to_pylist()
+            if row["collection"] == collection
+        )
+        for table in tables
+    }
+
+
+@pytest.mark.parametrize(
+    ("user_id", "is_admin", "documents_left"),
+    [(7, False, [("doc", 8), ("doc2", 7)]), (9, True, [("doc2", 7)])],
+)
+def test_delete_document_deletes_through_the_handle_the_same_rows(
+    temp_lancedb_dir: str,
+    monkeypatch: pytest.MonkeyPatch,
+    user_id: int,
+    is_admin: bool,
+    documents_left: list[tuple[str, int]],
+) -> None:
+    from src.xagent.core.tools.core.RAG_tools.kb.collection_handle import (
+        LanceDBCollectionHandle,
+    )
+
+    _seed_shared_doc_id("global_path")
+    _seed_shared_doc_id("handle_path")
+    get_vector_index_store().delete_document_data(
+        collection_name="global_path", doc_id="doc", user_id=user_id, is_admin=is_admin
+    )
+    calls: list[tuple[str, list[str]]] = []
+    delete_documents_data = LanceDBCollectionHandle.delete_documents_data
+
+    def _spy(self, doc_ids, **kwargs):
+        calls.append((self.context.collection, list(doc_ids)))
+        return delete_documents_data(self, doc_ids, **kwargs)
+
+    monkeypatch.setattr(LanceDBCollectionHandle, "delete_documents_data", _spy)
+
+    result = delete_document("handle_path", "doc", user_id=user_id, is_admin=is_admin)
+
+    assert result.status == "success"
+    assert calls == [("handle_path", ["doc"])]
+    assert _remaining_rows("handle_path") == _remaining_rows("global_path")
+    assert _remaining_rows("handle_path")["documents"] == documents_left
+
+
+def test_delete_document_reports_the_store_error(
+    temp_lancedb_dir: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from src.xagent.core.tools.core.RAG_tools.storage import lancedb_stores
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("boom")
+
+    _seed_shared_doc_id("c")
+    monkeypatch.setattr(lancedb_stores, "_vis_cascade_delete_documents", _boom)
+
+    result = delete_document("c", "doc", user_id=7, is_admin=False)
+
+    assert (result.status, result.message) == (
+        "error",
+        "Failed to delete document: boom",
+    )
+    [record] = [r for r in caplog.records if r.getMessage().startswith("Failed to")]
+    assert record.getMessage() == "Failed to delete document c/doc: boom"
+    assert record.exc_info is not None
+
+
+def test_delete_document_reports_an_unknown_backend_as_is(
+    temp_lancedb_dir: str,
+) -> None:
+    from src.xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+
+    _seed_shared_doc_id("c")
+    asyncio.run(
+        get_metadata_store().save_collection(
+            CollectionInfo(name="c", extra_metadata={"kb_storage": "bogus"})
+        )
+    )
+
+    result = delete_document("c", "doc", user_id=7, is_admin=False)
+
+    assert (result.status, result.message) == (
+        "error",
+        "Failed to delete document: Invalid kb_storage backend 'bogus'; "
+        "choose one of: lancedb",
     )
 
 

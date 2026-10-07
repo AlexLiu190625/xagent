@@ -997,12 +997,8 @@ def _delete_web_rag_side_effects_for_file_id(
         return
 
     doc_id = generate_deterministic_doc_id(collection_name, file_id)
-    vector_store = get_vector_index_store()
-    vector_store.delete_document_data(
-        collection_name=collection_name,
-        doc_id=doc_id,
-        user_id=user_id,
-        is_admin=is_admin,
+    get_kb_coordinator().delete_documents_data_sync(
+        collection_name, [doc_id], user_id=user_id, is_admin=is_admin
     )
     clear_ingestion_status(
         collection_name,
