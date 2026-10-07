@@ -16,7 +16,7 @@ if TYPE_CHECKING:
         EmbeddingReadResponse,
         EmbeddingWriteResponse,
     )
-    from .collection_handle import LanceDBCollectionHandle
+    from .collection_handle import KBCollectionHandle
     from .coordinator import KBCoordinator
     from .storage_shim import KBStorageShimCompatibilityFacade
 
@@ -68,7 +68,7 @@ class KBVectorStorageCompatibilityFacade:
 
     def _open_collection_handle(
         self, collection: str, *, user_id: Optional[int], is_admin: bool
-    ) -> "LanceDBCollectionHandle":
+    ) -> "KBCollectionHandle":
         """Open the collection handle that owns embedding storage (#510).
 
         Routed through the active coordinator so an injected shim keeps

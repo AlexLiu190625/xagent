@@ -32,7 +32,7 @@ from .chunk_strategies import (
 
 if TYPE_CHECKING:
     from ..kb import KBLegacyStepCompatibilityFacade
-    from ..kb.collection_handle import LanceDBCollectionHandle
+    from ..kb.collection_handle import KBCollectionHandle
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +132,7 @@ def _chunk_document_impl(
     user_id: Optional[int] = None,
     is_admin: bool = False,
     *,
-    handle: "LanceDBCollectionHandle",
+    handle: "KBCollectionHandle",
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """

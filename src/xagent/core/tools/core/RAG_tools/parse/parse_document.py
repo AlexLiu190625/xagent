@@ -32,7 +32,7 @@ from ..utils.hash_utils import compute_parse_hash, get_parse_params_whitelist
 
 if TYPE_CHECKING:
     from ..kb import KBLegacyStepCompatibilityFacade
-    from ..kb.collection_handle import LanceDBCollectionHandle
+    from ..kb.collection_handle import KBCollectionHandle
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +77,7 @@ def _parse_document_impl(
     progress_callback: Optional[Any] = None,
     source_path_override: Optional[str] = None,
     *,
-    handle: "LanceDBCollectionHandle",
+    handle: "KBCollectionHandle",
 ) -> Dict[str, Any]:
     """
     Parse a document using the specified method.
@@ -118,7 +118,7 @@ async def _parse_document_internal(
     request: ParseDocumentRequest,
     progress_callback: Optional[Any] = None,
     *,
-    handle: "LanceDBCollectionHandle",
+    handle: "KBCollectionHandle",
 ) -> ParseDocumentResponse:
     """
     Internal document parsing logic.

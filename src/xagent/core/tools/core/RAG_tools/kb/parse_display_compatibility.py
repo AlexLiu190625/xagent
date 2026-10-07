@@ -10,7 +10,7 @@ from .models import KBAccessMode, KBContextRequest
 
 if TYPE_CHECKING:
     from ..core.schemas import ParsedElementDisplay
-    from .collection_handle import LanceDBCollectionHandle
+    from .collection_handle import KBCollectionHandle
     from .coordinator import KBCoordinator
     from .storage_shim import KBStorageShimCompatibilityFacade
 
@@ -59,7 +59,7 @@ class KBParseDisplayCompatibilityFacade:
 
     def _open_collection_handle(
         self, collection: str, *, user_id: int | None, is_admin: bool
-    ) -> "LanceDBCollectionHandle":
+    ) -> "KBCollectionHandle":
         """Open the read-only collection handle that owns parse storage (#509)."""
         return self._active_coordinator().open_collection_sync(
             KBContextRequest(

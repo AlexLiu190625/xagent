@@ -18,7 +18,7 @@ from ..core.schemas import (
 
 if TYPE_CHECKING:
     from ..kb import KBParseDisplayCompatibilityFacade
-    from ..kb.collection_handle import LanceDBCollectionHandle
+    from ..kb.collection_handle import KBCollectionHandle
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +68,7 @@ def _reconstruct_parse_result_from_db_impl(
     user_id: Optional[int] = None,
     is_admin: bool = False,
     *,
-    handle: "LanceDBCollectionHandle",
+    handle: "KBCollectionHandle",
 ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     """Implementation for reconstruct_parse_result_from_db.
 

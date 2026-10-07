@@ -62,6 +62,7 @@ from ..core.schemas import (
     SearchResult,
     SearchWarning,
     SparseSearchResponse,
+    StepType,
 )
 from ..LanceDB.model_tag_utils import to_model_tag
 from ..LanceDB.schema_manager import (
@@ -276,7 +277,7 @@ def _restore_document_table_rows(
 class KBHandleProvider:
     """Open collection-scoped handles for resolved KB contexts."""
 
-    def open(self, context: KBCollectionContext) -> LanceDBCollectionHandle:
+    def open(self, context: KBCollectionContext) -> KBCollectionHandle:
         """Return a backend-specific handle for the resolved collection context."""
         if context.backend is KBStorageBackend.LANCEDB:
             return LanceDBCollectionHandle(context)
@@ -910,7 +911,6 @@ class KBCollectionHandle(ABC):
     ) -> None:
         """Rename control-plane metadata from this collection's name to ``new_name``.
 
-        Async – this is the **only** async method on ``KBCollectionHandle``.
         Wraps ``await metadata_store.rename_collection(...)`` to update the
         ``collection_config`` and ``collection_metadata`` rows.
 
@@ -1063,6 +1063,247 @@ class KBCollectionHandle(ABC):
         Returns:
             Sorted list of unique doc_id strings.
         """
+
+    # --- Ingestion-status data-plane (#513) ---
+
+    @abstractmethod
+    def write_ingestion_status(
+        self,
+        doc_id: str,
+        *,
+        status: str,
+        message: str | None = None,
+        parse_hash: str | None = None,
+        user_id: int | None = None,
+    ) -> None:
+        """Write ingestion status for a document in this collection."""
+
+    @abstractmethod
+    def load_ingestion_status(
+        self,
+        *,
+        doc_id: str | None = None,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Load ingestion status rows for this collection."""
+
+    @abstractmethod
+    def clear_ingestion_status(
+        self, doc_id: str, *, user_id: int | None = None, is_admin: bool = False
+    ) -> None:
+        """Remove the ingestion status row for a document in this collection."""
+
+    @abstractmethod
+    async def write_ingestion_status_async(
+        self,
+        doc_id: str,
+        *,
+        status: str,
+        message: str | None = None,
+        parse_hash: str | None = None,
+        user_id: int | None = None,
+    ) -> None:
+        """Async :meth:`write_ingestion_status`."""
+
+    @abstractmethod
+    async def load_ingestion_status_async(
+        self,
+        *,
+        doc_id: str | None = None,
+        user_id: int | None = None,
+        is_admin: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Async :meth:`load_ingestion_status`."""
+
+    @abstractmethod
+    async def clear_ingestion_status_async(
+        self, doc_id: str, *, user_id: int | None = None, is_admin: bool = False
+    ) -> None:
+        """Async :meth:`clear_ingestion_status`."""
+
+    # --- Main-pointer data-plane (#513) ---
+
+    @abstractmethod
+    def get_main_pointer(
+        self, doc_id: str, step_type: str, model_tag: str | None = None
+    ) -> Optional[Dict[str, Any]]:
+        """Return the main pointer for a document stage, or ``None``.
+
+        Known LanceDB deviation (#2858): with ``model_tag=None`` it never
+        matches, since the ``IS NULL`` / ``= ''`` alternatives are passed as a tuple
+        and combined with AND. New engines should not treat that as the reference.
+        """
+
+    @abstractmethod
+    def set_main_pointer(
+        self,
+        doc_id: str,
+        step_type: str,
+        semantic_id: str,
+        technical_id: str,
+        model_tag: str | None = None,
+        operator: str | None = None,
+    ) -> None:
+        """Set or update the main pointer for a document stage."""
+
+    @abstractmethod
+    def list_main_pointers(
+        self, doc_id: str | None = None, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """List main pointers for this collection.
+
+        Known LanceDB deviation (#2858): on lancedb 0.33 it raises
+        ``MainPointerError`` (the empty query builder has no ``count_rows``).
+        """
+
+    @abstractmethod
+    def delete_main_pointer(
+        self, doc_id: str, step_type: str, model_tag: str | None = None
+    ) -> bool:
+        """Delete the main pointer for a document stage; ``True`` if one existed.
+
+        Known LanceDB deviation (#2858): with ``model_tag=None`` it never
+        matches, for the same reason as :meth:`get_main_pointer`, so it deletes
+        nothing.
+        """
+
+    # --- Version candidates and promotion (#513) ---
+
+    @abstractmethod
+    def list_candidates(
+        self,
+        doc_id: str,
+        step_type: StepType | str,
+        model_tag: Optional[str] = None,
+        state: Optional[str] = None,
+        limit: int = 50,
+        order_by: str = "created_at desc",
+    ) -> Dict[str, Any]:
+        """List version candidates for a document stage in this collection.
+
+        Returns:
+            A ``dict`` with these keys:
+            - ``"candidates"`` – candidate rows after the state filter, sort and limit
+            - ``"total_count"`` – rows matching the state filter, before the limit
+            - ``"returned_count"`` – number of rows in ``"candidates"``
+            - ``"step_type"`` – the resolved step type value
+            - ``"model_tag"`` – the requested model tag
+            - ``"filters"`` – the requested ``state``, ``limit`` and ``order_by``
+        """
+
+    @abstractmethod
+    def promote_version_main(
+        self,
+        doc_id: str,
+        step_type: StepType | str,
+        selected_id: str,
+        operator: Optional[str] = None,
+        preview_only: bool = False,
+        confirm: bool = False,
+        model_tag: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Promote a candidate version to main for a document stage.
+
+        Returns:
+            A ``dict`` with these keys:
+            - ``"promoted"`` – ``True`` only when the promotion was executed
+            - ``"preview"`` – ``True`` when only a preview was returned
+            - ``"main_pointer"`` – ``step_type``, ``semantic_id``, ``technical_id``
+              and ``model_tag`` of the selected candidate
+            - ``"deleted_counts"`` – per-table counts, planned for a preview and
+              actual after execution
+            - ``"notes"`` – hints such as ``"Requires re-embed"``
+            - ``"message"`` – preview only
+            - ``"operator"`` – executed promotion only
+        """
+
+    # --- Rollback snapshot/restore primitives (#513) ---
+
+    @abstractmethod
+    def capture_status_snapshot(
+        self, doc_id: str, *, user_id: int | None = None, is_admin: bool = True
+    ) -> List[Dict[str, Any]]:
+        """Capture ``doc_id``'s ingestion-status rows (empty list if absent)."""
+
+    @abstractmethod
+    def restore_status_snapshot(
+        self, doc_id: str, snapshot: List[Dict[str, Any]], *, user_id: int | None = None
+    ) -> None:
+        """Rewrite the snapshot's status rows, or clear the row if it is empty."""
+
+    @abstractmethod
+    def clear_status_snapshot(
+        self, doc_id: str, *, user_id: int | None = None, is_admin: bool = True
+    ) -> None:
+        """Clear ``doc_id``'s ingestion-status row after a rollback."""
+
+    @abstractmethod
+    def capture_main_pointer_snapshot(
+        self, doc_id: str, step_type: str, model_tag: str | None = None
+    ) -> KBMainPointerSnapshot:
+        """Capture the current main pointer (``pointer=None`` if absent)."""
+
+    @abstractmethod
+    def restore_main_pointer_snapshot(
+        self, snapshot: KBMainPointerSnapshot, *, operator: str | None = None
+    ) -> bool:
+        """Restore or delete the pointer; ``False`` if the snapshot is incomplete."""
+
+    @abstractmethod
+    def capture_candidate_cleanup_snapshot(
+        self,
+        doc_id: str,
+        scope: str,
+        *,
+        new_parse_hash: str | None = None,
+        old_parse_hash: str | None = None,
+        model_tag: str | None = None,
+        user_id: int | None = None,
+        is_admin: bool | None = None,
+    ) -> KBVersionCandidateCleanupSnapshot:
+        """Preview what candidate cleanup would delete, without deleting."""
+
+    def restore_candidate_cleanup_snapshot(
+        self,
+        snapshot: KBVersionCandidateCleanupSnapshot,
+        *,
+        cleanup_executed: bool = False,
+    ) -> KBVersionCandidateRollbackResult:
+        """Assess rollback feasibility for a candidate-cleanup snapshot.
+
+        When ``cleanup_executed=True`` and the snapshot recorded side effects,
+        returns a result with ``status="incomplete"``, ``restorable=False``,
+        and ``side_effects_may_remain=True`` — the inspectable-incomplete
+        invariant.  Never issues further deletes; the state is left inspectable.
+        """
+        cleanup_counts = dict(snapshot.cleanup_counts)
+        has_candidate_side_effects = any(
+            int(count) > 0 for count in cleanup_counts.values()
+        )
+        if not cleanup_executed or not has_candidate_side_effects:
+            return KBVersionCandidateRollbackResult(
+                collection=snapshot.collection,
+                doc_id=snapshot.doc_id,
+                status="not_needed",
+                restorable=True,
+                cleanup_counts=cleanup_counts,
+            )
+
+        return KBVersionCandidateRollbackResult(
+            collection=snapshot.collection,
+            doc_id=snapshot.doc_id,
+            status="incomplete",
+            skipped=True,
+            restorable=False,
+            reason="candidate_cleanup_not_restorable",
+            cleanup_counts=cleanup_counts,
+            warnings=(
+                "Version candidate cleanup cannot be restored from the handle; "
+                "preserve visible rollback state and report remaining side effects.",
+            ),
+            side_effects_may_remain=True,
+        )
 
 
 @dataclass(frozen=True)
@@ -3869,8 +4110,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
     ) -> None:
         """Rename control-plane metadata rows to ``new_name``.
 
-        This is the **only** async method on ``KBCollectionHandle``.  It wraps
-        ``await metadata_store.rename_collection(...)`` which updates the
+        It wraps ``await metadata_store.rename_collection(...)`` which updates the
         ``collection_config`` and ``collection_metadata`` rows.  The coordinator
         calls this directly with ``await`` (no ``asyncio.to_thread`` wrapper
         needed, unlike the two sync rename primitives above).
@@ -4256,47 +4496,6 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             model_tag=model_tag,
             user_id=user_id,
             is_admin=is_admin,
-        )
-
-    def restore_candidate_cleanup_snapshot(
-        self,
-        snapshot: "KBVersionCandidateCleanupSnapshot",
-        *,
-        cleanup_executed: bool = False,
-    ) -> "KBVersionCandidateRollbackResult":
-        """Assess rollback feasibility for a candidate-cleanup snapshot.
-
-        When ``cleanup_executed=True`` and the snapshot recorded side effects,
-        returns a result with ``status="incomplete"``, ``restorable=False``,
-        and ``side_effects_may_remain=True`` — the inspectable-incomplete
-        invariant.  Never issues further deletes; the state is left inspectable.
-        """
-        cleanup_counts = dict(snapshot.cleanup_counts)
-        has_candidate_side_effects = any(
-            int(count) > 0 for count in cleanup_counts.values()
-        )
-        if not cleanup_executed or not has_candidate_side_effects:
-            return KBVersionCandidateRollbackResult(
-                collection=snapshot.collection,
-                doc_id=snapshot.doc_id,
-                status="not_needed",
-                restorable=True,
-                cleanup_counts=cleanup_counts,
-            )
-
-        return KBVersionCandidateRollbackResult(
-            collection=snapshot.collection,
-            doc_id=snapshot.doc_id,
-            status="incomplete",
-            skipped=True,
-            restorable=False,
-            reason="candidate_cleanup_not_restorable",
-            cleanup_counts=cleanup_counts,
-            warnings=(
-                "Version candidate cleanup cannot be restored from the handle; "
-                "preserve visible rollback state and report remaining side effects.",
-            ),
-            side_effects_may_remain=True,
         )
 
     async def write_ingestion_status_async(

@@ -34,7 +34,7 @@ from .operation_compatibility import (
 )
 
 if TYPE_CHECKING:
-    from .collection_handle import LanceDBCollectionHandle
+    from .collection_handle import KBCollectionHandle
     from .coordinator import KBCoordinator
     from .storage_shim import KBStorageShimCompatibilityFacade
 
@@ -174,7 +174,7 @@ class KBLegacyStepCompatibilityFacade:
         *,
         user_id: Optional[int],
         is_admin: bool,
-    ) -> "LanceDBCollectionHandle":
+    ) -> "KBCollectionHandle":
         """Open the collection handle that owns parse/chunk storage (#509).
 
         Routed through the active coordinator so an injected shim keeps

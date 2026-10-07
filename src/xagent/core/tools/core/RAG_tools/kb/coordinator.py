@@ -33,11 +33,11 @@ from ..utils.user_scope import resolve_user_scope
 from .api_compatibility import KBApiCompatibilityFacade
 from .async_utils import maybe_await
 from .collection_handle import (
+    KBCollectionHandle,
     KBHandleProvider,
     KBMainPointerSnapshot,
     KBVersionCandidateCleanupSnapshot,
     KBVersionCandidateRollbackResult,
-    LanceDBCollectionHandle,
 )
 from .file_compatibility import KBFileCompatibilityFacade
 from .legacy_step_compatibility import KBLegacyStepCompatibilityFacade
@@ -341,16 +341,12 @@ class KBCoordinator:
         """Synchronous wrapper for legacy compatibility surfaces."""
         return _run_in_separate_loop(self.get_context(request))
 
-    async def open_collection(
-        self, request: KBContextRequest
-    ) -> LanceDBCollectionHandle:
+    async def open_collection(self, request: KBContextRequest) -> KBCollectionHandle:
         """Open a thin collection handle for the resolved context."""
         context = await self.get_context(request)
         return self._handle_provider.open(context)
 
-    def open_collection_sync(
-        self, request: KBContextRequest
-    ) -> LanceDBCollectionHandle:
+    def open_collection_sync(self, request: KBContextRequest) -> KBCollectionHandle:
         """Synchronous wrapper for opening a collection handle."""
         return _run_in_separate_loop(self.open_collection(request))
 
@@ -964,14 +960,14 @@ class KBCoordinator:
         """Delete a collection by routing through the collection handle.
 
         When ``is_admin`` is ``True`` all rows are deleted via
-        :meth:`LanceDBCollectionHandle.delete_collection_data`.  For a tenant
+        :meth:`KBCollectionHandle.delete_collection_data`.  For a tenant
         caller, only the rows identified by ``doc_ids`` are removed via
-        :meth:`LanceDBCollectionHandle.delete_documents_data`.  When
+        :meth:`KBCollectionHandle.delete_documents_data`.  When
         ``doc_ids`` is ``None`` or empty and ``is_admin`` is ``False`` the
         data plane is left untouched (config-only path).
 
         ``delete_orphaned_metadata=True`` (default) additionally removes the
-        collection config row via :meth:`LanceDBCollectionHandle.delete_collection_config`.
+        collection config row via :meth:`KBCollectionHandle.delete_collection_config`.
 
         Returns:
             :class:`CollectionOperationResult` with status ``success``,
@@ -1164,9 +1160,9 @@ class KBCoordinator:
         """Rename a collection's data, status, and metadata in best-effort order.
 
         Calls three handle primitives sequentially:
-        1. :meth:`LanceDBCollectionHandle.rename_collection_data` – vector-side data tables
-        2. :meth:`LanceDBCollectionHandle.rename_collection_status` – ingestion status rows
-        3. :meth:`LanceDBCollectionHandle.rename_collection_metadata` – control-plane metadata (async)
+        1. :meth:`KBCollectionHandle.rename_collection_data` – vector-side data tables
+        2. :meth:`KBCollectionHandle.rename_collection_status` – ingestion status rows
+        3. :meth:`KBCollectionHandle.rename_collection_metadata` – control-plane metadata (async)
 
         Each step is best-effort: if one raises, the error is recorded as a
         warning and the remaining steps still execute.
