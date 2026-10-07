@@ -694,26 +694,6 @@ class VectorIndexStore(ABC):
         """
 
     @abstractmethod
-    def aggregate_document_stats(
-        self,
-        collection_name: str,
-        doc_id: str,
-        user_id: Optional[int],
-        is_admin: bool,
-    ) -> Dict[str, int]:
-        """Aggregate statistics for a single document.
-
-        Returns:
-            Dictionary with counts:
-            {
-                "documents": int,
-                "parses": int,
-                "chunks": int,
-                "embeddings": int,
-            }
-        """
-
-    @abstractmethod
     def list_table_names(self) -> Sequence[str]:
         """List backend table names."""
 

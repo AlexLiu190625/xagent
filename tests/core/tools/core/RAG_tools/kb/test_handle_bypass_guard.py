@@ -23,7 +23,7 @@ IMPLEMENTATIONS = (
 # VectorIndexStore methods that read or delete chunk/embedding rows.
 ROW_METHODS = frozenset(
     """
-    aggregate_collection_stats aggregate_document_counts aggregate_document_stats
+    aggregate_collection_stats aggregate_document_counts
     cascade_delete cleanup_cascade_by_scope cleanup_cascade_by_scope_async
     delete_chunk_records delete_collection_data delete_document_data
     delete_documents_data delete_embedding_records list_indexed_doc_refs
@@ -47,23 +47,6 @@ INFERS_MODEL = "infers the embedding model from embeddings_* tables"
 
 # Existing bypasses: how often each one occurs and what it is for.
 ALLOWLIST: dict[str, dict[tuple[str, str], tuple[int, str]]] = {
-    "xagent/core/tools/core/RAG_tools/management/collections.py": {
-        ("_list_collections_impl", "aggregate_collection_stats"): (
-            1,
-            "collection list stats",
-        ),
-        ("_list_documents_impl", "aggregate_document_counts"): (
-            2,
-            "document list counts",
-        ),
-        ("_list_documents_impl", "list_table_names"): (1, "document list counts"),
-        ("_get_document_stats_impl", "aggregate_document_stats"): (
-            1,
-            "document stats",
-        ),
-        ("_get_document_stats_impl", "count_rows"): (2, "document stats"),
-        ("_get_document_stats_impl", "list_table_names"): (1, "document stats"),
-    },
     "xagent/core/tools/core/RAG_tools/management/collection_manager.py": {
         ("_rebuild_collection_stats_impl", "aggregate_collection_stats"): (
             1,

@@ -1501,56 +1501,6 @@ class LanceDBVectorIndexStore(VectorIndexStore):
 
         return stats
 
-    def aggregate_document_stats(
-        self,
-        collection_name: str,
-        doc_id: str,
-        user_id: Optional[int],
-        is_admin: bool,
-    ) -> Dict[str, int]:
-        """Aggregate statistics for a single document."""
-        from ..LanceDB.schema_manager import (
-            _safe_close_table,
-            ensure_chunks_table,
-            ensure_documents_table,
-            ensure_parses_table,
-        )
-
-        stats = {"documents": 0, "parses": 0, "chunks": 0, "embeddings": 0}
-        conn = self._get_connection()
-
-        # Ensure tables exist
-        ensure_documents_table(conn)
-        ensure_parses_table(conn)
-        ensure_chunks_table(conn)
-
-        safe_collection = escape_lancedb_string(collection_name)
-        safe_doc_id = escape_lancedb_string(doc_id)
-
-        base_filter = f"collection = '{safe_collection}' AND doc_id = '{safe_doc_id}'"
-
-        def _count_table(table_name: str) -> int:
-            table = None
-            try:
-                table = conn.open_table(table_name)
-                return int(table.count_rows(base_filter))
-            except Exception:  # noqa: BLE001
-                return 0
-            finally:
-                _safe_close_table(table)
-
-        stats["documents"] = _count_table("documents")
-        stats["parses"] = _count_table("parses")
-        stats["chunks"] = _count_table("chunks")
-
-        # Count embeddings across all embeddings tables
-        for table_name in self.list_table_names():
-            if not table_name.startswith("embeddings_"):
-                continue
-            stats["embeddings"] += _count_table(table_name)
-
-        return stats
-
     def create_index(self, model_tag: str, readonly: bool = False) -> IndexResult:
         """Create or check vector index for embeddings table.
 

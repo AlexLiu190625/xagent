@@ -196,6 +196,16 @@ def test_coordinator_management_facade_uses_instance_storage() -> None:
         def get_ingestion_status_store(self) -> IngestionStatusStore:
             return self.status_store
 
+        def get_metadata_store(self):
+            metadata = MagicMock()
+            metadata.get_collection = AsyncMock(
+                side_effect=ValueError("Collection 'docs' not found")
+            )
+            return metadata
+
+        def get_main_pointer_store(self):
+            return MagicMock()
+
     vector_store = VectorStore()
     status_store = IngestionStatusStore()
 

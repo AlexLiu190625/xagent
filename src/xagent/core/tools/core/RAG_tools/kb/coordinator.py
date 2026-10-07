@@ -134,10 +134,10 @@ class KBCoordinator:
         api_compatibility: KBApiCompatibilityFacade | None = None,
     ) -> None:
         self._storage_factory = storage_factory or StorageFactory.get_factory()
-        self._handle_provider = handle_provider or KBHandleProvider()
         self._storage_shim = storage_shim or KBStorageShimCompatibilityFacade(
             storage_factory=self._storage_factory
         )
+        self._handle_provider = handle_provider or KBHandleProvider(self._storage_shim)
         self._file_compatibility = file_compatibility or KBFileCompatibilityFacade(
             storage_shim=self._storage_shim
         )
@@ -481,6 +481,41 @@ class KBCoordinator:
             self.delete_document_record(
                 collection, doc_id, user_id=user_id, is_admin=is_admin
             )
+        )
+
+    # --- Statistics ---
+
+    def aggregate_collection_stats_sync(
+        self, *, user_id: int | None, is_admin: bool
+    ) -> dict[str, dict[str, int]]:
+        """Return per-collection stats for the deployment engine in one batch."""
+        return self._handle_provider.aggregate_collection_stats(
+            user_id=user_id, is_admin=is_admin
+        )
+
+    def count_rows_by_document_sync(
+        self,
+        collection: str,
+        *,
+        user_id: int | None,
+        is_admin: bool,
+        doc_id: str | None = None,
+    ) -> dict[str, dict[str, int]]:
+        """Open the collection handle and count rows per document.
+
+        The handle follows the collection binding while the list stats follow
+        the deployment engine; with one engine per deployment they are equal.
+        """
+        handle = self.open_collection_sync(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                hide_missing=True,
+            )
+        )
+        return handle.count_rows_by_document(
+            user_id=user_id, is_admin=is_admin, doc_id=doc_id
         )
 
     # --- Search lifecycle (delegated to the collection handle) ---

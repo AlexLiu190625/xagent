@@ -8,8 +8,8 @@ API, ``/health`` included, for the scan's duration.
 The blocking calls live at two layers, and each is asserted where it belongs:
 
 * The vector-store scans (``iter_batches`` behind ``_scan_document_rows``, and
-  ``aggregate_collection_stats``) are plain sync methods, so
-  ``_list_collections_impl`` dispatches them itself.
+  ``aggregate_collection_stats`` behind the coordinator's batched stats entry)
+  are plain sync methods, so ``_list_collections_impl`` dispatches them itself.
 * The metadata-store calls (``list_collections``, ``save_collections``,
   ``get_collection_config``) are ``async def`` on the ``MetadataStore`` ABC, so
   the caller *cannot* wrap them: ``asyncio.to_thread`` on a coroutine function
@@ -27,6 +27,7 @@ import threading
 import pyarrow as pa
 import pytest
 
+from xagent.core.tools.core.RAG_tools.kb import KBCoordinator
 from xagent.core.tools.core.RAG_tools.management import (
     collections as collections_module,
 )
@@ -95,6 +96,14 @@ class _SlowVectorStore:
         return {"kb1": {"documents": 1, "parses": 1, "chunks": 1, "embeddings": 1}}
 
 
+class _StoreFactory:
+    def __init__(self, vector_store) -> None:
+        self._vector_store = vector_store
+
+    def get_vector_index_store(self):
+        return self._vector_store
+
+
 class _EmptyMetadataStore:
     """Instant metadata store, so only the vector-store calls are measured."""
 
@@ -117,17 +126,16 @@ async def test_each_vector_store_scan_runs_off_the_event_loop(monkeypatch):
     enough idle time to cover for it.
     """
     async with _Heartbeat() as heartbeat:
-        monkeypatch.setattr(
-            collections_module,
-            "get_vector_index_store",
-            lambda: _SlowVectorStore(heartbeat),
-        )
+        store = _SlowVectorStore(heartbeat)
+        monkeypatch.setattr(collections_module, "get_vector_index_store", lambda: store)
         monkeypatch.setattr(
             collections_module, "get_metadata_store", lambda: _EmptyMetadataStore()
         )
 
         result = await collections_module._list_collections_impl(
-            user_id=1, is_admin=False
+            user_id=1,
+            is_admin=False,
+            coordinator=KBCoordinator(storage_factory=_StoreFactory(store)),
         )
 
     assert result.status == "success"

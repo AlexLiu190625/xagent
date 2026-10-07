@@ -1504,12 +1504,17 @@ async def _rebuild_collection_metadata_impl() -> None:
 
                         break
 
-            # Update collection with embedding info
-            updated_collection = collection.model_copy(
-                update={
-                    "embedding_model_id": embedding_model_id,
-                    "embedding_dimension": embedding_dimension,
-                }
+            # Vectors the engine counts but no embeddings_* table holds: keep the
+            # stored model. Zero vectors still clear it so the KB can be rebound.
+            updated_collection = (
+                collection
+                if collection.embeddings > 0 and embedding_model_id is None
+                else collection.model_copy(
+                    update={
+                        "embedding_model_id": embedding_model_id,
+                        "embedding_dimension": embedding_dimension,
+                    }
+                )
             )
 
             # Use the async save_collection method through sync wrapper

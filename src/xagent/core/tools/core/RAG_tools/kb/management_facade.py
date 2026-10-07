@@ -85,6 +85,7 @@ class KBCoreManagementCompatibilityFacade:
                 user_id=user_id,
                 is_admin=is_admin,
                 force_realtime=force_realtime,
+                coordinator=self._active_coordinator(),
             )
 
     def list_documents(
@@ -100,6 +101,7 @@ class KBCoreManagementCompatibilityFacade:
                 collection=collection,
                 user_id=user_id,
                 is_admin=is_admin,
+                coordinator=self._active_coordinator(),
             )
 
     def get_document_stats(
@@ -119,6 +121,7 @@ class KBCoreManagementCompatibilityFacade:
                 model_tag=model_tag,
                 user_id=user_id,
                 is_admin=is_admin,
+                coordinator=self._active_coordinator(),
             )
 
     def delete_document(

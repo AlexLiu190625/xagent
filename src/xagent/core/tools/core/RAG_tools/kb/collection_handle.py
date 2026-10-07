@@ -82,11 +82,21 @@ from ..storage.contracts import (
     MainPointerStore,
     MetadataStore,
     VectorIndexStore,
+    build_filter_from_dict,
+)
+from ..storage.vector_backend import (
+    get_configured_vector_backend,
+    require_implemented_vector_backend,
 )
 from ..utils import check_file_type, compute_file_hash
 from ..utils.filter_utils import parse_legacy_filters, validate_filter_depth
 from ..utils.hash_utils import compute_chunk_hash
-from ..utils.lancedb_query_utils import build_fts_query, list_table_names, query_to_list
+from ..utils.lancedb_query_utils import (
+    _safe_count_rows,
+    build_fts_query,
+    list_table_names,
+    query_to_list,
+)
 from ..utils.metadata_utils import deserialize_metadata, serialize_metadata
 from ..utils.string_utils import escape_lancedb_string, generate_deterministic_doc_id
 from .models import (
@@ -95,6 +105,7 @@ from .models import (
     KBDocumentRowsSnapshot,
     KBStorageBackend,
 )
+from .storage_shim import KBStorageShimCompatibilityFacade
 from .version_compatibility import (
     KBMainPointerSnapshot,
     KBVersionCandidateCleanupSnapshot,
@@ -274,8 +285,24 @@ def _restore_document_table_rows(
         table.delete(_any_of(delete_filters))
 
 
+def deployment_kb_backend() -> KBStorageBackend:
+    """Return the KB engine of this deployment.
+
+    A deployment runs one engine for now, so every collection binding equals it.
+    Raises ``ConfigurationError`` for a known engine that is not implemented.
+    """
+    backend = get_configured_vector_backend()
+    require_implemented_vector_backend(backend)
+    return KBStorageBackend(backend.value)
+
+
 class KBHandleProvider:
     """Open collection-scoped handles for resolved KB contexts."""
+
+    def __init__(
+        self, storage_shim: KBStorageShimCompatibilityFacade | None = None
+    ) -> None:
+        self._storage_shim = storage_shim or KBStorageShimCompatibilityFacade()
 
     def open(self, context: KBCollectionContext) -> KBCollectionHandle:
         """Return a backend-specific handle for the resolved collection context."""
@@ -286,11 +313,27 @@ class KBHandleProvider:
             "KBHandleProvider"
         )
 
+    def aggregate_collection_stats(
+        self, *, user_id: int | None, is_admin: bool
+    ) -> dict[str, dict[str, int]]:
+        """Return per-collection stats for every collection the caller can see.
+
+        One batched call per deployment engine, not one call per collection.
+        """
+        backend = deployment_kb_backend()
+        if backend is KBStorageBackend.LANCEDB:
+            store = self._storage_shim.get_vector_index_store()
+            return store.aggregate_collection_stats(user_id=user_id, is_admin=is_admin)
+        raise ValueError(
+            f"KB storage backend {backend.value!r} is not supported by KBHandleProvider"
+        )
+
     def reset_for_tests(self) -> None:
         """Clear provider-owned caches for test reset.
 
-        The current provider is stateless, but the hook keeps the coordinator
-        reset path ready for backend handle caches.
+        The provider holds the storage shim but keeps no caches of its own;
+        the hook keeps the coordinator reset path ready for backend handle
+        caches.
         """
 
 
@@ -1039,6 +1082,22 @@ class KBCollectionHandle(ABC):
             - ``"chunks"``    – count of chunk rows
             - ``"embeddings"``– total count of embedding rows across all model
               tables
+        """
+
+    @abstractmethod
+    def count_rows_by_document(
+        self,
+        *,
+        user_id: int | None,
+        is_admin: bool,
+        doc_id: str | None = None,
+    ) -> dict[str, dict[str, int]]:
+        """Count chunk and embedding rows per document in this collection.
+
+        Maps each ``doc_id`` (only ``doc_id`` when given) to ``{"chunks": n}``
+        plus one ``embeddings_<model_tag>`` entry per model that holds rows for
+        it, counting only rows visible to the caller. Zero counts and documents
+        without chunk or embedding rows are omitted.
         """
 
     @abstractmethod
@@ -4170,6 +4229,57 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             "chunks": chunks,
             "embeddings": embeddings,
         }
+
+    def count_rows_by_document(
+        self,
+        *,
+        user_id: int | None,
+        is_admin: bool,
+        doc_id: str | None = None,
+    ) -> dict[str, dict[str, int]]:
+        """Count chunk and embedding rows per document from the LanceDB tables.
+
+        Tables are opened uncached so rows written by other processes are
+        counted; a single document is counted without reading its rows.
+        """
+        store = self.vector_index_store
+        collection = self.context.collection
+        table_names = ["chunks"] + [
+            name for name in store.list_table_names() if name.startswith("embeddings_")
+        ]
+        doc_filter = None
+        if doc_id is not None:
+            doc_filter = store.build_filter_expression(
+                build_filter_from_dict({"collection": collection, "doc_id": doc_id}),
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        counts: dict[str, dict[str, int]] = {}
+        for table_name in table_names:
+            if doc_id is None:
+                per_document = store.aggregate_document_counts(
+                    table_name=table_name,
+                    doc_id_column="doc_id",
+                    collection_name=collection,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                )
+            else:
+                per_document = {doc_id: self._count_uncached(table_name, doc_filter)}
+            for row_doc_id, count in per_document.items():
+                if count:
+                    counts.setdefault(row_doc_id, {})[table_name] = count
+        return counts
+
+    def _count_uncached(self, table_name: str, filter_expr: str | None) -> int:
+        table = None
+        try:
+            table = self.vector_index_store.get_raw_connection().open_table(table_name)
+            return _safe_count_rows(table, filter_expr)
+        except Exception:  # noqa: BLE001 - a missing table holds no rows
+            return 0
+        finally:
+            _safe_close_table(table)
 
     def count_documents(self, user_id: int | None, is_admin: bool) -> int:
         """Count documents visible to the given user in this collection.
