@@ -98,6 +98,8 @@ def max_command_defers() -> int:
 
 DISPATCHER_IDLE_SECONDS = 0.5
 DISPATCHER_CONCURRENCY = 4
+DISPATCHER_RESTART_LIMIT = 3
+DISPATCHER_RESTART_WINDOW_SECONDS = 600.0
 
 
 class TaskCommandKind(str, enum.Enum):
@@ -1890,6 +1892,28 @@ async def run_task_command_dispatcher(executor: CommandExecutor) -> None:
         await asyncio.gather(*workers, return_exceptions=True)
 
 
+def _observe_dispatcher_exit(task: asyncio.Task[Any]) -> None:
+    if task is not _dispatcher_task:
+        return  # stopped through stop_task_command_dispatcher
+    try:
+        task.result()
+    except asyncio.CancelledError as error:
+        logger.critical(
+            "component=task-command-dispatcher dispatcher ended by a cancellation "
+            "outside stop_task_command_dispatcher",
+            exc_info=(type(error), error, error.__traceback__),
+        )
+    except BaseException as error:  # noqa: BLE001
+        logger.critical(
+            "component=task-command-dispatcher dispatcher exited unexpectedly",
+            exc_info=(type(error), error, error.__traceback__),
+        )
+    else:
+        logger.critical(
+            "component=task-command-dispatcher dispatcher returned while still registered"
+        )
+
+
 def start_task_command_dispatcher(
     executor: CommandExecutor,
 ) -> asyncio.Task[Any] | None:
@@ -1899,7 +1923,70 @@ def start_task_command_dispatcher(
     if _dispatcher_task is not None and not _dispatcher_task.done():
         return _dispatcher_task
     _dispatcher_task = asyncio.create_task(run_task_command_dispatcher(executor))
+    _dispatcher_task.add_done_callback(_observe_dispatcher_exit)
     return _dispatcher_task
+
+
+async def supervise_task_command_dispatcher(
+    executor: CommandExecutor, stop: asyncio.Event
+) -> None:
+    """Keep the already-started dispatcher running until ``stop`` is set.
+
+    For worker entry points only. It never performs the first start (callers
+    start the dispatcher first). An unexpected exit is restarted in place;
+    more than DISPATCHER_RESTART_LIMIT restarts within
+    DISPATCHER_RESTART_WINDOW_SECONDS raises RuntimeError, and whether the
+    host restarts afterwards is up to the host process (the built-in worker
+    pools restart the whole group).
+    """
+
+    loop = asyncio.get_running_loop()
+    restarts: list[float] = []
+    while True:
+        dispatcher = _dispatcher_task
+        if dispatcher is None or dispatcher.done() or dispatcher.get_loop() is not loop:
+            if consumes_task_commands():
+                logger.warning(
+                    "component=task-command-dispatcher no running dispatcher to "
+                    "supervise; command consumption is not supervised in this "
+                    "process"
+                )
+            await stop.wait()
+            return
+        waiter = asyncio.create_task(stop.wait())
+        try:
+            await asyncio.wait(
+                {waiter, dispatcher}, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            if not waiter.done():
+                waiter.cancel()
+                await asyncio.gather(waiter, return_exceptions=True)
+        if stop.is_set():
+            return
+        if _dispatcher_task is not dispatcher:
+            logger.info(
+                "component=task-command-dispatcher dispatcher stopped explicitly; "
+                "supervision ends"
+            )
+            await stop.wait()
+            return
+        now = loop.time()
+        restarts = [t for t in restarts if now - t < DISPATCHER_RESTART_WINDOW_SECONDS]
+        if len(restarts) >= DISPATCHER_RESTART_LIMIT:
+            raise RuntimeError(
+                f"Task command dispatcher exited unexpectedly {len(restarts) + 1} "
+                f"times within {DISPATCHER_RESTART_WINDOW_SECONDS:g} seconds; exiting"
+            )
+        restarts.append(now)
+        logger.error(
+            "component=task-command-dispatcher restarting dispatcher "
+            "(restart %s of %s within %gs)",
+            len(restarts),
+            DISPATCHER_RESTART_LIMIT,
+            DISPATCHER_RESTART_WINDOW_SECONDS,
+        )
+        start_task_command_dispatcher(executor)
 
 
 async def stop_task_command_dispatcher() -> None:
