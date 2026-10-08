@@ -101,7 +101,7 @@ def _credentials(monkeypatch):
     [
         (
             lambda: powerpoint._success(
-                item={"id": "x" * 500, "description": "y" * 500},
+                item={"id": "x" * 500, "name": "y" * 500},
                 slide_index=3,
             ),
             "success",
@@ -135,13 +135,145 @@ def test_outcome_envelopes_survive_platform_string_filter(
         assert result["safe_to_retry"] is False
 
 
-def test_success_envelope_preserves_provider_metadata_when_it_fits(monkeypatch):
-    monkeypatch.setattr(powerpoint, "get_tool_max_output_length", lambda: 500)
-    item = {"id": "item-1", "customFacet": {"value": "kept"}}
+# OneDrive Personal serves the final upload-session response from its own
+# _api/v2.0 endpoint, which names the signed download link
+# "@content.downloadUrl" rather than Graph's "@microsoft.graph.downloadUrl".
+_SIGNED_DOWNLOAD_URL = (
+    "https://my.microsoftpersonalcontent.com/personal/abc/_layouts/15/download.aspx"
+    "?UniqueId=item-1&tempauth=v1e.signed-bearer-secret&ApiVersion=2.0"
+)
+_ALLOWLISTED_ITEM = {
+    "id": "item-1",
+    "name": "Deck.pptx",
+    "eTag": '"{ITEM-1},2"',
+    "cTag": '"c:{ITEM-1},2"',
+    "size": 29221,
+    "webUrl": "https://onedrive.live.com/personal/abc/_layouts/15/doc.aspx?resid=item-1",
+}
 
-    result = json.loads(powerpoint._success(item=item))
 
-    assert result["item"] == item
+def _personal_onedrive_upload_item() -> dict:
+    return {
+        "@odata.context": (
+            "https://my.microsoftpersonalcontent.com/personal/abc/_api/v2.0/"
+            "$metadata#items/$entity"
+        ),
+        "@content.downloadUrl": _SIGNED_DOWNLOAD_URL,
+        "@content.downloadUrlNoAuth": (
+            "https://my.microsoftpersonalcontent.com/personal/abc/_layouts/15/"
+            "download.aspx?UniqueId=item-1&ApiVersion=2.0"
+        ),
+        "@microsoft.graph.downloadUrl": _SIGNED_DOWNLOAD_URL,
+        "parentReference": {"driveId": "drive-1", "path": "/drive/root:"},
+        "customFacet": {"value": "dropped"},
+        **_ALLOWLISTED_ITEM,
+    }
+
+
+def _assert_caller_safe_success(raw: str) -> None:
+    assert "tempauth" not in raw
+    assert "downloadUrl" not in raw
+    result = json.loads(raw)
+    assert result["status"] == "success"
+    assert result["item"] == _ALLOWLISTED_ITEM
+
+
+def test_success_envelope_emits_only_allowlisted_item_fields(monkeypatch):
+    """A raw driveItem can carry provider-signed download links under field
+    names this module does not know about, so the success envelope must
+    project the item instead of passing it through."""
+    monkeypatch.setattr(powerpoint, "get_tool_max_output_length", lambda: 5000)
+
+    _assert_caller_safe_success(
+        powerpoint._success(item=_personal_onedrive_upload_item())
+    )
+
+
+def test_create_presentation_omits_personal_onedrive_signed_url(monkeypatch):
+    monkeypatch.setattr(
+        powerpoint.requests,
+        "request",
+        Mock(
+            return_value=MockResponse({"uploadUrl": "https://upload.example/session"})
+        ),
+    )
+    monkeypatch.setattr(
+        powerpoint.requests,
+        "put",
+        Mock(
+            return_value=MockResponse(_personal_onedrive_upload_item(), status_code=201)
+        ),
+    )
+
+    _assert_caller_safe_success(powerpoint.powerpoint_create_presentation("Deck.pptx"))
+
+
+def _build_two_titled_slides(prs):
+    for title in ("A", "B"):
+        prs.slides.add_slide(prs.slide_layouts[1]).shapes.title.text = title
+
+
+@pytest.mark.parametrize(
+    ("build", "call"),
+    [
+        (
+            None,
+            lambda: powerpoint.powerpoint_add_slide(
+                "Deck.pptx", '"etag-1"', title="New Title"
+            ),
+        ),
+        (
+            _build_two_titled_slides,
+            lambda: powerpoint.powerpoint_set_shape_text(
+                "Deck.pptx", 0, 0, "New Title", '"etag-1"'
+            ),
+        ),
+        (
+            _build_two_titled_slides,
+            lambda: powerpoint.powerpoint_delete_slide("Deck.pptx", 0, '"etag-1"'),
+        ),
+    ],
+    ids=["add_slide", "set_shape_text", "delete_slide"],
+)
+def test_replace_tools_omit_personal_onedrive_signed_url(monkeypatch, build, call):
+    _, _, mock_put = _mock_versioned_write(monkeypatch, _pptx_bytes(build))
+    mock_put.return_value = MockResponse(
+        _personal_onedrive_upload_item(), status_code=200
+    )
+
+    _assert_caller_safe_success(call())
+
+
+def test_upload_helpers_return_only_the_caller_safe_projection(monkeypatch):
+    """Pinned separately from _success so a caller that bypasses the
+    envelope still never receives the raw provider item."""
+    monkeypatch.setattr(
+        powerpoint.requests,
+        "request",
+        Mock(
+            return_value=MockResponse({"uploadUrl": "https://upload.example/session"})
+        ),
+    )
+    monkeypatch.setattr(
+        powerpoint.requests,
+        "put",
+        Mock(
+            return_value=MockResponse(_personal_onedrive_upload_item(), status_code=201)
+        ),
+    )
+    mock_session_cls = MagicMock()
+    mock_session_cls.return_value.__enter__.return_value.put = Mock(
+        return_value=MockResponse(_personal_onedrive_upload_item(), status_code=200)
+    )
+    monkeypatch.setattr(powerpoint.requests, "Session", mock_session_cls)
+
+    created = powerpoint._create_only_upload(b"pptx", "Deck.pptx", None, None)
+    replaced = powerpoint._upload_presentation_session(
+        b"pptx", "Deck.pptx", None, None, '"etag-1"'
+    )
+
+    assert created == _ALLOWLISTED_ITEM
+    assert replaced == _ALLOWLISTED_ITEM
 
 
 # ---------------------------------------------------------------------------

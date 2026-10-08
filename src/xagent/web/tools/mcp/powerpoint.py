@@ -116,7 +116,13 @@ def _bounded_envelope(
 
 
 def _caller_safe_item(item: Any) -> dict[str, Any]:
-    """Keep only stable, scalar driveItem fields useful after a mutation."""
+    """Keep only stable, scalar driveItem fields useful after a mutation.
+
+    An allowlist on purpose: a driveItem's signed download link is named
+    differently per endpoint (Graph's "@microsoft.graph.downloadUrl",
+    OneDrive Personal's upload-session "@content.downloadUrl"), so removing
+    known names cannot keep every variant out of a caller-visible result.
+    """
     if not isinstance(item, dict):
         return {}
     return {
@@ -127,16 +133,15 @@ def _caller_safe_item(item: Any) -> dict[str, Any]:
 
 
 def _success(**payload: Any) -> str:
-    compact_payload = dict(payload)
-    if "item" in compact_payload:
-        compact_payload["item"] = _caller_safe_item(compact_payload["item"])
-    without_item = {
-        key: value for key, value in compact_payload.items() if key != "item"
-    }
+    # Never emit the raw driveItem, even when it would fit: only its
+    # _caller_safe_item projection is a candidate.
+    safe_payload = dict(payload)
+    if "item" in safe_payload:
+        safe_payload["item"] = _caller_safe_item(safe_payload["item"])
+    without_item = {key: value for key, value in safe_payload.items() if key != "item"}
     return _bounded_envelope(
         [
-            {"status": "success", **payload},
-            {"status": "success", **compact_payload},
+            {"status": "success", **safe_payload},
             {"status": "success", **without_item},
             {"status": "success"},
         ],
@@ -665,6 +670,8 @@ def _upload_presentation_session(
     commit is Personal-only, while Business/SharePoint use a different final
     POST. Consequently this function must not claim that a change made after
     session creation is proven to be fenced by the final fragment.
+
+    Returns only the ``_caller_safe_item`` projection of the committed item.
     """
     try:
         session = _graph_request(
@@ -772,9 +779,7 @@ def _upload_presentation_session(
             "Graph did not confirm whether the PowerPoint update completed; read the "
             "presentation before retrying"
         )
-    safe_item = dict(result)
-    safe_item.pop("@microsoft.graph.downloadUrl", None)
-    return safe_item
+    return _caller_safe_item(result)
 
 
 def _cancel_upload_session(http: Any, upload_url: str) -> None:
@@ -805,6 +810,8 @@ def _create_only_upload(
     the target already exists) -- used here even though the content (a
     blank new presentation) is always small enough for a single-PUT
     session, specifically for that atomicity guarantee.
+
+    Returns only the ``_caller_safe_item`` projection of the created item.
     """
     item_path = _item_path(file_path, site_id, drive_id)
     try:
@@ -878,9 +885,7 @@ def _create_only_upload(
             "Graph did not confirm whether the PowerPoint presentation was created; "
             "check whether the file exists before retrying"
         )
-    safe_item = dict(result)
-    safe_item.pop("@microsoft.graph.downloadUrl", None)
-    return safe_item
+    return _caller_safe_item(result)
 
 
 def _shape_text(shape: Any) -> str | None:
