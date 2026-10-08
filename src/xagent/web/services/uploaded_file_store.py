@@ -1287,7 +1287,7 @@ def compensate_registered_uploads_sync(
                 expected_updated_at=claim.claimed_at,
                 compensation_delete=delete_uploaded_file_compensation_object,
             )
-            if outcome not in {"deleted", "stale"}:
+            if outcome not in {"deleted", "stale", "yielded"}:
                 unresolved.append(claim)
         except Exception as exc:
             # Finish already-claimed siblings, then preserve the primary error.

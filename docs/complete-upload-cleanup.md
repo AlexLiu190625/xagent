@@ -151,8 +151,11 @@ protocol and remains explicit follow-up work; this PR performs none.
 
 - #1086 2C still owns detached seven-day TTL, scan indexes, scheduling and work
   budget. Detached uploads remain excluded from the existing collector.
-  Per-manifest directory scans still scale with directory size; batching or
-  bounded discovery belongs to this performance/work-budget follow-up.
+  [2C-1a bounded disposal](bounded-upload-cleanup.md) limits captured-resource
+  disposal while retaining unfinished manifests. Persistent bounded resource
+  discovery remains [#2872](https://github.com/xorbitsai/xagent/issues/2872),
+  including local/temp and flat preview namespaces. Detached retention and
+  scheduler activation remain 2C-2 after that prerequisite.
 - #1086 legacy/local-only backfill and historical inventory remain later delivery.
 - [#2835](https://github.com/xorbitsai/xagent/issues/2835) owns fresh canonical-path
   publication while old metadata is compensating; the existing safe conflict remains.

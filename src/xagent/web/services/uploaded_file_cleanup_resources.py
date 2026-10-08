@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-import shutil
 import stat
 from contextlib import contextmanager
 from pathlib import Path
@@ -28,10 +27,11 @@ from ...core.file_storage.storage import (
 )
 from ...core.workspace import scoped_user_root
 from .managed_file_ref import _checksum_to_sha256_hex
-
-
-class CleanupResourceUncertain(RuntimeError):
-    """A retained manifest needs retry or operator reconciliation."""
+from .uploaded_file_cleanup_disposal import (
+    CleanupResourceUncertain,
+    CleanupWorkBudget,
+    dispose_directory,
+)
 
 
 def _canonical_root(path: Path) -> Path:
@@ -305,7 +305,7 @@ def validate_configuration(manifest: dict[str, Any]) -> None:
     storage._scoped(manifest["storage_key"], strict=False)
 
 
-def dispose_resource(resource: dict[str, Any]) -> None:
+def dispose_resource(resource: dict[str, Any], *, budget: CleanupWorkBudget) -> None:
     """Quarantine before deleting; an unexpected replacement is never unlinked.
 
     The quarantine locator is already durable. Exit after rename therefore
@@ -342,11 +342,7 @@ def dispose_resource(resource: dict[str, Any]) -> None:
                     "Retained quarantine contains a replacement"
                 )
             if stat.S_ISDIR(info.st_mode):
-                if not shutil.rmtree.avoids_symlink_attacks:
-                    raise CleanupResourceUncertain(
-                        "Directory disposal requires safe rmtree"
-                    )
-                shutil.rmtree(quarantine, dir_fd=parent)
+                dispose_directory(parent, quarantine, budget)
             else:
                 if resource.get("checksum"):
                     descriptor = os.open(
@@ -376,8 +372,7 @@ def dispose_resource(resource: dict[str, Any]) -> None:
                 return
             raise CleanupResourceUncertain("Cleanup path has a replacement")
     except FileNotFoundError:
-        # A disappearing child inside rmtree is not evidence that its owned
-        # quarantine disappeared. Verify both top-level locators before success.
+        # Verify both top-level locators before treating an interruption as done.
         try:
             with _parent_descriptor(path, root) as parent:
                 if resource["parent"] is not None and (

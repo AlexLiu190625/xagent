@@ -52,6 +52,7 @@ class UploadedFileCompensationRecoveryBatch:
     deferred_exists: int = 0
     deferred_unknown: int = 0
     failed: int = 0
+    deferred_budget: int = 0
     next_cursor: UploadedFileCompensationRecoveryCursor | None = None
 
 
@@ -135,6 +136,7 @@ def recover_stale_uploaded_file_compensations_batch_isolated(
     deferred_exists = 0
     deferred_unknown = 0
     failed = 0
+    deferred_budget = 0
     for candidate in candidates:
         try:
             outcome = run_uploaded_file_cleanup(
@@ -154,6 +156,8 @@ def recover_stale_uploaded_file_compensations_batch_isolated(
                 deferred_exists += 1
             elif outcome == "unknown":
                 deferred_unknown += 1
+            elif outcome == "yielded":
+                deferred_budget += 1
             elif outcome == "pending":
                 failed += 1
         except Exception as exc:
@@ -171,6 +175,7 @@ def recover_stale_uploaded_file_compensations_batch_isolated(
         deferred_exists=deferred_exists,
         deferred_unknown=deferred_unknown,
         failed=failed,
+        deferred_budget=deferred_budget,
         next_cursor=candidates[-1].cursor if candidates else None,
     )
 
@@ -203,12 +208,13 @@ async def run_uploaded_file_compensation_recovery_loop(
             if result.scanned:
                 logger.info(
                     "Uploaded-file compensation recovery: scanned=%s "
-                    "deleted=%s exists=%s unknown=%s failed=%s",
+                    "deleted=%s exists=%s unknown=%s failed=%s deferred_budget=%s",
                     result.scanned,
                     result.deleted,
                     result.deferred_exists,
                     result.deferred_unknown,
                     result.failed,
+                    result.deferred_budget,
                 )
         except asyncio.CancelledError:
             raise

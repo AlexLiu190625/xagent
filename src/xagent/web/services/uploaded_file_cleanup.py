@@ -11,8 +11,12 @@ from sqlalchemy.orm import Session
 
 from ...core.tools.core.RAG_tools.storage.file_reference import file_cleanup_lock
 from ..models.uploaded_file import UploadedFile
-from .uploaded_file_cleanup_resources import (
+from .uploaded_file_cleanup_disposal import (
+    CleanupBudgetExhausted,
     CleanupResourceUncertain,
+    CleanupWorkBudget,
+)
+from .uploaded_file_cleanup_resources import (
     build_cleanup_manifest,
     capture_previews,
     dispose_resource,
@@ -20,7 +24,7 @@ from .uploaded_file_cleanup_resources import (
 )
 
 logger = logging.getLogger(__name__)
-CleanupOutcome = Literal["deleted", "stale", "exists", "unknown", "pending"]
+CleanupOutcome = Literal["deleted", "stale", "exists", "unknown", "pending", "yielded"]
 CLEANUP_PHASES = ("durable", "local", "previews")
 
 
@@ -94,6 +98,20 @@ def run_uploaded_file_cleanup(
                 manifest,
             ):
                 return "stale"
+        budget = CleanupWorkBudget()
+
+        def save_progress() -> bool:
+            return _save_manifest(
+                session_factory,
+                row_id,
+                user_id,
+                file_id,
+                task_id,
+                storage_key,
+                token,
+                manifest,
+            )
+
         try:
             if (
                 manifest.get("version") != 1
@@ -105,7 +123,7 @@ def run_uploaded_file_cleanup(
                     "Cleanup manifest identity does not match its claim"
                 )
             validate_configuration(manifest)
-            # Retain the object when captured evidence already requires reconciliation.
+            # Retain the object when captured evidence already needs reconciliation.
             if "local" not in manifest["done"]:
                 uncertainty = manifest.get("uncertain_materialization") or next(
                     (
@@ -127,46 +145,26 @@ def run_uploaded_file_cleanup(
                     if presence != "absent":
                         return "exists" if presence == "exists" else "unknown"
                 elif phase == "local":
-                    if manifest.get("uncertain_materialization"):
-                        raise CleanupResourceUncertain(
-                            manifest["uncertain_materialization"]
-                        )
-                    for resource in manifest["local"]:
-                        dispose_resource(resource)
+                    _dispose_phase_resources(manifest, phase, budget)
                 else:
                     if manifest["previews"] is None:
                         manifest["previews"] = capture_previews(manifest)
-                        if not _save_manifest(
-                            session_factory,
-                            row_id,
-                            user_id,
-                            file_id,
-                            task_id,
-                            storage_key,
-                            token,
-                            manifest,
-                        ):
+                        if not save_progress():
                             return "stale"
-                    for resource in manifest["previews"]:
-                        dispose_resource(resource)
-                    # Producers hold the same execution guard and cannot
-                    # publish another preview between this phase and settlement.
+                    _dispose_phase_resources(manifest, phase, budget)
+                    # Producers hold the same execution guard and cannot publish
+                    # another preview between this check and settlement.
                     if capture_previews(manifest):
                         raise CleanupResourceUncertain(
                             "Owned previews remain after disposal"
                         )
                 manifest["done"].append(phase)
-                if not _save_manifest(
-                    session_factory,
-                    row_id,
-                    user_id,
-                    file_id,
-                    task_id,
-                    storage_key,
-                    token,
-                    manifest,
-                ):
+                if not save_progress():
                     return "stale"
+        except CleanupBudgetExhausted:
+            if not save_progress():
+                return "stale"
+            return "yielded"
         except (CleanupResourceUncertain, OSError):
             logger.warning(
                 "Upload cleanup needs reconciliation for %s", file_id, exc_info=True
@@ -187,6 +185,21 @@ def run_uploaded_file_cleanup(
                 return "stale"
             db.commit()
             return "deleted"
+
+
+def _dispose_phase_resources(
+    manifest: dict[str, Any], phase: str, budget: CleanupWorkBudget
+) -> None:
+    """Advance a durable prefix through the resources captured for one phase."""
+    positions = manifest.setdefault("disposal_positions", {})
+    position = positions.get(phase, 0)
+    resources = manifest[phase] or []
+    while position < len(resources):
+        budget.consume_disposal()
+        resource = resources[position]
+        dispose_resource(resource, budget=budget)
+        position += 1
+        positions[phase] = position
 
 
 def _claim_query(
