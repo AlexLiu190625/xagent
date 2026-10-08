@@ -2,6 +2,7 @@ import copy
 import json
 import logging
 import os
+import urllib.parse
 import uuid
 from datetime import date
 from functools import cache
@@ -56,6 +57,19 @@ mcp = FastMCP("calendar-mcp")
 # freebusy.query accepts at most this many calendars per call
 # (Google's calendarExpansionMax).
 _MAX_ATTENDEES_PER_FREEBUSY_QUERY = 50
+
+# Join URLs from Zoom, Teams, Webex and similar providers are well under this.
+# The cap only rejects a value that is clearly not a single link (e.g. a whole
+# pasted invitation) before it is written into an attendee-visible event.
+_MAX_MEETING_LINK_CHARS = 2048
+_MEETING_LINK_LABEL = "Join the meeting: "
+# Characters that can sit right before or after a URL in prose or markup
+# ("(url)", "<url>", '"url"', "<a href=...>url</a>") without being part of it.
+_LINK_OPENING_CHARS = frozenset("([{<>\"'")
+_LINK_CLOSING_CHARS = frozenset(")]}<>\"'")
+# Sentence punctuation that may follow a URL, when it ends the text or is
+# itself followed by whitespace ("Join at <url>.").
+_LINK_TRAILING_PUNCTUATION = frozenset(".,;:!?")
 
 
 def _is_insufficient_scope_error(exc: Any) -> bool:
@@ -1056,6 +1070,101 @@ def _api_call_kwargs(event: dict[str, Any], notify_attendees: bool) -> dict[str,
     }
 
 
+def _validated_meeting_link(
+    meeting_link: str | None, add_google_meet: bool
+) -> str | None:
+    """Validate an external meeting link before any Calendar API call.
+
+    Returns the stripped link, or None when no link was given. Raising here
+    (rather than after the conflict check) keeps a malformed value from ever
+    reaching an attendee's invitation, and keeps a rejected call from making
+    any request at all.
+    """
+    if meeting_link is None:
+        return None
+    link = meeting_link.strip()
+    if not link:
+        return None
+    if add_google_meet:
+        raise ValueError(
+            "meeting_link cannot be combined with add_google_meet=True: the "
+            "event already gets its video link from meeting_link, and adding a "
+            "Google Meet conference would give attendees two different places "
+            "to join. Nothing was written; retry with add_google_meet=False."
+        )
+    if len(link) > _MAX_MEETING_LINK_CHARS:
+        raise ValueError(
+            f"meeting_link is longer than {_MAX_MEETING_LINK_CHARS} characters; "
+            "pass only the join URL returned by the meeting provider"
+        )
+    if any(char.isspace() or not char.isprintable() for char in link):
+        raise ValueError(
+            "meeting_link must be a single URL without spaces or line breaks; "
+            "pass only the join URL returned by the meeting provider"
+        )
+    try:
+        parsed = urllib.parse.urlsplit(link)
+        valid = parsed.scheme.lower() in ("http", "https") and bool(parsed.hostname)
+    except ValueError:
+        # urlsplit raises on e.g. an unbalanced IPv6 bracket in the host.
+        valid = False
+    if not valid:
+        raise ValueError(
+            "meeting_link must be an http(s) URL with a host, such as the "
+            "join_url returned when the meeting was created"
+        )
+    return link
+
+
+def _text_contains_link(text: str, link: str) -> bool:
+    """Whether text already carries link as a whole URL.
+
+    A plain substring test is not enough: the link can be the prefix of a
+    different URL already in the text, such as a join URL without its
+    ``?pwd=`` part, or a meeting id that is the start of a longer one. Only
+    an occurrence with a URL boundary on both sides counts.
+    """
+    start = text.find(link)
+    while start != -1:
+        end = start + len(link)
+        before = text[start - 1] if start else ""
+        after = text[end : end + 2]
+        bounded_before = not before or before.isspace() or before in _LINK_OPENING_CHARS
+        bounded_after = (
+            not after
+            or after[0].isspace()
+            or after[0] in _LINK_CLOSING_CHARS
+            or (
+                after[0] in _LINK_TRAILING_PUNCTUATION
+                and (len(after) == 1 or after[1].isspace())
+            )
+        )
+        if bounded_before and bounded_after:
+            return True
+        start = text.find(link, start + 1)
+    return False
+
+
+def _attach_meeting_link(event: dict[str, Any], meeting_link: str) -> None:
+    """Put an external meeting's join link where attendees will see it.
+
+    The link is always present in the description afterwards: it is appended
+    to the existing text (never replacing it) unless that text already
+    contains it as a whole URL. It also fills the location, but only when
+    the event has no location yet, so a room or address the caller set is
+    never overwritten.
+    """
+    location = event.get("location")
+    if not isinstance(location, str) or not location.strip():
+        event["location"] = meeting_link
+    link_line = f"{_MEETING_LINK_LABEL}{meeting_link}"
+    description = event.get("description")
+    if not isinstance(description, str) or not description.strip():
+        event["description"] = link_line
+    elif not _text_contains_link(description, meeting_link):
+        event["description"] = f"{description}\n\n{link_line}"
+
+
 def _error_message(exc: Exception, requested_conference: bool) -> str:
     """Append an actionable hint when a request whose body actually included
     a Google Meet createRequest fails outright (as opposed to the conference
@@ -1141,6 +1250,7 @@ def google_calendar_create_events(
     timezone: str | None = None,
     recurrence: str | None = None,
     ignore_conflicts: bool = False,
+    meeting_link: str | None = None,
 ) -> str:
     """
     Create a new event in Google Calendar.
@@ -1180,9 +1290,22 @@ def google_calendar_create_events(
     google_calendar_get_event for it to change. A plain "Google Meet" string in location does not
     create a link, and if the account/domain can't create Meet conferences at all, this whole call
     can fail outright rather than just skipping the link.
+    For a meeting on another provider (Zoom, Microsoft Teams, Webex, ...), create that meeting
+    first with the provider's own connector, then pass the join URL it returned as meeting_link.
+    When the user gave a time, check that window with google_calendar_search_events before
+    creating the external meeting: it may not be possible to move that meeting afterwards.
+    The link fills location when no location is given and is appended to description unless
+    already there, so attendees see it in the invite. Never invent or guess a link. If the
+    external meeting could not be created, do not create an event without its link on your own:
+    tell the user what failed and let them decide. When retrying this call, reuse the same
+    meeting_link instead of creating another meeting. That includes retrying at a different time
+    (for example after a conflict): keep the link, and tell the user the external meeting itself
+    still shows the time it was created with. meeting_link cannot be combined with
+    add_google_meet=True.
     """
     requested_conference = False
     try:
+        meeting_link = _validated_meeting_link(meeting_link, add_google_meet)
         # Normalize both accepted input shapes before classifying or validating
         # them. Google expects exact RFC3339/date values and rejects otherwise
         # valid values that carry incidental surrounding whitespace.
@@ -1292,6 +1415,8 @@ def google_calendar_create_events(
             event["description"] = description
         if location:
             event["location"] = location
+        if meeting_link:
+            _attach_meeting_link(event, meeting_link)
         if normalized_recurrence is not None:
             event["recurrence"] = [normalized_recurrence]
         if normalized_attendees:
@@ -1347,6 +1472,7 @@ def google_calendar_update_events(
     recurrence: str | None = None,
     ignore_conflicts: bool = False,
     acknowledge_recurring_exception_risk: bool = False,
+    meeting_link: str | None = None,
 ) -> str:
     """
     Update an existing event in Google Calendar.
@@ -1437,9 +1563,20 @@ def google_calendar_update_events(
     google_calendar_get_event for it to change. A plain "Google Meet" string in location does not
     create a link, and if the account/domain can't create Meet conferences at all, this whole call
     can fail outright rather than just skipping the link.
+    meeting_link works as in google_calendar_create_events: pass the join URL returned by the
+    connector that created a meeting on another provider (Zoom, Microsoft Teams, ...). It is
+    appended to the description (the one passed in this call, otherwise the event's existing
+    one) unless already there, and fills location only when neither this call nor the event has
+    one. It never removes anything. To replace an older link, also pass a description without
+    the old link and, when the event's location holds the old link, pass the new link as
+    location too (an empty location is ignored, not cleared). An existing conference on the
+    event, such as Google Meet, is left as is and is not removed. Never invent a link;
+    if the external meeting could not be created, tell the user instead of updating the event
+    without it. meeting_link cannot be combined with add_google_meet=True.
     """
     requested_conference = False
     try:
+        meeting_link = _validated_meeting_link(meeting_link, add_google_meet)
         if recurrence is not None and not recurrence.strip():
             raise ValueError("recurrence rule must not be empty")
         start_input_is_all_day = None
@@ -2636,6 +2773,8 @@ def google_calendar_update_events(
             event["description"] = description
         if location:
             event["location"] = location
+        if meeting_link:
+            _attach_meeting_link(event, meeting_link)
         if recurrence is not None:
             # cast(): the earlier "could not determine the event's start
             # time" check already guarantees current_start_value is set
