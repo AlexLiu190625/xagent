@@ -10,13 +10,19 @@ then fails. This pins every connector currently documented by the policy,
 including whatsapp, Planner, SharePoint, PowerPoint, Excel, and Word, so a
 future edit cannot silently drop one.
 
-Deliberately narrow: a fully general "every builtin oauth app whose scopes
-exceed its provider's default_scopes must be listed here" test does not hold
-across the registry today -- several existing google/microsoft/zoom-family
-apps (e.g. onedrive, outlook, teams) also request scopes beyond their
-provider's (identity-only) default_scopes without being listed, and
-asserting that gap closed is a separate, cross-connector investigation well
-beyond these connectors' own scope.
+The Microsoft provider is held to a mechanical invariant (see
+test_every_microsoft_app_beyond_provider_defaults_requires_app_scoped_grant):
+every builtin Microsoft app whose scopes exceed the provider's identity-only
+default must be listed, so a new connector cannot silently omit itself.
+
+That invariant is deliberately not extended to the other providers. A fully
+general "every builtin oauth app whose scopes exceed its provider's
+default_scopes must be listed here" rule does not hold across the registry
+today: several unlisted apps under other providers (e.g. most google apps,
+zoom, linear, xero, employment-hero) also request scopes beyond their
+provider's default_scopes, and instagram is excluded on purpose so its
+existing bare "meta" grants keep working. Closing that gap is a separate,
+cross-connector decision.
 """
 
 from xagent.web.builtin_mcp_registry import (
@@ -35,9 +41,12 @@ _EXPECTED_APP_SCOPED_APPS = frozenset(
         "github",
         "myob",
         "meta-ads",
+        "onedrive",
+        "outlook",
         "planner",
         "powerpoint",
         "sharepoint",
+        "teams",
         "whatsapp",
         "word",
     }
@@ -128,3 +137,30 @@ def test_excel_scopes_actually_exceed_the_microsoft_providers_default_scopes():
         "Files.ReadWrite",
         "offline_access",
     }
+
+
+def test_every_microsoft_app_beyond_provider_defaults_requires_app_scoped_grant():
+    """A bare Microsoft login only ever requests the provider's default scopes,
+    so no builtin Microsoft app that needs more can be satisfied by it."""
+    microsoft_app_ids = [
+        row["app_id"]
+        for row in get_builtin_public_mcp_app_rows()
+        if row["provider_name"] == "microsoft"
+    ]
+    # Guard against the filter silently matching nothing.
+    assert {"onedrive", "outlook", "teams"} <= set(microsoft_app_ids)
+
+    unguarded = sorted(
+        app_id
+        for app_id in microsoft_app_ids
+        if _app_scopes_beyond_provider_defaults(app_id)
+        and not requires_app_scoped_oauth_grant(app_id)
+    )
+
+    assert not unguarded, (
+        f"Microsoft apps {unguarded} request scopes beyond the microsoft "
+        "provider's default_scopes but are not in "
+        "APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT, so a bare microsoft grant "
+        "would report them connected while every Graph call fails for "
+        "insufficient scope. Add them to the set in src/xagent/web/mcp_apps.py."
+    )

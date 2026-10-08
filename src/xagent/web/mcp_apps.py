@@ -89,6 +89,16 @@ from .models.public_mcp import PublicMCPApp
 # requires Files.ReadWrite, which isn't part of the microsoft provider's
 # default_scopes (["User.Read"]). A bare microsoft grant, or one scoped to
 # a different Microsoft app, must never be treated as satisfying it.
+#
+# onedrive, outlook, teams: same reasoning as excel -- OneDrive needs
+# Files.ReadWrite, Outlook needs Mail.*/Calendars.ReadWrite/Contacts.Read, and
+# Teams needs the Team/Channel/Chat scopes, none of which a bare microsoft
+# login (User.Read only) requests. A bare login's batch connect would
+# otherwise create their UserMCPServer rows and report them connected while
+# every Graph call fails for insufficient scope. Connecting one from its
+# catalog entry already stores an app-scoped grant (UserOAuth.provider == the
+# app_id), so this only stops the bare grant from standing in for it (reads and
+# disconnect both narrow to the app-scoped key).
 APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT = frozenset(
     {
         "excel",
@@ -96,9 +106,12 @@ APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT = frozenset(
         "github",
         "myob",
         "meta-ads",
+        "onedrive",
+        "outlook",
         "planner",
         "powerpoint",
         "sharepoint",
+        "teams",
         "whatsapp",
         "word",
     }
