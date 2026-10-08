@@ -105,7 +105,7 @@ reconcile it must change both sides in one change, not one alone. That
 disagreement is about legacy ``checkpoint_type`` only; how a row missing
 the run-partition field is classified is not settled the same way
 everywhere, and that is deliberate. This function and lease recovery's
-own resolver (``resolve_checkpoint_recovery``, ``task_lease_service.py``)
+own resolver (``resolve_checkpoint_recovery_with_data``, ``task_lease_service.py``)
 both reclassify it off the one shared predicate -- lease recovery has no
 resumable verdict for an absent checkpoint, so its deferral still ends in
 FAILED, but neither calls the row corrupt. The by-primary-key *read*

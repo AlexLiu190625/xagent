@@ -27,7 +27,7 @@ from .task_lease_service import (
     get_expired_task_lease_candidates,
     get_next_expired_task_lease_candidate_for_update,
     recover_expired_task_lease_no_commit,
-    resolve_checkpoint_recovery,
+    resolve_checkpoint_recovery_with_data,
     utc_now,
 )
 from .task_orchestrator import (
@@ -270,7 +270,8 @@ def recover_task_lease_candidate_no_commit(
 ) -> TaskStatus | None:
     """Stage one recovery and all lifecycle projections without committing."""
 
-    verdict = resolve_checkpoint_recovery(db, candidate)
+    resolution = resolve_checkpoint_recovery_with_data(db, candidate)
+    verdict = resolution.verdict
     if verdict is CheckpointRecoveryVerdict.INDETERMINATE:
         # Checkpoint identity/content could not be resolved this round
         # (an ambiguous legacy event_id or unavailable event read). Leave
@@ -315,6 +316,18 @@ def recover_task_lease_candidate_no_commit(
         )
     db.expire_all()
     task = db.query(Task).filter(Task.id == candidate.task_id).one()
+    from .task_auto_recovery import record_lease_expiry_interruption_no_commit
+
+    # Metadata only, after the fenced write so it sees the new state_version;
+    # it cannot change the status, error or projections staged here.
+    record_lease_expiry_interruption_no_commit(
+        db,
+        task=task,
+        candidate=candidate,
+        resolution=resolution,
+        task_status=next_status,
+        recovered_at=recovered_at,
+    )
     from .task_execution_event_writer import stage_result_fact_no_commit
 
     stage_result_fact_no_commit(db, task, {"error": task_error})

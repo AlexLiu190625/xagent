@@ -83,7 +83,8 @@ class TaskAutoRecovery(Base):  # type: ignore
     state: Mapped[str] = mapped_column(String(24), nullable=False)
     # e.g. ``ineligible:source_sdk``.
     state_detail: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    # ``tasks.state_version`` after the PAUSED write; fences dispatch.
+    # ``tasks.state_version`` after the settling write; for a PAUSED row it
+    # fences dispatch (a FAILED row's value is recorded but never read).
     paused_state_version: Mapped[int] = mapped_column(Integer, nullable=False)
     # Start of the staleness window.
     interrupted_at: Mapped[datetime] = mapped_column(

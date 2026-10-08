@@ -62,7 +62,7 @@ from xagent.web.services.task_lease_service import (
     CheckpointRecoveryVerdict,
     TaskLeaseRecoveryCandidate,
     get_expired_task_lease_candidates,
-    resolve_checkpoint_recovery,
+    resolve_checkpoint_recovery_with_data,
     utc_now,
 )
 
@@ -150,7 +150,7 @@ def _recover_expired_task(db, task: Task) -> TaskStatus | None:
 
 
 def _candidate_for_task(task: Task) -> TaskLeaseRecoveryCandidate:
-    """Build the recovery candidate snapshot resolve_checkpoint_recovery
+    """Build the recovery candidate snapshot resolve_checkpoint_recovery_with_data
     consumes, directly from a task's current column values -- for tests
     that exercise checkpoint pointer resolution without going through the
     full expired-lease scan query.
@@ -396,7 +396,7 @@ def test_pk_anchor_resolves_without_a_usable_legacy_pointer(db_session) -> None:
 
     candidate = _candidate_for_task(task)
     assert (
-        resolve_checkpoint_recovery(db_session, candidate)
+        resolve_checkpoint_recovery_with_data(db_session, candidate).verdict
         is CheckpointRecoveryVerdict.RECOVERABLE
     )
     assert _recover_expired_task(db_session, task) == TaskStatus.PAUSED
@@ -454,7 +454,7 @@ def test_pk_anchor_validation_failure_does_not_fall_back_to_the_legacy_scan(
 
     candidate = _candidate_for_task(task)
     assert (
-        resolve_checkpoint_recovery(db_session, candidate)
+        resolve_checkpoint_recovery_with_data(db_session, candidate).verdict
         is CheckpointRecoveryVerdict.NOT_RECOVERABLE
     )
     assert _recover_expired_task(db_session, task) == TaskStatus.FAILED
@@ -513,10 +513,10 @@ def test_pk_anchor_missing_run_partition_defers_to_the_legacy_scan(
 
     candidate = _candidate_for_task(task)
     assert (
-        resolve_checkpoint_recovery(db_session, candidate)
+        resolve_checkpoint_recovery_with_data(db_session, candidate).verdict
         is CheckpointRecoveryVerdict.RECOVERABLE
     )
-    # resolve_checkpoint_recovery is pure and was just called directly above
+    # resolve_checkpoint_recovery_with_data is pure and was just called directly above
     # to check the verdict; clear its log line so the assertion below pins
     # the recovery path's own call, not a second echo of the first.
     caplog.clear()
@@ -581,7 +581,7 @@ def test_pk_anchor_wrong_run_partition_still_fails_without_a_legacy_retry(
 
     candidate = _candidate_for_task(task)
     assert (
-        resolve_checkpoint_recovery(db_session, candidate)
+        resolve_checkpoint_recovery_with_data(db_session, candidate).verdict
         is CheckpointRecoveryVerdict.NOT_RECOVERABLE
     )
     assert _recover_expired_task(db_session, task) == TaskStatus.FAILED
@@ -627,7 +627,7 @@ def test_pk_anchor_no_run_id_candidate_fails_closed_before_the_shared_predicate(
 
     candidate = _candidate_for_task(task)
     assert (
-        resolve_checkpoint_recovery(db_session, candidate)
+        resolve_checkpoint_recovery_with_data(db_session, candidate).verdict
         is CheckpointRecoveryVerdict.NOT_RECOVERABLE
     )
 
@@ -666,7 +666,7 @@ def test_pk_anchor_execution_identity_mismatch_is_not_recoverable(
 
     candidate = _candidate_for_task(task)
     assert (
-        resolve_checkpoint_recovery(db_session, candidate)
+        resolve_checkpoint_recovery_with_data(db_session, candidate).verdict
         is CheckpointRecoveryVerdict.NOT_RECOVERABLE
     )
 
@@ -708,7 +708,7 @@ def test_pk_anchor_execution_identity_match_is_recoverable(db_session) -> None:
 
     candidate = _candidate_for_task(task)
     assert (
-        resolve_checkpoint_recovery(db_session, candidate)
+        resolve_checkpoint_recovery_with_data(db_session, candidate).verdict
         is CheckpointRecoveryVerdict.RECOVERABLE
     )
 
@@ -795,7 +795,7 @@ def test_pk_anchor_single_fault_is_not_recoverable(db_session, field: str) -> No
 
     candidate = _candidate_for_task(task)
     assert (
-        resolve_checkpoint_recovery(db_session, candidate)
+        resolve_checkpoint_recovery_with_data(db_session, candidate).verdict
         is CheckpointRecoveryVerdict.NOT_RECOVERABLE
     )
     assert _recover_expired_task(db_session, task) == TaskStatus.FAILED
@@ -853,7 +853,7 @@ def test_dangling_pk_pointer_falls_back_to_the_legacy_scan(
 
     candidate = _candidate_for_task(task)
     assert (
-        resolve_checkpoint_recovery(session, candidate)
+        resolve_checkpoint_recovery_with_data(session, candidate).verdict
         is CheckpointRecoveryVerdict.RECOVERABLE
     )
 
@@ -892,7 +892,7 @@ def test_ambiguous_legacy_checkpoint_skips_the_candidate_for_the_next_sweep(
 
     candidate = _candidate_for_task(task)
     assert (
-        resolve_checkpoint_recovery(db_session, candidate)
+        resolve_checkpoint_recovery_with_data(db_session, candidate).verdict
         is CheckpointRecoveryVerdict.INDETERMINATE
     )
     assert _recover_expired_task(db_session, task) is None
@@ -951,7 +951,7 @@ def test_ambiguous_legacy_checkpoint_registers_a_degradation_signal(
     try:
         candidate = _candidate_for_task(task)
         assert (
-            resolve_checkpoint_recovery(db_session, candidate)
+            resolve_checkpoint_recovery_with_data(db_session, candidate).verdict
             is CheckpointRecoveryVerdict.INDETERMINATE
         )
         assert CHECKPOINT_LEGACY_POINTER_AMBIGUOUS in active_degradations()
@@ -1033,7 +1033,7 @@ def test_pk_anchor_missing_run_partition_then_ambiguous_legacy_id_is_indetermina
     try:
         candidate = _candidate_for_task(task)
         assert (
-            resolve_checkpoint_recovery(db_session, candidate)
+            resolve_checkpoint_recovery_with_data(db_session, candidate).verdict
             is CheckpointRecoveryVerdict.INDETERMINATE
         )
         assert CHECKPOINT_LEGACY_POINTER_AMBIGUOUS in active_degradations()
