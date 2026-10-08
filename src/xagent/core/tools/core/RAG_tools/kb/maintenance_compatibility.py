@@ -268,7 +268,9 @@ class KBMaintenanceCompatibilityFacade:
         from ..management.collection_manager import _rebuild_collection_stats_impl
 
         with self._storage_context():
-            return await _rebuild_collection_stats_impl(collection_name)
+            return await _rebuild_collection_stats_impl(
+                collection_name, self._coordinator
+            )
 
     def rebuild_collection_stats_sync(
         self,
@@ -277,7 +279,9 @@ class KBMaintenanceCompatibilityFacade:
         from ..management.collection_manager import _rebuild_collection_stats_sync_impl
 
         with self._storage_context():
-            return _rebuild_collection_stats_sync_impl(collection_name)
+            return _rebuild_collection_stats_sync_impl(
+                collection_name, self._coordinator
+            )
 
     def resolve_effective_embedding_model_sync(
         self, collection_name: str, config_model_id: Optional[str] = None

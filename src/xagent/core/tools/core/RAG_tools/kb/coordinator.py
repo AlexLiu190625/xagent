@@ -1891,6 +1891,8 @@ class KBCoordinator:
     def _capabilities_for_backend(backend: KBStorageBackend) -> KBBackendCapabilities:
         if backend is KBStorageBackend.LANCEDB:
             return KBBackendCapabilities.lancedb()
+        if backend is KBStorageBackend.MILVUS:
+            return KBBackendCapabilities.milvus()
         return KBBackendCapabilities.unsupported()
 
     # --- Rollback snapshot/restore primitives (#513 Task 7) ---

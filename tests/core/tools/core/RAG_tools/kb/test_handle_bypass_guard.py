@@ -2,9 +2,12 @@
 global store; they go through ``KBCollectionHandle`` so each engine owns them.
 
 The scan covers ``src/xagent`` outside the LanceDB store, handle and migration
-code. It matches by name, so it is best effort. Existing bypasses are
-allowlisted one by one; the allowlist must match the scan exactly, so a fixed
-bypass has to leave it.
+code. It matches by name, so it is best effort. Code gated by
+``ledger_holds_vectors()``, as an ``if`` (or ``and``) condition or as a top-level
+``if not ledger_holds_vectors(): return/raise`` in a function, runs only on
+LanceDB deployments and is not flagged. Existing bypasses are allowlisted one
+by one; the allowlist must match the scan exactly, so a fixed bypass has to
+leave it.
 """
 
 from __future__ import annotations
@@ -43,52 +46,14 @@ TABLE_METHODS = frozenset(
 RAW_ACCESSORS = frozenset(
     {"get_vector_store_raw_connection", "list_embeddings_table_names"}
 )
-INFERS_MODEL = "infers the embedding model from embeddings_* tables"
+GATE = "ledger_holds_vectors"
 
 # Existing bypasses: how often each one occurs and what it is for.
 ALLOWLIST: dict[str, dict[tuple[str, str], tuple[int, str]]] = {
-    "xagent/core/tools/core/RAG_tools/management/collection_manager.py": {
-        ("_rebuild_collection_stats_impl", "aggregate_collection_stats"): (
-            1,
-            "stats rebuild (tests only)",
-        ),
-        ("_rebuild_collection_metadata_impl", "list_table_names"): (1, INFERS_MODEL),
-        ("_rebuild_collection_metadata_impl", "count_rows_or_zero"): (1, INFERS_MODEL),
-        ("_rebuild_collection_metadata_impl", "get_vector_dimension"): (
-            1,
-            INFERS_MODEL,
-        ),
-    },
-    "xagent/web/services/kb_file_service.py": {
-        ("_aggregate_uploaded_file_statuses_impl", "list_indexed_doc_refs"): (
-            1,
-            "indexed fallback for legacy files",
-        ),
-        ("_reconcile_uploaded_files_impl", "cascade_delete"): (
-            1,
-            "stale-file cleanup (delete_stale=True)",
-        ),
-    },
-    "xagent/core/tools/core/RAG_tools/kb/version_compatibility.py": {
-        ("KBVersionCompatibilityFacade.cascade_delete", "cascade_delete"): (
-            1,
-            "version cleanup",
-        ),
-    },
     "xagent/core/tools/core/RAG_tools/utils/migration_utils.py": {
-        (
-            "_infer_embedding_config_from_collection",
-            "get_vector_store_raw_connection",
-        ): (1, "model inference at search time"),
         ("migrate_embeddings_table", "get_vector_store_raw_connection"): (
             1,
             "body of LanceDBVectorIndexStore.migrate_embeddings_table",
-        ),
-    },
-    "xagent/web/app.py": {
-        ("startup_event", "list_embeddings_table_names"): (
-            1,
-            "startup user_id migration check",
         ),
     },
 }
@@ -100,6 +65,22 @@ def _callee(node: ast.Call) -> str | None:
     if isinstance(node.func, ast.Attribute):
         return node.func.attr
     return None
+
+
+def _is_gate(node: ast.expr) -> bool:
+    if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.And):
+        return any(_is_gate(value) for value in node.values)
+    return isinstance(node, ast.Call) and _callee(node) == GATE
+
+
+def _is_guard(node: ast.stmt) -> bool:
+    return (
+        isinstance(node, ast.If)
+        and isinstance(node.test, ast.UnaryOp)
+        and isinstance(node.test.op, ast.Not)
+        and _is_gate(node.test.operand)
+        and isinstance(node.body[-1], (ast.Return, ast.Raise))
+    )
 
 
 def _is_other_literal_table(node: ast.expr | None) -> bool:
@@ -145,11 +126,24 @@ class _BypassScanner(ast.NodeVisitor):
         }
         self.scope.append(node.name)
         self.store_names.append(names | self.store_names[-1])
-        self.generic_visit(node)
+        for child in [*node.decorator_list, node.args]:
+            self.visit(child)
+        for statement in node.body:
+            self.visit(statement)
+            if _is_guard(statement):
+                break
         self.store_names.pop()
         self.scope.pop()
 
     visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_If(self, node: ast.If) -> None:
+        if not _is_gate(node.test):
+            self.generic_visit(node)
+            return
+        self.visit(node.test)
+        for statement in node.orelse:
+            self.visit(statement)
 
     def _is_store(self, node: ast.expr) -> bool:
         if isinstance(node, ast.Call):
@@ -251,6 +245,25 @@ async def each_occurrence(store: VectorIndexStore):
     store.count_rows("chunks")
     store.count_rows("chunks")
     return await store.get_vector_dimension_async("embeddings_m")
+
+def gated(store: VectorIndexStore, flag):
+    if ledger_holds_vectors():
+        store.count_rows("chunks")
+    else:
+        store.cascade_delete()
+    if flag and ledger_holds_vectors():
+        store.list_indexed_doc_refs([])
+
+def guarded(conn):
+    if not ledger_holds_vectors():
+        return None
+    return list_embeddings_table_names(conn)
+
+def not_gated(store: VectorIndexStore, flag):
+    if not ledger_holds_vectors():
+        store.count_rows("chunks")
+    if flag or ledger_holds_vectors():
+        store.count_rows("chunks")
 """
 
     assert _scan(source) == {
@@ -264,4 +277,6 @@ async def each_occurrence(store: VectorIndexStore):
         ("Facade.enumerate", "list_embeddings_table_names"): 1,
         ("closure._compensate", "delete_documents_data"): 1,
         ("annotated_assignment", "list_indexed_doc_refs"): 1,
+        ("gated", "cascade_delete"): 1,
+        ("not_gated", "count_rows"): 2,
     }

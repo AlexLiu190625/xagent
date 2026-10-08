@@ -530,13 +530,45 @@ async def test_rebuild_collection_stats_refreshes_metadata_from_storage_state() 
 
 
 @pytest.mark.asyncio
+async def test_rebuild_collection_stats_counts_through_the_facades_storage() -> None:
+    """Given a coordinator with its own shim, stats rebuild counts through it."""
+    from types import SimpleNamespace
+
+    from xagent.core.tools.core.RAG_tools.kb import KBCoordinator
+    from xagent.core.tools.core.RAG_tools.storage.factory import get_metadata_store
+
+    reads: list[tuple[int | None, bool]] = []
+
+    def aggregate(*, user_id: int | None, is_admin: bool) -> dict:
+        reads.append((user_id, is_admin))
+        return {"kb_shim": {"documents": 2, "parses": 1, "chunks": 3, "embeddings": 4}}
+
+    metadata_store = get_metadata_store()
+    shim = SimpleNamespace(
+        get_vector_index_store=lambda: SimpleNamespace(
+            aggregate_collection_stats=aggregate
+        ),
+        get_metadata_store=lambda: metadata_store,
+    )
+    facade = KBCoordinator(storage_shim=shim).maintenance_compatibility
+
+    rebuilt = await facade.rebuild_collection_stats("kb_shim")
+    synced = facade.rebuild_collection_stats_sync("kb_shim")
+
+    assert rebuilt is not None and synced is not None
+    assert (rebuilt.documents, rebuilt.chunks, rebuilt.embeddings) == (2, 3, 4)
+    assert synced.embeddings == 4
+    assert reads == [(None, True), (None, True)]
+
+
+@pytest.mark.asyncio
 async def test_rebuild_collection_stats_treats_null_storage_counts_as_zero(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Given nullable aggregate counts, stats rebuild stores zero counts."""
     from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
     from xagent.core.tools.core.RAG_tools.kb import get_kb_coordinator
-    from xagent.core.tools.core.RAG_tools.management import collection_manager
+    from xagent.core.tools.core.RAG_tools.kb.collection_handle import KBHandleProvider
     from xagent.core.tools.core.RAG_tools.storage.factory import get_metadata_store
 
     metadata_store = get_metadata_store()
@@ -571,9 +603,11 @@ async def test_rebuild_collection_stats_treats_null_storage_counts_as_zero(
             }
 
     monkeypatch.setattr(
-        collection_manager,
-        "get_vector_index_store",
-        lambda: _FakeVectorIndexStore(),
+        KBHandleProvider,
+        "aggregate_collection_stats",
+        lambda _provider, **kwargs: _FakeVectorIndexStore().aggregate_collection_stats(
+            **kwargs
+        ),
     )
 
     rebuilt = await facade.rebuild_collection_stats(collection_name)

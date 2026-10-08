@@ -510,6 +510,8 @@ def _aggregate_uploaded_file_statuses_impl(
     Returns:
         Dictionary mapping file_id to status (RUNNING, SUCCESS, FAILED, UNKNOWN)
     """
+    from ...core.tools.core.RAG_tools.kb.collection_handle import ledger_holds_vectors
+
     normalized_file_ids = sorted({file_id for file_id in file_ids if file_id})
     if not normalized_file_ids:
         return {}
@@ -554,11 +556,13 @@ def _aggregate_uploaded_file_statuses_impl(
                 status_by_doc[(collection, doc_id)] = status
 
     # Legacy deployments may lack status rows; indexed documents then count as SUCCESS.
-    indexed_doc_refs = vector_store.list_indexed_doc_refs(
-        [ref for doc_refs in doc_refs_by_file_id.values() for ref in doc_refs],
-        user_id=user_id,
-        is_admin=is_admin,
-    )
+    indexed_doc_refs: set[tuple[str, str]] = set()
+    if ledger_holds_vectors():
+        indexed_doc_refs = vector_store.list_indexed_doc_refs(
+            [ref for doc_refs in doc_refs_by_file_id.values() for ref in doc_refs],
+            user_id=user_id,
+            is_admin=is_admin,
+        )
 
     status_map: Dict[str, str] = {}
     for file_id, doc_refs in doc_refs_by_file_id.items():
@@ -615,6 +619,9 @@ def _reconcile_uploaded_files_impl(
     The caller owns the SQL transaction boundary. This helper flushes its own
     UploadedFile deletes but does not commit the passed session.
     """
+    from ...core.tools.core.RAG_tools.kb import get_kb_coordinator
+    from ...core.tools.core.RAG_tools.kb.collection_handle import ledger_holds_vectors
+
     query = db.query(UploadedFile)
     if not is_admin:
         query = query.filter(UploadedFile.user_id == user_id)
@@ -685,9 +692,8 @@ def _reconcile_uploaded_files_impl(
             )
             continue
 
-        # Cascade delete all related data for each (collection, doc_id) pair
-        # Note: We use cascade_delete for complete cleanup across all tables
-        # (parses, chunks, embeddings_*, main_pointers, ingestion_runs, documents)
+        # Delete each (collection, doc_id): LanceDB cascades over every table,
+        # other engines go through the handle's delete_documents_data.
         cascade_deleted = 0
         cascade_error = False
         for doc in docs:
@@ -697,15 +703,20 @@ def _reconcile_uploaded_files_impl(
                 continue
 
             try:
-                deleted_counts = get_vector_index_store().cascade_delete(
-                    target="document",
-                    collection=collection,
-                    doc_id=doc_id,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                    preview_only=False,
-                    confirm=True,
-                )
+                if ledger_holds_vectors():
+                    deleted_counts = get_vector_index_store().cascade_delete(
+                        target="document",
+                        collection=collection,
+                        doc_id=doc_id,
+                        user_id=user_id,
+                        is_admin=is_admin,
+                        preview_only=False,
+                        confirm=True,
+                    )
+                else:
+                    deleted_counts = get_kb_coordinator().delete_documents_data_sync(
+                        collection, [doc_id], user_id=user_id, is_admin=is_admin
+                    )
                 cascade_deleted += sum(int(v) for v in deleted_counts.values())
                 logger.info(
                     "Cascade deleted %d rows for stale document: collection=%s, doc_id=%s, file_id=%s",

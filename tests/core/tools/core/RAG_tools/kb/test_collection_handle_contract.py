@@ -1,7 +1,11 @@
 """Behavior contract every ``KBCollectionHandle`` engine must satisfy.
 
 Tests drive the handle only through the abstract interface; an engine joins by
-adding an ``ENGINES`` entry. Not covered here:
+adding an ``ENGINES`` entry. On Milvus the ledger cases in ``MILVUS_SKELETON``
+run, the cascade cases in ``MILVUS_UNSUPPORTED`` are skipped because Milvus
+does not support cascade cleanup by design, and every other case needs Milvus
+rows: those are not implemented yet, so the cases are strict xfails on
+``NotImplementedError`` until they are. Not covered here:
 
 - async search: LanceDB async search returns no rows today;
 - untagged main pointers and ``list_main_pointers``: on LanceDB the untagged
@@ -39,6 +43,7 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
     ParsedParagraph,
     RegisterDocumentRequest,
 )
+from xagent.core.tools.core.RAG_tools.kb import collection_handle
 from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
     KBCollectionHandle,
     KBHandleProvider,
@@ -75,31 +80,95 @@ SEARCH_MODES = ("dense", "sparse", "hybrid")
 OpenHandle = Callable[..., KBCollectionHandle]
 
 
-def _open_lancedb(collection: str, user_id: int | None = None) -> KBCollectionHandle:
-    return KBHandleProvider().open(
-        KBCollectionContext(
-            collection=collection,
-            user_scope=KBUserScope(user_id=user_id, is_admin=user_id is None),
-            access_mode=KBAccessMode.WRITE,
-            allow_create=True,
-            hide_missing=True,
-            metadata_store=get_metadata_store(),
-            vector_index_store=get_vector_index_store(),
-            ingestion_status_store=get_ingestion_status_store(),
-            main_pointer_store=get_main_pointer_store(),
-            backend=KBStorageBackend.LANCEDB,
-            capabilities=KBBackendCapabilities.lancedb(),
-            collection_info=None,
+def _opener(
+    backend: KBStorageBackend, capabilities: KBBackendCapabilities
+) -> OpenHandle:
+    def open_handle(collection: str, user_id: int | None = None) -> KBCollectionHandle:
+        return KBHandleProvider().open(
+            KBCollectionContext(
+                collection=collection,
+                user_scope=KBUserScope(user_id=user_id, is_admin=user_id is None),
+                access_mode=KBAccessMode.WRITE,
+                allow_create=True,
+                hide_missing=True,
+                metadata_store=get_metadata_store(),
+                vector_index_store=get_vector_index_store(),
+                ingestion_status_store=get_ingestion_status_store(),
+                main_pointer_store=get_main_pointer_store(),
+                backend=backend,
+                capabilities=capabilities,
+                collection_info=None,
+            )
         )
+
+    return open_handle
+
+
+ENGINES: dict[str, OpenHandle] = {
+    "lancedb": _opener(KBStorageBackend.LANCEDB, KBBackendCapabilities.lancedb()),
+    "milvus": _opener(KBStorageBackend.MILVUS, KBBackendCapabilities.milvus()),
+}
+MILVUS_SKELETON = {
+    "test_register_document_is_idempotent_and_owner_scoped",
+    "test_parse_rows_round_trip_within_owner_scope",
+    "test_ingestion_status_round_trip_and_snapshot",
+    "test_ingestion_status_async_round_trip",
+    "test_main_pointer_round_trip_and_snapshot",
+    "test_rename_collection_status_moves_only_the_callers_rows",
+    "test_rename_collection_metadata_moves_only_the_callers_config",
+    "test_delete_collection_config_follows_tenant_scope",
+}
+MILVUS_UNSUPPORTED = {
+    "test_cascade_deletes_its_scope_only_when_confirmed",
+    "test_cascade_leaves_other_owners_rows",
+}
+
+
+def _engine_marks(engine: str, case: str) -> tuple[pytest.MarkDecorator, ...]:
+    if engine != "milvus" or case in MILVUS_SKELETON:
+        return ()
+    if case in MILVUS_UNSUPPORTED:
+        return (pytest.mark.skip(reason="Milvus does not support cascade cleanup"),)
+    return (
+        pytest.mark.xfail(
+            strict=True,
+            raises=NotImplementedError,
+            reason="needs Milvus rows, which are not implemented yet",
+        ),
     )
 
 
-ENGINES: dict[str, OpenHandle] = {"lancedb": _open_lancedb}
+def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
+    if "open_handle" in metafunc.fixturenames:
+        metafunc.parametrize(
+            "open_handle",
+            [
+                pytest.param(
+                    engine, marks=_engine_marks(engine, metafunc.function.__name__)
+                )
+                for engine in sorted(ENGINES)
+            ],
+            indirect=True,
+        )
 
 
-@pytest.fixture(params=sorted(ENGINES))
-def open_handle(request: pytest.FixtureRequest) -> OpenHandle:
+@pytest.fixture
+def open_handle(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> OpenHandle:
+    if request.param == "milvus":
+        monkeypatch.setenv("XAGENT_VECTOR_BACKEND", "milvus")
+        monkeypatch.setattr(
+            collection_handle, "require_implemented_vector_backend", lambda _: None
+        )
     return ENGINES[request.param]
+
+
+def test_milvus_case_lists_name_real_cases() -> None:
+    cases = {name for name in globals() if name.startswith("test_")}
+
+    assert MILVUS_SKELETON | MILVUS_UNSUPPORTED <= cases
+    assert not MILVUS_SKELETON & MILVUS_UNSUPPORTED
 
 
 def _write_chunks(

@@ -16,6 +16,7 @@ import time
 import pytest
 
 from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+from xagent.core.tools.core.RAG_tools.kb.collection_handle import KBHandleProvider
 from xagent.core.tools.core.RAG_tools.management import (
     collection_manager as collection_manager_module,
 )
@@ -59,7 +60,9 @@ def slow_vector_store(monkeypatch: pytest.MonkeyPatch) -> _SlowVectorStore:
         saved.append(collection)
 
     monkeypatch.setattr(
-        collection_manager_module, "get_vector_index_store", lambda: store
+        KBHandleProvider,
+        "aggregate_collection_stats",
+        lambda _provider, **kwargs: store.aggregate_collection_stats(**kwargs),
     )
     monkeypatch.setattr(
         collection_manager_module, "get_metadata_store", lambda: _StubMetadataStore()

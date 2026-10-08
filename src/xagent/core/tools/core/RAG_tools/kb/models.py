@@ -41,6 +41,7 @@ class KBBackendCapabilities:
     supports_search: bool
     supports_versions: bool
     supports_raw_connection: bool
+    supports_async_search: bool
 
     @classmethod
     def lancedb(cls) -> KBBackendCapabilities:
@@ -53,6 +54,26 @@ class KBBackendCapabilities:
             supports_search=True,
             supports_versions=True,
             supports_raw_connection=True,
+            supports_async_search=True,
+        )
+
+    @classmethod
+    def milvus(cls) -> KBBackendCapabilities:
+        """Return what ``MilvusCollectionHandle`` supports.
+
+        Documents, parses and chunks are served by the LanceDB ledger. Embeddings
+        and search are off until Milvus rows are written and searched. Versions,
+        which here include cascade cleanup, and async search stay off.
+        """
+        return cls(
+            supports_documents=True,
+            supports_parses=True,
+            supports_chunks=True,
+            supports_embeddings=False,
+            supports_search=False,
+            supports_versions=False,
+            supports_raw_connection=False,
+            supports_async_search=False,
         )
 
     @classmethod
@@ -66,6 +87,7 @@ class KBBackendCapabilities:
             supports_search=False,
             supports_versions=False,
             supports_raw_connection=False,
+            supports_async_search=False,
         )
 
 

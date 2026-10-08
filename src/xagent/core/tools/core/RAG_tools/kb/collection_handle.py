@@ -9,21 +9,24 @@ vector index store.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import numbers
 import os
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from datetime import timezone
+from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, cast
+from typing import TYPE_CHECKING, Any, Dict, List, NoReturn, Optional, TypeVar, cast
 
 from ..storage.file_reference import guard_document_restore
 
 if TYPE_CHECKING:
+    from ......providers.vector_store.milvus import MilvusConnectionManager
     from .models import KBVectorStorageCleanupResult
 
 import pandas as pd
@@ -298,6 +301,15 @@ def deployment_kb_backend() -> KBStorageBackend:
     return backend
 
 
+def ledger_holds_vectors() -> bool:
+    """Whether the LanceDB ledger also holds chunk vectors (``embeddings_*`` tables).
+
+    True only in a LanceDB deployment; upper-layer code that reads those tables
+    directly runs only when this holds.
+    """
+    return deployment_kb_backend() is KBStorageBackend.LANCEDB
+
+
 class KBHandleProvider:
     """Open collection-scoped handles for resolved KB contexts."""
 
@@ -310,6 +322,20 @@ class KBHandleProvider:
         """Return a backend-specific handle for the resolved collection context."""
         if context.backend is KBStorageBackend.LANCEDB:
             return LanceDBCollectionHandle(context)
+        if context.backend is KBStorageBackend.MILVUS:
+            deployment = deployment_kb_backend()
+            if deployment is not KBStorageBackend.MILVUS:
+                raise ValueError(
+                    f"Collection {context.collection!r} is bound to the milvus "
+                    f"engine, but this deployment runs {deployment.value}"
+                )
+            from ......providers.vector_store.milvus import MilvusConnectionManager
+
+            return MilvusCollectionHandle(
+                context,
+                ledger=LanceDBCollectionHandle(context),
+                connections=MilvusConnectionManager(),
+            )
         raise ValueError(
             f"KB storage backend {context.backend.value!r} is not supported by "
             "KBHandleProvider"
@@ -326,6 +352,11 @@ class KBHandleProvider:
         if backend is KBStorageBackend.LANCEDB:
             store = self._storage_shim.get_vector_index_store()
             return store.aggregate_collection_stats(user_id=user_id, is_admin=is_admin)
+        if backend is KBStorageBackend.MILVUS:
+            raise NotImplementedError(
+                "Batched collection stats for the milvus KB engine are not "
+                "implemented yet (#2867)"
+            )
         raise ValueError(
             f"KB storage backend {backend.value!r} is not supported by KBHandleProvider"
         )
@@ -5198,3 +5229,196 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             if isinstance(e, VersionManagementError):
                 raise
             raise VersionManagementError(f"Failed to promote version main: {e}") from e
+
+
+_Method = TypeVar("_Method", bound=Callable[..., Any])
+
+
+def _route(method: _Method, call: Callable[..., Any]) -> _Method:
+    """Implement ``method`` with ``call(handle, ...)``, async when ``method`` is."""
+    if inspect.iscoroutinefunction(method):
+
+        async def call_async(handle: Any, *args: Any, **kwargs: Any) -> Any:
+            return await call(handle, *args, **kwargs)
+
+        routed = call_async
+    else:
+        routed = call
+    routed.__name__ = method.__name__
+    routed.__qualname__ = f"MilvusCollectionHandle.{method.__name__}"
+    routed.__doc__ = method.__doc__
+    return cast(_Method, routed)
+
+
+def _ledger(method: _Method) -> _Method:
+    """Serve ``method`` with the same method of the injected ledger handle."""
+    name = method.__name__
+
+    def forward(handle: MilvusCollectionHandle, *args: Any, **kwargs: Any) -> Any:
+        return getattr(handle.ledger, name)(*args, **kwargs)
+
+    return _route(method, forward)
+
+
+def _unsupported(method: _Method, family: str) -> _Method:
+    """Refuse ``method``: the Milvus engine does not support ``family``."""
+    message = f"The milvus KB engine does not support {family} ({method.__name__})"
+
+    def refuse(handle: MilvusCollectionHandle, *args: Any, **kwargs: Any) -> NoReturn:
+        raise ConfigurationError(message)
+
+    return _route(method, refuse)
+
+
+def _pending(method: _Method) -> _Method:
+    """Refuse ``method``, which needs Milvus rows, until it is implemented."""
+    message = (
+        f"MilvusCollectionHandle.{method.__name__} needs Milvus rows and is not "
+        "implemented yet"
+    )
+
+    def refuse(handle: MilvusCollectionHandle, *args: Any, **kwargs: Any) -> NoReturn:
+        raise NotImplementedError(message)
+
+    return _route(method, refuse)
+
+
+_ASYNC_SEARCH = "async search"
+_CASCADE = "cascade cleanup"
+_VERSIONS = "version candidates and promotion"
+
+
+@dataclass(frozen=True)
+class MilvusCollectionHandle(KBCollectionHandle):
+    """Milvus-backed collection handle.
+
+    The ledger (documents, parses, chunks, ingestion status, main pointers,
+    config and metadata) stays in LanceDB and is served by the injected
+    ``ledger`` handle; chunk copies and vectors for search live in Milvus.
+    Async search, cascade cleanup, and version candidates and promotion raise
+    ``ConfigurationError``. Methods that need Milvus rows raise
+    ``NotImplementedError``. ``KBBackendCapabilities.milvus`` reports the same
+    split.
+    """
+
+    context: KBCollectionContext
+    ledger: KBCollectionHandle
+    connections: MilvusConnectionManager
+
+    @cached_property
+    def client(self) -> Any:
+        """Milvus client for ``MILVUS_URI``, created on first use."""
+        return self.connections.get_client_from_env()
+
+    register_document = _ledger(KBCollectionHandle.register_document)
+    load_document = _ledger(KBCollectionHandle.load_document)
+    list_documents = _ledger(KBCollectionHandle.list_documents)
+    delete_document_record = _ledger(KBCollectionHandle.delete_document_record)
+    snapshot_document = _ledger(KBCollectionHandle.snapshot_document)
+    restore_document = _ledger(KBCollectionHandle.restore_document)
+    delete_created_document = _ledger(KBCollectionHandle.delete_created_document)
+    parse_exists = _ledger(KBCollectionHandle.parse_exists)
+    read_parse_paragraphs = _ledger(KBCollectionHandle.read_parse_paragraphs)
+    write_parse = _ledger(KBCollectionHandle.write_parse)
+    read_latest_parse_record = _ledger(KBCollectionHandle.read_latest_parse_record)
+    chunk_exists = _ledger(KBCollectionHandle.chunk_exists)
+    read_existing_chunks = _ledger(KBCollectionHandle.read_existing_chunks)
+    read_parse_paragraph_dicts = _ledger(KBCollectionHandle.read_parse_paragraph_dicts)
+    write_chunks = _ledger(KBCollectionHandle.write_chunks)
+    delete_parse_records = _ledger(KBCollectionHandle.delete_parse_records)
+    delete_chunk_records = _ledger(KBCollectionHandle.delete_chunk_records)
+    snapshot_parse = _ledger(KBCollectionHandle.snapshot_parse)
+    restore_parse = _ledger(KBCollectionHandle.restore_parse)
+    delete_created_parse = _ledger(KBCollectionHandle.delete_created_parse)
+    snapshot_chunks = _ledger(KBCollectionHandle.snapshot_chunks)
+    restore_chunks = _ledger(KBCollectionHandle.restore_chunks)
+    delete_created_chunks = _ledger(KBCollectionHandle.delete_created_chunks)
+    rename_collection_data = _ledger(KBCollectionHandle.rename_collection_data)
+    rename_collection_status = _ledger(KBCollectionHandle.rename_collection_status)
+    rename_collection_metadata = _ledger(KBCollectionHandle.rename_collection_metadata)
+    delete_collection_config = _ledger(KBCollectionHandle.delete_collection_config)
+    count_documents = _ledger(KBCollectionHandle.count_documents)
+    list_collection_documents = _ledger(KBCollectionHandle.list_collection_documents)
+    write_ingestion_status = _ledger(KBCollectionHandle.write_ingestion_status)
+    load_ingestion_status = _ledger(KBCollectionHandle.load_ingestion_status)
+    clear_ingestion_status = _ledger(KBCollectionHandle.clear_ingestion_status)
+    write_ingestion_status_async = _ledger(
+        KBCollectionHandle.write_ingestion_status_async
+    )
+    load_ingestion_status_async = _ledger(
+        KBCollectionHandle.load_ingestion_status_async
+    )
+    clear_ingestion_status_async = _ledger(
+        KBCollectionHandle.clear_ingestion_status_async
+    )
+    get_main_pointer = _ledger(KBCollectionHandle.get_main_pointer)
+    set_main_pointer = _ledger(KBCollectionHandle.set_main_pointer)
+    list_main_pointers = _ledger(KBCollectionHandle.list_main_pointers)
+    delete_main_pointer = _ledger(KBCollectionHandle.delete_main_pointer)
+    capture_status_snapshot = _ledger(KBCollectionHandle.capture_status_snapshot)
+    restore_status_snapshot = _ledger(KBCollectionHandle.restore_status_snapshot)
+    clear_status_snapshot = _ledger(KBCollectionHandle.clear_status_snapshot)
+    capture_main_pointer_snapshot = _ledger(
+        KBCollectionHandle.capture_main_pointer_snapshot
+    )
+    restore_main_pointer_snapshot = _ledger(
+        KBCollectionHandle.restore_main_pointer_snapshot
+    )
+
+    search_dense_async = _unsupported(
+        KBCollectionHandle.search_dense_async, _ASYNC_SEARCH
+    )
+    search_sparse_async = _unsupported(
+        KBCollectionHandle.search_sparse_async, _ASYNC_SEARCH
+    )
+    search_hybrid_async = _unsupported(
+        KBCollectionHandle.search_hybrid_async, _ASYNC_SEARCH
+    )
+    cleanup_cascade = _unsupported(KBCollectionHandle.cleanup_cascade, _CASCADE)
+    cleanup_document_cascade = _unsupported(
+        KBCollectionHandle.cleanup_document_cascade, _CASCADE
+    )
+    cleanup_parse_cascade = _unsupported(
+        KBCollectionHandle.cleanup_parse_cascade, _CASCADE
+    )
+    cleanup_chunk_cascade = _unsupported(
+        KBCollectionHandle.cleanup_chunk_cascade, _CASCADE
+    )
+    cleanup_embed_cascade = _unsupported(
+        KBCollectionHandle.cleanup_embed_cascade, _CASCADE
+    )
+    list_candidates = _unsupported(KBCollectionHandle.list_candidates, _VERSIONS)
+    promote_version_main = _unsupported(
+        KBCollectionHandle.promote_version_main, _VERSIONS
+    )
+    capture_candidate_cleanup_snapshot = _unsupported(
+        KBCollectionHandle.capture_candidate_cleanup_snapshot, _VERSIONS
+    )
+    restore_candidate_cleanup_snapshot = _unsupported(
+        KBCollectionHandle.restore_candidate_cleanup_snapshot, _VERSIONS
+    )
+
+    capture_document_rows = _pending(KBCollectionHandle.capture_document_rows)
+    restore_document_rows = _pending(KBCollectionHandle.restore_document_rows)
+    validate_query_vector = _pending(KBCollectionHandle.validate_query_vector)
+    read_chunks_needing_embedding = _pending(
+        KBCollectionHandle.read_chunks_needing_embedding
+    )
+    write_embeddings = _pending(KBCollectionHandle.write_embeddings)
+    delete_embedding_records = _pending(KBCollectionHandle.delete_embedding_records)
+    snapshot_embeddings = _pending(KBCollectionHandle.snapshot_embeddings)
+    restore_embeddings = _pending(KBCollectionHandle.restore_embeddings)
+    delete_created_embeddings = _pending(KBCollectionHandle.delete_created_embeddings)
+    search_dense = _pending(KBCollectionHandle.search_dense)
+    search_sparse = _pending(KBCollectionHandle.search_sparse)
+    search_hybrid = _pending(KBCollectionHandle.search_hybrid)
+    delete_documents_data = _pending(KBCollectionHandle.delete_documents_data)
+    delete_collection_data = _pending(KBCollectionHandle.delete_collection_data)
+    cleanup_collection_data_after_rollback = _pending(
+        KBCollectionHandle.cleanup_collection_data_after_rollback
+    )
+    cleanup_embeddings_for_operation = _pending(
+        KBCollectionHandle.cleanup_embeddings_for_operation
+    )
+    collection_stats = _pending(KBCollectionHandle.collection_stats)
+    count_rows_by_document = _pending(KBCollectionHandle.count_rows_by_document)

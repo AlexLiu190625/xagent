@@ -1712,6 +1712,9 @@ async def startup_event() -> None:
     auto_migrate = os.getenv("LANCEDB_AUTO_MIGRATE", "true").lower() == "true"
 
     try:
+        from ..core.tools.core.RAG_tools.kb.collection_handle import (
+            ledger_holds_vectors,
+        )
         from ..core.tools.core.RAG_tools.LanceDB.schema_manager import (
             check_table_needs_migration,
         )
@@ -1740,7 +1743,7 @@ async def startup_event() -> None:
                 needs_migration = True
 
         # Check embeddings tables (use shared compat helper)
-        if not needs_migration:
+        if not needs_migration and ledger_holds_vectors():
             try:
                 from ..core.tools.core.RAG_tools.utils.lancedb_query_utils import (
                     list_embeddings_table_names,

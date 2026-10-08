@@ -146,6 +146,10 @@ def _infer_embedding_config_from_collection(
     Returns:
         Tuple of (embedding_model_id, embedding_dimension), or (None, None) if cannot infer
     """
+    from ..kb.collection_handle import ledger_holds_vectors
+
+    if not ledger_holds_vectors():
+        return None, None
     logger.debug(
         "Starting embedding config inference for collection '%s'", collection_name
     )

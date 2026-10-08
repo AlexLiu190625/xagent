@@ -380,8 +380,15 @@ class KBVersionCompatibilityFacade:
         preview_only: bool = True,
         confirm: bool = False,
     ) -> Dict[str, int]:
+        from ..core.exceptions import ConfigurationError
         from ..storage.factory import get_vector_index_store
+        from .collection_handle import deployment_kb_backend, ledger_holds_vectors
 
+        if not ledger_holds_vectors():
+            raise ConfigurationError(
+                f"The {deployment_kb_backend().value} KB engine does not support "
+                "cascade cleanup (cascade_delete)"
+            )
         with self._storage_context():
             return get_vector_index_store().cascade_delete(
                 target=target,
