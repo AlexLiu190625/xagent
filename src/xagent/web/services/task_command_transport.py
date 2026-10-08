@@ -35,6 +35,7 @@ from ..models.task_command import TaskExecutionCommand
 from ..models.user import User
 from .db_runtime import (
     await_task_settlement,
+    caller_is_cancelling,
     is_database_pool_timeout,
     propagate_deferred_cancellation,
     run_db_io_cancellation_safe,
@@ -1589,9 +1590,10 @@ async def dispatch_one_task_command(
         return False
     except _CoordinatorInterrupted:
         logger.warning(
-            "task_id=%s component=task-command-dispatcher command interrupted by "
-            "its task owner; any claim it held is left for recovery "
-            "(command_db_id=%s, kind=%s)",
+            "task_id=%s component=task-command-dispatcher command application "
+            "was cancelled by something other than the dispatcher (task owner "
+            "close or a cancellation inside the command); any claim it held is "
+            "left for recovery (command_db_id=%s, kind=%s)",
             task_id,
             selected_id,
             kind.value,
@@ -1851,8 +1853,7 @@ async def _run_task_command_dispatcher_worker(executor: CommandExecutor) -> None
         try:
             processed = await dispatch_one_task_command(executor)
         except asyncio.CancelledError as exc:
-            current = asyncio.current_task()
-            if current is not None and current.cancelling() > 0:
+            if caller_is_cancelling():
                 raise
             logger.error(
                 "component=task-command-dispatcher dispatch raised a "

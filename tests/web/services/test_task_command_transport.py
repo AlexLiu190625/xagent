@@ -3195,6 +3195,36 @@ async def test_dispatcher_worker_survives_cancellation_not_aimed_at_it(
     assert dispatcher.done()
 
 
+@pytest.mark.asyncio
+async def test_dispatcher_worker_exits_when_it_is_cancelled(monkeypatch) -> None:
+    """Cancelling the worker itself ends it even while its wakeup is still live."""
+
+    transport = task_command_transport_module
+    parked = asyncio.Event()
+
+    async def dispatch(_executor, *, command_db_id=None) -> bool:
+        parked.set()
+        await asyncio.Event().wait()
+        return False
+
+    monkeypatch.setattr(transport, "dispatch_one_task_command", dispatch)
+    monkeypatch.setattr(transport, "_dispatcher_wakeup", asyncio.Event())
+    worker = asyncio.create_task(
+        transport._run_task_command_dispatcher_worker(lambda _command: asyncio.sleep(0))
+    )
+    try:
+        await asyncio.wait_for(parked.wait(), DB_PROGRESS_TIMEOUT)
+        worker.cancel()
+        await asyncio.wait({worker}, timeout=DB_PROGRESS_TIMEOUT)
+        assert worker.cancelled()
+    finally:
+        if not worker.done():
+            # Let a loop that wrongly survived its own cancel return.
+            monkeypatch.setattr(transport, "_dispatcher_wakeup", None)
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+
+
 class _Boom(BaseException):
     """An exit that is neither a cancellation nor an ordinary exception."""
 

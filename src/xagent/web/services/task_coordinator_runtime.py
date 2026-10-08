@@ -23,6 +23,7 @@ from ..models.task import Task, TaskStatus
 from ..models.task_command import TaskExecutionCommand
 from .db_runtime import (
     await_task_settlement,
+    caller_is_cancelling,
     cancel_and_drain_async_task,
     drain_async_task_cancellation_safe,
     is_database_pool_timeout,
@@ -594,13 +595,12 @@ class TaskCoordinator:
             return await asyncio.shield(handle)
         except asyncio.CancelledError as cancellation:
             await cancel_and_drain_async_task(handle)
-            current = asyncio.current_task()
-            if current is not None and current.cancelling() > 0:
+            if caller_is_cancelling():
                 raise
-            # The command handle was cancelled by something other than this
-            # caller: heartbeat loss, an owner shutdown drain, or any other
-            # cancellation of the handle. The caller itself is still running
-            # and must not inherit that cancel.
+            # Command application was cancelled by something other than this
+            # caller: an owner close (heartbeat loss, shutdown drain) or a
+            # cancellation inside the command itself. The caller is still
+            # running and must not inherit that cancel.
             raise _CoordinatorInterrupted from cancellation
         finally:
             self._command_tasks.discard(handle)
@@ -857,7 +857,13 @@ class _CoordinatorClosed(Exception):
 
 
 class _CoordinatorInterrupted(Exception):
-    """The owner cancelled a command before it finished applying."""
+    """Command application was cancelled by something other than its caller.
+
+    Raised for an owner close (heartbeat loss, shutdown drain) or a
+    cancellation inside the command itself. It must not subclass
+    ``_CoordinatorClosed``: that one is retried, and an interrupted command
+    may already be partly applied.
+    """
 
 
 def current_task_coordinator(task_id: int) -> TaskCoordinator | None:

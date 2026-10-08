@@ -994,7 +994,36 @@ async def test_dispatch_one_returns_false_when_owner_interrupts_command(host, ca
         assert row.failure_count == 0
         assert row.error is None
     interrupted = [
-        r for r in caplog.records if "interrupted by its task owner" in r.getMessage()
+        r
+        for r in caplog.records
+        if "cancelled by something other than the dispatcher" in r.getMessage()
     ]
     assert len(interrupted) == 1
     assert interrupted[0].levelno == logging.WARNING
+
+
+async def test_execute_coordinated_command_does_not_retry_an_interrupted_command(
+    monkeypatch,
+):
+    attempts = 0
+
+    class Owner:
+        async def execute_command(self, command, execute):
+            nonlocal attempts
+            attempts += 1
+            if attempts > 1:
+                raise AssertionError("interrupted command was applied again")
+            raise task_coordinator_runtime._CoordinatorInterrupted
+
+    class Registry:
+        async def ensure(self, task_id):
+            return Owner()
+
+    monkeypatch.setattr(
+        task_coordinator_runtime, "get_task_coordinator_registry", lambda: Registry()
+    )
+    with pytest.raises(task_coordinator_runtime._CoordinatorInterrupted):
+        await task_coordinator_runtime.execute_coordinated_command(
+            SimpleNamespace(task_id=1), AsyncMock()
+        )
+    assert attempts == 1
