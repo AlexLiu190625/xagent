@@ -15,6 +15,7 @@ import enum
 import json
 import logging
 import re
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -98,6 +99,14 @@ def max_command_defers() -> int:
 
 DISPATCHER_IDLE_SECONDS = 0.5
 DISPATCHER_CONCURRENCY = 4
+# A failing claim (typically an unreachable database) backs off exponentially
+# from DISPATCHER_IDLE_SECONDS up to this ceiling instead of retrying every
+# idle tick, and repeats of the failure are logged at most once per interval.
+# Both are per worker: with DISPATCHER_CONCURRENCY workers an outage logs up
+# to that many lines per interval, and each line's consecutive_failures counts
+# only that worker's failed claims.
+DISPATCHER_FAILURE_BACKOFF_MAX_SECONDS = 30.0
+DISPATCHER_FAILURE_LOG_INTERVAL_SECONDS = 60.0
 
 
 class TaskCommandKind(str, enum.Enum):
@@ -447,7 +456,10 @@ def stage_task_command(
        notify_task_command_dispatcher(). Skipping it does not lose the
        command -- the dispatcher's idle poll still recovers it -- but
        delivery silently degrades to up to DISPATCHER_IDLE_SECONDS of added
-       latency instead of an immediate wakeup.
+       latency instead of an immediate wakeup. While a worker is backing off
+       after failed claims, its poll interval grows to at most
+       DISPATCHER_FAILURE_BACKOFF_MAX_SECONDS, which then bounds that latency;
+       a notify only reaches workers in the process that sent it.
     b. On IntegrityError from the command-insert flush in step 5, the caller
        must roll back the whole transaction before issuing any further
        statement on this session -- classify_task_command_conflict below
@@ -1815,7 +1827,24 @@ def _consume_prompt_dispatch_result(task: asyncio.Task[bool]) -> None:
         )
 
 
+def _dispatcher_clock() -> float:
+    return time.monotonic()
+
+
+def _dispatcher_failure_backoff_seconds(consecutive_failures: int) -> float:
+    """Return the retry delay after ``consecutive_failures`` (>= 1) failures."""
+
+    exponent = min(max(consecutive_failures, 1) - 1, 16)
+    return min(
+        DISPATCHER_IDLE_SECONDS * float(1 << exponent),
+        DISPATCHER_FAILURE_BACKOFF_MAX_SECONDS,
+    )
+
+
 async def _run_task_command_dispatcher_worker(executor: CommandExecutor) -> None:
+    consecutive_failures = 0
+    suppressed_failures = 0
+    last_failure_logged_at: float | None = None
     while True:
         wakeup = _dispatcher_wakeup
         if wakeup is None:
@@ -1829,17 +1858,45 @@ async def _run_task_command_dispatcher_worker(executor: CommandExecutor) -> None
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
-            logger.error(
-                "component=task-command-dispatcher command dispatch failed; "
-                "worker continuing: %s",
-                exc,
-                exc_info=(type(exc), exc, exc.__traceback__),
-            )
+            consecutive_failures += 1
+            retry_in = _dispatcher_failure_backoff_seconds(consecutive_failures)
+            now = _dispatcher_clock()
+            if (
+                last_failure_logged_at is None
+                or now - last_failure_logged_at
+                >= DISPATCHER_FAILURE_LOG_INTERVAL_SECONDS
+            ):
+                logger.error(
+                    "component=task-command-dispatcher command dispatch failed; "
+                    "worker continuing (consecutive_failures=%s "
+                    "suppressed_since_last_log=%s retry_in=%.2fs): %s",
+                    consecutive_failures,
+                    suppressed_failures,
+                    retry_in,
+                    exc,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+                last_failure_logged_at = now
+                suppressed_failures = 0
+            else:
+                suppressed_failures += 1
+            # A notify still cuts the backoff short: notifies follow a
+            # committed command write, so new work is a strong hint that the
+            # database is reachable again.
             try:
-                await asyncio.wait_for(wakeup.wait(), timeout=DISPATCHER_IDLE_SECONDS)
+                await asyncio.wait_for(wakeup.wait(), timeout=retry_in)
             except asyncio.TimeoutError:
                 pass
             continue
+        if consecutive_failures:
+            logger.info(
+                "component=task-command-dispatcher dispatch recovered after "
+                "%s consecutive failure(s)",
+                consecutive_failures,
+            )
+            consecutive_failures = 0
+            suppressed_failures = 0
+            last_failure_logged_at = None
         if processed:
             continue
         try:
