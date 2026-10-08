@@ -10,7 +10,12 @@ from googleapiclient.discovery import build  # type: ignore[import-not-found]
 from googleapiclient.http import MediaIoBaseUpload  # type: ignore[import-not-found]
 from mcp.server.fastmcp import FastMCP
 
-from .utils import resolve_id_from_url, setup_proxy_env
+from .utils import (
+    GoogleFileKind,
+    google_file_error_message,
+    resolve_google_file_id,
+    setup_proxy_env,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("google-docs-mcp")
@@ -20,7 +25,15 @@ setup_proxy_env()
 
 mcp = FastMCP("google-docs-mcp")
 
-_DOCUMENT_URL_ID_PATTERN = re.compile(r"/document/d/([a-zA-Z0-9_-]+)")
+# "(?!e/)" skips a published-to-the-web link (".../d/e/<publish-id>/pub"),
+# whose "e" segment is not the document id.
+_DOCUMENT_URL_ID_PATTERN = re.compile(r"/document/(?:u/\d+/)?d/(?!e/)([a-zA-Z0-9_-]+)")
+_DOCUMENT_KIND = GoogleFileKind(
+    product="Google Docs",
+    noun="document",
+    link_example="https://docs.google.com/document/d/...",
+    create_tool="google_docs_create_document",
+)
 
 _HEADING_PREFIXES = {
     "TITLE": "# ",
@@ -66,7 +79,19 @@ def get_drive_service() -> Any:
 
 def _resolve_document_id(document_id: str) -> str:
     """Accept either a bare document id or a full Google Docs URL."""
-    return resolve_id_from_url(document_id, _DOCUMENT_URL_ID_PATTERN, "document_id")
+    return resolve_google_file_id(
+        document_id, _DOCUMENT_URL_ID_PATTERN, "document_id", _DOCUMENT_KIND
+    )
+
+
+def _document_error(exc: Exception, *, editing: bool = False) -> str:
+    return json.dumps(
+        {
+            "status": "error",
+            "message": google_file_error_message(exc, _DOCUMENT_KIND, editing=editing),
+        },
+        ensure_ascii=False,
+    )
 
 
 def _paragraph_text(paragraph: dict[str, Any]) -> str:
@@ -109,6 +134,15 @@ def google_docs_get_document(document_id: str) -> str:
     """
     Read a Google Doc by document id or full document URL.
     Returns the title and the document text with headings rendered as Markdown.
+
+    Documents are opened only by link or id; this connector cannot
+    search for or list documents by name. When the user names a document
+    without giving its link, use google_drive_search to find its id if
+    that tool is available (with per-file Drive access it only finds
+    files created through this app or granted to it); otherwise, or if
+    it finds nothing, ask the user to paste the link
+    (https://docs.google.com/document/d/...). Connecting Google Drive is
+    not needed to open a document by its link.
     """
     try:
         doc_id = _resolve_document_id(document_id)
@@ -125,7 +159,7 @@ def google_docs_get_document(document_id: str) -> str:
         )
     except Exception as e:
         logger.error(f"Error getting document: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        return _document_error(e)
 
 
 @mcp.tool()
@@ -213,7 +247,7 @@ def google_docs_append_text(document_id: str, text: str) -> str:
         )
     except Exception as e:
         logger.error(f"Error appending text: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        return _document_error(e, editing=True)
 
 
 @mcp.tool()
@@ -260,7 +294,7 @@ def google_docs_replace_text(
         )
     except Exception as e:
         logger.error(f"Error replacing text: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        return _document_error(e, editing=True)
 
 
 @mcp.tool()
@@ -293,7 +327,7 @@ def google_docs_batch_update(document_id: str, requests_json: str) -> str:
         )
     except Exception as e:
         logger.error(f"Error applying batch update: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        return _document_error(e, editing=True)
 
 
 if __name__ == "__main__":

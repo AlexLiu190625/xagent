@@ -31,18 +31,26 @@ Do not build a new outlined deck with repeated `google_slides_create_presentatio
 and `google_slides_add_slide` calls. Those tools are for explicitly requested
 simple text/layout edits and do not preserve visual design.
 
-For simple Google Slides layout edits, pass the `default_slide_id` returned by
-`google_slides_create_presentation` to the first `google_slides_add_slide` call
-when calls may cross MCP processes. Without the id, the connector removes the
-sole empty page as the default page; an empty page in a multi-page deck is
-preserved. Pass `preserve_blank_slide=true` when that sole page is intentional.
+For simple Google Slides layout edits, when
+`google_slides_create_presentation` returns a `default_slide_id` (it is `null`
+when there is no default page to replace), pass it to the first
+`google_slides_add_slide` call. Unless the user specified a different first
+slide, make that first slide the cover (`layout="TITLE"` with the deck title).
+Calls may run in separate MCP processes; without the id the connector only
+removes a sole page that has no elements at all, so a default page with
+placeholders stays as the first slide. `google_slides_create_presentation`
+writes the deck title into that page when it can, so it then reads as a
+title-only cover: do not add a second cover in that case. An empty page in a
+multi-page deck is preserved. Pass `preserve_blank_slide=true` when that sole
+page is intentional.
 `google_slides_add_slide` only supports layouts with title/body placeholders;
 use `google_slides_batch_update` directly for blank/custom slides.
 
 When using `google_slides_batch_update` after `google_slides_create_presentation`,
 the connector cannot infer the default page across MCP processes. Include a
-`deleteObject` request for the returned `default_slide_id` after creating the
-first content page, or use `google_slides_add_slide` with that ID.
+`deleteObject` request for the returned `default_slide_id`, when one is
+returned, after creating the first content page, or use
+`google_slides_add_slide` with that ID.
 
 ## ⚠️ CRITICAL REQUIREMENTS - READ FIRST
 

@@ -19,7 +19,13 @@ from pydantic import BeforeValidator
 
 from mcp.server.fastmcp import FastMCP
 
-from .utils import allowed_dirs_from_env, resolve_id_from_url, setup_proxy_env
+from .utils import (
+    GoogleFileKind,
+    allowed_dirs_from_env,
+    google_file_error_message,
+    resolve_google_file_id,
+    setup_proxy_env,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("google-slides-mcp")
@@ -29,7 +35,17 @@ setup_proxy_env()
 
 mcp = FastMCP("google-slides-mcp")
 
-_PRESENTATION_URL_ID_PATTERN = re.compile(r"/presentation/d/([a-zA-Z0-9_-]+)")
+# "(?!e/)" skips a published-to-the-web link (".../d/e/<publish-id>/pub"),
+# whose "e" segment is not the presentation id.
+_PRESENTATION_URL_ID_PATTERN = re.compile(
+    r"/presentation/(?:u/\d+/)?d/(?!e/)([a-zA-Z0-9_-]+)"
+)
+_PRESENTATION_KIND = GoogleFileKind(
+    product="Google Slides",
+    noun="presentation",
+    link_example="https://docs.google.com/presentation/d/...",
+    create_tool="google_slides_create_presentation",
+)
 _PPTX_MIME_TYPE = (
     "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 )
@@ -178,6 +194,10 @@ def _strip_bullet_prefixes(text: str) -> str:
 
 def _error(message: str) -> str:
     return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
+
+
+def _presentation_error(exc: Exception, *, editing: bool = False) -> str:
+    return _error(google_file_error_message(exc, _PRESENTATION_KIND, editing=editing))
 
 
 def _delete_imported_presentation(drive_service: Any, presentation_id: str) -> bool:
@@ -476,8 +496,11 @@ def _record_created_default_slide(presentation_id: str, slide_id: str) -> None:
 
 def _resolve_presentation_id(presentation_id: str) -> str:
     """Accept either a bare presentation id or a full Google Slides URL."""
-    return resolve_id_from_url(
-        presentation_id, _PRESENTATION_URL_ID_PATTERN, "presentation_id"
+    return resolve_google_file_id(
+        presentation_id,
+        _PRESENTATION_URL_ID_PATTERN,
+        "presentation_id",
+        _PRESENTATION_KIND,
     )
 
 
@@ -565,11 +588,66 @@ def _slide_is_untouched_default(slide: dict[str, Any]) -> bool:
     )
 
 
+def _title_placeholder_id(slide: dict[str, Any]) -> str | None:
+    """Return the object id of the slide's first title placeholder."""
+    for element in slide.get("pageElements", []):
+        placeholder = (element.get("shape") or {}).get("placeholder") or {}
+        if placeholder.get("type") in _TITLE_PLACEHOLDER_TYPES:
+            object_id = element.get("objectId")
+            if isinstance(object_id, str) and object_id:
+                return object_id
+    return None
+
+
+def _slide_is_titled_default(slide: dict[str, Any], deck_title: object) -> bool:
+    """Return whether a slide is the default page as
+    google_slides_create_presentation leaves it: placeholders only, with the
+    deck title in its title placeholder and every other placeholder empty.
+
+    Only used for a page already known to be the default (by its id), so
+    that writing the deck title into it at create time does not make it
+    look like user content to google_slides_add_slide. The comparison uses
+    the deck's current title: if the deck was renamed after create, the page
+    shows the old title and is kept like a page the user edited.
+    """
+    if not isinstance(deck_title, str):
+        return False
+    expected = _normalize_title(deck_title).strip()
+    if not expected:
+        return False
+    titled = False
+    for element in slide.get("pageElements", []):
+        shape = element.get("shape")
+        if shape is None or "placeholder" not in shape:
+            return False
+        text = _element_text(element).strip()
+        if not text:
+            continue
+        if (
+            not titled
+            and shape["placeholder"].get("type") in _TITLE_PLACEHOLDER_TYPES
+            and text == expected
+        ):
+            titled = True
+            continue
+        return False
+    return titled
+
+
 @mcp.tool()
 def google_slides_get_presentation(presentation_id: str) -> str:
     """
     Read a Google Slides presentation by id or full URL.
     Returns the title and the text content of each slide.
+
+    Presentations are opened only by link or id; this connector cannot
+    search for or list presentations by name. When the user names a presentation
+    without giving its link, use google_drive_search to find its id if
+    that tool is available (with per-file Drive access it only finds
+    files created through this app or granted to it); otherwise, or if
+    it finds nothing, ask the user to paste the link
+    (https://docs.google.com/presentation/d/...). Connecting Google Drive is
+    not needed to open a presentation by its link.
     """
     try:
         pres_id = _resolve_presentation_id(presentation_id)
@@ -592,7 +670,7 @@ def google_slides_get_presentation(presentation_id: str) -> str:
         )
     except Exception as e:
         logger.error(f"Error getting presentation: {e}")
-        return _error(str(e))
+        return _presentation_error(e)
 
 
 @mcp.tool()
@@ -604,11 +682,21 @@ def google_slides_create_presentation(title: str) -> str:
     design, create a styled PPTX first and call google_slides_import_pptx;
     do not build the deck by repeatedly calling google_slides_add_slide.
 
-    Google creates a default, empty slide as part of this operation. Keep it
-    until the first content slide is created: google_slides_add_slide removes
-    it in the same batchUpdate after creating the real slide, so the API never
-    has to delete the only page from the presentation. The response reports
-    the default slide id so callers can diagnose the initial state.
+    Google creates a default, empty slide as part of this operation. When
+    that page has a title placeholder, this call writes the deck title into
+    it, so the deck opens on a title cover even if the page is never
+    replaced. Keep the page until the first content slide is created:
+    google_slides_add_slide removes it in the same batchUpdate after creating
+    the real slide, so the API never has to delete the only page from the
+    presentation. The response reports that page as default_slide_id (null
+    when there is no such page); pass it to the first google_slides_add_slide
+    call, because each call may run in a separate process that cannot
+    recognize the default page on its own. Unless the user asked for a
+    different first slide, make that first slide the deck's cover:
+    layout="TITLE" with the deck title (and an optional subtitle in body).
+    Without the id the default page stays first, so do not add a second
+    cover then. The response's next_step repeats this; it does not ask for
+    slides the user did not request.
     """
     try:
         service = get_slides_service()
@@ -627,6 +715,7 @@ def google_slides_create_presentation(title: str) -> str:
             slides = created.get("slides", [])
 
         default_slide_id = None
+        default_page_titled = False
         if len(slides) == 1 and _slide_is_empty(slides[0]):
             default_slide_id = slides[0].get("objectId")
             if not default_slide_id:
@@ -634,18 +723,73 @@ def google_slides_create_presentation(title: str) -> str:
                     "Google Slides returned an empty initial slide without an object_id"
                 )
             _record_created_default_slide(pres_id, default_slide_id)
+            # Without default_slide_id, google_slides_add_slide keeps a
+            # default page that has placeholders, so a caller that does not
+            # pass the id would otherwise leave a blank first slide. With
+            # the deck title in it, that page is a title cover instead. A
+            # failed write leaves the page blank, as before.
+            title_placeholder_id = _title_placeholder_id(slides[0])
+            cover_title = _normalize_title(presentation.get("title") or title).strip()
+            if title_placeholder_id and cover_title:
+                try:
+                    service.presentations().batchUpdate(
+                        presentationId=pres_id,
+                        body={
+                            "requests": [
+                                {
+                                    "insertText": {
+                                        "objectId": title_placeholder_id,
+                                        "text": cover_title,
+                                    }
+                                }
+                            ]
+                        },
+                    ).execute()
+                    default_page_titled = True
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Could not write the deck title into the default page "
+                        "of %s: %s",
+                        pres_id,
+                        exc,
+                    )
 
-        return json.dumps(
-            {
-                "status": "success",
-                "presentation_id": pres_id,
-                "title": presentation.get("title"),
-                "link": f"https://docs.google.com/presentation/d/{pres_id}/edit",
-                "slide_count": len(slides),
-                "default_slide_id": default_slide_id,
-            },
-            ensure_ascii=False,
-        )
+        response: dict[str, Any] = {
+            "status": "success",
+            "presentation_id": pres_id,
+            "title": presentation.get("title"),
+            "link": f"https://docs.google.com/presentation/d/{pres_id}/edit",
+            "slide_count": len(slides),
+            "default_slide_id": default_slide_id,
+        }
+        if default_slide_id:
+            first_call = (
+                "When you add slides to this presentation, pass "
+                f"default_slide_id={default_slide_id!r} on the first "
+                f"google_slides_add_slide call for presentation_id={pres_id!r}. "
+            )
+            cover = (
+                "the cover: layout='TITLE' with the deck title as title and an "
+                "optional subtitle as body."
+            )
+            if default_page_titled:
+                response["next_step"] = (
+                    f"{first_call}The id lets that call replace the default "
+                    "page, which already shows the deck title. Unless the user "
+                    f"asked for a different first slide, make that call {cover} "
+                    "Without the id the default page stays first as a "
+                    "title-only cover, so do not add a second cover; a "
+                    "different first slide the user asked for would then come "
+                    "second."
+                )
+            else:
+                response["next_step"] = (
+                    f"{first_call}The id lets that call replace Google's blank "
+                    "default page; without it the page can remain as an empty "
+                    "first slide. Unless the user asked for a different first "
+                    f"slide, make it {cover}"
+                )
+        return json.dumps(response, ensure_ascii=False)
     except Exception as e:
         logger.error(f"Error creating presentation: {e}")
         return _error(str(e))
@@ -862,12 +1006,20 @@ def google_slides_add_slide(
     google_slides_batch_update directly for presentations with a
     non-standard theme.
 
-    When the presentation was created with google_slides_create_presentation,
-    pass its returned default_slide_id when this call may run in another MCP
-    process. The known default page is removed even if other pages were added
-    before this call. Without an id, cleanup is limited to a presentation with
-    exactly one empty page; an empty page in a multi-page deck is preserved.
+    When google_slides_create_presentation returned a default_slide_id, pass
+    it on the first call: each call may run in a separate MCP process, and
+    with the id the default page is removed in the same batch. An empty
+    default page is removed even if other pages were added before this call;
+    one that only shows the deck title that create wrote into it is removed
+    only while it is the only page, and is kept as the cover once other pages
+    exist. Without an id, only a sole page with no elements at all is
+    removed, so a default page with title/subtitle placeholders stays as the
+    first slide (showing the deck title when create wrote it); an empty page
+    in a multi-page deck is preserved.
     Set preserve_blank_slide=True when that sole empty page is intentional.
+    Unless the user specified a different first slide, make the first slide
+    of a new deck its cover: layout="TITLE" with the deck title as title and
+    an optional subtitle as body.
 
     To fix a slide this call already created (wrong/missing text), use
     google_slides_update_slide with its slide_id — do NOT call
@@ -972,7 +1124,18 @@ def google_slides_add_slide(
                     None,
                 )
                 if candidate_slide is not None:
-                    if _slide_is_empty(candidate_slide):
+                    # A default page that create titled is already a usable
+                    # cover. Replace it only on a call that passes its id while
+                    # it is still the only page, as the descriptions ask for
+                    # the first call. With only the id remembered in this
+                    # process, or once other pages exist, it stays the cover.
+                    if _slide_is_empty(candidate_slide) or (
+                        requested_default_slide_id
+                        and len(existing_slides) == 1
+                        and _slide_is_titled_default(
+                            candidate_slide, existing.get("title")
+                        )
+                    ):
                         slide_to_remove = candidate_default_slide_id
                     else:
                         # The caller used the page before asking us to append
@@ -1047,7 +1210,7 @@ def google_slides_add_slide(
         )
     except Exception as e:
         logger.error(f"Error adding slide: {e}")
-        return _error(str(e))
+        return _presentation_error(e, editing=True)
 
 
 @mcp.tool()
@@ -1158,7 +1321,7 @@ def google_slides_update_slide(
         )
     except Exception as e:
         logger.error(f"Error updating slide: {e}")
-        return _error(str(e))
+        return _presentation_error(e, editing=True)
 
 
 @mcp.tool()
@@ -1196,7 +1359,7 @@ def google_slides_delete_slide(presentation_id: str, slide_id: str) -> str:
         )
     except Exception as e:
         logger.error(f"Error deleting slide: {e}")
-        return _error(str(e))
+        return _presentation_error(e, editing=True)
 
 
 @mcp.tool()
@@ -1233,7 +1396,7 @@ def google_slides_batch_update(presentation_id: str, requests_json: str) -> str:
         )
     except Exception as e:
         logger.error(f"Error applying batch update: {e}")
-        return _error(str(e))
+        return _presentation_error(e, editing=True)
 
 
 if __name__ == "__main__":

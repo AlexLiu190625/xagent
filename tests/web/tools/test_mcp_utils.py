@@ -2083,3 +2083,365 @@ def test_success_with_capped_dict_rejects_overlapping_extra_and_critical_fields(
             extra_fields={"note": "a"},
             critical_fields={"note": "b"},
         )
+
+
+class _GoogleHttpResponse:
+    def __init__(self, status):
+        self.status = status
+        self.reason = "error"
+
+
+def _google_http_error(status, content: bytes):
+    from googleapiclient.errors import HttpError
+
+    return HttpError(
+        _GoogleHttpResponse(status),
+        content,
+        uri="https://www.googleapis.com/drive/v3/files/abc404?alt=json",
+    )
+
+
+def test_google_api_error_status_reads_http_error_status():
+    assert utils.google_api_error_status(_google_http_error(404, b"{}")) == 404
+    assert utils.google_api_error_status(_google_http_error("403", b"{}")) == 403
+    assert utils.google_api_error_status(RuntimeError("404 not found")) is None
+
+
+def test_google_api_error_reasons_reads_both_google_body_shapes():
+    error = _google_http_error(
+        403,
+        json.dumps(
+            {
+                "error": {
+                    "message": "denied",
+                    "errors": [{"reason": "insufficientPermissions"}],
+                    "details": [{"reason": "ACCESS_TOKEN_SCOPE_INSUFFICIENT"}],
+                }
+            }
+        ).encode("utf-8"),
+    )
+
+    assert utils.google_api_error_reasons(error) == {
+        "insufficientPermissions",
+        "ACCESS_TOKEN_SCOPE_INSUFFICIENT",
+    }
+    assert utils.google_api_error_reasons(_google_http_error(500, b"oops")) == set()
+    assert utils.google_api_error_reasons(RuntimeError("x")) == set()
+
+
+def test_google_api_error_summary_leaves_out_the_request_uri():
+    error = _google_http_error(
+        404, b'{"error": {"message": "File not found: abc404."}}'
+    )
+
+    assert "googleapis.com" in str(error)
+    assert utils.google_api_error_summary(error) == "HTTP 404 File not found: abc404."
+    assert utils.google_api_error_summary(RuntimeError("boom")) == "boom"
+
+
+_TEST_FILE_KIND = utils.GoogleFileKind(
+    product="Google Docs",
+    noun="document",
+    link_example="https://docs.google.com/document/d/...",
+    create_tool="google_docs_create_document",
+)
+_TEST_DOC_PATTERN = re.compile(r"/document/d/([a-zA-Z0-9_-]+)")
+
+
+def test_resolve_google_file_id_accepts_ids_and_links():
+    assert (
+        utils.resolve_google_file_id(
+            " abc_-123 ", _TEST_DOC_PATTERN, "document_id", _TEST_FILE_KIND
+        )
+        == "abc_-123"
+    )
+    assert (
+        utils.resolve_google_file_id(
+            "https://docs.google.com/document/d/abc123/edit",
+            _TEST_DOC_PATTERN,
+            "document_id",
+            _TEST_FILE_KIND,
+        )
+        == "abc123"
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "Quarterly plan",
+        "https://drive.google.com/open?id=abc123",
+        # Drive gives this link shape mostly for uploaded Office or PDF files,
+        # which the Docs/Sheets/Slides APIs cannot open.
+        "https://drive.google.com/file/d/abc123/view?usp=sharing",
+        "../x",
+    ],
+)
+def test_resolve_google_file_id_rejects_values_that_cannot_be_ids(value):
+    with pytest.raises(ValueError, match="is not a Google Docs link or document id"):
+        utils.resolve_google_file_id(
+            value, _TEST_DOC_PATTERN, "document_id", _TEST_FILE_KIND
+        )
+
+
+def test_resolve_google_file_id_shortens_a_long_value_in_the_message():
+    with pytest.raises(ValueError) as excinfo:
+        utils.resolve_google_file_id(
+            "word " * 100, _TEST_DOC_PATTERN, "document_id", _TEST_FILE_KIND
+        )
+
+    assert "word word" in str(excinfo.value)
+    assert "word " * 30 not in str(excinfo.value)
+    assert "...' is not a Google Docs link" in str(excinfo.value)
+
+
+def test_google_file_error_message_only_rewrites_file_access_errors():
+    not_found = _google_http_error(404, b'{"error": {"message": "Not found."}}')
+    rate_limited = _google_http_error(
+        403,
+        b'{"error": {"message": "Slow down.", '
+        b'"errors": [{"reason": "userRateLimitExceeded"}]}}',
+    )
+
+    assert utils.google_file_error_message(not_found, _TEST_FILE_KIND).startswith(
+        "Google Docs could not open this document"
+    )
+    assert utils.google_file_error_message(rate_limited, _TEST_FILE_KIND) == str(
+        rate_limited
+    )
+    assert (
+        utils.google_file_error_message(RuntimeError("boom"), _TEST_FILE_KIND) == "boom"
+    )
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "rateLimitExceeded",
+        "userRateLimitExceeded",
+        "dailyLimitExceeded",
+        "sharingRateLimitExceeded",
+        "quotaExceeded",
+        "RATE_LIMIT_EXCEEDED",
+        "accessNotConfigured",
+        "SERVICE_DISABLED",
+        "insufficientPermissions",
+        "ACCESS_TOKEN_SCOPE_INSUFFICIENT",
+    ],
+)
+@pytest.mark.parametrize("field", ["errors", "details"])
+@pytest.mark.parametrize("editing", [False, True])
+def test_google_file_error_message_keeps_raw_error_for_non_file_access_403(
+    reason, field, editing
+):
+    error = _google_http_error(
+        403,
+        json.dumps(
+            {"error": {"message": "Denied.", field: [{"reason": reason}]}}
+        ).encode("utf-8"),
+    )
+
+    assert not utils.is_google_file_access_error(error)
+    assert utils.google_file_error_message(
+        error, _TEST_FILE_KIND, editing=editing
+    ) == str(error)
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "storageQuotaExceeded",
+        "domainPolicy",
+        "teamDriveFileLimitExceeded",
+        "teamDrivesParentLimit",
+        "cannotMoveTrashedItemIntoTeamDrive",
+    ],
+)
+@pytest.mark.parametrize("editing", [False, True])
+def test_google_file_error_message_keeps_raw_error_for_unlisted_403_reasons(
+    reason, editing
+):
+    error = _google_http_error(
+        403,
+        json.dumps(
+            {"error": {"message": "Denied.", "errors": [{"reason": reason}]}}
+        ).encode("utf-8"),
+    )
+
+    assert not utils.is_google_file_access_error(error)
+    assert utils.google_file_error_message(
+        error, _TEST_FILE_KIND, editing=editing
+    ) == str(error)
+
+
+@pytest.mark.parametrize(
+    "reason", ["insufficientFilePermissions", "appNotAuthorizedToFile", "forbidden"]
+)
+@pytest.mark.parametrize("editing", [False, True])
+def test_google_file_error_message_names_the_file_permission_reason(reason, editing):
+    error = _google_http_error(
+        403,
+        json.dumps(
+            {"error": {"message": "Denied.", "errors": [{"reason": reason}]}}
+        ).encode("utf-8"),
+    )
+
+    message = utils.google_file_error_message(error, _TEST_FILE_KIND, editing=editing)
+
+    assert utils.is_google_file_access_error(error)
+    assert message.startswith(
+        "Google Docs could not make this change"
+        if editing
+        else "Google Docs could not open this document"
+    )
+    assert message.endswith(f"Google API response: HTTP 403 Denied. (reason: {reason})")
+
+
+@pytest.mark.parametrize(
+    ("status", "reason", "unavailable", "access"),
+    [
+        (404, "notFound", True, True),
+        (403, "appNotAuthorizedToFile", True, True),
+        (403, "insufficientFilePermissions", False, True),
+        (403, None, False, True),
+        (403, "storageQuotaExceeded", False, False),
+        (500, "backendError", False, False),
+        # The unavailable check runs first, so appNotAuthorizedToFile counts
+        # even next to a non-file reason; a permission reason does not.
+        (403, ("appNotAuthorizedToFile", "rateLimitExceeded"), True, True),
+        (403, ("insufficientFilePermissions", "rateLimitExceeded"), False, False),
+    ],
+)
+def test_google_file_error_classifiers_share_one_definition(
+    status, reason, unavailable, access
+):
+    body: dict = {"error": {"message": "Denied."}}
+    if reason:
+        reasons = (reason,) if isinstance(reason, str) else reason
+        body["error"]["errors"] = [{"reason": r} for r in reasons]
+    error = _google_http_error(status, json.dumps(body).encode("utf-8"))
+
+    assert utils.is_google_file_unavailable_error(error) is unavailable
+    assert utils.is_google_file_access_error(error) is access
+
+
+def test_google_api_error_summary_appends_reasons_only_when_asked():
+    error = _google_http_error(
+        403,
+        b'{"error": {"message": "Denied.", "errors": [{"reason": "forbidden"}]}}',
+    )
+
+    assert utils.google_api_error_summary(error) == "HTTP 403 Denied."
+    assert (
+        utils.google_api_error_summary(error, with_reasons=True)
+        == "HTTP 403 Denied. (reason: forbidden)"
+    )
+    assert (
+        utils.google_api_error_summary(
+            _google_http_error(404, b'{"error": {"message": "Gone."}}'),
+            with_reasons=True,
+        )
+        == "HTTP 404 Gone."
+    )
+
+
+def test_google_file_error_message_describes_a_refused_edit():
+    denied = _google_http_error(
+        403, b'{"error": {"message": "The caller does not have permission"}}'
+    )
+    not_found = _google_http_error(404, b'{"error": {"message": "Not found."}}')
+
+    read_message = utils.google_file_error_message(denied, _TEST_FILE_KIND)
+    edit_message = utils.google_file_error_message(
+        denied, _TEST_FILE_KIND, editing=True
+    )
+
+    assert read_message.startswith("Google Docs could not open this document")
+    assert edit_message.startswith("Google Docs could not make this change")
+    assert "only view or comment access" in edit_message
+    assert "google_docs_create_document" in edit_message
+    assert edit_message.endswith(
+        "Google API response: HTTP 403 The caller does not have permission"
+    )
+    assert utils.google_file_error_message(
+        not_found, _TEST_FILE_KIND, editing=True
+    ).startswith("Google Docs could not open this document")
+    for message in (read_message, edit_message):
+        assert "Connecting Google Drive would not change this access." in message
+
+
+def test_google_file_error_message_says_names_are_not_searched_only_for_404():
+    not_found = _google_http_error(404, b'{"error": {"message": "Not found."}}')
+    denied = _google_http_error(
+        403, b'{"error": {"message": "The caller does not have permission"}}'
+    )
+
+    for editing in (False, True):
+        message = utils.google_file_error_message(
+            not_found, _TEST_FILE_KIND, editing=editing
+        )
+        assert "cannot search for or list documents by name" in message
+        assert "Otherwise, ask the user to check that the link is complete" in message
+    for editing in (False, True):
+        message = utils.google_file_error_message(
+            denied, _TEST_FILE_KIND, editing=editing
+        )
+        assert "by name" not in message
+
+
+@pytest.mark.parametrize(
+    ("value", "product"),
+    [
+        ("https://docs.google.com/spreadsheets/d/abc123/edit", "Google Sheets"),
+        ("https://docs.google.com/presentation/d/abc123/edit", "Google Slides"),
+        ("docs.google.com/spreadsheets/u/0/d/abc123", "Google Sheets"),
+    ],
+)
+def test_resolve_google_file_id_names_a_link_to_another_kind_of_file(value, product):
+    with pytest.raises(ValueError) as excinfo:
+        utils.resolve_google_file_id(
+            value, _TEST_DOC_PATTERN, "document_id", _TEST_FILE_KIND
+        )
+
+    message = str(excinfo.value)
+    assert f"is a {product} link, not a Google Docs link" in message
+    assert f"Open it with the {product} tools if they are available" in message
+    assert "by name" not in message
+
+
+def test_resolve_google_file_id_decodes_a_percent_encoded_link():
+    wrapped = (
+        "https://www.google.com/url?q=https%3A%2F%2Fdocs.google.com%2F"
+        "document%2Fd%2Fabc123%2Fedit&sa=D"
+    )
+
+    assert (
+        utils.resolve_google_file_id(
+            wrapped, _TEST_DOC_PATTERN, "document_id", _TEST_FILE_KIND
+        )
+        == "abc123"
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "by_name"),
+    [
+        ("https://drive.google.com/open?id=abc123", False),
+        ("https://example.com/report", False),
+        ("Quarterly plan", True),
+    ],
+)
+def test_resolve_google_file_id_only_mentions_name_search_for_a_non_link(
+    value, by_name
+):
+    with pytest.raises(ValueError) as excinfo:
+        utils.resolve_google_file_id(
+            value, _TEST_DOC_PATTERN, "document_id", _TEST_FILE_KIND
+        )
+
+    message = str(excinfo.value)
+    assert "https://docs.google.com/document/d/..." in message
+    assert ("cannot search for or list documents by name" in message) is by_name
+    assert ("If google_drive_search is available" in message) is by_name
+    assert ("Connecting Google Drive is not needed" in message) is by_name

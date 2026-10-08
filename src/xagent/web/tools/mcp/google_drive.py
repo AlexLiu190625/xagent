@@ -22,6 +22,9 @@ from ....config import get_tool_max_output_length
 from .utils import (
     allowed_dirs_from_env,
     clamp_limit,
+    google_api_error_summary,
+    is_google_file_access_error,
+    is_google_file_unavailable_error,
     require_clean_identifier,
     setup_proxy_env,
 )
@@ -1029,6 +1032,57 @@ def get_drive_service() -> Any:
     return build("drive", "v3", credentials=credentials)
 
 
+# What a Drive connection can see depends on its OAuth scope, which this
+# process does not know. With the per-file drive.file scope, files.list and
+# files.get only see files created through this app or explicitly granted to
+# it, so the user's other files look missing. Both texts below are worded to
+# stay true under either scope.
+_PER_FILE_ACCESS_NOTE = (
+    "If this connection uses per-file Drive access, it can only see files "
+    "created through this app or explicitly granted to it, so a file the "
+    "user can open in Google Drive may still not be visible here."
+)
+_OPEN_BY_LINK_HINT = (
+    "To work with an existing Google Docs, Sheets or Slides file, ask the "
+    "user for its link and open it with the Google Docs, Sheets or Slides "
+    "tools when they are available; otherwise offer to create a new file."
+)
+_EMPTY_SEARCH_NOTE = (
+    "No files matched. This connection only sees files it can access. "
+    f"{_PER_FILE_ACCESS_NOTE} An empty result does not mean the file does "
+    f"not exist. {_OPEN_BY_LINK_HINT}"
+)
+# files.list can return an empty page together with a nextPageToken, so an
+# empty page only means "nothing matched" when no token comes with it.
+_EMPTY_PAGE_NOTE = (
+    "Google Drive returned no files in this page of results but reported "
+    "that more results may exist, so files matching this query may still "
+    "exist. Retry with a larger max_results or a more specific query."
+)
+
+
+def _unavailable_file_message(exc: Exception) -> str:
+    return (
+        "Google Drive could not open this file: it does not exist, or this "
+        f"Drive connection cannot access it. {_PER_FILE_ACCESS_NOTE} "
+        f"{_OPEN_BY_LINK_HINT} Google API response: "
+        f"{google_api_error_summary(exc)}"
+    )
+
+
+def _file_read_error(exc: Exception) -> str:
+    # Only a missing or invisible file is rewritten. A 403 about the
+    # account's own permission on a file this app can see keeps Drive's raw
+    # error, which already names the missing permission; see
+    # is_google_file_unavailable_error.
+    message = (
+        _unavailable_file_message(exc)
+        if is_google_file_unavailable_error(exc)
+        else str(exc)
+    )
+    return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
+
+
 @mcp.tool()
 def google_drive_search(query: str = "", max_results: int = 10) -> str:
     """
@@ -1037,6 +1091,13 @@ def google_drive_search(query: str = "", max_results: int = 10) -> str:
     The result's "truncated" field is true if the output was too large and
     some matching files were cut to fit -- treat the "files" list as
     possibly incomplete in that case rather than the full result set.
+
+    Results only include files this connection can access. With per-file
+    Drive access (drive.file), that is only files created through this app
+    or explicitly granted to it, so a file missing from the results may
+    still exist. An empty result carries a "note" field explaining this; when
+    Google reports that more results may exist beyond an empty page, the note
+    says so instead.
     """
     try:
         page_size = clamp_limit(max_results, max_limit=1000)
@@ -1053,6 +1114,20 @@ def google_drive_search(query: str = "", max_results: int = 10) -> str:
             .execute()
         )
         items = results.get("files", [])
+        if not items:
+            return json.dumps(
+                {
+                    "status": "success",
+                    "files": [],
+                    "truncated": False,
+                    "note": (
+                        _EMPTY_PAGE_NOTE
+                        if results.get("nextPageToken")
+                        else _EMPTY_SEARCH_NOTE
+                    ),
+                },
+                ensure_ascii=False,
+            )
 
         return _capped_list_response("files", items)
     except Exception as e:
@@ -1210,7 +1285,7 @@ def google_drive_get_file_content(file_id: str, mime_type: str = "text/plain") -
         return _capped_content_response(file_metadata, content, encoding)
     except Exception as e:
         logger.error(f"Error getting file content: {e}")
-        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+        return _file_read_error(e)
 
 
 @mcp.tool()
@@ -1300,7 +1375,7 @@ def google_drive_download_file(
         )
     except Exception as e:
         logger.error(f"Error downloading file: {e}")
-        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+        return _file_read_error(e)
 
 
 @mcp.tool()
@@ -1623,25 +1698,145 @@ def google_drive_rename_file(file_id: str, new_name: str) -> str:
         return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
 
+# Offered, not prescribed: a new folder with the same name would be a
+# separate folder from the one the user meant, so the user decides.
+_CREATE_FOLDER_OFFER = (
+    "offer to create a new folder with google_drive_create_folder and move "
+    "the file there (ask the user first: it would be a separate folder from "
+    "theirs, even with the same name)"
+)
+
+
+def _move_error(message: str) -> str:
+    return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
+
+
+_NO_VISIBLE_PARENT_MESSAGE = (
+    "Drive did not return the parent folder that holds file_id, so nothing "
+    "was moved. This connection may not be able to see that folder: for "
+    "example, the file is shared with the user but is not in their My Drive, "
+    "or, if this connection uses per-file Drive access, the file sits in a "
+    "folder that was not created through this app. Ask the user to move the "
+    "file in Google Drive."
+)
+
+
+def _unavailable_move_source_message(exc: Exception) -> str:
+    return (
+        "Google Drive could not open file_id: the file does not exist, or this "
+        "Drive connection cannot access it, so nothing was moved. If this "
+        "connection uses per-file Drive access, it can only use files created "
+        "through this app or explicitly granted to it; ask the user to move "
+        "the file in Google Drive instead. Google API response: "
+        f"{google_api_error_summary(exc)}"
+    )
+
+
+def _unavailable_move_destination_message(exc: Exception) -> str:
+    return (
+        "Google Drive could not open destination_folder_id: the folder does "
+        "not exist, or this Drive connection cannot access it, so nothing was "
+        "moved. If this connection uses per-file Drive access, it can only use "
+        "folders created through this app, so a folder the user created "
+        "directly in Google Drive cannot be a destination. Ask the user to "
+        f"move the file in Google Drive, or {_CREATE_FOLDER_OFFER}. Google "
+        f"API response: {google_api_error_summary(exc)}"
+    )
+
+
+def _move_update_error_message(exc: Exception, *, moving: bool) -> str | None:
+    """An actionable message for a failed move/rename update, or ``None`` to
+    keep the raw error (anything ``is_google_file_access_error`` does not
+    cover, such as a rate limit, quota, a disabled API, a missing OAuth scope
+    or a shared drive limit).
+
+    ``moving`` is false for a rename-only update of an item that is already
+    in the destination folder; its message then leaves out the folder."""
+    summary = google_api_error_summary(exc, with_reasons=True)
+    if is_google_file_unavailable_error(exc):
+        if not moving:
+            return (
+                "Google Drive could not open the file while renaming it, or "
+                "this Drive connection cannot access it, so nothing was "
+                "renamed. If this connection uses per-file Drive access, it "
+                "can only use files created through this app or explicitly "
+                "granted to it. Ask the user to rename the file in Google "
+                f"Drive. Google API response: {summary}"
+            )
+        return (
+            "Google Drive could not open the file or the destination folder "
+            "while updating it, or this Drive connection cannot access one of "
+            "them, so nothing was moved or renamed. If this connection uses "
+            "per-file Drive access, it can only use files and folders created "
+            "through this app. Ask the user to move the file in Google Drive, "
+            f"or {_CREATE_FOLDER_OFFER}. Google API response: {summary}"
+        )
+    if not is_google_file_access_error(exc):
+        return None
+    if not moving:
+        return (
+            "Google Drive refused this change, so nothing was renamed. The "
+            "connected Google account may not have permission to rename it "
+            "(for example, it has only view or comment access). Ask the user "
+            "to rename it in Google Drive or to ask the item's owner. Google "
+            f"API response: {summary}"
+        )
+    return (
+        "Google Drive refused this change, so nothing was moved or renamed. "
+        "The connected Google account may not have permission to move it (for "
+        "example, it has only view or comment access). Ask the user to move it "
+        "in Google Drive or to ask the item's owner. Google API response: "
+        f"{summary}"
+    )
+
+
 @mcp.tool()
-def google_drive_move_file(file_id: str, destination_folder_id: str) -> str:
+def google_drive_move_file(
+    file_id: str, destination_folder_id: str, new_name: str = ""
+) -> str:
     """Move a Drive file or folder into another folder.
 
     ``file_id`` and ``destination_folder_id`` may be bare IDs or trusted
     Google Drive/Docs/Slides URLs.  The operation preserves the file's
-    presentation/document ID; it only changes its parent folder.  The source
+    presentation/document ID; it changes its parent folder and, optionally,
+    its name.  The source
     and destination are read before the update so malformed inputs and
     non-folder destinations fail without mutating anything. The update response
     is validated before reporting success.
+
+    ``new_name`` optionally renames the item in the same update, including
+    when it is already in the destination folder. Leave it empty to keep the
+    current name.
+
+    On success the response holds ``file`` (the item after the call),
+    ``destination_folder_id``, ``already_in_destination`` (true when the item
+    was already in that folder, so it was not moved) and ``renamed`` (true
+    when ``new_name`` changed its name). When the item is already in the
+    folder with the requested name, nothing is updated: ``already_in_destination``
+    is true and ``renamed`` is false.
 
     Moving can change who can access the item because it may inherit permissions
     from the destination folder or shared drive. Confirm the destination and this
     access change with the user before calling this tool. This also requires the
     connected account to have permission to move the item.
-    For ``drive.file`` accounts, the item and destination folder must first be
-    selected through Google's file picker or created by Xagent.
+
+    If this connection uses per-file Drive access (drive.file), the item and
+    the destination folder must both be visible to this app: files and
+    folders created through this app (for example with
+    google_drive_create_folder), or files explicitly granted to it. A folder
+    the user created directly in Google Drive is not visible, so it cannot be
+    a destination; ask the user to move the item in Google Drive, or offer to
+    create a new folder with google_drive_create_folder (it would be a
+    separate folder from the user's, so ask first).
     """
     try:
+        if not isinstance(new_name, str):
+            raise ValueError("new_name must be a string")
+        requested_name = new_name.strip()
+        if new_name and not requested_name:
+            raise ValueError(
+                "new_name must not be blank; leave it empty to keep the current name"
+            )
         resolved_file_id = _resolve_file_id(file_id)
         requested_destination_id = _resolve_file_id(
             destination_folder_id, "destination_folder_id"
@@ -1659,7 +1854,13 @@ def google_drive_move_file(file_id: str, destination_folder_id: str) -> str:
             fields="id,name,webViewLink,mimeType,parents,trashed",
         )
         _attach_resource_keys(source_get, [(resolved_file_id, source_resource_key)])
-        source = source_get.execute()
+        try:
+            source = source_get.execute()
+        except Exception as exc:
+            if is_google_file_unavailable_error(exc):
+                logger.error(f"Error moving file: {exc}")
+                return _move_error(_unavailable_move_source_message(exc))
+            raise
         source_id = source.get("id")
         if isinstance(source_id, str) and source_id:
             resolved_file_id = source_id
@@ -1675,7 +1876,13 @@ def google_drive_move_file(file_id: str, destination_folder_id: str) -> str:
             destination_get,
             [(requested_destination_id, destination_resource_key)],
         )
-        destination = destination_get.execute()
+        try:
+            destination = destination_get.execute()
+        except Exception as exc:
+            if is_google_file_unavailable_error(exc):
+                logger.error(f"Error moving file: {exc}")
+                return _move_error(_unavailable_move_destination_message(exc))
+            raise
 
         destination_mime_type = destination.get("mimeType")
         if destination_mime_type == "application/vnd.google-apps.shortcut":
@@ -1693,38 +1900,46 @@ def google_drive_move_file(file_id: str, destination_folder_id: str) -> str:
         if resolved_file_id == resolved_destination_id:
             raise ValueError("A file or folder cannot be moved into itself.")
 
-        current_parents = source.get("parents")
+        # A missing parents field is read as an empty list: Google's JSON
+        # responses may leave out an empty repeated field.
+        current_parents = source.get("parents", [])
         if not isinstance(current_parents, list) or not all(
             isinstance(parent, str) for parent in current_parents
         ):
             raise ValueError("Drive returned an invalid parents list for file_id")
         if not current_parents:
-            raise ValueError(
-                "Drive did not return the current parent folder for file_id"
-            )
-        if current_parents == [resolved_destination_id]:
+            raise ValueError(_NO_VISIBLE_PARENT_MESSAGE)
+        update_body: dict[str, Any] = {}
+        if requested_name and requested_name != source.get("name"):
+            update_body["name"] = requested_name
+        already_in_destination = current_parents == [resolved_destination_id]
+        if already_in_destination and not update_body:
             return json.dumps(
                 {
                     "status": "success",
                     "file": source,
                     "destination_folder_id": resolved_destination_id,
                     "already_in_destination": True,
+                    "renamed": False,
                 },
                 ensure_ascii=False,
             )
 
         update_kwargs: dict[str, Any] = {
             "fileId": resolved_file_id,
-            "body": {},
-            "addParents": resolved_destination_id,
+            "body": update_body,
             "supportsAllDrives": True,
             "fields": "id,name,mimeType,parents,webViewLink,trashed",
         }
-        parents_to_remove = [
-            parent for parent in current_parents if parent != resolved_destination_id
-        ]
-        if parents_to_remove:
-            update_kwargs["removeParents"] = ",".join(parents_to_remove)
+        if not already_in_destination:
+            update_kwargs["addParents"] = resolved_destination_id
+            parents_to_remove = [
+                parent
+                for parent in current_parents
+                if parent != resolved_destination_id
+            ]
+            if parents_to_remove:
+                update_kwargs["removeParents"] = ",".join(parents_to_remove)
 
         update_request = service.files().update(**update_kwargs)
         _attach_resource_keys(
@@ -1734,7 +1949,14 @@ def google_drive_move_file(file_id: str, destination_folder_id: str) -> str:
                 (resolved_destination_id, destination_resource_key),
             ],
         )
-        updated_file = update_request.execute()
+        try:
+            updated_file = update_request.execute()
+        except Exception as exc:
+            message = _move_update_error_message(exc, moving=not already_in_destination)
+            if message is None:
+                raise
+            logger.error(f"Error moving file: {exc}")
+            return _move_error(message)
         if not isinstance(updated_file, dict):
             raise RuntimeError("Drive move returned an invalid file response")
         updated_parents = updated_file.get("parents", [])
@@ -1753,7 +1975,8 @@ def google_drive_move_file(file_id: str, destination_folder_id: str) -> str:
                 "status": "success",
                 "file": updated_file,
                 "destination_folder_id": resolved_destination_id,
-                "already_in_destination": False,
+                "already_in_destination": already_in_destination,
+                "renamed": "name" in update_body,
             },
             ensure_ascii=False,
         )

@@ -1,0 +1,357 @@
+import json
+from unittest.mock import Mock
+
+import pytest
+from googleapiclient.errors import HttpError
+
+from xagent.web.tools.mcp import google_docs
+
+
+@pytest.fixture(autouse=True)
+def _credentials(monkeypatch):
+    monkeypatch.setenv("GOOGLE_ACCESS_TOKEN", "access-token")
+
+
+class _HttpResponse:
+    def __init__(self, status: int, reason: str = "error"):
+        self.status = status
+        self.reason = reason
+
+
+def _http_error(status: int, body: dict) -> HttpError:
+    return HttpError(
+        _HttpResponse(status),
+        json.dumps(body).encode("utf-8"),
+        uri="https://docs.googleapis.com/v1/documents/doc123?alt=json",
+    )
+
+
+def _not_found() -> HttpError:
+    return _http_error(
+        404,
+        {
+            "error": {
+                "code": 404,
+                "message": "Requested entity was not found.",
+                "status": "NOT_FOUND",
+            }
+        },
+    )
+
+
+def _mock_docs_service(monkeypatch):
+    service = Mock()
+    get_service = Mock(return_value=service)
+    monkeypatch.setattr(google_docs, "get_docs_service", get_service)
+    return service, get_service
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("doc123", "doc123"),
+        ("https://docs.google.com/document/d/doc123/edit", "doc123"),
+        ("https://docs.google.com/document/u/1/d/doc123/edit?tab=t.0", "doc123"),
+    ],
+)
+def test_get_document_accepts_bare_id_and_link_forms(monkeypatch, value, expected):
+    service, _ = _mock_docs_service(monkeypatch)
+    service.documents.return_value.get.return_value.execute.return_value = {
+        "documentId": expected,
+        "title": "Plan",
+        "body": {"content": []},
+    }
+
+    result = json.loads(google_docs.google_docs_get_document(value))
+
+    assert result["status"] == "success"
+    assert service.documents.return_value.get.call_args.kwargs == {
+        "documentId": expected
+    }
+
+
+def test_get_document_rejects_a_title_without_calling_the_api(monkeypatch):
+    _, get_service = _mock_docs_service(monkeypatch)
+
+    result = json.loads(google_docs.google_docs_get_document("Q3 planning notes"))
+
+    assert result["status"] == "error"
+    message = result["message"]
+    assert "'Q3 planning notes' is not a Google Docs link" in message
+    assert "cannot search for or list documents by name" in message
+    assert "If google_drive_search is available, use it to find the document's id" in (
+        message
+    )
+    assert "otherwise, or if it finds nothing, ask the user to paste" in message
+    assert "https://docs.google.com/document/d/" in message
+    assert "google_docs_create_document" in message
+    assert "Connecting Google Drive is not needed" in message
+    get_service.assert_not_called()
+
+
+def test_get_document_error_keeps_non_ascii_input_readable(monkeypatch):
+    _mock_docs_service(monkeypatch)
+
+    raw = google_docs.google_docs_get_document("季度预算 报告")
+
+    assert "'季度预算 报告' is not a Google Docs link" in raw
+    assert "\\u" not in raw
+
+
+def test_get_document_rejects_a_published_link_instead_of_reading_e_as_the_id(
+    monkeypatch,
+):
+    _, get_service = _mock_docs_service(monkeypatch)
+
+    result = json.loads(
+        google_docs.google_docs_get_document(
+            "https://docs.google.com/document/d/e/2PACX-1vTabc123/pub"
+        )
+    )
+
+    assert result["status"] == "error"
+    message = result["message"]
+    assert "is a published-to-the-web link" in message
+    assert "https://docs.google.com/document/d/..." in message
+    get_service.assert_not_called()
+
+
+def test_get_document_names_a_link_to_another_kind_of_google_file(monkeypatch):
+    _, get_service = _mock_docs_service(monkeypatch)
+
+    result = json.loads(
+        google_docs.google_docs_get_document(
+            "https://docs.google.com/spreadsheets/d/abc123/edit"
+        )
+    )
+
+    assert result["status"] == "error"
+    message = result["message"]
+    assert "is a Google Sheets link, not a Google Docs link" in message
+    assert "Open it with the Google Sheets tools" in message
+    assert "by name" not in message
+    get_service.assert_not_called()
+
+
+def test_get_document_decodes_a_percent_encoded_wrapped_link(monkeypatch):
+    service, _ = _mock_docs_service(monkeypatch)
+    service.documents.return_value.get.return_value.execute.return_value = {
+        "documentId": "doc123",
+        "title": "Plan",
+        "body": {"content": []},
+    }
+
+    result = json.loads(
+        google_docs.google_docs_get_document(
+            "https://www.google.com/url?q=https%3A%2F%2Fdocs.google.com%2F"
+            "document%2Fd%2Fdoc123%2Fedit&sa=D"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert service.documents.return_value.get.call_args.kwargs == {
+        "documentId": "doc123"
+    }
+
+
+def test_get_document_maps_not_found_to_an_actionable_message(monkeypatch):
+    service, _ = _mock_docs_service(monkeypatch)
+    service.documents.return_value.get.return_value.execute.side_effect = _not_found()
+
+    result = json.loads(google_docs.google_docs_get_document("doc123"))
+
+    assert result["status"] == "error"
+    message = result["message"]
+    assert message.startswith("Google Docs could not open this document")
+    assert "does not exist" in message
+    assert "google_docs_create_document" in message
+    assert "Connecting Google Drive would not change this access." in message
+    assert message.endswith(
+        "Google API response: HTTP 404 Requested entity was not found."
+    )
+
+
+@pytest.mark.parametrize("title", ["budget", "Q3-report"])
+def test_get_document_not_found_for_a_one_word_title_says_names_are_not_searched(
+    monkeypatch, title
+):
+    service, _ = _mock_docs_service(monkeypatch)
+    service.documents.return_value.get.return_value.execute.side_effect = _not_found()
+
+    result = json.loads(google_docs.google_docs_get_document(title))
+
+    assert service.documents.return_value.get.call_args.kwargs == {"documentId": title}
+    message = result["message"]
+    assert message.startswith("Google Docs could not open this document")
+    assert "cannot search for or list documents by name" in message
+    assert "If this value is the document's name rather than its id" in message
+    assert "If google_drive_search is available" in message
+    assert "https://docs.google.com/document/d/..." in message
+
+
+def test_get_document_maps_permission_denied_to_an_actionable_message(monkeypatch):
+    service, _ = _mock_docs_service(monkeypatch)
+    service.documents.return_value.get.return_value.execute.side_effect = _http_error(
+        403,
+        {
+            "error": {
+                "code": 403,
+                "message": "The caller does not have permission",
+                "status": "PERMISSION_DENIED",
+            }
+        },
+    )
+
+    result = json.loads(google_docs.google_docs_get_document("doc123"))
+
+    assert result["message"].startswith("Google Docs could not open this document")
+    assert "HTTP 403 The caller does not have permission" in result["message"]
+
+
+@pytest.mark.parametrize(
+    "reason_body",
+    [
+        {"errors": [{"reason": "rateLimitExceeded"}]},
+        {"details": [{"reason": "ACCESS_TOKEN_SCOPE_INSUFFICIENT"}]},
+        {"details": [{"reason": "SERVICE_DISABLED"}]},
+    ],
+)
+def test_get_document_keeps_raw_error_for_non_access_403(monkeypatch, reason_body):
+    service, _ = _mock_docs_service(monkeypatch)
+    error = _http_error(
+        403, {"error": {"code": 403, "message": "Denied", **reason_body}}
+    )
+    service.documents.return_value.get.return_value.execute.side_effect = error
+
+    result = json.loads(google_docs.google_docs_get_document("doc123"))
+
+    assert result["message"] == str(error)
+
+
+def test_get_document_keeps_raw_error_for_other_failures(monkeypatch):
+    service, _ = _mock_docs_service(monkeypatch)
+    service.documents.return_value.get.return_value.execute.side_effect = RuntimeError(
+        "boom"
+    )
+
+    result = json.loads(google_docs.google_docs_get_document("doc123"))
+
+    assert result == {"status": "error", "message": "boom"}
+
+
+def test_append_text_maps_not_found_to_an_actionable_message(monkeypatch):
+    service, _ = _mock_docs_service(monkeypatch)
+    service.documents.return_value.get.return_value.execute.side_effect = _not_found()
+
+    result = json.loads(google_docs.google_docs_append_text("doc123", "more"))
+
+    assert result["message"].startswith("Google Docs could not open this document")
+    service.documents.return_value.batchUpdate.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: google_docs.google_docs_append_text("Weekly report", "x"),
+        lambda: google_docs.google_docs_replace_text("Weekly report", "a", "b"),
+        lambda: google_docs.google_docs_batch_update("Weekly report", "[]"),
+    ],
+)
+def test_editing_tools_reject_a_title_without_calling_the_api(monkeypatch, call):
+    _, get_service = _mock_docs_service(monkeypatch)
+
+    result = json.loads(call())
+
+    assert result["status"] == "error"
+    assert "is not a Google Docs link" in result["message"]
+    get_service.assert_not_called()
+
+
+_VIEW_ONLY_403 = {
+    "error": {
+        "code": 403,
+        "message": "The caller does not have permission",
+        "status": "PERMISSION_DENIED",
+    }
+}
+
+
+def _assert_refused_edit(result):
+    assert result["status"] == "error"
+    message = result["message"]
+    assert message.startswith("Google Docs could not make this change")
+    assert "only view or comment access" in message
+    assert "can edit the document" in message
+    assert "could not open" not in message
+    assert "Connecting Google Drive would not change this access." in message
+    assert message.endswith(
+        "Google API response: HTTP 403 The caller does not have permission"
+    )
+
+
+def test_append_text_explains_a_refused_edit_on_a_readable_document(monkeypatch):
+    service, _ = _mock_docs_service(monkeypatch)
+    documents = service.documents.return_value
+    documents.get.return_value.execute.return_value = {
+        "documentId": "doc123",
+        "body": {"content": [{"endIndex": 5}]},
+    }
+    documents.batchUpdate.return_value.execute.side_effect = _http_error(
+        403, _VIEW_ONLY_403
+    )
+
+    result = json.loads(google_docs.google_docs_append_text("doc123", "more"))
+
+    _assert_refused_edit(result)
+    documents.batchUpdate.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: google_docs.google_docs_replace_text("doc123", "a", "b"),
+        lambda: google_docs.google_docs_batch_update(
+            "doc123", '[{"insertText": {"location": {"index": 1}, "text": "x"}}]'
+        ),
+    ],
+)
+def test_editing_tools_explain_a_refused_edit(monkeypatch, call):
+    service, _ = _mock_docs_service(monkeypatch)
+    service.documents.return_value.batchUpdate.return_value.execute.side_effect = (
+        _http_error(403, _VIEW_ONLY_403)
+    )
+
+    _assert_refused_edit(json.loads(call()))
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: google_docs.google_docs_replace_text("doc123", "a", "b"),
+        lambda: google_docs.google_docs_batch_update("doc123", "[]"),
+    ],
+)
+def test_editing_tools_map_not_found_to_an_actionable_message(monkeypatch, call):
+    service, _ = _mock_docs_service(monkeypatch)
+    service.documents.return_value.batchUpdate.return_value.execute.side_effect = (
+        _not_found()
+    )
+
+    result = json.loads(call())
+
+    assert result["message"].startswith("Google Docs could not open this document")
+
+
+async def test_get_document_description_says_drive_is_not_needed():
+    tools = {tool.name: tool for tool in await google_docs.mcp.list_tools()}
+
+    description = " ".join(tools["google_docs_get_document"].description.split())
+    assert "cannot search for or list documents by name" in description
+    assert "Connecting Google Drive is not needed" in description
+    assert (
+        "use google_drive_search to find its id if that tool is available"
+        in description
+    )
+    assert "otherwise, or if it finds nothing, ask the user to paste the link" in (
+        description
+    )
