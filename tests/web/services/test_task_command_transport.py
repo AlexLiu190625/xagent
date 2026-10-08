@@ -3143,3 +3143,50 @@ def test_duplicate_command_cannot_replace_persisted_reply_origin(db_session):
         .one()
     )
     assert (row.reply_host_id, row.reply_origin) == ("web-a", "socket-a")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("swallow_exceptions", [False, True])
+async def test_dispatcher_worker_survives_cancellation_not_aimed_at_it(
+    monkeypatch, caplog, swallow_exceptions
+) -> None:
+    """A cancel raised inside dispatch must not end loops nobody cancelled."""
+
+    transport = task_command_transport_module
+    monkeypatch.setattr(transport, "consumes_task_commands", lambda: True)
+    monkeypatch.setattr(transport, "DISPATCHER_IDLE_SECONDS", 0.01)
+    foreign: asyncio.Task | None = None
+    calls = 0
+
+    async def dispatch(_executor, *, command_db_id=None) -> bool:
+        nonlocal foreign, calls
+        calls += 1
+        if calls == 1:
+            foreign = asyncio.create_task(asyncio.Event().wait())
+            if swallow_exceptions:
+                # Shaped like a wait on another task's completion that treats
+                # ordinary errors as non-fatal.
+                try:
+                    await asyncio.shield(foreign)
+                except Exception:
+                    pass
+            else:
+                await asyncio.shield(foreign)
+        return False
+
+    monkeypatch.setattr(transport, "dispatch_one_task_command", dispatch)
+    caplog.set_level(logging.ERROR, logger=transport.__name__)
+    dispatcher = start_task_command_dispatcher(lambda _command: asyncio.sleep(0))
+    assert dispatcher is not None
+    try:
+        await eventually(lambda: foreign is not None)
+        foreign.cancel()
+        await eventually(lambda: calls > transport.DISPATCHER_CONCURRENCY)
+        assert not dispatcher.done()
+        aimed = [
+            r for r in caplog.records if "not aimed at this worker" in r.getMessage()
+        ]
+        assert len(aimed) == 1
+    finally:
+        await stop_task_command_dispatcher()
+    assert dispatcher.done()

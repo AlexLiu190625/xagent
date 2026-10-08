@@ -1827,6 +1827,16 @@ def _consume_prompt_dispatch_result(task: asyncio.Task[bool]) -> None:
 
 
 async def _run_task_command_dispatcher_worker(executor: CommandExecutor) -> None:
+    # Invariant: this loop exits only when the worker task itself is cancelled.
+    # A CancelledError raised from inside dispatch that nobody aimed at this
+    # task (for example a shared await on another task that was cancelled)
+    # must not end the loop.
+    async def idle_wait(wakeup: asyncio.Event) -> None:
+        try:
+            await asyncio.wait_for(wakeup.wait(), timeout=DISPATCHER_IDLE_SECONDS)
+        except asyncio.TimeoutError:
+            pass
+
     while True:
         wakeup = _dispatcher_wakeup
         if wakeup is None:
@@ -1837,8 +1847,17 @@ async def _run_task_command_dispatcher_worker(executor: CommandExecutor) -> None
         wakeup.clear()
         try:
             processed = await dispatch_one_task_command(executor)
-        except asyncio.CancelledError:
-            raise
+        except asyncio.CancelledError as exc:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling() > 0:
+                raise
+            logger.error(
+                "component=task-command-dispatcher dispatch raised a "
+                "cancellation not aimed at this worker; worker continuing",
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+            await idle_wait(wakeup)
+            continue
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "component=task-command-dispatcher command dispatch failed; "
@@ -1846,17 +1865,11 @@ async def _run_task_command_dispatcher_worker(executor: CommandExecutor) -> None
                 exc,
                 exc_info=(type(exc), exc, exc.__traceback__),
             )
-            try:
-                await asyncio.wait_for(wakeup.wait(), timeout=DISPATCHER_IDLE_SECONDS)
-            except asyncio.TimeoutError:
-                pass
+            await idle_wait(wakeup)
             continue
         if processed:
             continue
-        try:
-            await asyncio.wait_for(wakeup.wait(), timeout=DISPATCHER_IDLE_SECONDS)
-        except asyncio.TimeoutError:
-            pass
+        await idle_wait(wakeup)
 
 
 async def run_task_command_dispatcher(executor: CommandExecutor) -> None:
