@@ -592,9 +592,14 @@ class TaskCoordinator:
         self._command_tasks.add(handle)
         try:
             return await asyncio.shield(handle)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancellation:
             await cancel_and_drain_async_task(handle)
-            raise
+            current = asyncio.current_task()
+            if current is not None and current.cancelling() > 0:
+                raise
+            # The owner cancelled this command (heartbeat loss or shutdown drain);
+            # the caller itself is still running and must not inherit that cancel.
+            raise _CoordinatorInterrupted from cancellation
         finally:
             self._command_tasks.discard(handle)
             self._discard_continuation_pin(getattr(command, "id", None))
@@ -847,6 +852,10 @@ _registry: TaskCoordinatorRegistry | None = None
 
 class _CoordinatorClosed(Exception):
     """An idle owner retired before this command entered its application gate."""
+
+
+class _CoordinatorInterrupted(Exception):
+    """The owner cancelled a command that was already applying."""
 
 
 def current_task_coordinator(task_id: int) -> TaskCoordinator | None:

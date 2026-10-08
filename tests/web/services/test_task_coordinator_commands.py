@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -18,6 +19,8 @@ from sqlalchemy.orm import sessionmaker
 from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.shared.postgres_disposable import disposable_database_factory
 from tests.web.services.coordinator_command_shared import claim_task_command
+from tests.web.services.task_database_shared import engine as engine_fixture
+from tests.web.services.task_database_shared import task_id as task_id_fixture
 from xagent.web.models.agent import Agent
 from xagent.web.models.database import Base, get_engine, get_session_local, init_db
 from xagent.web.models.task import Task, TaskStatus
@@ -36,6 +39,9 @@ from xagent.web.services import (
     task_resume_command,
     task_start,
 )
+
+engine = engine_fixture
+task_id = task_id_fixture
 
 
 @pytest.fixture(
@@ -691,9 +697,11 @@ async def test_shutdown_drains_command_waiting_for_execution_cleanup(host):
     pending = asyncio.create_task(coordinator.execute_command(command, apply))
     await eventually(coordinator._command_lock.locked)
     await asyncio.wait_for(coordinator.close(), DB_PROGRESS_TIMEOUT)
-    await asyncio.gather(pending, return_exceptions=True)
+    (outcome,) = await asyncio.gather(pending, return_exceptions=True)
     assert cleanup_done.is_set()
-    assert pending.cancelled()
+    # The drained caller was not cancelled itself; the owner interrupted it.
+    assert isinstance(outcome, task_coordinator_runtime._CoordinatorInterrupted)
+    assert not pending.cancelled()
     apply.assert_not_awaited()
     assert coordinator.state == task_coordinator_runtime.CoordinatorState.CLOSED
     with get_session_local()() as db:
@@ -863,3 +871,125 @@ async def test_proven_absent_reply_replays_retry_with_new_id_for_same_identity(
         if not request.done():
             request.cancel()
         await asyncio.gather(request, return_exceptions=True)
+
+
+@pytest.fixture
+async def applying_command(engine, task_id, monkeypatch):
+    """A real owner whose command is blocked inside its executor."""
+    monkeypatch.setattr(
+        task_coordinator_runtime, "get_task_lease_heartbeat_seconds", lambda: 3600
+    )
+    registry = task_coordinator_runtime.TaskCoordinatorRegistry(sessionmaker(engine))
+    try:
+        coordinator = await registry.ensure(task_id)
+        assert coordinator is not None
+        started = asyncio.Event()
+
+        async def execute():
+            started.set()
+            await asyncio.Event().wait()
+
+        caller = asyncio.create_task(
+            coordinator.execute_command(
+                SimpleNamespace(
+                    task_id=task_id,
+                    kind=task_command_transport.TaskCommandKind.MESSAGE,
+                ),
+                execute,
+            )
+        )
+        await started.wait()
+        yield registry, coordinator, caller
+    finally:
+        await registry.close()
+
+
+def _connection_lost():
+    return OperationalError(
+        "renew", {}, OSError("connection lost"), connection_invalidated=True
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["connection_error", "lost_lease", "close"])
+async def test_owner_close_interrupts_applying_command_without_cancelling_caller(
+    applying_command, source
+):
+    registry, coordinator, caller = applying_command
+    if source == "connection_error":
+        registry._finish_heartbeat(coordinator, _connection_lost())
+    elif source == "lost_lease":
+        coordinator.state = task_coordinator_runtime.CoordinatorState.LOST
+        registry._finish_heartbeat(coordinator)
+    else:
+        asyncio.create_task(coordinator.close())
+    (outcome,) = await asyncio.gather(caller, return_exceptions=True)
+    assert isinstance(outcome, task_coordinator_runtime._CoordinatorInterrupted)
+    assert not caller.cancelled()
+    assert not coordinator._command_tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_cancels_handle", [False, True])
+async def test_caller_cancellation_still_propagates_from_execute_command(
+    applying_command, owner_cancels_handle
+):
+    _registry, coordinator, caller = applying_command
+    if owner_cancels_handle:
+        # Owner and caller cancellation land in the same loop iteration.
+        for handle in tuple(coordinator._command_tasks):
+            handle.cancel()
+    caller.cancel()
+    await asyncio.gather(caller, return_exceptions=True)
+    assert caller.cancelled()
+    assert not coordinator._command_tasks
+
+
+@pytest.mark.asyncio
+async def test_dispatch_one_returns_false_when_owner_interrupts_command(host, caplog):
+    first = await create(host)
+    with get_session_local()() as db:
+        command_db_id = (
+            db.query(TaskExecutionCommand.id)
+            .filter_by(task_id=first.task_id, status="pending")
+            .scalar()
+        )
+    entered = asyncio.Event()
+
+    async def blocking_executor(command):
+        entered.set()
+        await asyncio.Event().wait()
+
+    caplog.set_level(
+        logging.WARNING, logger="xagent.web.services.task_command_transport"
+    )
+    registry = task_coordinator_runtime.get_task_coordinator_registry()
+    dispatch = asyncio.create_task(
+        task_command_transport.dispatch_one_task_command(
+            blocking_executor, command_db_id=command_db_id
+        )
+    )
+    await asyncio.wait_for(entered.wait(), DB_PROGRESS_TIMEOUT)
+    coordinator = await registry.ensure(first.task_id)
+    assert coordinator is not None
+    with get_session_local()() as db:
+        before = db.get(TaskExecutionCommand, command_db_id)
+        attempts = before.attempt_count
+    registry._finish_heartbeat(
+        coordinator,
+        OperationalError(
+            "renew", {}, OSError("connection lost"), connection_invalidated=True
+        ),
+    )
+    assert await asyncio.wait_for(dispatch, DB_PROGRESS_TIMEOUT) is False
+    with get_session_local()() as db:
+        row = db.get(TaskExecutionCommand, command_db_id)
+        assert row.status == "processing"
+        assert row.attempt_count == attempts
+        assert row.failure_count == 0
+        assert row.error is None
+    interrupted = [
+        r for r in caplog.records if "interrupted by its task owner" in r.getMessage()
+    ]
+    assert len(interrupted) == 1
+    assert interrupted[0].levelno == logging.WARNING

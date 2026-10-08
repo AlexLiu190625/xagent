@@ -1550,6 +1550,7 @@ async def dispatch_one_task_command(
 
     from .task_coordinator_runtime import (
         _CoordinatorClosed,
+        _CoordinatorInterrupted,
         get_task_coordinator_registry,
     )
 
@@ -1583,6 +1584,16 @@ async def dispatch_one_task_command(
         )
     except (TaskCommandDeferred, _CoordinatorClosed):
         # Ownership health is not a business attempt or deferral.
+        return False
+    except _CoordinatorInterrupted:
+        logger.warning(
+            "task_id=%s component=task-command-dispatcher command interrupted by "
+            "its task owner; any claim it held is left for recovery "
+            "(command_db_id=%s, kind=%s)",
+            task_id,
+            selected_id,
+            kind.value,
+        )
         return False
 
 
