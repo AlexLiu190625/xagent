@@ -22,6 +22,7 @@ from xagent.core.tools.adapters.vibe import (
 from xagent.web.api.v1.errors import V1ErrorCode
 from xagent.web.services.client_error_messages import (
     CONNECTOR_RUNTIME_CLIENT_ERROR_CODES,
+    ClientErrorCode,
 )
 from xagent.web.services.task_execution import create_terminal_task_error_event
 
@@ -155,18 +156,27 @@ def test_the_closed_set_is_the_connector_runtime_subset_of_v1() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    "code",
+    ["invalid_api_key", ClientErrorCode.EXTERNAL_TURN_INTERRUPTED.value],
+    ids=["non_connector_v1_code", "external_cancel_interruption_code"],
+)
 def test_a_non_connector_v1_code_is_dropped_and_logged(
+    code: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A V1ErrorCode member outside the connector-runtime family is dropped.
+    """A real code outside this builder's closed set is dropped.
 
     ``invalid_api_key`` is a real member of ``V1ErrorCode`` -- the /v1 error
     surface -- but it is not a connector-runtime code, so it must not reach
-    this frame.
+    this frame. ``external_turn_interrupted`` is a real client error code,
+    but only the external cancel core's own builder may put it on a frame;
+    any other caller handing it to this builder loses it, so a real failure
+    cannot read as a stop.
     """
 
     with caplog.at_level(logging.ERROR):
-        event = create_terminal_task_error_event(1, "x", code="invalid_api_key")
+        event = create_terminal_task_error_event(1, "x", code=code)
 
     assert "code" not in event
     dropped = [
