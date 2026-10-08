@@ -25,6 +25,7 @@ AgentOS Workflow:
 - `read_chunks_for_embedding()`: Read chunks needing embedding from database
 - `write_vectors_to_db()`: Write vectors with staleness cleanup and indexing
 - `validate_query_vector()`: Validate vector format for search operations
+- `commit_vectors_to_db()`: Make written vectors searchable (LanceDB: no-op)
 
 ## Vector Management
 
@@ -35,12 +36,14 @@ AgentOS Workflow:
 """
 
 from .vector_manager import (
+    commit_vectors_to_db,
     read_chunks_for_embedding,
     validate_query_vector,
     write_vectors_to_db,
 )
 
 __all__ = [
+    "commit_vectors_to_db",
     "read_chunks_for_embedding",
     "write_vectors_to_db",
     "validate_query_vector",

@@ -58,6 +58,7 @@ from ..utils.model_resolver import resolve_embedding_adapter
 from ..utils.token_utils import get_token_counter
 from ..utils.user_scope import resolve_user_scope
 from ..vector_storage.vector_manager import (
+    commit_vectors_to_db,
     read_chunks_for_embedding,
     write_vectors_to_db,
 )
@@ -1075,6 +1076,16 @@ def _process_document_impl(
                 "No pending chunks for embedding; returning early",
                 extra={"collection": collection, "doc_id": doc_id},
             )
+            current_step = "write_vectors_to_db"
+            commit_vectors_to_db(
+                collection=collection,
+                doc_id=doc_id,
+                parse_hash=parse_hash,
+                model=embedding_config.id,
+                commit_gate=commit_gate,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
             _record_ingestion_status(
                 collection,
                 doc_id,
@@ -1402,6 +1413,15 @@ def _process_document_impl(
         vector_count = total_vector_count
         write_elapsed_ms = int(write_elapsed_total * 1000)
         current_step = "write_vectors_to_db"
+        commit_vectors_to_db(
+            collection=collection,
+            doc_id=doc_id,
+            parse_hash=parse_hash,
+            model=embedding_config.id,
+            commit_gate=commit_gate,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
         completed_steps.append(
             IngestionStepResult(
                 name="write_vectors_to_db",

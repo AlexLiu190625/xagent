@@ -15,7 +15,7 @@ from ..core.schemas import (
     WebCrawlConfig,
     WebIngestionResult,
 )
-from .collection_handle import deployment_kb_backend
+from .collection_handle import deployment_kb_backend, ingest_scope
 from .operation_compatibility import (
     KBOperation,
     KBOperationCompatibilityFacade,
@@ -208,7 +208,7 @@ class KBPipelineCompatibilityFacade:
             collection=collection,
             details={"source_path": source_path, "file_id": file_id},
         ) as operation:
-            with self._storage_context():
+            with self._storage_context(), ingest_scope():
                 result = _process_document_impl(
                     collection=collection,
                     source_path=source_path,

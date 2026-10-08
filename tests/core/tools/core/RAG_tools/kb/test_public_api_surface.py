@@ -468,6 +468,11 @@ PUBLIC_SURFACE: list[tuple[str, str, str]] = [
     ("xagent.core.tools.core.RAG_tools.utils.__init__", "validate_hash_format", "sync"),
     (
         "xagent.core.tools.core.RAG_tools.vector_storage.__init__",
+        "commit_vectors_to_db",
+        "sync",
+    ),
+    (
+        "xagent.core.tools.core.RAG_tools.vector_storage.__init__",
         "read_chunks_for_embedding",
         "sync",
     ),

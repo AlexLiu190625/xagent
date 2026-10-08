@@ -657,3 +657,12 @@ class TestHandleWriteEmbeddingsMechanics:
                 [_embedding("d1", "c0", "h1", "m1", vector=[0.1, 0.2])],
                 create_index=False,
             )
+
+
+def test_commit_embeddings_does_nothing_on_lancedb():
+    handle = make_handle()
+
+    def gate() -> None:
+        raise AssertionError("the commit gate must not run on LanceDB")
+
+    assert handle.commit_embeddings("d", "p", "m", commit_gate=gate, user_id=1) is None

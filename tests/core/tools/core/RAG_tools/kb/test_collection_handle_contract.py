@@ -2,9 +2,10 @@
 
 Tests drive the handle only through the abstract interface; an engine joins by
 adding an ``ENGINES`` entry. On Milvus the ledger cases in ``MILVUS_SKELETON``
-run, the cascade cases in ``MILVUS_UNSUPPORTED`` are skipped because Milvus
-does not support cascade cleanup by design, and every other case needs Milvus
-rows: those are not implemented yet, so the cases are strict xfails on
+run, the cases in ``MILVUS_ROWS`` run against the server at ``MILVUS_URI``, the
+cascade cases in ``MILVUS_UNSUPPORTED`` are skipped because Milvus does not
+support cascade cleanup by design, and every other case needs Milvus search or
+delete: those are not implemented yet, so the cases are strict xfails on
 ``NotImplementedError`` until they are. Not covered here:
 
 - async search: LanceDB async search returns no rows today;
@@ -31,6 +32,7 @@ from __future__ import annotations
 import ast
 import importlib
 import inspect
+import os
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -47,6 +49,7 @@ from xagent.core.tools.core.RAG_tools.kb import collection_handle
 from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
     KBCollectionHandle,
     KBHandleProvider,
+    milvus_collection_name,
 )
 from xagent.core.tools.core.RAG_tools.kb.models import (
     KBAccessMode,
@@ -118,6 +121,11 @@ MILVUS_SKELETON = {
     "test_rename_collection_metadata_moves_only_the_callers_config",
     "test_delete_collection_config_follows_tenant_scope",
 }
+MILVUS_ROWS = {
+    "test_chunk_rows_round_trip_in_index_order",
+    "test_chunks_needing_embedding_resume_after_partial_write",
+    "test_stats_and_listings_follow_owner_scope",
+}
 MILVUS_UNSUPPORTED = {
     "test_cascade_deletes_its_scope_only_when_confirmed",
     "test_cascade_leaves_other_owners_rows",
@@ -129,11 +137,14 @@ def _engine_marks(engine: str, case: str) -> tuple[pytest.MarkDecorator, ...]:
         return ()
     if case in MILVUS_UNSUPPORTED:
         return (pytest.mark.skip(reason="Milvus does not support cascade cleanup"),)
+    if case in MILVUS_ROWS:
+        return (pytest.mark.milvus,)
     return (
+        pytest.mark.milvus,
         pytest.mark.xfail(
             strict=True,
             raises=NotImplementedError,
-            reason="needs Milvus rows, which are not implemented yet",
+            reason="needs Milvus search or delete, which are not implemented yet",
         ),
     )
 
@@ -161,14 +172,23 @@ def open_handle(
         monkeypatch.setattr(
             collection_handle, "require_implemented_vector_backend", lambda _: None
         )
+        if uri := os.environ.get("MILVUS_URI"):
+            from pymilvus import MilvusClient
+
+            request.addfinalizer(
+                lambda: MilvusClient(uri=uri).drop_collection(
+                    milvus_collection_name(MODEL)
+                )
+            )
     return ENGINES[request.param]
 
 
 def test_milvus_case_lists_name_real_cases() -> None:
     cases = {name for name in globals() if name.startswith("test_")}
 
-    assert MILVUS_SKELETON | MILVUS_UNSUPPORTED <= cases
-    assert not MILVUS_SKELETON & MILVUS_UNSUPPORTED
+    assert MILVUS_SKELETON | MILVUS_ROWS | MILVUS_UNSUPPORTED <= cases
+    assert not MILVUS_SKELETON & MILVUS_ROWS
+    assert not (MILVUS_SKELETON | MILVUS_ROWS) & MILVUS_UNSUPPORTED
 
 
 def _write_chunks(
@@ -219,6 +239,8 @@ def _embed(
         for chunk in sorted(pending, key=lambda chunk: chunk.index)[:limit]
     ]
     handle.write_embeddings(embeddings, user_id=user_id)
+    if limit is None:
+        handle.commit_embeddings(doc_id, parse_hash, MODEL, user_id=user_id)
     return embeddings
 
 
@@ -426,6 +448,7 @@ def test_rewriting_embeddings_does_not_duplicate_rows(
     )
 
     handle.write_embeddings(embeddings, user_id=1)
+    handle.commit_embeddings("doc-1", PARSE, MODEL, user_id=1)
 
     assert handle.collection_stats(None, True)["embeddings"] == 2
     assert set(_search(handle, "dense")) == {"doc-1-c0", "doc-1-c1"}

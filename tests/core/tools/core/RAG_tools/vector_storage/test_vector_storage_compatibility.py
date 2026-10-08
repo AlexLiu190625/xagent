@@ -97,6 +97,49 @@ def test_public_vector_storage_functions_route_through_facade(monkeypatch):
     )
 
 
+def test_commit_vectors_to_db_routes_through_the_facade(monkeypatch):
+    facade = MagicMock()
+    monkeypatch.setattr(
+        vector_manager,
+        "_get_vector_storage_compatibility_facade",
+        lambda: facade,
+    )
+    gate = MagicMock()
+
+    vector_manager.commit_vectors_to_db(
+        "c", "d", "p", "m", commit_gate=gate, user_id=7, is_admin=True
+    )
+
+    facade.commit_vectors.assert_called_once_with(
+        collection="c",
+        doc_id="d",
+        parse_hash="p",
+        model="m",
+        commit_gate=gate,
+        user_id=7,
+        is_admin=True,
+    )
+
+
+def test_commit_vectors_commits_through_the_opened_handle():
+    handle = MagicMock()
+    coordinator = MagicMock()
+    coordinator.open_collection_sync.return_value = handle
+    facade = KBVectorStorageCompatibilityFacade(coordinator=coordinator)
+    gate = MagicMock()
+
+    facade.commit_vectors(
+        "c", "d", "p", "m", commit_gate=gate, user_id=7, is_admin=True
+    )
+
+    (request,) = coordinator.open_collection_sync.call_args.args
+    assert (request.collection, request.user_id, request.is_admin) == ("c", 7, True)
+    handle.commit_embeddings.assert_called_once_with(
+        "d", "p", "m", commit_gate=gate, user_id=7, is_admin=True
+    )
+    gate.assert_not_called()
+
+
 def test_vector_storage_facade_binds_storage_shim_for_read_chunks():
     # An injected shim (no coordinator) must keep embedding reads bound to that
     # shim's stores: the facade opens a handle through a shim-backed coordinator

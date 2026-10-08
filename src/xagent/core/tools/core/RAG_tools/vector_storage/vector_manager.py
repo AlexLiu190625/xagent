@@ -18,7 +18,7 @@ stays in the pipeline/provider layer).
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from ..core.schemas import (
     ChunkEmbeddingData,
@@ -102,3 +102,24 @@ def write_vectors_to_db(
             create_index=create_index,
             user_id=user_id,
         )
+
+
+def commit_vectors_to_db(
+    collection: str,
+    doc_id: str,
+    parse_hash: str,
+    model: str,
+    commit_gate: Optional[Callable[[], None]] = None,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+) -> None:
+    """Make the written vectors searchable through the facade (no-op on LanceDB)."""
+    _get_vector_storage_compatibility_facade().commit_vectors(
+        collection=collection,
+        doc_id=doc_id,
+        parse_hash=parse_hash,
+        model=model,
+        commit_gate=commit_gate,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
