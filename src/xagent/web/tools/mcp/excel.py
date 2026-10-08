@@ -29,10 +29,12 @@ DEFAULT_SCAN_CHUNK_ROWS = 100
 MAX_QUERY_MATCHES = 100
 MAX_QUERY_ROWS = 10_000
 MAX_QUERY_REQUESTS = 100
+_EXCEL_MAX_ROW_NUMBER = 1_048_576  # the last row in an Excel worksheet
 
 StrictNonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
 StrictPageSize = Annotated[int, Field(strict=True, ge=1, le=MAX_COLLECTION_PAGE_SIZE)]
 StrictQueryMaxMatches = Annotated[int, Field(strict=True, ge=1, le=MAX_QUERY_MATCHES)]
+StrictRowNumber = Annotated[int, Field(strict=True, ge=1, le=_EXCEL_MAX_ROW_NUMBER)]
 
 _VALID_CLEAR_APPLY_TO = frozenset({"All", "Formats", "Contents"})
 _EXCEL_MAX_COLUMN_NUMBER = 16_384  # XFD, the last column in an Excel worksheet
@@ -257,6 +259,24 @@ def _normalize_column_range(start_column: str, end_column: str) -> str:
     end, end_number = _validated_column(end_column)
     if start_number > end_number:
         raise ValueError("start_column must not be after end_column")
+    return f"{start}:{end}"
+
+
+def _validated_row(row: int, field_name: str) -> int:
+    """Return a one-based Excel row number after strict validation."""
+    if not isinstance(row, int) or isinstance(row, bool):
+        raise TypeError(f"{field_name} must be an integer")
+    if not 1 <= row <= _EXCEL_MAX_ROW_NUMBER:
+        raise ValueError(f"{field_name} must be between 1 and {_EXCEL_MAX_ROW_NUMBER}")
+    return row
+
+
+def _normalize_row_range(start_row: int, end_row: int) -> str:
+    """Build a canonical full-row range and reject reversed ranges."""
+    start = _validated_row(start_row, "start_row")
+    end = _validated_row(end_row, "end_row")
+    if start > end:
+        raise ValueError("start_row must not be after end_row")
     return f"{start}:{end}"
 
 
@@ -824,7 +844,11 @@ def excel_update_range(
     array-of-arrays of cell values matching the range's shape, e.g.
     '[["Name", "Score"], ["Ada", 98]]'. A single-cell values_json is
     broadcast across the whole range (matches Excel's own CTRL+Enter fill
-    behavior) when the target range is larger than one cell."""
+    behavior) when the target range is larger than one cell.
+
+    This overwrites cells in place. To remove rows or columns use
+    excel_delete_rows or excel_delete_columns; rewriting cells to shift data
+    up or left misaligns the sheet and breaks formulas."""
     try:
         values = _parse_values_json(values_json)
         base = _workbook_base(file_path, site_id, drive_id)
@@ -900,6 +924,64 @@ def excel_delete_columns(
             "Error deleting columns %s:%s on worksheet %s in %s: %s",
             start_column,
             end_column,
+            worksheet,
+            file_path,
+            e,
+        )
+        return _error(str(e))
+
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=False))
+def excel_delete_rows(
+    file_path: str,
+    worksheet: str,
+    start_row: StrictRowNumber,
+    end_row: StrictRowNumber,
+    site_id: str | None = None,
+    drive_id: str | None = None,
+) -> str:
+    """Delete one or more complete worksheet rows and shift later rows up.
+
+    start_row and end_row are one-based sheet row numbers such as ``5`` and
+    ``7``: the numbers in an A1 address or in excel_find_rows row_number, not
+    the zero-based rowIndex Graph reports for a range. The operation is
+    irreversible: formulas that reference deleted rows may become ``#REF!``. It
+    removes whole rows structurally, so every column stays aligned and formulas
+    and formatting move with the remaining cells. Pass the same number twice to
+    delete a single row, for example ``5`` and ``5``, and pass the whole range
+    in one call to delete adjacent rows. Rows below end_row move up, so their
+    numbers change: when deleting several separate rows, delete them from the
+    bottom up (highest row number first), using the row numbers from a single
+    read. To delete a row of an Excel table instead, use excel_delete_table_row.
+    """
+    try:
+        address = _normalize_row_range(start_row, end_row)
+        base = _workbook_base(file_path, site_id, drive_id)
+        segment = _odata_key_segment("worksheets", worksheet)
+        path = (
+            f"{base}/{segment}/range(address='{_odata_string_literal(address)}')/delete"
+        )
+        _graph_mutation_request("POST", path, body={"shift": "Up"})
+        return _success(
+            message="Rows deleted successfully",
+            worksheet=worksheet,
+            deleted_range=address,
+        )
+    except _GraphMutationIndeterminateError as e:
+        logger.error(
+            "Row deletion outcome is indeterminate for %s:%s on worksheet %s in %s: %s",
+            start_row,
+            end_row,
+            worksheet,
+            file_path,
+            e,
+        )
+        return _indeterminate(str(e))
+    except Exception as e:
+        logger.error(
+            "Error deleting rows %s:%s on worksheet %s in %s: %s",
+            start_row,
+            end_row,
             worksheet,
             file_path,
             e,

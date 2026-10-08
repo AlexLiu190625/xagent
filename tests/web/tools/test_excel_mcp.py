@@ -538,6 +538,107 @@ def test_delete_columns_declares_destructive_non_idempotent_annotation():
     assert tool.annotations.idempotentHint is False
 
 
+@pytest.mark.parametrize(
+    ("start_row", "end_row", "expected"),
+    [(5, 5, "5:5"), (5, 7, "5:7"), (1, 1_048_576, "1:1048576")],
+)
+def test_delete_rows_uses_structural_up_shift(
+    monkeypatch, start_row, end_row, expected
+):
+    mock_request = Mock(return_value=MockResponse({}, status_code=204, content=b""))
+    monkeypatch.setattr(excel.requests, "request", mock_request)
+
+    result = json.loads(
+        excel.excel_delete_rows("book.xlsx", "Sheet1", start_row, end_row)
+    )
+
+    assert result["status"] == "success"
+    assert result["deleted_range"] == expected
+    # One whole-row delete and nothing else: no read-modify-write that could
+    # shift only part of a row and leave the other columns misaligned.
+    assert mock_request.call_count == 1
+    kwargs = mock_request.call_args.kwargs
+    assert kwargs["method"] == "POST"
+    assert kwargs["url"].endswith(
+        f"worksheets('Sheet1')/range(address='{expected.replace(':', '%3A')}')/delete"
+    )
+    assert kwargs["json"] == {"shift": "Up"}
+
+
+@pytest.mark.parametrize("row", [True, "5", 5.0, None])
+@pytest.mark.parametrize("field", ["start_row", "end_row"])
+def test_delete_rows_rejects_non_integer_rows(monkeypatch, field, row):
+    mock_request = Mock()
+    monkeypatch.setattr(excel.requests, "request", mock_request)
+    row_args = {"start_row": 5, "end_row": 7, field: row}
+
+    result = json.loads(excel.excel_delete_rows("book.xlsx", "Sheet1", **row_args))
+
+    assert result["status"] == "error"
+    assert f"{field} must be an integer" in result["message"]
+    mock_request.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("start_row", "end_row", "message"),
+    [
+        (0, 5, "start_row must be between 1 and 1048576"),
+        (-1, 5, "start_row must be between 1 and 1048576"),
+        (5, 1_048_577, "end_row must be between 1 and 1048576"),
+        (7, 5, "start_row must not be after end_row"),
+    ],
+)
+def test_delete_rows_rejects_invalid_ranges(monkeypatch, start_row, end_row, message):
+    mock_request = Mock()
+    monkeypatch.setattr(excel.requests, "request", mock_request)
+
+    result = json.loads(
+        excel.excel_delete_rows("book.xlsx", "Sheet1", start_row, end_row)
+    )
+
+    assert result["status"] == "error"
+    assert message in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_delete_rows_transport_failure_is_indeterminate(monkeypatch):
+    monkeypatch.setattr(
+        excel.requests,
+        "request",
+        Mock(side_effect=requests.ConnectionError("connection dropped")),
+    )
+
+    result = json.loads(excel.excel_delete_rows("book.xlsx", "Sheet1", 5, 5))
+
+    assert result["status"] == "indeterminate"
+    assert result["retry_safe"] is False
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected_status"), [(400, "error"), (503, "indeterminate")]
+)
+def test_delete_rows_maps_graph_failures(monkeypatch, status_code, expected_status):
+    monkeypatch.setattr(
+        excel.requests,
+        "request",
+        Mock(return_value=MockResponse({"error": "failure"}, status_code=status_code)),
+    )
+
+    result = json.loads(excel.excel_delete_rows("book.xlsx", "Sheet1", 5, 5))
+
+    assert result["status"] == expected_status
+    if expected_status == "indeterminate":
+        assert result["retry_safe"] is False
+
+
+def test_delete_rows_declares_destructive_non_idempotent_annotation():
+    tool = excel.mcp._tool_manager.get_tool("excel_delete_rows")
+
+    assert tool.annotations is not None
+    assert tool.annotations.destructiveHint is True
+    assert tool.annotations.idempotentHint is False
+
+
 # ---------------------------------------------------------------------------
 # ranges
 # ---------------------------------------------------------------------------
@@ -1232,6 +1333,50 @@ async def test_delete_columns_validates_arguments_at_mcp_ingress(monkeypatch):
             },
         )
     mock_request.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"start_row": True, "end_row": 7},
+        {"start_row": "5", "end_row": 7},
+        {"start_row": 5.0, "end_row": 7},
+        {"start_row": 5, "end_row": None},
+        {"start_row": 0, "end_row": 7},
+        {"start_row": 5, "end_row": 1_048_577},
+    ],
+)
+async def test_delete_rows_validates_arguments_at_mcp_ingress(monkeypatch, arguments):
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    mock_request = Mock()
+    monkeypatch.setattr(excel.requests, "request", mock_request)
+
+    with pytest.raises(ToolError, match="validation error"):
+        await excel.mcp.call_tool(
+            "excel_delete_rows",
+            {"file_path": "book.xlsx", "worksheet": "Sheet1", **arguments},
+        )
+    mock_request.assert_not_called()
+
+
+async def test_delete_rows_accepts_the_last_worksheet_row_at_mcp_ingress(monkeypatch):
+    mock_request = Mock(return_value=MockResponse({}, status_code=204, content=b""))
+    monkeypatch.setattr(excel.requests, "request", mock_request)
+
+    result = await excel.mcp.call_tool(
+        "excel_delete_rows",
+        {
+            "file_path": "book.xlsx",
+            "worksheet": "Sheet1",
+            "start_row": 1,
+            "end_row": 1_048_576,
+        },
+    )
+
+    blocks = result[0] if isinstance(result, tuple) else result
+    assert json.loads(blocks[0].text)["deleted_range"] == "1:1048576"
+    assert mock_request.call_count == 1
 
 
 @pytest.mark.parametrize(
