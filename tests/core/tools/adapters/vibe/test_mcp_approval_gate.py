@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 from pydantic import BaseModel
 
+from xagent.core.tools.adapters.vibe import mcp_approval_gate as approval_gate_module
 from xagent.core.tools.adapters.vibe.base import AbstractBaseTool, ToolMetadata
 from xagent.core.tools.adapters.vibe.interaction_types import TYPES_REQUIRING_OPTIONS
 from xagent.core.tools.adapters.vibe.mcp_approval_gate import (
@@ -1052,7 +1053,7 @@ async def test_dispatch_observe_seconds_overrides_the_module_default(
 
 @pytest.mark.asyncio
 async def test_cancellation_mid_observation_shares_the_deadline_not_restarts_it(
-    registrations: list[Any],
+    registrations: list[Any], monkeypatch: Any
 ) -> None:
     """Cancellation mid-observation must not re-arm a fresh full budget.
 
@@ -1064,10 +1065,27 @@ async def test_cancellation_mid_observation_shares_the_deadline_not_restarts_it(
     the first one had already elapsed - roughly doubling worst-case
     dispatch-to-cancel-completion latency. The fix records a monotonic
     deadline once and shares it between both waits.
+
+    The test asserts the budget the ``finally`` drain is given, not how long
+    the cancel takes to complete: the latter would also measure the load of
+    the machine running the test.
     """
 
     dispatch_observe_seconds = 0.4
     started = asyncio.Event()
+
+    # Record the budget each drain is given instead of timing how long the
+    # drains take: elapsed time measures the runner's load as much as the
+    # budget, while the budget itself is computed from the shared deadline and
+    # can only shrink when the runner is slow.
+    drain_timeouts: list[float | None] = []
+    real_drain = approval_gate_module._drain
+
+    async def recording_drain(awaitable: Any, *, timeout: float | None = None) -> None:
+        drain_timeouts.append(timeout)
+        await real_drain(awaitable, timeout=timeout)
+
+    monkeypatch.setattr(approval_gate_module, "_drain", recording_drain)
 
     class HangingTarget(_Target):
         async def run_json_async(self, args: Mapping[str, Any]) -> Any:
@@ -1096,21 +1114,32 @@ async def test_cancellation_mid_observation_shares_the_deadline_not_restarts_it(
 
     task = asyncio.ensure_future(run())
     await started.wait()
+    # Let the gate arm its observation deadline before the half-budget sleep
+    # starts (it needs 2 loop iterations; 3 keep one spare), so a stall can
+    # only shrink the drain budget.
+    for _ in range(3):
+        await asyncio.sleep(0)
     # Let the observation wait consume roughly half its budget before the
     # external cancellation arrives - the shape that used to restart it.
     await asyncio.sleep(dispatch_observe_seconds / 2)
-    loop = asyncio.get_running_loop()
-    cancel_time = loop.time()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, timeout=dispatch_observe_seconds * 3)
-    elapsed_after_cancel = loop.time() - cancel_time
+        await asyncio.wait_for(task, timeout=5)
 
-    # The fix bounds this to roughly the REMAINING half of the shared budget
-    # (~0.2s here). The bug re-armed a fresh full budget in `finally`
-    # (~0.4s), so a threshold at 75% of the full budget cleanly separates the
-    # two without being sensitive to ordinary scheduling jitter.
-    assert elapsed_after_cancel < dispatch_observe_seconds * 0.75, elapsed_after_cancel
+    # The first drain is the one `finally` runs on the dispatched call under
+    # the observation budget; any later one is the unobserved-call cleanup,
+    # which has its own budget.
+    assert drain_timeouts, "the dispatched call was never drained"
+    observation_drain_timeout = drain_timeouts[0]
+    assert observation_drain_timeout is not None
+    # The fix gives it only the REMAINING half of the shared budget (at most
+    # ~0.2s here; less the slower the runner is). The bug re-armed a fresh
+    # full budget in `finally` (0.4s), so a threshold at 75% of the full
+    # budget separates the two, and a slow runner can only push the fixed
+    # behaviour further below it.
+    assert observation_drain_timeout < dispatch_observe_seconds * 0.75, (
+        observation_drain_timeout
+    )
 
 
 def test_wrapper_delegates_unknown_attributes_to_the_wrapped_tool() -> None:

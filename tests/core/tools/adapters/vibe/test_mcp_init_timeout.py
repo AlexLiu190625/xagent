@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import inspect
 import logging
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -53,12 +54,15 @@ class _FakeHttpxClient:
 
 def _counting_http_connection(transport: str) -> tuple[dict, dict]:
     """An sse/streamable_http connection whose httpx client factory builds
-    ``_FakeHttpxClient`` instances and counts how many it has built."""
-    counts = {"built": 0}
+    ``_FakeHttpxClient`` instances, counts how many it has built (``built``)
+    and keeps them, in build order (``clients``)."""
+    counts: dict[str, Any] = {"built": 0, "clients": []}
 
     def factory(headers=None, timeout=None, auth=None) -> _FakeHttpxClient:
         counts["built"] += 1
-        return _FakeHttpxClient()
+        client = _FakeHttpxClient()
+        counts["clients"].append(client)
+        return client
 
     connection = {
         "transport": transport,
@@ -394,7 +398,8 @@ async def test_abandoned_http_load_is_force_closed_after_grace_bare_coroutine(
     ``blocked_on_transport``: swallows every cancel it receives and only ends
     once its own client is force-closed.
     """
-    monkeypatch.setattr(mcp_adapter_module, "_HANDSHAKE_RECLAIM_GRACE_SECONDS", 0.2)
+    grace = 0.2
+    monkeypatch.setattr(mcp_adapter_module, "_HANDSHAKE_RECLAIM_GRACE_SECONDS", grace)
     caplog.set_level(logging.WARNING, logger=_LOGGER_NAME)
 
     connection, _counts = _counting_http_connection(transport)
@@ -431,8 +436,13 @@ async def test_abandoned_http_load_is_force_closed_after_grace_bare_coroutine(
     ended_after = asyncio.get_event_loop().time() - abandoned_at
 
     assert client.aclose_calls == 1
-    assert ended_after < 0.2 + 0.5
-    await asyncio.sleep(0.05)
+    _assert_reaper_waited_out_grace(ended_after, grace)
+    # The reaper leaves _RECLAIM_TASKS 2 loop iterations after this test's own
+    # asyncio.wait on the load returns (both wait on the same task); 3 yields
+    # keep one spare. Iteration-based, not wall-clock: a reaper that lingers
+    # after its force-close fails this.
+    for _ in range(3):
+        await asyncio.sleep(0)
     assert _new_reapers(reapers_before) == set()
     assert len(_reclaim_warnings(caplog.records)) == 1
 
@@ -448,7 +458,8 @@ async def test_abandoned_http_load_is_force_closed_after_grace_real_retry_loop(
     force-closes it. Because the retry loop checks the seal before every
     attempt, the load starts no second attempt at all -- it ends with
     ``_TransportReclaimedError``."""
-    monkeypatch.setattr(mcp_adapter_module, "_HANDSHAKE_RECLAIM_GRACE_SECONDS", 1.5)
+    grace = 1.5
+    monkeypatch.setattr(mcp_adapter_module, "_HANDSHAKE_RECLAIM_GRACE_SECONDS", grace)
     caplog.set_level(logging.WARNING, logger=_LOGGER_NAME)
 
     connection, counts = _counting_http_connection(transport)
@@ -484,8 +495,14 @@ async def test_abandoned_http_load_is_force_closed_after_grace_real_retry_loop(
 
     assert counts["built"] == built_at_abandon  # zero new clients after abandonment
     assert calls["n"] == 1  # zero new attempts
-    assert ended_after < 1.5 + 1 + 0.5
-    await asyncio.sleep(0.05)
+    assert [c.aclose_calls for c in counts["clients"]] == [1]  # force-closed
+    _assert_reaper_waited_out_grace(ended_after, grace)
+    # The reaper leaves _RECLAIM_TASKS 2 loop iterations after this test's own
+    # asyncio.wait on the load returns (both wait on the same task); 3 yields
+    # keep one spare. Iteration-based, not wall-clock: a reaper that lingers
+    # after its force-close fails this.
+    for _ in range(3):
+        await asyncio.sleep(0)
     assert _new_reapers(reapers_before) == set()
     assert len(_reclaim_warnings(caplog.records)) == 1
     assert _still_alive_warnings(caplog.records) == []
@@ -564,6 +581,30 @@ async def _wait_until_no_new_reapers(before: set, timeout: float = 5.0) -> None:
     while _new_reapers(before):
         assert loop.time() < deadline, f"reapers still running after {timeout}s"
         await asyncio.sleep(0.02)
+
+
+def _assert_reaper_waited_out_grace(ended_after: float, grace: float) -> None:
+    """Assert a load that only the reaper's force-close can end was not ended
+    before the grace period had passed.
+
+    ``ended_after`` is measured on the loop clock from the instant
+    ``_load_server_tools_bounded`` raised. The reaper's grace wait only starts
+    once the test next yields, so it starts after that instant. A loaded
+    runner makes everything slower, never faster, so this lower bound cannot
+    flake.
+    Do not add the matching upper bound ("ended promptly"): a stalled event
+    loop would trip it, so it measures the runner instead of the reaper. That
+    a force-close ended the load is shown by the client's ``aclose`` count and
+    the reclaim WARNING, and that it ended within a generous cap by
+    ``_assert_task_done_within``.
+
+    A loop may fire a timer up to its clock resolution early, so allow that.
+    """
+    resolution = time.get_clock_info("monotonic").resolution
+    assert ended_after >= grace - resolution, (
+        f"task ended {ended_after:.3f}s after abandonment, before the "
+        f"{grace}s grace period passed"
+    )
 
 
 async def _assert_task_done_within(task: "asyncio.Task[Any]", timeout: float) -> None:
@@ -1122,8 +1163,18 @@ async def test_abandoned_load_starts_no_further_attempt(
     _TransportReclaimedError when k < 3 (the next attempt's check fails it);
     when k == 3 there is no next attempt, so it returns normally with a
     failure record instead of raising -- attempts == 3, error_type is the
-    stand-in's own exception class name."""
-    grace = 1.5
+    stand-in's own exception class name.
+
+    The ``by_itself`` cells get a grace far beyond the load's natural end
+    (at most ~1.2s after abandonment: 0.2s of swallowed cancels plus one 1s
+    retry backoff) and beyond the 5s cap they wait under, so the reaper can
+    only reach its force-close if the load failed to end by itself, however
+    slow the runner is. The reaper stops waiting as soon as its load ends, so
+    the large grace costs the test nothing. The ``by_force_close`` cells use
+    a short grace so they do not wait for it.
+    """
+    by_itself = ending == "by_itself"
+    grace = 10.0 if by_itself else 1.5
     monkeypatch.setattr(mcp_adapter_module, "_HANDSHAKE_RECLAIM_GRACE_SECONDS", grace)
     caplog.set_level(logging.WARNING, logger=_LOGGER_NAME)
 
@@ -1131,7 +1182,7 @@ async def test_abandoned_load_starts_no_further_attempt(
     if has_factory:
         connection, counts = _counting_http_connection(transport)
     else:
-        connection, counts = {"transport": transport}, {"built": 0}
+        connection, counts = {"transport": transport}, {"built": 0, "clients": []}
 
     stand_in, calls = _make_stalling_create_session(
         k=k, ending=ending, has_factory=has_factory
@@ -1159,7 +1210,7 @@ async def test_abandoned_load_starts_no_further_attempt(
     abandoned_at = asyncio.get_event_loop().time()
 
     task = _new_active_load_task(before)
-    await _assert_task_done_within(task, timeout=10)
+    await _assert_task_done_within(task, timeout=5 if by_itself else 10)
     if k < 3:
         assert isinstance(task.exception(), _TransportReclaimedError)
     else:
@@ -1175,11 +1226,19 @@ async def test_abandoned_load_starts_no_further_attempt(
     if has_factory:
         assert counts["built"] == k  # zero new clients after abandonment
 
-    backoff = 1 if k < 3 else 0
-    if ending == "by_itself":
-        assert ended_after < 0.2 + backoff + 0.5
+    if by_itself:
+        # The load ended long before its grace period could expire, so the
+        # reaper never reached its force-close: no reclaim WARNING, and the
+        # stuck attempt's client (the k-th built) was not closed. stdio and
+        # websocket build no client, so for them only the WARNING is checked.
+        assert _reclaim_warnings(caplog.records) == []
+        if has_factory:
+            assert counts["clients"][k - 1].aclose_calls == 0
     else:
-        assert ended_after < grace + backoff + 0.5
+        # Only the reaper's force-close can end this load: the stuck attempt's
+        # client (the k-th built) was closed by it, after the grace period.
+        assert counts["clients"][k - 1].aclose_calls == 1
+        _assert_reaper_waited_out_grace(ended_after, grace)
 
     await _wait_until_no_new_reapers(reapers_before)
     assert _still_alive_warnings(caplog.records) == []
