@@ -9,6 +9,7 @@ from ..models.task import (
     TraceEvent,
     TraceMessageBlob,
 )
+from ..models.task_auto_recovery import TaskAutoRecovery, TaskRecoveryEvent
 from ..models.task_interaction import TaskInteractionRequest
 from .task_file_lifecycle import (
     DetachmentReason,
@@ -78,6 +79,18 @@ def purge_task_rows(
         db.query(TaskInteractionRequest).filter(
             TaskInteractionRequest.task_id == task_id
         ).delete(synchronize_session=False)
+
+    # Explicit rather than relying on ON DELETE CASCADE: SQLite only enforces
+    # foreign keys when the pragma is on. No presence gate, unlike the
+    # interaction table: an Alembic upgrade can stop short of these tables,
+    # but ``Base.metadata.create_all`` runs right after ``try_upgrade_db`` on
+    # every startup, so they exist before the process serves anything.
+    db.query(TaskRecoveryEvent).filter(TaskRecoveryEvent.task_id == task_id).delete(
+        synchronize_session=False
+    )
+    db.query(TaskAutoRecovery).filter(TaskAutoRecovery.task_id == task_id).delete(
+        synchronize_session=False
+    )
 
     db.query(TraceCheckpointBlob).filter(TraceCheckpointBlob.task_id == task_id).delete(
         synchronize_session=False

@@ -20,6 +20,7 @@ from ..models.task import (
     TraceEvent,
     TraceMessageBlob,
 )
+from ..models.task_auto_recovery import TaskAutoRecovery, TaskRecoveryEvent
 from ..models.task_interaction import TaskInteractionRequest
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
@@ -128,6 +129,13 @@ def _purge_user_task_rows(db: Session, *, user_id: int) -> None:
         db.query(TaskInteractionRequest).filter(
             TaskInteractionRequest.task_id.in_(task_ids)
         ).delete(synchronize_session=False)
+
+    # Auto-recovery rows cascade with their task at the database level; delete
+    # them explicitly so this does not depend on SQLite honouring the FK.
+    for recovery_model in (TaskRecoveryEvent, TaskAutoRecovery):
+        db.query(recovery_model).filter(recovery_model.task_id.in_(task_ids)).delete(
+            synchronize_session=False
+        )
 
     # Children without a DB-level ``ON DELETE`` clause -- these are the rows a
     # bare ``DELETE FROM tasks`` would strand or fail on under strict FKs.

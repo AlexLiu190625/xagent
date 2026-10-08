@@ -54,6 +54,32 @@ TASK_LEASE_TTL_SECONDS = "XAGENT_TASK_LEASE_TTL_SECONDS"
 TASK_LEASE_HEARTBEAT_SECONDS = "XAGENT_TASK_LEASE_HEARTBEAT_SECONDS"
 TASK_LEASE_RECOVERY_INTERVAL_SECONDS = "XAGENT_TASK_LEASE_RECOVERY_INTERVAL_SECONDS"
 TASK_LEASE_RECOVERY_BATCH_SIZE = "XAGENT_TASK_LEASE_RECOVERY_BATCH_SIZE"
+TASK_INFRA_FAILURE_PAUSE_ENABLED = "XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED"
+TASK_AUTO_RESUME_ENABLED = "XAGENT_TASK_AUTO_RESUME_ENABLED"
+TASK_AUTO_RESUME_POLL_SECONDS = "XAGENT_TASK_AUTO_RESUME_POLL_SECONDS"
+TASK_AUTO_RESUME_MAX_PER_TICK = "XAGENT_TASK_AUTO_RESUME_MAX_PER_TICK"
+TASK_AUTO_RESUME_MAX_INFLIGHT = "XAGENT_TASK_AUTO_RESUME_MAX_INFLIGHT"
+TASK_AUTO_RESUME_WINDOW_SECONDS = "XAGENT_TASK_AUTO_RESUME_WINDOW_SECONDS"
+TASK_AUTO_RESUME_CHANNEL_WINDOW_SECONDS = (
+    "XAGENT_TASK_AUTO_RESUME_CHANNEL_WINDOW_SECONDS"
+)
+TASK_AUTO_RESUME_MAX_TOTAL_PER_RUN = "XAGENT_TASK_AUTO_RESUME_MAX_TOTAL_PER_RUN"
+TASK_AUTO_RESUME_SHORT_INITIAL_BACKOFF_SECONDS = (
+    "XAGENT_TASK_AUTO_RESUME_SHORT_INITIAL_BACKOFF_SECONDS"
+)
+TASK_AUTO_RESUME_SHORT_MAX_NO_PROGRESS = "XAGENT_TASK_AUTO_RESUME_SHORT_MAX_NO_PROGRESS"
+TASK_AUTO_RESUME_LLM_INITIAL_BACKOFF_SECONDS = (
+    "XAGENT_TASK_AUTO_RESUME_LLM_INITIAL_BACKOFF_SECONDS"
+)
+TASK_AUTO_RESUME_LLM_MAX_BACKOFF_SECONDS = (
+    "XAGENT_TASK_AUTO_RESUME_LLM_MAX_BACKOFF_SECONDS"
+)
+TASK_AUTO_RESUME_LLM_MAX_ELAPSED_SECONDS = (
+    "XAGENT_TASK_AUTO_RESUME_LLM_MAX_ELAPSED_SECONDS"
+)
+TASK_AUTO_RESUME_MODEL_OUTPUT_MAX_NO_PROGRESS = (
+    "XAGENT_TASK_AUTO_RESUME_MODEL_OUTPUT_MAX_NO_PROGRESS"
+)
 UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS = (
     "XAGENT_UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS"
 )
@@ -462,6 +488,123 @@ def get_task_lease_recovery_batch_size() -> int:
     """Get the maximum number of expired leases scanned per recovery batch."""
 
     return _get_positive_int_env(TASK_LEASE_RECOVERY_BATCH_SIZE, 100)
+
+
+def _get_strict_bool_env(env_var: str, default: bool) -> bool:
+    """Parse a boolean env var, warning and falling back on unrecognised values.
+
+    Unlike :func:`_get_bool_env`, an unrecognised value keeps the default
+    instead of reading as ``False``, so a typo cannot silently turn off a
+    default-on switch. Blank counts as unset, as in
+    :func:`_get_retention_bool_env`: a compose file interpolating an unset
+    shell variable passes an empty string, which states nothing and must not
+    warn on every read.
+    """
+
+    value = os.getenv(env_var)
+    if value is None or not value.strip():
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    logger.warning("Invalid %s=%r; falling back to %s", env_var, value, default)
+    return default
+
+
+def get_task_infra_failure_pause_enabled() -> bool:
+    """Whether eligible tasks pause (instead of failing) on infrastructure failures.
+
+    Priority:
+        1. XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED environment variable
+        2. True
+    """
+
+    return _get_strict_bool_env(TASK_INFRA_FAILURE_PAUSE_ENABLED, True)
+
+
+def get_task_auto_resume_enabled() -> bool:
+    """Whether tasks paused by an interruption are resumed automatically.
+
+    Priority:
+        1. XAGENT_TASK_AUTO_RESUME_ENABLED environment variable
+        2. True
+    """
+
+    return _get_strict_bool_env(TASK_AUTO_RESUME_ENABLED, True)
+
+
+def get_task_auto_resume_poll_seconds() -> int:
+    """Get the auto-resume sweeper polling interval in seconds (default 5)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_POLL_SECONDS, 5)
+
+
+def get_task_auto_resume_max_per_tick() -> int:
+    """Get the maximum auto-resumes dispatched per sweeper tick (default 20)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_MAX_PER_TICK, 20)
+
+
+def get_task_auto_resume_max_inflight() -> int:
+    """Get the global cap on auto-resumed runs in flight (default 50)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_MAX_INFLIGHT, 50)
+
+
+def get_task_auto_resume_window_seconds() -> int:
+    """Get how long after an interruption auto-resume stays allowed (default 24h)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_WINDOW_SECONDS, 86400)
+
+
+def get_task_auto_resume_channel_window_seconds() -> int:
+    """Get the auto-resume staleness window for channel tasks (default 30 min)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_CHANNEL_WINDOW_SECONDS, 1800)
+
+
+def get_task_auto_resume_max_total_per_run() -> int:
+    """Get the absolute cap on auto-resumes for a single run (default 20)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_MAX_TOTAL_PER_RUN, 20)
+
+
+def get_task_auto_resume_short_initial_backoff_seconds() -> int:
+    """Get the first backoff for lease_expired/persistence_failure (default 10s)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_SHORT_INITIAL_BACKOFF_SECONDS, 10)
+
+
+def get_task_auto_resume_short_max_no_progress() -> int:
+    """Get the no-progress resume limit for short-backoff reasons (default 3)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_SHORT_MAX_NO_PROGRESS, 3)
+
+
+def get_task_auto_resume_llm_initial_backoff_seconds() -> int:
+    """Get the first backoff for llm_unavailable interruptions (default 60s)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_LLM_INITIAL_BACKOFF_SECONDS, 60)
+
+
+def get_task_auto_resume_llm_max_backoff_seconds() -> int:
+    """Get the backoff ceiling for llm_unavailable interruptions (default 900s)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_LLM_MAX_BACKOFF_SECONDS, 900)
+
+
+def get_task_auto_resume_llm_max_elapsed_seconds() -> int:
+    """Get the total retry duration for llm_unavailable interruptions (default 2h)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_LLM_MAX_ELAPSED_SECONDS, 7200)
+
+
+def get_task_auto_resume_model_output_max_no_progress() -> int:
+    """Get the run-level retry limit for model_output_invalid (default 2)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_MODEL_OUTPUT_MAX_NO_PROGRESS, 2)
 
 
 def get_uploaded_file_recovery_interval_seconds() -> int:

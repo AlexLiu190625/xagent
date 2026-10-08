@@ -3738,6 +3738,121 @@ def test_no_module_assigns_a_retention_environment_variable():
     )
 
 
+_AUTO_RESUME_INT_SETTINGS = [
+    ("TASK_AUTO_RESUME_POLL_SECONDS", "get_task_auto_resume_poll_seconds", 5),
+    ("TASK_AUTO_RESUME_MAX_PER_TICK", "get_task_auto_resume_max_per_tick", 20),
+    ("TASK_AUTO_RESUME_MAX_INFLIGHT", "get_task_auto_resume_max_inflight", 50),
+    ("TASK_AUTO_RESUME_WINDOW_SECONDS", "get_task_auto_resume_window_seconds", 86400),
+    (
+        "TASK_AUTO_RESUME_CHANNEL_WINDOW_SECONDS",
+        "get_task_auto_resume_channel_window_seconds",
+        1800,
+    ),
+    (
+        "TASK_AUTO_RESUME_MAX_TOTAL_PER_RUN",
+        "get_task_auto_resume_max_total_per_run",
+        20,
+    ),
+    (
+        "TASK_AUTO_RESUME_SHORT_INITIAL_BACKOFF_SECONDS",
+        "get_task_auto_resume_short_initial_backoff_seconds",
+        10,
+    ),
+    (
+        "TASK_AUTO_RESUME_SHORT_MAX_NO_PROGRESS",
+        "get_task_auto_resume_short_max_no_progress",
+        3,
+    ),
+    (
+        "TASK_AUTO_RESUME_LLM_INITIAL_BACKOFF_SECONDS",
+        "get_task_auto_resume_llm_initial_backoff_seconds",
+        60,
+    ),
+    (
+        "TASK_AUTO_RESUME_LLM_MAX_BACKOFF_SECONDS",
+        "get_task_auto_resume_llm_max_backoff_seconds",
+        900,
+    ),
+    (
+        "TASK_AUTO_RESUME_LLM_MAX_ELAPSED_SECONDS",
+        "get_task_auto_resume_llm_max_elapsed_seconds",
+        7200,
+    ),
+    (
+        "TASK_AUTO_RESUME_MODEL_OUTPUT_MAX_NO_PROGRESS",
+        "get_task_auto_resume_model_output_max_no_progress",
+        2,
+    ),
+]
+
+_AUTO_RESUME_BOOL_SETTINGS = [
+    ("TASK_INFRA_FAILURE_PAUSE_ENABLED", "get_task_infra_failure_pause_enabled"),
+    ("TASK_AUTO_RESUME_ENABLED", "get_task_auto_resume_enabled"),
+]
+
+
+class TestTaskAutoRecoveryConfig:
+    @pytest.mark.parametrize("const,getter,default", _AUTO_RESUME_INT_SETTINGS)
+    def test_int_setting_defaults_overrides_and_invalid(
+        self, monkeypatch, caplog, const, getter, default
+    ):
+        env_var = getattr(config, const)
+        assert env_var == f"XAGENT_{const}"
+        read = getattr(config, getter)
+
+        monkeypatch.delenv(env_var, raising=False)
+        assert read() == default
+
+        monkeypatch.setenv(env_var, "7")
+        assert read() == 7
+
+        for invalid in ("", "abc", "0", "-3", "1.5"):
+            monkeypatch.setenv(env_var, invalid)
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="xagent.config"):
+                assert read() == default
+            assert env_var in caplog.text
+
+    @pytest.mark.parametrize("const,getter", _AUTO_RESUME_BOOL_SETTINGS)
+    def test_bool_setting_defaults_overrides_and_invalid(
+        self, monkeypatch, caplog, const, getter
+    ):
+        env_var = getattr(config, const)
+        assert env_var == f"XAGENT_{const}"
+        read = getattr(config, getter)
+
+        monkeypatch.delenv(env_var, raising=False)
+        assert read() is True
+
+        for falsy in ("false", "0", "no", "off", " FALSE "):
+            monkeypatch.setenv(env_var, falsy)
+            assert read() is False
+        for truthy in ("true", "1", "yes", "on", "True"):
+            monkeypatch.setenv(env_var, truthy)
+            assert read() is True
+
+        for blank in ("", "   "):
+            monkeypatch.setenv(env_var, blank)
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="xagent.config"):
+                assert read() is True
+            assert env_var not in caplog.text
+
+        for invalid in ("maybe", "2"):
+            monkeypatch.setenv(env_var, invalid)
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="xagent.config"):
+                assert read() is True
+            assert env_var in caplog.text
+
+    def test_example_env_documents_every_setting(self):
+        example = (Path(config.__file__).parents[2] / "example.env").read_text()
+        names = [f"XAGENT_{const}" for const, *_ in _AUTO_RESUME_INT_SETTINGS]
+        names += [f"XAGENT_{const}" for const, _ in _AUTO_RESUME_BOOL_SETTINGS]
+        for name in names:
+            assert f"# {name}=" in example
+
+
 @pytest.mark.parametrize(
     "name,value",
     [
