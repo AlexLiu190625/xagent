@@ -1627,6 +1627,11 @@ async def startup_event() -> None:
         raise ValueError("Use python -m xagent.web.worker for the worker role")
     logger.info("Agent runtime configured: %s", get_agent_runtime())
     validate_interaction_rollout_at_startup()
+    from ..core.tools.core.RAG_tools.storage.vector_backend import (
+        lock_deployment_kb_engine,
+    )
+
+    lock_deployment_kb_engine()
     await _initialize_database_and_admit_runtime(app)
 
     # Persisted ExecutionScope snapshots (workforce sub-tasks) keep a

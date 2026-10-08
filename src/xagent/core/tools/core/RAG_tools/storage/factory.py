@@ -31,11 +31,6 @@ from .lancedb_stores import (
     LanceDBPromptTemplateStore,
     LanceDBVectorIndexStore,
 )
-from .vector_backend import (
-    VectorBackend,
-    get_configured_vector_backend,
-    require_implemented_vector_backend,
-)
 
 logger = logging.getLogger(__name__)
 _storage_shim_override: ContextVar[Any] = ContextVar(
@@ -91,7 +86,6 @@ class StorageFactory:
 
         # Store instances (lazy initialization)
         self._vector_index_store: Optional[VectorIndexStore] = None
-        self._vector_backend: Optional[VectorBackend] = None
         self._metadata_store: Optional[MetadataStore] = None
         self._ingestion_status_store: Optional[IngestionStatusStore] = None
         self._prompt_template_store: Optional[PromptTemplateStore] = None
@@ -121,7 +115,6 @@ class StorageFactory:
         """
         with self._lock:
             self._vector_index_store = None
-            self._vector_backend = None
             self._metadata_store = None
             self._ingestion_status_store = None
             self._prompt_template_store = None
@@ -138,42 +131,14 @@ class StorageFactory:
     def get_vector_index_store(self) -> VectorIndexStore:
         """Get or create vector index store.
 
-        Backend is selected via :envvar:`XAGENT_VECTOR_BACKEND` (or legacy
-        ``VECTOR_STORE_BACKEND``); see :mod:`.vector_backend`.
-
         Returns:
-            Concrete :class:`~.contracts.VectorIndexStore` (currently
-            :class:`~.lancedb_stores.LanceDBVectorIndexStore` when backend is
-            ``lancedb``).
-
-        Raises:
-            ConfigurationError: Unknown backend name, or backend not implemented
-                yet (e.g. ``milvus`` / ``qdrant`` without an adapter).
+            The LanceDB ledger, whatever the deployment's KB engine.
         """
         if self._vector_index_store is None:
             with self._lock:
                 if self._vector_index_store is None:
-                    backend = get_configured_vector_backend()
-                    require_implemented_vector_backend(backend)
-                    if backend is VectorBackend.LANCEDB:
-                        self._vector_index_store = LanceDBVectorIndexStore()
-                        self._vector_backend = backend
-                    else:
-                        raise AssertionError(
-                            "require_implemented_vector_backend must prevent this branch"
-                        )
+                    self._vector_index_store = LanceDBVectorIndexStore()
         return self._vector_index_store
-
-    def get_resolved_vector_backend(self) -> VectorBackend:
-        """Return the backend bound to the current vector index store singleton.
-
-        After the store is created, this reflects the backend used at creation
-        time (cached). Before creation, returns :func:`.get_configured_vector_backend`
-        without instantiating the store.
-        """
-        if self._vector_backend is not None:
-            return self._vector_backend
-        return get_configured_vector_backend()
 
     # --- MetadataStore ---
 
@@ -280,16 +245,8 @@ def reset_rag_storage_for_tests() -> None:
     This is the **single entry point** pytest fixtures should use instead of
     importing vector-database modules (e.g. LanceDB) directly. It:
 
-    1. Clears backend-specific connection caches and related resources for the
-       configured :class:`~.vector_backend.VectorBackend`.
+    1. Clears the LanceDB connection cache.
     2. Resets :class:`StorageFactory` singletons via :func:`reset_kb_write_coordinator`.
-
-    When adding Milvus, Qdrant, etc., extend the backend branch below so test
-    isolation stays correct without changing every ``conftest.py``.
-
-    Raises:
-        ConfigurationError: If ``XAGENT_VECTOR_BACKEND`` is set to an unknown value
-            (same as :func:`~.vector_backend.get_configured_vector_backend`).
     """
     _get_storage_shim().reset_rag_storage_for_tests()
     logger.debug("[TEST_RESET] Global collection locks reset via public helper")

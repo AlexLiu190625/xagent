@@ -59,17 +59,13 @@ def test_factory_creates_lancedb_store(
     StorageFactory.get_factory().reset_all()
     store = StorageFactory.get_factory().get_vector_index_store()
     assert isinstance(store, LanceDBVectorIndexStore)
-    assert (
-        StorageFactory.get_factory().get_resolved_vector_backend()
-        is VectorBackend.LANCEDB
-    )
 
 
-def test_unimplemented_backend_raises(
+def test_factory_returns_the_lancedb_ledger_for_milvus(
     monkeypatch: pytest.MonkeyPatch, clean_vector_backend_env: None, tmp_path: str
 ) -> None:
     monkeypatch.setenv("LANCEDB_DIR", str(tmp_path))
     monkeypatch.setenv(VECTOR_BACKEND_ENV, "milvus")
     StorageFactory.get_factory().reset_all()
-    with pytest.raises(ConfigurationError, match="not implemented"):
-        StorageFactory.get_factory().get_vector_index_store()
+    store = StorageFactory.get_factory().get_vector_index_store()
+    assert isinstance(store, LanceDBVectorIndexStore)

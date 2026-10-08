@@ -38,6 +38,7 @@ from .collection_handle import (
     KBMainPointerSnapshot,
     KBVersionCandidateCleanupSnapshot,
     KBVersionCandidateRollbackResult,
+    deployment_kb_backend,
 )
 from .file_compatibility import KBFileCompatibilityFacade
 from .legacy_step_compatibility import KBLegacyStepCompatibilityFacade
@@ -320,6 +321,14 @@ class KBCoordinator:
                 raise ValueError(f"Collection '{collection}' not found") from exc
 
         backend = self._resolve_backend(collection_info)
+        if request.deployment_engine_only:
+            deployment = deployment_kb_backend()
+            if backend is not deployment:
+                raise ValueError(
+                    f"Collection {collection!r} is bound to the {backend.value} "
+                    f"engine, but this deployment runs {deployment.value}; "
+                    "re-import it to search or ingest."
+                )
         capabilities = self._capabilities_for_backend(backend)
 
         return KBCollectionContext(
@@ -529,6 +538,7 @@ class KBCoordinator:
             is_admin=is_admin,
             access_mode=KBAccessMode.READ,
             hide_missing=True,
+            deployment_engine_only=True,
         )
 
     async def search_dense(
@@ -1846,12 +1856,12 @@ class KBCoordinator:
 
     def _resolve_backend(self, collection_info: object | None) -> KBStorageBackend:
         if collection_info is None:
-            return KBStorageBackend.LANCEDB
+            return deployment_kb_backend()
 
         extra_metadata = getattr(collection_info, "extra_metadata", None) or {}
         binding = extra_metadata.get(KB_STORAGE_METADATA_KEY)
         if binding is None:
-            return KBStorageBackend.LANCEDB
+            return deployment_kb_backend()
 
         if isinstance(binding, str):
             return self._parse_backend(binding)
@@ -1859,7 +1869,7 @@ class KBCoordinator:
         if isinstance(binding, dict):
             raw_backend = binding.get("backend")
             if raw_backend is None or str(raw_backend).strip() == "":
-                return KBStorageBackend.LANCEDB
+                return deployment_kb_backend()
             return self._parse_backend(str(raw_backend))
 
         raise ValueError(

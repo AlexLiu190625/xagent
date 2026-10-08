@@ -1378,7 +1378,7 @@ def test_delete_document_reports_an_unknown_backend_as_is(
     assert (result.status, result.message) == (
         "error",
         "Failed to delete document: Invalid kb_storage backend 'bogus'; "
-        "choose one of: lancedb",
+        "choose one of: lancedb, milvus, qdrant",
     )
 
 

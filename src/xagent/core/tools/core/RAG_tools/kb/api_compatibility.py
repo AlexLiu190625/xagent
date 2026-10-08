@@ -31,7 +31,7 @@ from ..core.schemas import (
     WebIngestionResult,
 )
 from .async_utils import maybe_await
-from .models import KBStorageBackend
+from .collection_handle import deployment_kb_backend
 from .operation_compatibility import (
     KBOperationOutcome,
     RollbackStatus,
@@ -644,7 +644,7 @@ class KBApiCompatibilityFacade:
             return collection_info
 
         extra_metadata[KB_STORAGE_METADATA_KEY] = {
-            "backend": KBStorageBackend.LANCEDB.value
+            "backend": deployment_kb_backend().value
         }
         updated_collection = collection_info.model_copy(
             update={"extra_metadata": extra_metadata}

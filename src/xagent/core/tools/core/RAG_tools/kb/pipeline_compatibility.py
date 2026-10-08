@@ -15,7 +15,7 @@ from ..core.schemas import (
     WebCrawlConfig,
     WebIngestionResult,
 )
-from .models import KBStorageBackend
+from .collection_handle import deployment_kb_backend
 from .operation_compatibility import (
     KBOperation,
     KBOperationCompatibilityFacade,
@@ -168,7 +168,7 @@ class KBPipelineCompatibilityFacade:
             return collection_info
 
         extra_metadata[KB_STORAGE_METADATA_KEY] = {
-            "backend": KBStorageBackend.LANCEDB.value
+            "backend": deployment_kb_backend().value
         }
         updated_collection = collection_info.model_copy(
             update={"extra_metadata": extra_metadata}

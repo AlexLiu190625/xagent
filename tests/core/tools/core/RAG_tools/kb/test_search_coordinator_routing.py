@@ -144,6 +144,7 @@ def test_coordinator_opens_a_read_handle_and_forwards_every_argument(
     assert request.user_id == kwargs["user_id"]
     assert request.is_admin == kwargs["is_admin"]
     assert request.hide_missing is True
+    assert request.deployment_engine_only is True
 
     getattr(handle, handle_method).assert_called_once_with(*args, **kwargs)
 

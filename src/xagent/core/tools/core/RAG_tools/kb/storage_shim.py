@@ -66,23 +66,9 @@ class KBStorageShimCompatibilityFacade:
 
     def reset_rag_storage_for_tests(self) -> None:
         """Reset all process-global KB/RAG storage state for tests."""
-        from ..storage.vector_backend import (
-            VectorBackend,
-            get_configured_vector_backend,
-        )
+        from xagent.providers.vector_store.lancedb import clear_connection_cache
 
-        backend = get_configured_vector_backend()
-        if backend is VectorBackend.LANCEDB:
-            from xagent.providers.vector_store.lancedb import clear_connection_cache
-
-            clear_connection_cache()
-        elif backend is VectorBackend.MILVUS:
-            # Future: clear Milvus client pools / connection cache when implemented.
-            pass
-        elif backend is VectorBackend.QDRANT:
-            # Future: clear Qdrant client singleton when implemented.
-            pass
-
+        clear_connection_cache()
         self.reset_kb_write_coordinator()
 
         from ..management import collection_manager

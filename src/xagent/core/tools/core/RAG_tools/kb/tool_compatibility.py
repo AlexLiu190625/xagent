@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from ..core.schemas import CollectionInfo, IngestionConfig
 from .async_utils import maybe_await
-from .models import KBStorageBackend
+from .collection_handle import deployment_kb_backend
 from .pipeline_compatibility import KB_STORAGE_METADATA_KEY
 
 logger = logging.getLogger(__name__)
@@ -343,7 +343,7 @@ class KBToolCompatibilityFacade:
                 return collection_info
 
             extra_metadata[KB_STORAGE_METADATA_KEY] = {
-                "backend": KBStorageBackend.LANCEDB.value
+                "backend": deployment_kb_backend().value
             }
             updated_collection = collection_info.model_copy(
                 update={"extra_metadata": extra_metadata}

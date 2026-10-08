@@ -22,6 +22,9 @@ from ..config import (
     get_task_lease_recovery_interval_seconds,
     validate_task_execution_host_config,
 )
+from ..core.tools.core.RAG_tools.storage.vector_backend import (
+    lock_deployment_kb_engine,
+)
 from ..core.tracing.langfuse import flush_langfuse, initialize_langfuse
 from ..db.config import create_alembic_config
 from ..skills.utils import create_skill_manager
@@ -78,6 +81,7 @@ async def run_worker(
     configure_db()
     await asyncio.to_thread(validate_worker_schema)
     validate_interaction_rollout_at_startup()
+    await asyncio.to_thread(lock_deployment_kb_engine)
     recovery = None
     sandbox = None
     idle_sweep = None
