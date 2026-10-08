@@ -256,6 +256,23 @@ def restrict_to_app_scoped_oauth_grant(
     ]
 
 
+def oauth_grant_keys_rejected_by_app_scope(
+    app_or_id: object, candidates: Iterable[object]
+) -> list[str]:
+    """Candidates ``restrict_to_app_scoped_oauth_grant`` drops for this app.
+
+    A persisted grant under one of these keys is a connection the user made
+    that no longer counts for this app: reconnecting the app (which stores an
+    app-scoped grant) fixes it, so callers report that instead of "no grant".
+    Empty wherever the policy narrows nothing: an app outside
+    ``APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT``, an operator-owned ``word`` row,
+    or an app whose provider key is its own app_id.
+    """
+    deduped = list(dict.fromkeys(c for c in candidates if isinstance(c, str) and c))
+    accepted = set(restrict_to_app_scoped_oauth_grant(app_or_id, deduped))
+    return [candidate for candidate in deduped if candidate not in accepted]
+
+
 def classify_app_auth(transport: Any, launch_config: Any) -> str:
     """Single source of truth for how a catalog app is connected.
 

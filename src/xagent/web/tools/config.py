@@ -102,6 +102,12 @@ OAUTH_TOKEN_RESOLVER_FAILURE_CODE = "oauth_token_resolver_failed"
 OAUTH_TOKEN_RESOLVER_FAILURE_MESSAGE = "OAuth token resolver failed"
 UNAVAILABLE_MCP_MESSAGE = "MCP server is unavailable."
 UNAVAILABLE_MCP_CREDENTIAL_MESSAGE = "MCP server credentials are unavailable."
+# The user's only grant is a provider-level one this app no longer accepts
+# (APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT); connecting the app itself fixes it.
+UNAVAILABLE_MCP_APP_SCOPED_GRANT_MESSAGE = (
+    f"{UNAVAILABLE_MCP_CREDENTIAL_MESSAGE} "
+    "Reconnect this app to grant the permissions it needs."
+)
 _ACTOR_OAUTH_REFRESH_LOCKS: WeakValueDictionary[
     tuple[int, int, str, str], asyncio.Lock
 ] = WeakValueDictionary()
@@ -189,6 +195,9 @@ class _LegacyOAuthTokenResolution:
     access_token: str | None
     refresh_failed: bool = False
     credential_present: bool = False
+    # No accepted grant, but a provider-level one the app-scoped policy
+    # rejected exists: reconnecting the app fixes it.
+    policy_rejected_grant_present: bool = False
     # Set only for providers that return a per-org API host instead of
     # using a fixed domain (Salesforce) -- None for everyone else.
     instance_url: str | None = None
@@ -4089,7 +4098,10 @@ class WebToolConfig(BaseToolConfig):
         resource_owner_key: str | None = None,
     ) -> _LegacyOAuthTokenResolution:
         """Resolve and persist one exact OAuth owner in an isolated transaction."""
-        from ...web.mcp_apps import restrict_to_app_scoped_oauth_grant
+        from ...web.mcp_apps import (
+            oauth_grant_keys_rejected_by_app_scope,
+            restrict_to_app_scoped_oauth_grant,
+        )
         from ...web.models.user_oauth import UserOAuth
 
         if self._user_id is None:
@@ -4112,9 +4124,10 @@ class WebToolConfig(BaseToolConfig):
                 # "meta") never requested this app's own oauth_scopes, so it
                 # can't be trusted to carry a permission added after that flow
                 # already existed. See APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT.
+                policy_app = app_info if app_info is not None else app_id
+                provider_candidates = [provider_name, app_id]
                 providers_to_check = restrict_to_app_scoped_oauth_grant(
-                    app_info if app_info is not None else app_id,
-                    [provider_name, app_id],
+                    policy_app, provider_candidates
                 )
                 oauth_account = (
                     scoped_user_oauth_query(
@@ -4138,6 +4151,26 @@ class WebToolConfig(BaseToolConfig):
                     self._user_id,
                     oauth_account is not None,
                 )
+                if oauth_account is None:
+                    rejected_keys = oauth_grant_keys_rejected_by_app_scope(
+                        policy_app, provider_candidates
+                    )
+                    rejected_grant_present = bool(rejected_keys) and (
+                        scoped_user_oauth_query(
+                            oauth_db,
+                            user_id=user_id,
+                            resource_owner_key=None,
+                        )
+                        .filter(UserOAuth.provider.in_(rejected_keys))
+                        .first()
+                        is not None
+                    )
+                    # The finish helper's no-account result, plus whether a
+                    # grant the policy rejected exists.
+                    return _LegacyOAuthTokenResolution(
+                        access_token=None,
+                        policy_rejected_grant_present=rejected_grant_present,
+                    )
             else:
                 oauth_account = (
                     scoped_user_oauth_query(
@@ -4402,7 +4435,11 @@ class WebToolConfig(BaseToolConfig):
                     return self._build_unavailable_mcp_config(
                         server=server,
                         reason="oauth_token_required",
-                        message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
+                        message=(
+                            UNAVAILABLE_MCP_APP_SCOPED_GRANT_MESSAGE
+                            if legacy_token.policy_rejected_grant_present
+                            else UNAVAILABLE_MCP_CREDENTIAL_MESSAGE
+                        ),
                         failure_code="oauth_token_required",
                     )
                 logger.info("OAUTH CONFIG: Mapping '%s' to executable proxy", app_id)

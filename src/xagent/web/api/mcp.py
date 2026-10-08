@@ -60,6 +60,7 @@ from ..mcp_apps import (
     get_app_for_mcp_server,
     get_catalog_mcp_oauth_credentials,
     normalize_catalog_key,
+    oauth_grant_keys_rejected_by_app_scope,
     restrict_to_app_scoped_oauth_grant,
 )
 from ..models.custom_api import CustomApi, UserCustomApi
@@ -237,8 +238,10 @@ class MCPServerResponse(BaseModel):
         default=None,
         description=(
             "Persisted OAuth grant state: connected when the selected grant has an "
-            "access token, needs_reconnect when its token was cleared, or null when "
-            "no persisted grant exists. This is not a runtime readiness probe."
+            "access token, needs_reconnect when its token was cleared or the only "
+            "grant is a provider-level one this app requires an app-scoped grant "
+            "in place of, or null when no persisted grant exists. This is not a "
+            "runtime readiness probe."
         ),
     )
 
@@ -2398,7 +2401,9 @@ def _enrich_oauth_server_info(
     # resolver's own `provider.in_([app_id, provider]).order_by(id.desc())`
     # query -- never "whichever key is healthier," which can pick a row
     # runtime would never select.
-    for key in restrict_to_app_scoped_oauth_grant(app_id, [app_id, provider]):
+    # Pass the app, not its id: "word" is policy-covered only with the builtin
+    # provenance, as the catalog and runtime already decide it.
+    for key in restrict_to_app_scoped_oauth_grant(app_info, [app_id, provider]):
         summary = oauth_accounts.get(key)
         if not summary:
             continue
@@ -2409,6 +2414,14 @@ def _enrich_oauth_server_info(
                 status,
                 account_id,
             )
+
+    # A persisted grant the app-scoped policy rejects is still a connection
+    # the user made; reconnecting the app replaces it (#2887).
+    if connection_status is None and any(
+        key in oauth_accounts
+        for key in oauth_grant_keys_rejected_by_app_scope(app_info, [app_id, provider])
+    ):
+        connection_status = "needs_reconnect"
 
     # A pre-existing invariant this response has always kept (see
     # test_meta_oauth.py's blanked-token regression test, from an earlier
