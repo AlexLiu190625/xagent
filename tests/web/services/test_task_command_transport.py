@@ -3146,9 +3146,9 @@ def test_duplicate_command_cannot_replace_persisted_reply_origin(db_session):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("swallow_exceptions", [False, True])
+@pytest.mark.parametrize("wait_style", ["shield", "wait_for_previous"])
 async def test_dispatcher_worker_survives_cancellation_not_aimed_at_it(
-    monkeypatch, caplog, swallow_exceptions
+    monkeypatch, caplog, wait_style
 ) -> None:
     """A cancel raised inside dispatch must not end loops nobody cancelled."""
 
@@ -3156,22 +3156,22 @@ async def test_dispatcher_worker_survives_cancellation_not_aimed_at_it(
     monkeypatch.setattr(transport, "consumes_task_commands", lambda: True)
     monkeypatch.setattr(transport, "DISPATCHER_IDLE_SECONDS", 0.01)
     foreign: asyncio.Task | None = None
-    calls = 0
+    hit_worker: asyncio.Task | None = None
+    hit_calls = 0
+    manager = task_execution_service.BackgroundTaskManager()
 
     async def dispatch(_executor, *, command_db_id=None) -> bool:
-        nonlocal foreign, calls
-        calls += 1
-        if calls == 1:
+        nonlocal foreign, hit_worker, hit_calls
+        if hit_worker is None:
+            hit_worker = asyncio.current_task()
             foreign = asyncio.create_task(asyncio.Event().wait())
-            if swallow_exceptions:
-                # Shaped like a wait on another task's completion that treats
-                # ordinary errors as non-fatal.
-                try:
-                    await asyncio.shield(foreign)
-                except Exception:
-                    pass
-            else:
+            if wait_style == "shield":
                 await asyncio.shield(foreign)
+            else:
+                manager.running_tasks[1] = foreign
+                await manager.wait_for_previous(1)
+        elif asyncio.current_task() is hit_worker:
+            hit_calls += 1
         return False
 
     monkeypatch.setattr(transport, "dispatch_one_task_command", dispatch)
@@ -3181,7 +3181,10 @@ async def test_dispatcher_worker_survives_cancellation_not_aimed_at_it(
     try:
         await eventually(lambda: foreign is not None)
         foreign.cancel()
-        await eventually(lambda: calls > transport.DISPATCHER_CONCURRENCY)
+        # The very loop that took the cancellation must dispatch again; other
+        # loops running meanwhile cannot satisfy this.
+        await eventually(lambda: hit_calls > 0)
+        assert hit_worker is not None and not hit_worker.done()
         assert not dispatcher.done()
         aimed = [
             r for r in caplog.records if "not aimed at this worker" in r.getMessage()
@@ -3248,6 +3251,8 @@ async def test_dispatcher_exit_callback_reports_only_unregistered_exits(
     else:
         assert len(critical) == 1
         assert expected in critical[0].getMessage()
+        if scenario in ("external_cancel", "base_exception"):
+            assert critical[0].exc_info is not None
 
 
 async def _restart_after(transport, dispatcher) -> None:
@@ -3263,6 +3268,7 @@ async def _restart_after(transport, dispatcher) -> None:
     "scenario",
     [
         "stop_first",
+        "stop_with_dispatcher_ending",
         "one_restart",
         "restart_limit",
         "exits_spaced_beyond_window",
@@ -3308,6 +3314,13 @@ async def test_supervise_task_command_dispatcher(
             await asyncio.wait_for(supervisor, DB_PROGRESS_TIMEOUT)
             assert not registered.done()
             assert errors() == []
+        elif scenario == "stop_with_dispatcher_ending":
+            stop.set()
+            registered.cancel()
+            await asyncio.wait_for(supervisor, DB_PROGRESS_TIMEOUT)
+            await asyncio.sleep(0)
+            assert [r for r in errors() if r.levelno == logging.ERROR] == []
+            assert not any("restarting" in r.getMessage() for r in caplog.records)
         elif scenario == "one_restart":
             registered.cancel()
             await _restart_after(transport, registered)
@@ -3359,6 +3372,13 @@ async def test_supervise_task_command_dispatcher(
             with pytest.raises(asyncio.CancelledError):
                 await supervisor
             assert not registered.done()
+            await asyncio.sleep(0)
+            # The supervisor's internal stop.wait() task must be reclaimed.
+            assert not [
+                t
+                for t in asyncio.all_tasks()
+                if t.get_coro().__qualname__ == "Event.wait"
+            ]
         else:
             await stop_task_command_dispatcher()
             await eventually(

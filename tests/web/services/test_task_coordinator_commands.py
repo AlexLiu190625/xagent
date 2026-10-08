@@ -884,10 +884,11 @@ async def applying_command(engine, task_id, monkeypatch):
         coordinator = await registry.ensure(task_id)
         assert coordinator is not None
         started = asyncio.Event()
+        gate = asyncio.get_running_loop().create_future()
 
         async def execute():
             started.set()
-            await asyncio.Event().wait()
+            await gate
 
         caller = asyncio.create_task(
             coordinator.execute_command(
@@ -899,7 +900,7 @@ async def applying_command(engine, task_id, monkeypatch):
             )
         )
         await started.wait()
-        yield registry, coordinator, caller
+        yield registry, coordinator, caller, gate
     finally:
         await registry.close()
 
@@ -911,22 +912,29 @@ def _connection_lost():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("source", ["connection_error", "lost_lease", "close"])
+@pytest.mark.parametrize(
+    "source", ["connection_error", "lost_lease", "close", "executor_cancelled"]
+)
 async def test_owner_close_interrupts_applying_command_without_cancelling_caller(
     applying_command, source
 ):
-    registry, coordinator, caller = applying_command
+    registry, coordinator, caller, gate = applying_command
     if source == "connection_error":
         registry._finish_heartbeat(coordinator, _connection_lost())
     elif source == "lost_lease":
         coordinator.state = task_coordinator_runtime.CoordinatorState.LOST
         registry._finish_heartbeat(coordinator)
-    else:
+    elif source == "close":
         asyncio.create_task(coordinator.close())
+    else:
+        # The business executor itself raises a cancellation.
+        gate.cancel()
     (outcome,) = await asyncio.gather(caller, return_exceptions=True)
     assert isinstance(outcome, task_coordinator_runtime._CoordinatorInterrupted)
     assert not caller.cancelled()
     assert not coordinator._command_tasks
+    if source == "executor_cancelled":
+        assert isinstance(outcome.__cause__, asyncio.CancelledError)
 
 
 @pytest.mark.asyncio
@@ -934,7 +942,7 @@ async def test_owner_close_interrupts_applying_command_without_cancelling_caller
 async def test_caller_cancellation_still_propagates_from_execute_command(
     applying_command, owner_cancels_handle
 ):
-    _registry, coordinator, caller = applying_command
+    _registry, coordinator, caller, _gate = applying_command
     if owner_cancels_handle:
         # Owner and caller cancellation land in the same loop iteration.
         for handle in tuple(coordinator._command_tasks):
@@ -975,17 +983,14 @@ async def test_dispatch_one_returns_false_when_owner_interrupts_command(host, ca
     with get_session_local()() as db:
         before = db.get(TaskExecutionCommand, command_db_id)
         attempts = before.attempt_count
-    registry._finish_heartbeat(
-        coordinator,
-        OperationalError(
-            "renew", {}, OSError("connection lost"), connection_invalidated=True
-        ),
-    )
+        claimed_by = before.claimed_by
+    registry._finish_heartbeat(coordinator, _connection_lost())
     assert await asyncio.wait_for(dispatch, DB_PROGRESS_TIMEOUT) is False
     with get_session_local()() as db:
         row = db.get(TaskExecutionCommand, command_db_id)
         assert row.status == "processing"
         assert row.attempt_count == attempts
+        assert row.claimed_by == claimed_by
         assert row.failure_count == 0
         assert row.error is None
     interrupted = [

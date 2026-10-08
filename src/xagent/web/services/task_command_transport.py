@@ -1829,7 +1829,8 @@ def _consume_prompt_dispatch_result(task: asyncio.Task[bool]) -> None:
 
 
 async def _run_task_command_dispatcher_worker(executor: CommandExecutor) -> None:
-    # Invariant: this loop exits only when the worker task itself is cancelled.
+    # Invariant: this loop exits only when the worker task itself is cancelled
+    # (or when stop_task_command_dispatcher cleared the wakeup event).
     # A CancelledError raised from inside dispatch that nobody aimed at this
     # task (for example a shared await on another task that was cancelled)
     # must not end the loop.

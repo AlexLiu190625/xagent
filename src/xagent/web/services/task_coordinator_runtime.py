@@ -597,8 +597,10 @@ class TaskCoordinator:
             current = asyncio.current_task()
             if current is not None and current.cancelling() > 0:
                 raise
-            # The owner cancelled this command (heartbeat loss or shutdown drain);
-            # the caller itself is still running and must not inherit that cancel.
+            # The command handle was cancelled by something other than this
+            # caller: heartbeat loss, an owner shutdown drain, or any other
+            # cancellation of the handle. The caller itself is still running
+            # and must not inherit that cancel.
             raise _CoordinatorInterrupted from cancellation
         finally:
             self._command_tasks.discard(handle)
@@ -855,7 +857,7 @@ class _CoordinatorClosed(Exception):
 
 
 class _CoordinatorInterrupted(Exception):
-    """The owner cancelled a command that was already applying."""
+    """The owner cancelled a command before it finished applying."""
 
 
 def current_task_coordinator(task_id: int) -> TaskCoordinator | None:
