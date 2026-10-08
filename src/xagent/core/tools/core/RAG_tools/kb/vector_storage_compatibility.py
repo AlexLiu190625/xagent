@@ -82,6 +82,7 @@ class KBVectorStorageCompatibilityFacade:
                 is_admin=is_admin,
                 access_mode=KBAccessMode.WRITE,
                 hide_missing=True,
+                deployment_engine_only=True,
             )
         )
 

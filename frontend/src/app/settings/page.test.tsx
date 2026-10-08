@@ -17,6 +17,9 @@ vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({ t: i18nState.t, locale: "en", setLocale: i18nState.setLocale }),
 }))
 vi.mock("@/lib/api-wrapper", () => ({ apiRequest }))
+vi.mock("@/components/settings/execution-budget", () => ({
+  ExecutionBudgetSettings: () => <section data-testid="execution-budget-settings" />,
+}))
 vi.mock("@/lib/task-runtime-ui-extension", async () => {
   const actual = await vi.importActual<
     typeof import("@/lib/task-runtime-ui-extension")

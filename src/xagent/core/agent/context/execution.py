@@ -641,6 +641,7 @@ class ExecutionContext:
     created_at: datetime = field(default_factory=_utcnow)
     compact_config: CompactConfig = field(default_factory=CompactConfig)
     llm_calls: list[LLMCallRecord] = field(default_factory=list)
+    execution_budget: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         self.components.setdefault("workspace", WorkspaceComponent())
@@ -1749,6 +1750,7 @@ class ExecutionContext:
             ],
             "system_prompt": self.system_prompt,
             "metadata": snapshot_container(self.metadata),
+            "execution_budget": snapshot_container(self.execution_budget),
             # A sibling of ``metadata``, deliberately not a member of it:
             # ``request_context`` keys land inside ``metadata`` verbatim
             # (``runner.py:1001`` writes ``context.metadata[key] = value``), so
@@ -1881,6 +1883,7 @@ class ExecutionContext:
             metadata=metadata,
             created_at=created_at,
             llm_calls=llm_calls,
+            execution_budget=data.get("execution_budget"),
             compact_config=compact_config,
         )
 

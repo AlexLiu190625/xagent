@@ -1218,6 +1218,9 @@ _SCAN_ROOT = _REPO_ROOT / "src" / "xagent"
 _UNRELATED_SOURCE_LITERALS = {
     ("skills/personal_db.py", "personal"),  # SkillRecord.source
     ("services/tool_credentials.py", "db"),  # local var: credential origin
+    # ExecutionBudgetPolicy.source identifies the policy that sets the cap,
+    # not a task ingress channel or a value written to tasks.source.
+    ("web/services/execution_budget.py", "system_maximum"),
     # ClarificationDraft.source: which waiting mechanism produced the draft
     # (send_message / ask_user_question / tool_waiting), not a Task ingress
     # channel -- these values never reach the tasks.source column or the

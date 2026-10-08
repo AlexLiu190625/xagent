@@ -81,6 +81,7 @@ from .db_runtime import (
     is_database_pool_timeout,
     run_db_io_cancellation_safe,
 )
+from .execution_budget import budget_policy_provider
 from .llm_utils import AutoModelUnavailableError, resolve_llms_from_names
 from .managed_file_ref import ensure_uploaded_file_local_path
 from .mcp_runtime import (
@@ -3015,6 +3016,11 @@ class AgentServiceManager:
 
                     # Create AgentService first (this creates the workspace)
                     self._agents[task_id] = AgentService(
+                        budget_policy_provider=budget_policy_provider(
+                            user_id=int(runtime_user.id),
+                            task_id=str(task_id),
+                            scope=scope,
+                        ),
                         name=f"web_chat_agent_task_{task_id}",
                         id=f"web_task_{task_id}",  # Use task ID only for workspace
                         llm=task_llm,
@@ -4177,6 +4183,9 @@ class AgentServiceManager:
 
             with UserContext(user_id):
                 self._agents[task_id] = AgentService(
+                    budget_policy_provider=budget_policy_provider(
+                        user_id=int(user_id), task_id=str(task_id), scope=scope
+                    ),
                     name=f"reconstructed_agent_task_{task_id}",
                     id=f"web_task_{task_id}",
                     llm=task_llm,

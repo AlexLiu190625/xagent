@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
+from xagent.core.agent.budget import ExecutionBudgetPolicy
 from xagent.core.tools.adapters.vibe.config import MCPFailurePolicy
 from xagent.web.models.task import (
     DAGExecution,
@@ -428,6 +429,14 @@ class TestAgentServiceManagerReconstruction:
             )
 
         kwargs = mock_agent_service_class.call_args.kwargs
+        with patch(
+            "xagent.web.services.execution_budget.resolve_execution_budget_policy",
+            new_callable=AsyncMock,
+            return_value=ExecutionBudgetPolicy(max_tokens=123),
+        ) as resolve_budget:
+            assert (await kwargs["budget_policy_provider"]()).max_tokens == 123
+        request = resolve_budget.await_args.args[0]
+        assert (request.user_id, request.task_id, request.scope) == (7, "1", None)
         assert kwargs["workspace_base_dir"] == str(uploads_dir / "user_7")
         assert str(uploads_dir / "user_7") in kwargs["allowed_external_dirs"]
         tool_config = kwargs["tool_config"]
@@ -870,6 +879,14 @@ class TestAgentServiceManagerReconstruction:
         # 验证reconstruct_from_history被调用
         mock_agent_instance.reconstruct_from_history.assert_called_once()
         _, agent_kwargs = mock_agent_service_class.call_args
+        with patch(
+            "xagent.web.services.execution_budget.resolve_execution_budget_policy",
+            new_callable=AsyncMock,
+            return_value=ExecutionBudgetPolicy(max_tokens=123),
+        ) as resolve_budget:
+            assert (await agent_kwargs["budget_policy_provider"]()).max_tokens == 123
+        request = resolve_budget.await_args.args[0]
+        assert (request.user_id, request.task_id, request.scope) == (1, "1", None)
         assert agent_kwargs["tools"] == ["tool"]
         assert agent_kwargs["tool_config"] == "tool_config"
 

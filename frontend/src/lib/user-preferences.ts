@@ -9,6 +9,8 @@ import type { OnboardingVoiceId } from "@/lib/onboarding-data";
  * the fields it has. `voice` must be one of VALID_USER_VOICES or the
  * backend 422s. */
 export interface UserPreferences {
+  execution_budget_tokens?: number | null;
+  execution_budget_soft_percent?: number | null;
   onboarded?: boolean;
   department?: string;
   // null is this endpoint's merge-PATCH "clear this field" signal (see

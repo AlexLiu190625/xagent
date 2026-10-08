@@ -18,6 +18,7 @@ import { useI18n } from "@/contexts/i18n-context"
 import { Select } from "@/components/ui/select"
 import { inspectAuthSession, updateAuthSessionUser } from "@/lib/auth-cache"
 import { TaskRuntimeSettingsExtension } from "@/lib/task-runtime-ui-extension"
+import { ExecutionBudgetSettings } from "@/components/settings/execution-budget"
 
 export default function SettingsPage() {
   const { user, session } = useAuth()
@@ -85,6 +86,7 @@ export default function SettingsPage() {
 
       <div className="space-y-6">
         <TaskRuntimeSettingsExtension />
+        <ExecutionBudgetSettings key={session.sessionId} isAdmin={user?.is_admin} />
 
         {/* Language Section */}
         <Card>

@@ -18,6 +18,7 @@ from ..storage.contracts import (
     MetadataStore,
     VectorIndexStore,
 )
+from ..storage.vector_backend import KBStorageBackend
 from .operation_compatibility import KBOperation, RollbackStatus
 
 
@@ -27,12 +28,6 @@ class KBAccessMode(StrEnum):
     READ = "read"
     WRITE = "write"
     ADMIN = "admin"
-
-
-class KBStorageBackend(StrEnum):
-    """Collection-level KB storage backend binding."""
-
-    LANCEDB = "lancedb"
 
 
 @dataclass(frozen=True)
@@ -92,6 +87,7 @@ class KBContextRequest:
     access_mode: KBAccessMode = KBAccessMode.READ
     allow_create: bool = False
     hide_missing: bool = False
+    deployment_engine_only: bool = False
 
 
 @dataclass(frozen=True)

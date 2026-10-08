@@ -27,6 +27,7 @@ from ..tools.adapters.vibe.config import (
 )
 from ..tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ..workspace import TaskWorkspace, create_workspace
+from .budget import BudgetPolicyProvider
 from .context.execution import (
     MODEL_CONTEXT_WATERMARK_METADATA_KEY,
     TRANSCRIPT_WATERMARK_METADATA_KEY,
@@ -87,6 +88,7 @@ class AgentService:
         skills_enabled: bool = True,
         user_interaction_enabled: bool = True,
         execution_metadata: dict[str, Any] | None = None,
+        budget_policy_provider: BudgetPolicyProvider | None = None,
         **agent_kwargs: Any,
     ) -> None:
         self.name = name
@@ -118,6 +120,7 @@ class AgentService:
         self.skills_enabled = skills_enabled
         self.user_interaction_enabled = user_interaction_enabled
         self.execution_metadata = dict(execution_metadata or {})
+        self.budget_policy_provider = budget_policy_provider
         if tools is not None and tool_config is not None:
             handoff_factory_runtime = getattr(
                 tool_config, "handoff_factory_runtime", None
@@ -590,6 +593,9 @@ class AgentService:
                 self._outbound_message_handler
             )
             self._execution_adapter.config.interrupt_checker = self._interrupt_checker
+            self._execution_adapter.config.budget_policy_provider = (
+                self.budget_policy_provider
+            )
             self._execution_adapter.config.conversation_history = (
                 self._conversation_history
             )
@@ -646,6 +652,7 @@ class AgentService:
         )
         return AgentExecutionAdapter(
             AgentExecutionConfig(
+                budget_policy_provider=self.budget_policy_provider,
                 name=self.name,
                 tools=self.tools,
                 llm=self.llm,

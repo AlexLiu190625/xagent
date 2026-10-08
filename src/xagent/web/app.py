@@ -74,6 +74,7 @@ from .api.computer import computer_router
 from .api.conversation_logs import router as conversation_logs_router
 from .api.custom_api import custom_api_router
 from .api.deployment_config import router as deployment_config_router
+from .api.execution_budget import router as execution_budget_router
 from .api.files import file_router
 from .api.jobs import jobs_router
 from .api.kb import kb_router
@@ -1436,6 +1437,7 @@ app.include_router(deployment_config_router)
 app.include_router(tools_router)
 app.include_router(admin_users_router)
 app.include_router(admin_interaction_rollout_router)
+app.include_router(execution_budget_router)
 app.include_router(admin_memory_embedding_authority_router)
 app.include_router(admin_mcp_router)
 app.include_router(skills_router)
@@ -1627,6 +1629,11 @@ async def startup_event() -> None:
         raise ValueError("Use python -m xagent.web.worker for the worker role")
     logger.info("Agent runtime configured: %s", get_agent_runtime())
     validate_interaction_rollout_at_startup()
+    from ..core.tools.core.RAG_tools.storage.vector_backend import (
+        lock_deployment_kb_engine,
+    )
+
+    lock_deployment_kb_engine()
     await _initialize_database_and_admit_runtime(app)
 
     # Persisted ExecutionScope snapshots (workforce sub-tasks) keep a

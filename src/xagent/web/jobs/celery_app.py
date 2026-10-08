@@ -4,6 +4,7 @@ from importlib import import_module
 from typing import Any
 
 from celery import Celery
+from celery.signals import worker_init
 
 from ...config import (
     get_background_job_sweep_interval_seconds,
@@ -55,6 +56,19 @@ def create_celery_app() -> Any:
 
 
 celery_app = create_celery_app()
+
+
+@worker_init.connect
+def lock_kb_engine_at_worker_start(**_: Any) -> None:
+    from ...core.tools.core.RAG_tools.storage.vector_backend import (
+        lock_deployment_kb_engine,
+    )
+
+    # Celery logs and swallows an Exception from a signal handler.
+    try:
+        lock_deployment_kb_engine()
+    except Exception as exc:
+        raise SystemExit(f"Refusing to start the Celery worker: {exc}") from exc
 
 
 def register_celery_tasks() -> None:

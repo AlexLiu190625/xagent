@@ -1704,6 +1704,171 @@ async def test_dispatcher_worker_isolates_one_command_error(
     assert "single command failure" in caplog.text
 
 
+def test_dispatcher_failure_backoff_grows_exponentially_to_cap(monkeypatch) -> None:
+    monkeypatch.setattr(task_command_transport_module, "DISPATCHER_IDLE_SECONDS", 0.5)
+    monkeypatch.setattr(
+        task_command_transport_module, "DISPATCHER_FAILURE_BACKOFF_MAX_SECONDS", 30.0
+    )
+
+    delays = [
+        task_command_transport_module._dispatcher_failure_backoff_seconds(failures)
+        # 2000 is past 1025, where an unclamped float(1 << exponent) overflows.
+        for failures in (1, 2, 3, 4, 5, 6, 7, 8, 2000)
+    ]
+
+    assert delays == [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0, 30.0]
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_worker_backs_off_and_rate_limits_failure_logs(
+    monkeypatch,
+    caplog,
+) -> None:
+    """Repeated claim failures back off, log once per interval, and reset."""
+
+    # fail x3, idle success, fail x1, idle success (stop).
+    script = [True, True, True, False, True, False]
+    finished = asyncio.Event()
+    calls = 0
+
+    async def dispatch(_executor, *, command_db_id=None) -> bool:
+        nonlocal calls
+        del command_db_id
+        if calls >= len(script):
+            return False
+        step = script[calls]
+        calls += 1
+        if calls == len(script):
+            finished.set()
+        if step:
+            raise RuntimeError("database unreachable")
+        return False
+
+    backoff_requests: list[int] = []
+
+    def record_backoff(consecutive_failures: int) -> float:
+        backoff_requests.append(consecutive_failures)
+        return 0.001
+
+    monkeypatch.setattr(
+        task_command_transport_module, "dispatch_one_task_command", dispatch
+    )
+    monkeypatch.setattr(
+        task_command_transport_module,
+        "_dispatcher_failure_backoff_seconds",
+        record_backoff,
+    )
+    monkeypatch.setattr(
+        task_command_transport_module, "_dispatcher_wakeup", asyncio.Event()
+    )
+    monkeypatch.setattr(task_command_transport_module, "DISPATCHER_IDLE_SECONDS", 0.001)
+    monkeypatch.setattr(
+        task_command_transport_module, "DISPATCHER_FAILURE_LOG_INTERVAL_SECONDS", 3600.0
+    )
+    caplog.set_level(logging.INFO, logger="xagent.web.services.task_command_transport")
+
+    worker = asyncio.create_task(
+        task_command_transport_module._run_task_command_dispatcher_worker(
+            lambda _command: asyncio.sleep(0)
+        )
+    )
+    try:
+        await asyncio.wait_for(finished.wait(), timeout=GUARD_TIMEOUT)
+        # Let the final idle claim's bookkeeping run before cancelling.
+        await asyncio.sleep(0.01)
+    finally:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+
+    assert backoff_requests == [1, 2, 3, 1]
+    failure_logs = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.ERROR
+        and "command dispatch failed" in record.getMessage()
+    ]
+    # The first failure of each outage is logged; repeats inside the interval
+    # are suppressed, and recovery re-arms logging for the next outage.
+    assert len(failure_logs) == 2
+    assert "consecutive_failures=1" in failure_logs[0].getMessage()
+    assert "consecutive_failures=1" in failure_logs[1].getMessage()
+    recovered = [
+        record.getMessage()
+        for record in caplog.records
+        if "dispatch recovered after" in record.getMessage()
+    ]
+    assert recovered == [
+        "component=task-command-dispatcher dispatch recovered after "
+        "3 consecutive failure(s)",
+        "component=task-command-dispatcher dispatch recovered after "
+        "1 consecutive failure(s)",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_worker_logs_suppressed_count_after_interval(
+    monkeypatch,
+    caplog,
+) -> None:
+    """Once the log interval elapses, the next failure reports what was suppressed."""
+
+    finished = asyncio.Event()
+    calls = 0
+    clock = [1000.0]
+
+    async def dispatch(_executor, *, command_db_id=None) -> bool:
+        nonlocal calls
+        del command_db_id
+        calls += 1
+        if calls == 4:
+            # Simulate the log interval elapsing before the fourth failure.
+            clock[0] += 61.0
+        if calls >= 5:
+            finished.set()
+            return False
+        raise RuntimeError("database unreachable")
+
+    monkeypatch.setattr(
+        task_command_transport_module, "dispatch_one_task_command", dispatch
+    )
+    monkeypatch.setattr(
+        task_command_transport_module,
+        "_dispatcher_failure_backoff_seconds",
+        lambda _failures: 0.001,
+    )
+    monkeypatch.setattr(
+        task_command_transport_module, "_dispatcher_clock", lambda: clock[0]
+    )
+    monkeypatch.setattr(
+        task_command_transport_module, "_dispatcher_wakeup", asyncio.Event()
+    )
+    monkeypatch.setattr(task_command_transport_module, "DISPATCHER_IDLE_SECONDS", 0.001)
+    monkeypatch.setattr(
+        task_command_transport_module, "DISPATCHER_FAILURE_LOG_INTERVAL_SECONDS", 60.0
+    )
+    caplog.set_level(logging.ERROR, logger="xagent.web.services.task_command_transport")
+
+    worker = asyncio.create_task(
+        task_command_transport_module._run_task_command_dispatcher_worker(
+            lambda _command: asyncio.sleep(0)
+        )
+    )
+    try:
+        await asyncio.wait_for(finished.wait(), timeout=GUARD_TIMEOUT)
+    finally:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+
+    failure_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if "command dispatch failed" in record.getMessage()
+    ]
+    assert len(failure_logs) == 2
+    assert "consecutive_failures=1 suppressed_since_last_log=0" in failure_logs[0]
+    assert "consecutive_failures=4 suppressed_since_last_log=2" in failure_logs[1]
+
+
 def _dispatch_diagnostics(db_session, dispatch_task, command_db_id) -> str:
     """Temporary CI diagnostics: why finish_task_command was never reached."""
     import io

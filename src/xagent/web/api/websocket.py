@@ -94,6 +94,7 @@ from ..services.db_runtime import (
     cancel_and_drain_async_task,
     run_db_io_cancellation_safe,
 )
+from ..services.execution_budget import budget_policy_provider
 from ..services.file_reference_output_service import (
     load_assistant_file_reference_records,
     reconcile_assistant_file_references,
@@ -3465,6 +3466,9 @@ clarification questions as plain assistant text.
 
             # Create agent service with pre-built tool (no WebToolConfig needed)
             agent_service = AgentService(
+                budget_policy_provider=budget_policy_provider(
+                    user_id=user_id, task_id=builder_task_id, scope=None
+                ),
                 name="builder_chat_agent",
                 llm=llm,
                 fast_llm=None,  # No fast llm for builder chat

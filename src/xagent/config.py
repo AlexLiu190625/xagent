@@ -946,6 +946,42 @@ def get_celery_enabled() -> bool:
     return _get_bool_env(CELERY_ENABLED, False)
 
 
+EXECUTION_BUDGET_DEFAULT_TOKENS = "XAGENT_EXECUTION_BUDGET_DEFAULT_TOKENS"
+EXECUTION_BUDGET_MAX_TOKENS = "XAGENT_EXECUTION_BUDGET_MAX_TOKENS"
+EXECUTION_BUDGET_SOFT_PERCENT = "XAGENT_EXECUTION_BUDGET_SOFT_PERCENT"
+
+
+def get_execution_budget_defaults() -> dict[str, int | None]:
+    """Read execution-budget defaults; absent limits preserve unlimited runs.
+
+    Invalid limits are configuration errors, never silently unlimited budgets.
+    """
+    values: dict[str, int | None] = {}
+    for key, env_name in (
+        ("default_tokens", EXECUTION_BUDGET_DEFAULT_TOKENS),
+        ("max_tokens", EXECUTION_BUDGET_MAX_TOKENS),
+        ("soft_limit_percent", EXECUTION_BUDGET_SOFT_PERCENT),
+    ):
+        raw = os.getenv(env_name)
+        value = int(raw) if raw else (80 if key == "soft_limit_percent" else None)
+        if value is not None and (
+            value <= 0 or (key == "soft_limit_percent" and value >= 100)
+        ):
+            raise ValueError(f"Invalid {env_name}")
+        values[key] = value
+    default_tokens, max_tokens = values["default_tokens"], values["max_tokens"]
+    if (
+        default_tokens is not None
+        and max_tokens is not None
+        and default_tokens > max_tokens
+    ):
+        raise ValueError(
+            f"{EXECUTION_BUDGET_DEFAULT_TOKENS} must not exceed "
+            f"{EXECUTION_BUDGET_MAX_TOKENS}"
+        )
+    return values
+
+
 def get_tool_parallel_enabled() -> bool:
     """Whether independent tool calls in a ReAct turn run concurrently.
 
