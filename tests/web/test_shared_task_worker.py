@@ -112,6 +112,13 @@ async def test_runtime_readiness_and_shutdown_order(monkeypatch, bridge_fails):
         lambda executor: order.append("dispatch"),
     )
 
+    async def supervise(executor, stop_event):
+        assert executor is worker.execute_durable_task_command
+        assert stop_event is stop
+        order.append("supervise")
+
+    monkeypatch.setattr(worker, "supervise_task_command_dispatcher", supervise)
+
     async def initialize_host():
         order.append("host_hooks")
 
@@ -122,6 +129,7 @@ async def test_runtime_readiness_and_shutdown_order(monkeypatch, bridge_fails):
             await worker.run_worker(initialize_host=initialize_host, stop=stop)
         assert "accept" not in order
         assert "dispatch" not in order
+        assert "supervise" not in order
     else:
         await worker.run_worker(initialize_host=initialize_host, stop=stop)
         assert (
@@ -129,6 +137,8 @@ async def test_runtime_readiness_and_shutdown_order(monkeypatch, bridge_fails):
             < order.index("bridge")
             < order.index("accept")
             < order.index("dispatch")
+            < order.index("supervise")
+            < order.index("stop_claims")
         )
         # Persistent memory is admitted before this worker will accept a task.
         # The worker process never runs the FastAPI startup, so this is its

@@ -36,6 +36,7 @@ from ..models.task_command import TaskExecutionCommand
 from ..models.user import User
 from .db_runtime import (
     await_task_settlement,
+    caller_is_cancelling,
     is_database_pool_timeout,
     propagate_deferred_cancellation,
     run_db_io_cancellation_safe,
@@ -99,6 +100,8 @@ def max_command_defers() -> int:
 
 DISPATCHER_IDLE_SECONDS = 0.5
 DISPATCHER_CONCURRENCY = 4
+DISPATCHER_RESTART_LIMIT = 3
+DISPATCHER_RESTART_WINDOW_SECONDS = 600.0
 # A failing claim (typically an unreachable database) backs off exponentially
 # from DISPATCHER_IDLE_SECONDS up to this ceiling instead of retrying every
 # idle tick, and repeats of the failure are logged at most once per interval.
@@ -1562,6 +1565,7 @@ async def dispatch_one_task_command(
 
     from .task_coordinator_runtime import (
         _CoordinatorClosed,
+        _CoordinatorInterrupted,
         get_task_coordinator_registry,
     )
 
@@ -1595,6 +1599,17 @@ async def dispatch_one_task_command(
         )
     except (TaskCommandDeferred, _CoordinatorClosed):
         # Ownership health is not a business attempt or deferral.
+        return False
+    except _CoordinatorInterrupted:
+        logger.warning(
+            "task_id=%s component=task-command-dispatcher command application "
+            "was cancelled by something other than the dispatcher (task owner "
+            "close or a cancellation inside the command); any claim it held is "
+            "left for recovery (command_db_id=%s, kind=%s)",
+            task_id,
+            selected_id,
+            kind.value,
+        )
         return False
 
 
@@ -1842,6 +1857,20 @@ def _dispatcher_failure_backoff_seconds(consecutive_failures: int) -> float:
 
 
 async def _run_task_command_dispatcher_worker(executor: CommandExecutor) -> None:
+    # Invariant: this loop exits only when the worker task itself is cancelled
+    # (or when stop_task_command_dispatcher cleared the wakeup event).
+    # A CancelledError raised from inside dispatch that nobody aimed at this
+    # task (for example a shared await on another task that was cancelled)
+    # must not end the loop. It is not a failed claim, so it does not feed the
+    # failure backoff below.
+    async def idle_wait(
+        wakeup: asyncio.Event, timeout: float = DISPATCHER_IDLE_SECONDS
+    ) -> None:
+        try:
+            await asyncio.wait_for(wakeup.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+
     consecutive_failures = 0
     suppressed_failures = 0
     last_failure_logged_at: float | None = None
@@ -1855,8 +1884,16 @@ async def _run_task_command_dispatcher_worker(executor: CommandExecutor) -> None
         wakeup.clear()
         try:
             processed = await dispatch_one_task_command(executor)
-        except asyncio.CancelledError:
-            raise
+        except asyncio.CancelledError as exc:
+            if caller_is_cancelling():
+                raise
+            logger.error(
+                "component=task-command-dispatcher dispatch raised a "
+                "cancellation not aimed at this worker; worker continuing",
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+            await idle_wait(wakeup)
+            continue
         except Exception as exc:  # noqa: BLE001
             consecutive_failures += 1
             retry_in = _dispatcher_failure_backoff_seconds(consecutive_failures)
@@ -1883,10 +1920,7 @@ async def _run_task_command_dispatcher_worker(executor: CommandExecutor) -> None
             # A notify still cuts the backoff short: notifies follow a
             # committed command write, so new work is a strong hint that the
             # database is reachable again.
-            try:
-                await asyncio.wait_for(wakeup.wait(), timeout=retry_in)
-            except asyncio.TimeoutError:
-                pass
+            await idle_wait(wakeup, retry_in)
             continue
         if consecutive_failures:
             logger.info(
@@ -1899,10 +1933,7 @@ async def _run_task_command_dispatcher_worker(executor: CommandExecutor) -> None
             last_failure_logged_at = None
         if processed:
             continue
-        try:
-            await asyncio.wait_for(wakeup.wait(), timeout=DISPATCHER_IDLE_SECONDS)
-        except asyncio.TimeoutError:
-            pass
+        await idle_wait(wakeup)
 
 
 async def run_task_command_dispatcher(executor: CommandExecutor) -> None:
@@ -1923,6 +1954,28 @@ async def run_task_command_dispatcher(executor: CommandExecutor) -> None:
         await asyncio.gather(*workers, return_exceptions=True)
 
 
+def _observe_dispatcher_exit(task: asyncio.Task[Any]) -> None:
+    if task is not _dispatcher_task:
+        return  # stopped through stop_task_command_dispatcher
+    try:
+        task.result()
+    except asyncio.CancelledError as error:
+        logger.critical(
+            "component=task-command-dispatcher dispatcher ended by a cancellation "
+            "outside stop_task_command_dispatcher",
+            exc_info=(type(error), error, error.__traceback__),
+        )
+    except BaseException as error:  # noqa: BLE001
+        logger.critical(
+            "component=task-command-dispatcher dispatcher exited unexpectedly",
+            exc_info=(type(error), error, error.__traceback__),
+        )
+    else:
+        logger.critical(
+            "component=task-command-dispatcher dispatcher returned while still registered"
+        )
+
+
 def start_task_command_dispatcher(
     executor: CommandExecutor,
 ) -> asyncio.Task[Any] | None:
@@ -1932,7 +1985,70 @@ def start_task_command_dispatcher(
     if _dispatcher_task is not None and not _dispatcher_task.done():
         return _dispatcher_task
     _dispatcher_task = asyncio.create_task(run_task_command_dispatcher(executor))
+    _dispatcher_task.add_done_callback(_observe_dispatcher_exit)
     return _dispatcher_task
+
+
+async def supervise_task_command_dispatcher(
+    executor: CommandExecutor, stop: asyncio.Event
+) -> None:
+    """Keep the already-started dispatcher running until ``stop`` is set.
+
+    For worker entry points only. It never performs the first start (callers
+    start the dispatcher first). An unexpected exit is restarted in place.
+    An unexpected exit after DISPATCHER_RESTART_LIMIT restarts within
+    DISPATCHER_RESTART_WINDOW_SECONDS raises RuntimeError instead. Whether the
+    process is restarted afterwards is up to whatever runs it: the built-in
+    worker pool stops the whole group when any child exits.
+    """
+
+    loop = asyncio.get_running_loop()
+    restarts: list[float] = []
+    while True:
+        dispatcher = _dispatcher_task
+        if dispatcher is None or dispatcher.done() or dispatcher.get_loop() is not loop:
+            if consumes_task_commands():
+                logger.warning(
+                    "component=task-command-dispatcher no running dispatcher to "
+                    "supervise; command consumption is not supervised in this "
+                    "process"
+                )
+            await stop.wait()
+            return
+        waiter = asyncio.create_task(stop.wait())
+        try:
+            await asyncio.wait(
+                {waiter, dispatcher}, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            if not waiter.done():
+                waiter.cancel()
+                await asyncio.gather(waiter, return_exceptions=True)
+        if stop.is_set():
+            return
+        if _dispatcher_task is not dispatcher:
+            logger.info(
+                "component=task-command-dispatcher dispatcher stopped explicitly; "
+                "supervision ends"
+            )
+            await stop.wait()
+            return
+        now = loop.time()
+        restarts = [t for t in restarts if now - t < DISPATCHER_RESTART_WINDOW_SECONDS]
+        if len(restarts) >= DISPATCHER_RESTART_LIMIT:
+            raise RuntimeError(
+                f"Task command dispatcher exited unexpectedly {len(restarts) + 1} "
+                f"times within {DISPATCHER_RESTART_WINDOW_SECONDS:g} seconds; exiting"
+            )
+        restarts.append(now)
+        logger.error(
+            "component=task-command-dispatcher restarting dispatcher "
+            "(restart %s of %s within %gs)",
+            len(restarts),
+            DISPATCHER_RESTART_LIMIT,
+            DISPATCHER_RESTART_WINDOW_SECONDS,
+        )
+        start_task_command_dispatcher(executor)
 
 
 async def stop_task_command_dispatcher() -> None:

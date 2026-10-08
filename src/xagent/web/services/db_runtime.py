@@ -17,6 +17,17 @@ def is_process_control_exception(error: BaseException) -> bool:
     return not isinstance(error, (Exception, asyncio.CancelledError))
 
 
+def caller_is_cancelling() -> bool:
+    """Return whether the running task itself has a pending cancellation.
+
+    A ``CancelledError`` surfacing from an awaited task that someone else
+    cancelled leaves this ``False``; only a cancel aimed at the caller sets it.
+    """
+
+    current = asyncio.current_task()
+    return current is not None and current.cancelling() > 0
+
+
 def is_database_pool_timeout(error: BaseException) -> bool:
     """Return whether an exception chain represents pool checkout exhaustion."""
     current: BaseException | None = error

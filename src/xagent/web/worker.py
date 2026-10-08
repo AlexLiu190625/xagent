@@ -43,6 +43,7 @@ from .services.task_command_execution import execute_durable_task_command
 from .services.task_command_transport import (
     start_task_command_dispatcher,
     stop_task_command_dispatcher,
+    supervise_task_command_dispatcher,
 )
 from .services.task_coordinator_runtime import close_task_coordinators
 from .services.task_event_bridge import start_task_event_bridge, stop_task_event_bridge
@@ -123,7 +124,7 @@ async def run_worker(
         )
         start_task_command_dispatcher(execute_durable_task_command)
         logger.info("Shared task worker ready")
-        await stop.wait()
+        await supervise_task_command_dispatcher(execute_durable_task_command, stop)
     finally:
         # Stop every claim path first. Finalizers retain the bridge and runtime
         # resources until execution and its heartbeats have drained.
