@@ -1934,11 +1934,11 @@ async def supervise_task_command_dispatcher(
     """Keep the already-started dispatcher running until ``stop`` is set.
 
     For worker entry points only. It never performs the first start (callers
-    start the dispatcher first). An unexpected exit is restarted in place;
-    more than DISPATCHER_RESTART_LIMIT restarts within
-    DISPATCHER_RESTART_WINDOW_SECONDS raises RuntimeError, and whether the
-    host restarts afterwards is up to the host process (the built-in worker
-    pools restart the whole group).
+    start the dispatcher first). An unexpected exit is restarted in place.
+    An unexpected exit after DISPATCHER_RESTART_LIMIT restarts within
+    DISPATCHER_RESTART_WINDOW_SECONDS raises RuntimeError instead. Whether the
+    process is restarted afterwards is up to whatever runs it: the built-in
+    worker pool stops the whole group when any child exits.
     """
 
     loop = asyncio.get_running_loop()
