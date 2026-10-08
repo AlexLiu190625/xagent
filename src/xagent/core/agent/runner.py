@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
 import logging
@@ -18,7 +19,9 @@ from ...config import (
 )
 from ..context_materializer import WorkspaceContextReferenceResolver
 from ..context_ref import CONTEXT_REFS_KEY, ContextReference
+from ..file_ref import build_file_id_ref
 from ..inline_file_delivery import InlineFileDelivery
+from ..model.chat.token_context import token_usage_observer
 from ..model.intent import enter_goal, exit_goal
 from ..task_runtime import (
     PREFERRED_INPUT_MODALITIES_METADATA_KEY,
@@ -26,6 +29,14 @@ from ..task_runtime import (
 )
 from ..workspace import WorkspaceManager
 from .attachments import build_image_context_references
+from .budget import (
+    BudgetPolicyProvider,
+    ExecutionBudget,
+    ExecutionBudgetPolicy,
+    active_execution_budget,
+    budget_warning_handler,
+    default_execution_budget_policy,
+)
 from .checkpoint import (
     CheckpointCorruptError,
     CheckpointPersistenceError,
@@ -289,6 +300,7 @@ class AgentRunner:
         workspace_enabled: bool = True,
         scope_segments: tuple[str, ...] = (),
         outbound_message_handler: Any | None = None,
+        budget_policy_provider: BudgetPolicyProvider | None = None,
     ) -> None:
         self.agent = agent
         self.workspace_manager = workspace_manager or WorkspaceManager()
@@ -300,6 +312,7 @@ class AgentRunner:
         self.workspace_enabled = workspace_enabled
         self.scope_segments = scope_segments
         self.outbound_message_handler = outbound_message_handler
+        self.budget_policy_provider = budget_policy_provider
         self._active_controls: dict[str, ExecutionControl] = {}
 
     async def run(
@@ -489,7 +502,55 @@ class AgentRunner:
         # call carries; finer units (DAG steps) override it with their own goal.
         goal_token = enter_goal(task)
 
+        # Nested runners inherit the active allowance. Only the outer owner
+        # resolves policy and subscribes to provider usage, avoiding double counts.
+        inherited_budget = active_execution_budget.get()
+        runtime.budget_owner = inherited_budget is None
+        budget_token = None
+        usage_token = None
+        warning_token = None
+
         try:
+            if inherited_budget is None:
+                policy = (
+                    self.budget_policy_provider()
+                    if self.budget_policy_provider is not None
+                    else default_execution_budget_policy()
+                )
+                if inspect.isawaitable(policy):
+                    policy = await policy
+                policy = ExecutionBudgetPolicy.model_validate(policy)
+                turn_id = next(
+                    (
+                        self._message_turn_id(message) or ""
+                        for message in reversed(context.messages)
+                        if message.role == "user"
+                    ),
+                    "",
+                )
+                budget = (
+                    ExecutionBudget.model_validate(context.execution_budget)
+                    if context.execution_budget is not None
+                    else None
+                )
+                previous_turn_finished = budget is not None and (
+                    budget.closed
+                    or (checkpoint or {}).get("status")
+                    in {"completed", "failed", "max_iterations"}
+                )
+                if budget is None or (
+                    previous_turn_finished and turn_id and turn_id != budget.turn_id
+                ):
+                    budget = ExecutionBudget(policy=policy, turn_id=turn_id)
+                else:
+                    budget.tighten(policy)
+                context.execution_budget = budget.checkpoint_state()
+                budget_token = active_execution_budget.set(budget)
+                usage_token = token_usage_observer.set(budget.record_usage)
+                from .language import effective_output_language
+
+                runtime.budget_warning_language = effective_output_language(context)
+                warning_token = budget_warning_handler.set(runtime._send_budget_warning)
             await self._dispatch_callback(
                 "on_run_start",
                 runner=self,
@@ -530,6 +591,11 @@ class AgentRunner:
                             )
                         )
                     except ExecutionInterrupted as exc:
+                        if runtime.budget_stopped:
+                            teardown_status = "completed"
+                            return await self._finish_budget_stop(
+                                context, runtime, pattern, workspace
+                            )
                         teardown_status = "interrupted"
                         normalized = {
                             "success": False,
@@ -584,6 +650,12 @@ class AgentRunner:
                             }
                         )
                         continue
+
+                    if runtime.budget_stopped:
+                        teardown_status = "completed"
+                        return await self._finish_budget_stop(
+                            context, runtime, pattern, workspace
+                        )
 
                     # Normalize user-facing answer text, never tool arguments,
                     # input files or reasoning. Streaming and buffered patterns
@@ -698,6 +770,78 @@ class AgentRunner:
             runtime.discard_inline_file_streams()
             self._active_controls.pop(execution_id, None)
             exit_goal(goal_token)
+            if usage_token is not None:
+                token_usage_observer.reset(usage_token)
+            if budget_token is not None:
+                active_execution_budget.reset(budget_token)
+            if warning_token is not None:
+                budget_warning_handler.reset(warning_token)
+
+    async def _finish_budget_stop(
+        self,
+        context: ExecutionContext,
+        runtime: PatternRuntime,
+        pattern: Any,
+        workspace: Any,
+    ) -> dict[str, Any]:
+        """Deliver a deterministic handoff without spending more model tokens."""
+        from .language import effective_output_language
+
+        budget = active_execution_budget.get()
+        chinese = "Chinese" in effective_output_language(context)
+        answer = (
+            "本次执行已达到 token 上限，已停止继续调用。任务尚未全部完成，已有结果保留在执行记录中。"
+            if chinese
+            else "Execution stopped at the token budget limit. The task is not fully completed; existing results remain in the execution history."
+        )
+        files: list[dict[str, Any]] = []
+        if workspace is not None:
+            try:
+                if callable(getattr(workspace, "get_all_files", None)):
+                    # Command/code tools may write deliverables in the workspace
+                    # root, not only output/. Never hand over inputs or temp files.
+                    grouped = await asyncio.to_thread(workspace.get_all_files)
+                    files = [
+                        *grouped.get("output", []),
+                        *grouped.get("workspace", []),
+                    ]
+                elif callable(getattr(workspace, "get_output_files", None)):
+                    files = await asyncio.to_thread(workspace.get_output_files)
+            except Exception:
+                logger.warning(
+                    "Could not list existing budget-stop deliverables", exc_info=True
+                )
+        links = [
+            f"- [{str(item.get('filename') or 'File').replace('[', '').replace(']', '')}]({build_file_id_ref(item['file_id'])})"
+            for item in files
+            if item.get("file_id")
+            and (budget is None or item.get("modified_time", 0) >= budget.started_at)
+        ]
+        if links:
+            answer += (
+                "\n\n已有文件（不代表已完成校验）：\n"
+                if chinese
+                else "\n\nExisting files (not a claim of validation):\n"
+            ) + "\n".join(links)
+        context.add_assistant_message(answer)
+        result = {
+            "success": True,
+            "status": "completed",
+            "output": answer,
+            "completion_outcome": "partial" if links else "blocked",
+            "termination_reason": "token_budget",
+            "execution_id": context.execution_id,
+            "context": context,
+            "execution_budget": budget.model_dump() if budget is not None else None,
+        }
+        await runtime.checkpoint(
+            "execution_budget_stopped",
+            context=context,
+            pattern=pattern,
+            status="completed",
+        )
+        await self._finish_run(context, result, runtime=runtime)
+        return result
 
     def _release_idle_context(
         self, execution_id: str, context: ExecutionContext
@@ -1940,6 +2084,15 @@ class AgentRunner:
         async with gate.shared():
             gate.run_finishing = True
             result["injection_outcome_unknown"] = gate.injection_uncertain
+        budget = active_execution_budget.get()
+        if budget is not None and runtime.budget_owner:
+            if result.get("status") not in {
+                "waiting_for_user",
+                "interrupted",
+                "paused",
+            }:
+                budget.closed = True
+            context.execution_budget = budget.checkpoint_state()
         # The idle context is evicted when the run returns, so the answer the
         # runner appended after the pattern's last checkpoint must be durable
         # for the next input to see it. Only completed runs: a waiting or

@@ -3736,3 +3736,45 @@ def test_no_module_assigns_a_retention_environment_variable():
         "these modules can change a retention variable after start-up, which "
         f"breaks the documented 'takes a restart' guarantee: {offenders}"
     )
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("XAGENT_EXECUTION_BUDGET_DEFAULT_TOKENS", "-1"),
+        ("XAGENT_EXECUTION_BUDGET_MAX_TOKENS", "0"),
+        ("XAGENT_EXECUTION_BUDGET_SOFT_PERCENT", "100"),
+        ("XAGENT_EXECUTION_BUDGET_SOFT_PERCENT", "no"),
+    ],
+)
+def test_execution_budget_invalid_env_rejected(monkeypatch, name, value):
+    from xagent.config import get_execution_budget_defaults
+
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError):
+        get_execution_budget_defaults()
+
+
+def test_execution_budget_env_defaults(monkeypatch):
+    from xagent.config import get_execution_budget_defaults
+
+    for key in ("DEFAULT_TOKENS", "MAX_TOKENS", "SOFT_PERCENT"):
+        monkeypatch.delenv(f"XAGENT_EXECUTION_BUDGET_{key}", raising=False)
+    assert get_execution_budget_defaults() == {
+        "default_tokens": None,
+        "max_tokens": None,
+        "soft_limit_percent": 80,
+    }
+    monkeypatch.setenv("XAGENT_EXECUTION_BUDGET_DEFAULT_TOKENS", "12345")
+    monkeypatch.setenv("XAGENT_EXECUTION_BUDGET_SOFT_PERCENT", "65")
+    assert get_execution_budget_defaults()["default_tokens"] == 12345
+    assert get_execution_budget_defaults()["soft_limit_percent"] == 65
+
+
+def test_execution_budget_env_default_cannot_exceed_maximum(monkeypatch):
+    from xagent.config import get_execution_budget_defaults
+
+    monkeypatch.setenv("XAGENT_EXECUTION_BUDGET_DEFAULT_TOKENS", "200")
+    monkeypatch.setenv("XAGENT_EXECUTION_BUDGET_MAX_TOKENS", "100")
+    with pytest.raises(ValueError, match="must not exceed"):
+        get_execution_budget_defaults()

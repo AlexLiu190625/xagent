@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field, field_validator
 
+from ...core.agent.budget import BudgetPolicyProvider
 from ...core.agent.language import (
     detect_prose_script_mismatch,
     render_dag_step_language_reference,
@@ -597,6 +598,7 @@ async def build_workforce_prompt_plan(
     available_agents: Sequence[Mapping[str, Any]],
     compact_llm: BaseLLM | None = None,
     voice: str | None = None,
+    budget_policy_provider: BudgetPolicyProvider | None = None,
 ) -> dict[str, Any]:
     """Run the ReAct builder and return its validated in-memory plan."""
 
@@ -611,6 +613,7 @@ async def build_workforce_prompt_plan(
     # create_workforce's persisted arguments here - see its docstring.
     system_prompt = apply_output_voice(workforce_prompt_builder_system_prompt(), voice)
     service = AgentService(
+        budget_policy_provider=budget_policy_provider,
         name="Workforce Prompt Builder",
         id=execution_id,
         task_id=execution_id,
@@ -639,6 +642,12 @@ async def build_workforce_prompt_plan(
         raise WorkforcePromptBuilderUnavailableError(
             "The ReAct Workforce builder runtime is unavailable."
         ) from exc
+    if result.get("termination_reason") == "token_budget":
+        raise WorkforcePromptBuilderError(
+            "The Workforce builder reached its execution token budget. "
+            "Review Settings > Execution budget (including the administrator "
+            "maximum) before retrying, or reduce the requested work."
+        )
     if not result.get("success"):
         status = str(result.get("status") or "failed")
         error = str(result.get("error") or result.get("output") or "").strip()

@@ -5,10 +5,13 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
 
+from xagent.core.agent.budget import ExecutionBudgetPolicy
+from xagent.core.model.chat.token_context import add_token_usage
 from xagent.web.services import workforce_creator, workforce_prompt_runtime
 from xagent.web.services.workforce_creator import (
     generate_workforce_creation_plan,
@@ -457,14 +460,19 @@ async def test_build_workforce_prompt_plan_without_voice_leaves_prompt_unchanged
         _recording_agent_service_class(captured_kwargs),
     )
 
+    def budget_provider():
+        return ExecutionBudgetPolicy(max_tokens=123)
+
     with pytest.raises(WorkforcePromptBuilderError):
         await build_workforce_prompt_plan(
             prompt="创建一个产品研究工作组。",
             llm=FakeLLM([]),
             available_agents=[],
+            budget_policy_provider=budget_provider,
         )
 
     assert captured_kwargs["system_prompt"] == workforce_prompt_builder_system_prompt()
+    assert captured_kwargs["budget_policy_provider"] is budget_provider
 
 
 @pytest.mark.asyncio
@@ -586,6 +594,11 @@ async def test_generation_releases_database_before_react_runtime(
     llm = FakeLLM([])
     events: list[str] = []
     catalog_limits: list[int | None] = []
+    resolve_budget = AsyncMock(return_value=ExecutionBudgetPolicy(max_tokens=123))
+    monkeypatch.setattr(
+        "xagent.web.services.execution_budget.resolve_execution_budget_policy",
+        resolve_budget,
+    )
 
     class ModelStorage:
         def __init__(self, _db: object) -> None:
@@ -596,6 +609,9 @@ async def test_generation_releases_database_before_react_runtime(
 
     async def fake_build_workforce_prompt_plan(**kwargs: Any) -> dict[str, Any]:
         events.append("runtime")
+        assert (await kwargs["budget_policy_provider"]()).max_tokens == 123
+        request = resolve_budget.await_args.args[0]
+        assert (request.user_id, request.task_id, request.scope) == (7, None, None)
         assert kwargs["available_agents"] == [
             {
                 "agent_id": 12,
@@ -649,6 +665,28 @@ async def test_generation_releases_database_before_react_runtime(
     assert result == {"name": "Research Workforce"}
     assert events == ["release", "runtime"]
     assert catalog_limits == [MAX_WORKFORCE_BUILDER_EXISTING_AGENTS]
+
+
+@pytest.mark.asyncio
+async def test_workforce_budget_stop_names_the_setting_instead_of_generic_incomplete():
+    class MeteredBuilderLLM(FakeLLM):
+        async def chat(self, **kwargs):
+            response = await super().chat(**kwargs)
+            add_token_usage(input_tokens=9, output_tokens=1)
+            return response
+
+    llm = MeteredBuilderLLM([_tool_call("list", "list_available_agents", {})])
+    with pytest.raises(
+        WorkforcePromptBuilderError, match="execution token budget"
+    ) as exc:
+        await build_workforce_prompt_plan(
+            prompt="Create a research Workforce.",
+            llm=llm,
+            available_agents=[],
+            budget_policy_provider=lambda: ExecutionBudgetPolicy(max_tokens=1),
+        )
+    assert "Settings > Execution budget" in str(exc.value)
+    assert len(llm.calls) == 1
 
 
 @pytest.mark.asyncio

@@ -65,6 +65,7 @@ from ..services.agent_team_scope import (
 )
 from ..services.api_keys import AgentApiKeyService, KeyRotationConflict
 from ..services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+from ..services.execution_budget import budget_policy_provider
 from ..services.llm_utils import AutoModelUnavailableError, UserAwareModelStorage
 from ..services.workforce_access import get_visible_agent_ids
 from ..tools.config import WebToolConfig
@@ -1848,6 +1849,9 @@ async def preview_agent(
         # Create agent service (Langfuse only, no database/websocket logging)
         memory = InMemoryMemoryStore()
         agent_service = AgentService(
+            budget_policy_provider=budget_policy_provider(
+                user_id=int(current_user.id), task_id=preview_task_id, scope=None
+            ),
             name="preview_agent",
             llm=default_llm,
             fast_llm=fast_llm,

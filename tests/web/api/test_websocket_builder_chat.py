@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import WebSocketDisconnect
 
+from xagent.core.agent.budget import ExecutionBudgetPolicy
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api.websocket import (
     handle_builder_chat,
@@ -198,6 +199,16 @@ async def test_handle_builder_chat_basic() -> None:
         # extra pattern-selection tool calls.
         assert MockAgentService.called
         call_kwargs = MockAgentService.call_args[1]
+        with patch(
+            "xagent.web.services.execution_budget.resolve_execution_budget_policy",
+            new_callable=AsyncMock,
+            return_value=ExecutionBudgetPolicy(max_tokens=123),
+        ) as resolve_budget:
+            assert (await call_kwargs["budget_policy_provider"]()).max_tokens == 123
+        request = resolve_budget.await_args.args[0]
+        assert request.user_id == 1
+        assert request.task_id == mock_websocket.state.builder_task_id
+        assert request.scope is None
         assert call_kwargs["pattern"] == "react"
         assert call_kwargs["name"] == "builder_chat_agent"
         assert call_kwargs["compact_llm"] is mock_compact_llm

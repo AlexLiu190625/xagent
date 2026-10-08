@@ -15,6 +15,7 @@ persistence and quota paths carry media rows with no schema change.
 import contextvars
 import logging
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -354,6 +355,12 @@ class TokenUsage:
 # memory. get_token_usage() lazily creates a per-context instance instead.
 token_context: contextvars.ContextVar[Optional[TokenUsage]] = contextvars.ContextVar(
     "token_context", default=None
+)
+
+# A scoped observer sees provider usage even when a nested call uses its own
+# TokenContextManager. It does not change the existing billing counters.
+token_usage_observer: contextvars.ContextVar[Callable[[int, int], None] | None] = (
+    contextvars.ContextVar("token_usage_observer", default=None)
 )
 
 
@@ -707,6 +714,10 @@ def add_token_usage(
         )
     if output_tokens:
         usage.add_output_tokens(output_tokens, model, call_type, model_id)
+
+    observer = token_usage_observer.get()
+    if observer is not None:
+        observer(input_tokens, output_tokens)
 
     logger.debug(
         f"Token usage added: input={input_tokens}, output={output_tokens}, "

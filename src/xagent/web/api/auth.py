@@ -1426,6 +1426,10 @@ class UpdatePreferencesRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     onboarded: Optional[StrictBool] = None
+    execution_budget_tokens: Optional[StrictInt] = Field(default=None, gt=0)
+    execution_budget_soft_percent: Optional[StrictInt] = Field(
+        default=None, ge=1, le=99
+    )
     department: Optional[str] = Field(
         default=None, max_length=PREFERENCES_TEXT_FIELD_MAX_LENGTH
     )

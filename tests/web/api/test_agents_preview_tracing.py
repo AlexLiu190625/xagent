@@ -13,6 +13,7 @@ from tests.utils.mock_helpers import create_langfuse_mock
 from xagent.core.tracing.langfuse.handler import LangfuseTraceHandler
 from xagent.web.api.agents import AgentPreviewRequest, preview_agent
 from xagent.web.models.user import User
+from xagent.web.services.execution_budget import ExecutionBudgetDefaults
 
 
 @pytest.mark.asyncio
@@ -77,6 +78,12 @@ async def test_preview_agent_rest_executes_with_langfuse_trace(
     mocker.patch(
         "xagent.core.tracing.langfuse.client.Langfuse", return_value=fake_client
     )
+    # This tracing test uses a mocked database. Keep the real policy provider
+    # and runtime wiring, but stub its independent database read as well.
+    load_budget = mocker.patch(
+        "xagent.web.services.execution_budget._load_user_budget",
+        return_value=(ExecutionBudgetDefaults(), {}),
+    )
 
     current_user = User()
     current_user.id = 7
@@ -118,6 +125,7 @@ async def test_preview_agent_rest_executes_with_langfuse_trace(
 
     assert response.status == "completed"
     assert response.response == "The result is 4"
+    load_budget.assert_called_once_with(7)
 
     agent_observations = [
         observation
