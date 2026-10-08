@@ -52,6 +52,7 @@ GATED_JOBS = {
     "pytest-fast": "code",
     "pytest-fast-deepdoc": "code",
     "pytest-slow": "code",
+    "pytest-milvus": "code",
     "e2e": "code",
     "frontend-build": "frontend",
 }
@@ -100,6 +101,7 @@ GATED_JOB_WORK_STEPS = {
     "pytest-fast": ("Run tests", "python -m pytest"),
     "pytest-fast-deepdoc": ("Run tests", "python -m pytest"),
     "pytest-slow": ("Run slow tests", "python -m pytest"),
+    "pytest-milvus": ("Run Milvus tests", "python -m pytest"),
     "e2e": ("Run e2e tests", "python -m pytest"),
 }
 
@@ -117,6 +119,7 @@ STEP_GUARD_EXTRAS = {
     ("pytest-fast-deepdoc", "Download Deepdoc cache artifact"): _CACHE_MISS,
     ("pytest-slow", "Restore Deepdoc cache"): _CACHE_HIT,
     ("pytest-slow", "Download Deepdoc cache artifact"): _CACHE_MISS,
+    ("pytest-milvus", "Show Milvus logs"): "failure()",
 }
 
 # Applied to the value above, not to the workflow: renaming a leg in `strategy`

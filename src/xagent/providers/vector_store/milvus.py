@@ -3,7 +3,8 @@ from __future__ import annotations
 import importlib
 import logging
 import os
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional
+import threading
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 from .base import VectorStore
@@ -41,6 +42,9 @@ def _import_milvus_client_class() -> Any:
 class MilvusConnectionManager:
     """Milvus connection manager."""
 
+    _shared_clients: ClassVar[Dict[Tuple[Any, ...], Any]] = {}
+    _shared_clients_lock: ClassVar[threading.Lock] = threading.Lock()
+
     def get_client(
         self,
         uri: str,
@@ -63,15 +67,47 @@ class MilvusConnectionManager:
         token_env_var: str = "MILVUS_TOKEN",
         db_name_env_var: str = "MILVUS_DB_NAME",
     ) -> "MilvusClient":
+        uri, token, db_name = self._settings_from_env(
+            uri_env_var, token_env_var, db_name_env_var
+        )
+        return self.get_client(uri=uri, token=token, db_name=db_name)
+
+    def get_shared_client_from_env(
+        self,
+        uri_env_var: str = "MILVUS_URI",
+        token_env_var: str = "MILVUS_TOKEN",
+        db_name_env_var: str = "MILVUS_DB_NAME",
+    ) -> "MilvusClient":
+        """Return the process-wide client for the environment's (uri, token, db).
+
+        Never closed: pymilvus shares one connection per alias, and ``close()``
+        drops it for every other client. The lock covers only a miss, because
+        pymilvus does not lock the first connect of an alias.
+        """
+        uri, token, db_name = self._settings_from_env(
+            uri_env_var, token_env_var, db_name_env_var
+        )
+        key = (type(self), uri.strip(), (token or "").strip(), (db_name or "").strip())
+        client = self._shared_clients.get(key)
+        if client is None:
+            with self._shared_clients_lock:
+                client = self._shared_clients.get(key)
+                if client is None:
+                    client = self._shared_clients[key] = self.get_client(
+                        uri=uri, token=token, db_name=db_name
+                    )
+        return client
+
+    @staticmethod
+    def _settings_from_env(
+        uri_env_var: str, token_env_var: str, db_name_env_var: str
+    ) -> Tuple[str, Optional[str], Optional[str]]:
         uri = os.getenv(uri_env_var)
         if uri is None:
             raise KeyError(f"Environment variable {uri_env_var} is not set")
         if not uri.strip():
             raise ValueError(f"Environment variable {uri_env_var} is empty")
-
-        token = os.getenv(token_env_var)
-        db_name = os.getenv(db_name_env_var)
-        return self.get_client(uri=uri, token=token, db_name=db_name)
+        return uri, os.getenv(token_env_var), os.getenv(db_name_env_var)
 
 
 class MilvusVectorStore(VectorStore):

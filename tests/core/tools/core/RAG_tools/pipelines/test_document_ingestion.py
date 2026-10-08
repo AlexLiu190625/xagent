@@ -1529,4 +1529,5 @@ def test_ingest_tables_are_real_schema_manager_tables() -> None:
         "embeddings",  # named per model tag; the caller appends it
         "main_pointers",  # grows with collection count, not ingest count
         "prompt_templates",  # same
+        "kb_ids",  # same
     }

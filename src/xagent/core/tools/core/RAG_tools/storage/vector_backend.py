@@ -118,7 +118,7 @@ def _detect_engine(
 ) -> tuple[KBStorageBackend, list[str]] | None:
     import lancedb
 
-    from ..LanceDB.schema_manager import _safe_close_table
+    from ..LanceDB.schema_manager import KB_IDS_TABLE, _safe_close_table
     from ..utils.lancedb_query_utils import list_table_names
 
     conn = None
@@ -131,7 +131,9 @@ def _detect_engine(
         logger.warning("Cannot detect the KB engine in %s: %s", db_dir, exc)
         return None
     try:
-        blocking = _tables_with_rows(conn, ["kb_ids"] if "kb_ids" in names else [])
+        blocking = _tables_with_rows(
+            conn, [KB_IDS_TABLE] if KB_IDS_TABLE in names else []
+        )
         if blocking:
             return KBStorageBackend.MILVUS, blocking
         blocking = _tables_with_rows(

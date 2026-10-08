@@ -735,6 +735,75 @@ jobs:
           set -e
           python3 -m uv run python -m pytest -m "slow and not postgresql" -v
 
+  pytest-milvus:
+    name: Pytest Milvus
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    needs: [changes, pre-commit]
+    env:
+      MILVUS_URI: http://localhost:19530
+      MILVUS_VERSION: v2.6.25
+      XAGENT_REQUIRE_MILVUS: "1"
+
+    steps:
+      - name: Skip tests
+        if: needs.changes.outputs.code != 'true'
+        run: echo "Docs-only change; no code paths touched."
+
+      - name: Checkout code
+        if: needs.changes.outputs.code == 'true'
+        uses: actions/checkout@v7
+
+      - name: Start Milvus standalone
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          set -e
+          compose="$RUNNER_TEMP/milvus-standalone.yml"
+          curl -fsSL --retry 3 --retry-all-errors --retry-delay 5 -o "$compose" \
+            "https://github.com/milvus-io/milvus/releases/download/${MILVUS_VERSION}/milvus-standalone-docker-compose.yml"
+          docker compose -f "$compose" config --images | xargs .github/scripts/docker-pull-retry.sh
+          docker compose -f "$compose" up -d --wait --wait-timeout 300
+
+      - name: Ensure uv is available
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          set -e
+          if ! command -v uv >/dev/null 2>&1; then
+            echo "uv not found, installing..."
+            python3 -m pip install --user uv
+            echo "$HOME/.local/bin" >> $GITHUB_PATH
+          fi
+          python3 -m uv --version || uv --version
+
+      - name: Create virtual environment (if not exists)
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv venv --python 3.12
+
+      - name: Install dependencies
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv sync --extra milvus
+
+      - name: Run Milvus tests
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv run python -m pytest tests/core/tools/core/RAG_tools -m milvus -v
+
+      - name: Show Milvus logs
+        if: needs.changes.outputs.code == 'true' && failure()
+        shell: bash
+        run: docker compose -f "$RUNNER_TEMP/milvus-standalone.yml" logs --tail 200
+
   e2e:
     name: e2e (${{ matrix.shard }})
     runs-on: ubuntu-latest
@@ -994,6 +1063,7 @@ jobs:
       - pytest-fast
       - pytest-fast-deepdoc
       - pytest-slow
+      - pytest-milvus
       - e2e
       - frontend-build
       - lancedb-memory-compatibility
@@ -1020,6 +1090,7 @@ jobs:
           check_job "pytest-fast" "${{ needs['pytest-fast'].result }}"
           check_job "pytest-fast-deepdoc" "${{ needs['pytest-fast-deepdoc'].result }}"
           check_job "pytest-slow" "${{ needs['pytest-slow'].result }}"
+          check_job "pytest-milvus" "${{ needs['pytest-milvus'].result }}"
           check_job "e2e" "${{ needs.e2e.result }}"
           check_job "frontend-build" "${{ needs['frontend-build'].result }}"
           check_job "lancedb-memory-compatibility" "${{ needs['lancedb-memory-compatibility'].result }}"

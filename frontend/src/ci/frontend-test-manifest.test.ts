@@ -51,6 +51,7 @@ const ciSummaryFailurePropagationCommands = [
   'check_job "pytest-fast" "${{ needs[\'pytest-fast\'].result }}"',
   'check_job "pytest-fast-deepdoc" "${{ needs[\'pytest-fast-deepdoc\'].result }}"',
   'check_job "pytest-slow" "${{ needs[\'pytest-slow\'].result }}"',
+  'check_job "pytest-milvus" "${{ needs[\'pytest-milvus\'].result }}"',
   'check_job "e2e" "${{ needs.e2e.result }}"',
   frontendSummaryCheckCommand,
   'check_job "lancedb-memory-compatibility" "${{ needs[\'lancedb-memory-compatibility\'].result }}"',

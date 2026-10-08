@@ -24,6 +24,8 @@ __all__ = [
     "check_table_needs_migration",
 ]
 
+KB_IDS_TABLE = "kb_ids"
+
 
 def _safe_close_table(table: Any) -> None:
     """Close a LanceDB table if it supports close()."""
@@ -674,3 +676,16 @@ def ensure_collection_metadata_table(conn: DBConnection) -> None:
         ]
     )
     _create_table(conn, "collection_metadata", schema=schema)
+
+
+def ensure_kb_ids_table(conn: DBConnection) -> None:
+    """Ensure the kb_ids table exists: one stable Milvus kb_id per collection owner."""
+    schema = pa.schema(
+        [
+            pa.field("collection", pa.string()),
+            pa.field("user_id", pa.int64()),
+            pa.field("kb_id", pa.string()),
+            pa.field("created_at", pa.timestamp("us", tz="UTC")),
+        ]
+    )
+    _create_table(conn, KB_IDS_TABLE, schema=schema)

@@ -155,6 +155,17 @@ def pytest_collection_modifyitems(config, items):
             if "real_rag" in item.keywords:
                 item.add_marker(skip_real_rag)
 
+    if not os.getenv("MILVUS_URI"):
+        if os.getenv("XAGENT_REQUIRE_MILVUS", "0").strip() == "1":
+            raise pytest.UsageError(
+                "XAGENT_REQUIRE_MILVUS is set but MILVUS_URI is empty; "
+                "the Milvus tests would all be skipped"
+            )
+        skip_milvus = pytest.mark.skip(reason="Requires a Milvus server at MILVUS_URI")
+        for item in items:
+            if item.get_closest_marker("milvus"):
+                item.add_marker(skip_milvus)
+
     # Skip requires_network tests unless --run-special or XAGENT_TESTS_ALLOW_NETWORK=1
     run_special = config.getoption("--run-special", default=False)
     allow_network = os.getenv("XAGENT_TESTS_ALLOW_NETWORK", "0").strip() == "1"
