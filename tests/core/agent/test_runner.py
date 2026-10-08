@@ -28,6 +28,7 @@ from xagent.core.agent.context.execution import (
     TOOL_EVIDENCE_REMOVED_METADATA_KEY,
     tool_evidence_state,
 )
+from xagent.core.agent.interruption import InterruptionReason
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
@@ -35,6 +36,7 @@ from xagent.core.agent.language import (
 )
 from xagent.core.agent.runner import AgentRunner, UserMessageInjectionOutcome
 from xagent.core.agent.runtime import LLMCallInterrupted
+from xagent.core.model.chat.exceptions import LLMEmptyContentError, LLMTimeoutError
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 
 
@@ -905,6 +907,200 @@ async def test_runner_returns_aggregate_error_when_all_patterns_fail(
     assert result["patterns_attempted"] == 2
     assert len(result["pattern_errors"]) == 2
     assert result["context"].messages[0].content == "Impossible"
+    assert [entry["interruption_reason"] for entry in result["pattern_errors"]] == [
+        None,
+        None,
+    ]
+    assert "interruption_reason" not in result
+
+
+class ErrorRaisingPattern:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    async def run(self, **_: Any) -> dict[str, Any]:
+        raise self.error
+
+
+@pytest.mark.asyncio
+async def test_runner_attaches_agreed_interruption_reason(tmp_path: Path) -> None:
+    provider_down = RuntimeError("chat failed")
+    provider_down.__cause__ = LLMTimeoutError("first token timeout")
+    agent = Agent(
+        name="writer",
+        patterns=[
+            ErrorRaisingPattern(LLMTimeoutError("timed out")),
+            ErrorRaisingPattern(provider_down),
+        ],
+    )
+    runner = AgentRunner(agent=agent, workspace_manager=FakeWorkspaceManager(tmp_path))
+
+    result = await runner.run(task="Impossible", execution_id="exec-reason-agree")
+
+    assert result["success"] is False
+    assert [entry["interruption_reason"] for entry in result["pattern_errors"]] == [
+        "llm_unavailable",
+        "llm_unavailable",
+    ]
+    assert result["interruption_reason"] == "llm_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_runner_single_raising_pattern_reports_reason(tmp_path: Path) -> None:
+    agent = Agent(
+        name="writer", patterns=[ErrorRaisingPattern(LLMEmptyContentError("empty"))]
+    )
+    runner = AgentRunner(agent=agent, workspace_manager=FakeWorkspaceManager(tmp_path))
+
+    result = await runner.run(task="Impossible", execution_id="exec-reason-single")
+
+    assert result["pattern_errors"][0]["interruption_reason"] == "model_output_invalid"
+    assert result["pattern_errors"][0]["exception_type"] == "LLMEmptyContentError"
+    assert result["interruption_reason"] == "model_output_invalid"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "second",
+    [
+        ErrorRaisingPattern(ValueError("bad tool arguments")),
+        ErrorRaisingPattern(LLMEmptyContentError("empty")),
+        FailingPattern("structured failure"),
+    ],
+)
+async def test_runner_omits_interruption_reason_when_patterns_disagree(
+    tmp_path: Path, second: Any
+) -> None:
+    agent = Agent(
+        name="writer",
+        patterns=[ErrorRaisingPattern(LLMTimeoutError("timed out")), second],
+    )
+    runner = AgentRunner(agent=agent, workspace_manager=FakeWorkspaceManager(tmp_path))
+
+    result = await runner.run(task="Impossible", execution_id="exec-reason-mixed")
+
+    assert result["success"] is False
+    assert result["pattern_errors"][0]["interruption_reason"] == "llm_unavailable"
+    assert result["pattern_errors"][1]["interruption_reason"] != "llm_unavailable"
+    assert "interruption_reason" not in result
+
+
+@pytest.mark.asyncio
+async def test_runner_classifies_unsuccessful_pattern_results(tmp_path: Path) -> None:
+    agent = Agent(
+        name="writer",
+        patterns=[
+            FakePattern({"success": False, "status": "invalid_tool_protocol"}),
+            FakePattern({"success": False, "status": "invalid_tool_protocol"}),
+        ],
+    )
+    runner = AgentRunner(agent=agent, workspace_manager=FakeWorkspaceManager(tmp_path))
+
+    result = await runner.run(task="Impossible", execution_id="exec-reason-result")
+
+    assert [entry["interruption_reason"] for entry in result["pattern_errors"]] == [
+        "model_output_invalid",
+        "model_output_invalid",
+    ]
+    assert result["interruption_reason"] == "model_output_invalid"
+
+
+@pytest.mark.asyncio
+async def test_runner_single_unsuccessful_pattern_result_carries_reason(
+    tmp_path: Path,
+) -> None:
+    """Production runs one pattern; its returned result must carry the reason."""
+    agent = Agent(
+        name="writer",
+        patterns=[FakePattern({"success": False, "status": "invalid_tool_protocol"})],
+    )
+    runner = AgentRunner(agent=agent, workspace_manager=FakeWorkspaceManager(tmp_path))
+
+    result = await runner.run(task="Impossible", execution_id="exec-reason-single")
+
+    assert result["status"] == "invalid_tool_protocol"
+    assert result["interruption_reason"] == "model_output_invalid"
+
+
+@pytest.mark.asyncio
+async def test_runner_single_pattern_keeps_its_own_interruption_reason(
+    tmp_path: Path,
+) -> None:
+    # The enum member, not its value: only the classifier's own-reason branch
+    # turns it into a plain string. ``InterruptionReason`` subclasses ``str``,
+    # so equality alone would pass either way; the type is what is pinned.
+    agent = Agent(
+        name="writer",
+        patterns=[
+            FakePattern(
+                {
+                    "success": False,
+                    "interruption_reason": InterruptionReason.LLM_UNAVAILABLE,
+                }
+            )
+        ],
+    )
+    runner = AgentRunner(agent=agent, workspace_manager=FakeWorkspaceManager(tmp_path))
+
+    result = await runner.run(task="Impossible", execution_id="exec-reason-own")
+
+    assert result["interruption_reason"] == "llm_unavailable"
+    assert type(result["interruption_reason"]) is str
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("own_reason", ["not_a_real_reason", 42, None])
+async def test_runner_single_pattern_drops_invalid_own_reason(
+    tmp_path: Path, own_reason: object
+) -> None:
+    agent = Agent(
+        name="writer",
+        patterns=[
+            FakePattern(
+                {"success": False, "error": "x", "interruption_reason": own_reason}
+            )
+        ],
+    )
+    runner = AgentRunner(agent=agent, workspace_manager=FakeWorkspaceManager(tmp_path))
+
+    result = await runner.run(task="Impossible", execution_id="exec-reason-bad")
+
+    assert "interruption_reason" not in result
+
+
+@pytest.mark.asyncio
+async def test_runner_single_terminal_pattern_result_has_no_reason(
+    tmp_path: Path,
+) -> None:
+    agent = Agent(
+        name="writer",
+        patterns=[FakePattern({"success": False, "error": "bad request"})],
+    )
+    runner = AgentRunner(agent=agent, workspace_manager=FakeWorkspaceManager(tmp_path))
+
+    result = await runner.run(task="Impossible", execution_id="exec-reason-none")
+
+    assert "interruption_reason" not in result
+
+
+@pytest.mark.asyncio
+async def test_runner_success_after_failed_pattern_has_no_interruption_reason(
+    tmp_path: Path,
+) -> None:
+    agent = Agent(
+        name="writer",
+        patterns=[
+            ErrorRaisingPattern(LLMTimeoutError("timed out")),
+            FakePattern({"success": True, "output": "done"}),
+        ],
+    )
+    runner = AgentRunner(agent=agent, workspace_manager=FakeWorkspaceManager(tmp_path))
+
+    result = await runner.run(task="Answer", execution_id="exec-reason-success")
+
+    assert result["success"] is True
+    assert "interruption_reason" not in result
+    assert "pattern_errors" not in result
 
 
 @pytest.mark.asyncio

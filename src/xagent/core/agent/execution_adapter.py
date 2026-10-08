@@ -13,6 +13,11 @@ from ..task_runtime import (
 from .agent import Agent
 from .attachments import build_image_context_references
 from .budget import BudgetPolicyProvider
+from .interruption import (
+    INTERRUPTION_REASON_KEY,
+    classify_run_result,
+    interruption_reason_value,
+)
 from .pattern import AutoPattern, DAGPattern, LLMPlanGenerator, ReActPattern
 from .registry import ExecutionRegistry
 from .result import NO_OUTPUT_PLACEHOLDER
@@ -469,6 +474,13 @@ class AgentExecutionAdapter:
         if termination_reason in ("max_iterations", "step_failed", "token_budget"):
             normalized["termination_reason"] = termination_reason
             normalized["metadata"]["termination_reason"] = termination_reason
+        # The supported contract for whatever settles the run; only a value
+        # the classifier recognises crosses this boundary.
+        if not result.get("success"):
+            interruption_reason = interruption_reason_value(classify_run_result(result))
+            if interruption_reason is not None:
+                normalized[INTERRUPTION_REASON_KEY] = interruption_reason
+                normalized["metadata"][INTERRUPTION_REASON_KEY] = interruption_reason
         if status == "waiting_for_user":
             message = str(result.get("message") or output or "")
             interactions = result.get("interactions")

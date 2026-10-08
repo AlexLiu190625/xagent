@@ -53,6 +53,12 @@ from .context.execution import (
     context_checkpoint_gate,
     derive_compact_threshold,
 )
+from .interruption import (
+    INTERRUPTION_REASON_KEY,
+    classify_run_failure,
+    classify_run_result,
+    interruption_reason_value,
+)
 from .language import reset_output_language_to_request_context
 from .result import extract_assistant_message, set_assistant_message
 from .runtime import (
@@ -647,6 +653,11 @@ class AgentRunner:
                                 "pattern": pattern.__class__.__name__,
                                 "error": str(exc),
                                 "exception_type": exc.__class__.__name__,
+                                # The exception object is only visible here;
+                                # callers see this classification instead.
+                                INTERRUPTION_REASON_KEY: interruption_reason_value(
+                                    classify_run_failure(exc)
+                                ),
                             }
                         )
                         continue
@@ -727,6 +738,16 @@ class AgentRunner:
                         await self._finish_run(context, normalized, runtime=runtime)
                         return normalized
 
+                    reason = interruption_reason_value(classify_run_result(normalized))
+                    # On the result itself, not only the entry: a single failed
+                    # pattern returns ``normalized`` directly below and the
+                    # aggregate that copies entry reasons is skipped. Only the
+                    # validated value survives; an unknown or non-string reason
+                    # the pattern set itself is dropped.
+                    if reason is not None:
+                        normalized[INTERRUPTION_REASON_KEY] = reason
+                    else:
+                        normalized.pop(INTERRUPTION_REASON_KEY, None)
                     pattern_errors.append(
                         {
                             "pattern": pattern.__class__.__name__,
@@ -734,6 +755,7 @@ class AgentRunner:
                                 "error", "Pattern failed without a detailed error."
                             ),
                             "result": normalized,
+                            INTERRUPTION_REASON_KEY: reason,
                         }
                     )
             finally:
@@ -757,6 +779,11 @@ class AgentRunner:
                 "execution_id": execution_id,
                 "context": context,
             }
+            # Only an interruption every pattern agrees on describes the run;
+            # a mix means at least one pattern failed for a terminal reason.
+            reasons = {entry.get(INTERRUPTION_REASON_KEY) for entry in pattern_errors}
+            if len(reasons) == 1 and None not in reasons:
+                result[INTERRUPTION_REASON_KEY] = reasons.pop()
             await self._finish_run(context, result, runtime=runtime)
             return result
         finally:

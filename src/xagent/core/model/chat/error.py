@@ -25,16 +25,25 @@ _CONTEXT_LENGTH_ERROR_MARKERS = (
 )
 
 
+def matches_context_length_error(error: BaseException) -> bool:
+    """Whether this one exception is a context-window failure.
+
+    Unlike :func:`is_context_length_error`, no linked exception is followed,
+    so a caller can choose its own chain walk.
+    """
+    if isinstance(error, LLMContextLengthError):
+        return True
+    message = str(error).lower()
+    return any(marker in message for marker in _CONTEXT_LENGTH_ERROR_MARKERS)
+
+
 def is_context_length_error(error: BaseException) -> bool:
     """Recognize provider context-window failures through wrapper exceptions."""
     seen: set[int] = set()
     current: BaseException | None = error
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        if isinstance(current, LLMContextLengthError):
-            return True
-        message = str(current).lower()
-        if any(marker in message for marker in _CONTEXT_LENGTH_ERROR_MARKERS):
+        if matches_context_length_error(current):
             return True
         current = current.__cause__ or current.__context__
     return False

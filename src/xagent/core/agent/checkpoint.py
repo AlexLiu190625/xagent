@@ -178,6 +178,110 @@ async def read_latest_checkpoint_payload(
     return None
 
 
+def _count(value: Any) -> int:
+    return len(value) if isinstance(value, (list, dict)) else 0
+
+
+def _non_negative_int(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return max(int(value), 0)
+
+
+def _message_count(context: Any) -> int:
+    return _count(context.get("messages")) if isinstance(context, dict) else 0
+
+
+def _accumulate_pattern_progress(state: Any, totals: dict[str, int]) -> None:
+    """Add one pattern state's progress counters into ``totals``.
+
+    Shapes are read by key rather than by pattern class so nested states
+    (an Auto child, a DAG step's ReAct) are walked the same way as top-level
+    ones, and a state missing a key simply contributes nothing.
+    """
+    if not isinstance(state, dict):
+        return
+
+    # ReAct: the iteration only advances once a turn's LLM response has been
+    # handled, and every executed tool call adds one ledger entry.
+    totals["iterations"] += _non_negative_int(state.get("current_iteration"))
+    totals["tool_calls"] += _count(state.get("tool_ledger"))
+
+    # DAG: a generated plan, each completed step, and the step-level ReAct
+    # states and contexts of steps still in flight.
+    plan = state.get("plan")
+    steps = plan.get("steps") if isinstance(plan, dict) else None
+    if isinstance(steps, list):
+        totals["plan_steps"] += len(steps)
+        totals["completed_steps"] += sum(
+            1
+            for step in steps
+            if isinstance(step, dict) and step.get("status") == "completed"
+        )
+    raw_step_states = state.get("active_step_pattern_states")
+    step_states = dict(raw_step_states) if isinstance(raw_step_states, dict) else {}
+    raw_step_contexts = state.get("active_step_contexts")
+    step_contexts = (
+        dict(raw_step_contexts) if isinstance(raw_step_contexts, dict) else {}
+    )
+    # The singular fields are the legacy form of one entry of the dicts above;
+    # ``DAGPattern.load_state`` merges them with ``setdefault``, and so does
+    # this, so the same step is never counted twice.
+    active_step_id = state.get("active_step_id")
+    if isinstance(active_step_id, str) and active_step_id:
+        if state.get("active_step_pattern_state"):
+            step_states.setdefault(
+                active_step_id, state.get("active_step_pattern_state")
+            )
+        if state.get("active_step_context"):
+            step_contexts.setdefault(active_step_id, state.get("active_step_context"))
+    for step_state in step_states.values():
+        _accumulate_pattern_progress(step_state, totals)
+    for step_context in step_contexts.values():
+        totals["messages"] += _message_count(step_context)
+
+    # Auto: the selected child's state is carried inside the parent's.
+    _accumulate_pattern_progress(state.get("react_state"), totals)
+    _accumulate_pattern_progress(state.get("dag_state"), totals)
+
+
+def checkpoint_progress_marker(checkpoint: dict[str, Any] | None) -> str:
+    """Fingerprint how far a checkpoint's run has actually got.
+
+    Two checkpoints share a marker when they record the same position, even
+    if different runs wrote them: a resumed run rewrites ``before_llm`` at the
+    iteration it resumed from, and that rewrite must not read as progress. So
+    the marker is built only from counters that move when work is done, never
+    from labels, statuses, timestamps, ids or metadata:
+
+    * ``m`` -- messages in the root context plus in-flight DAG step contexts;
+    * ``i`` -- ReAct ``current_iteration``, summed over every ReAct state;
+    * ``t`` -- entries in every ReAct ``tool_ledger``;
+    * ``p`` -- steps in the DAG plan (generating a plan is progress);
+    * ``s`` -- DAG plan steps with status ``completed``.
+
+    Nested states (Auto's ``react_state``/``dag_state`` and DAG step ReAct
+    states) are summed into the same counters. Compare markers for equality
+    only: context compaction shrinks ``m``, and it still follows an LLM call.
+    Missing or malformed fields count as zero, so a legacy or partial
+    checkpoint yields a marker instead of raising.
+    """
+    totals = {
+        "messages": 0,
+        "iterations": 0,
+        "tool_calls": 0,
+        "plan_steps": 0,
+        "completed_steps": 0,
+    }
+    if isinstance(checkpoint, dict):
+        totals["messages"] += _message_count(checkpoint.get("context"))
+        _accumulate_pattern_progress(checkpoint.get("pattern_state"), totals)
+    return (
+        f"m{totals['messages']}:i{totals['iterations']}:t{totals['tool_calls']}"
+        f":p{totals['plan_steps']}:s{totals['completed_steps']}"
+    )
+
+
 @dataclass
 class TraceCheckpointStore:
     """Durable checkpoint adapter backed by the tracer event pipeline.

@@ -2133,3 +2133,61 @@ def test_execution_adapter_stays_silent_when_a_paused_run_has_no_output(
         )
 
     assert _placeholder_warning_records(caplog) == []
+
+
+@pytest.mark.parametrize(
+    ("agent_result", "expected"),
+    [
+        ({"success": False, "status": "invalid_tool_protocol"}, "model_output_invalid"),
+        (
+            {"success": False, "interruption_reason": "llm_unavailable"},
+            "llm_unavailable",
+        ),
+        (
+            {
+                "success": False,
+                "error": "All 1 patterns failed",
+                "interruption_reason": "persistence_failure",
+            },
+            "persistence_failure",
+        ),
+    ],
+)
+def test_execution_adapter_forwards_interruption_reason(
+    agent_result: dict[str, Any], expected: str
+) -> None:
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(name="test", pattern="react", llm=FakeLLM([]))
+    )
+    result = adapter._normalize_result(
+        result={"output": "", **agent_result},
+        execution_type="agent_react",
+        execution_id="interrupted",
+    )
+    assert result["interruption_reason"] == expected
+    assert type(result["interruption_reason"]) is str
+    assert result["metadata"]["interruption_reason"] == expected
+
+
+@pytest.mark.parametrize(
+    "agent_result",
+    [
+        {"success": False, "error": "bad request"},
+        {"success": False, "interruption_reason": "not_a_real_reason"},
+        {"success": False, "interruption_reason": 42},
+        {"success": True, "output": "done", "interruption_reason": "llm_unavailable"},
+    ],
+)
+def test_execution_adapter_does_not_forward_invalid_interruption_reason(
+    agent_result: dict[str, Any],
+) -> None:
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(name="test", pattern="react", llm=FakeLLM([]))
+    )
+    result = adapter._normalize_result(
+        result=agent_result,
+        execution_type="agent_react",
+        execution_id="not-interrupted",
+    )
+    assert "interruption_reason" not in result
+    assert "interruption_reason" not in result["metadata"]
