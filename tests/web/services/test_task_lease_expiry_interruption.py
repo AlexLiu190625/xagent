@@ -381,7 +381,7 @@ def test_gated_settlement_state_precedence(
             task_status=TaskStatus.FAILED,
             interrupted_at=utc_now(),
             progress_marker=None,
-            gated_by_infra_pause_switch=True,
+            gated_by_settlement_switches=True,
         )
         assert row is not None
         event = db.scalars(

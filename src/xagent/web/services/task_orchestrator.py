@@ -56,10 +56,7 @@ from uuid import uuid4
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from ...config import (
-    get_shared_task_execution_enabled,
-    get_task_infra_failure_pause_enabled,
-)
+from ...config import get_shared_task_execution_enabled
 from ...core.agent.context.execution import CLOCK_TIMEZONE_METADATA_KEY
 from ...core.agent.interruption import InterruptionReason
 from ...core.execution_scope import resolve_execution_scope
@@ -106,9 +103,8 @@ from .task_auto_recovery import (
     InterruptionOutcome,
     InterruptionSettlementDeferred,
     apply_interruption_outcome_no_commit,
-    decide_interruption,
+    decide_owned_run_interruption,
     interruption_pause_result,
-    legacy_interruption_decision,
     settlement_interruption_for_failure,
 )
 from .task_command_transport import ClaimedTaskCommand
@@ -1807,37 +1803,6 @@ async def publish_interruption_pause(
         )
 
 
-def _decide_owned_run_interruption(
-    db: Session, lease: TaskLease, reason: InterruptionReason
-) -> InterruptionDecision | None:
-    """Decide the interruption of ``lease``'s run, if it is still RUNNING.
-
-    With ``XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED`` off the decision is
-    ``LEGACY`` without touching the row, so the settlement issues the same
-    statements as without an interruption (plus the metadata row). Otherwise
-    the run's row is locked and read first; ``None`` means the lease no
-    longer owns a RUNNING row: the caller's fenced write then misses as it
-    always has and ``finish_turn`` reconciles.
-    """
-    if not get_task_infra_failure_pause_enabled():
-        return legacy_interruption_decision(reason)
-    if not lock_task_lease_for_settlement_no_commit(db, lease):
-        return None
-    task = (
-        db.query(Task)
-        .filter(
-            Task.id == lease.task_id,
-            Task.runner_id == lease.runner_id,
-            task_lease_attempt_predicate(lease),
-            Task.run_id == lease.run_id,
-        )
-        .first()
-    )
-    if task is None or task.status != TaskStatus.RUNNING:
-        return None
-    return decide_interruption(db, task=task, reason=reason)
-
-
 def _pause_interrupted_run_no_commit(
     db: Session, lease: TaskLease, decision: InterruptionDecision, *, error: str
 ) -> dict[str, Any] | None:
@@ -1914,8 +1879,8 @@ def settle_task_lease_isolated(
     transcript -- an unknown tool effect fails with that message, and an
     undecidable run raises ``InterruptionSettlementDeferred``, retaining the
     lease for TTL recovery as above. When automatic recovery does not apply
-    the run fails as without ``interruption``: with the switch off by the
-    very same statements; for an ineligible task with the same outcome but
+    the run fails as without ``interruption``: with a settlement switch off
+    by the very same statements; for an ineligible task with the same outcome but
     after an extra row lock and eligibility read. Every decided interruption
     is recorded in ``task_auto_recovery``. ``paused_for``, when supplied,
     receives the recorded reason of a committed pause.
@@ -1934,7 +1899,7 @@ def settle_task_lease_isolated(
         try:
             if error_message is not None:
                 decision = (
-                    _decide_owned_run_interruption(settle_db, lease, interruption)
+                    decide_owned_run_interruption(settle_db, lease, interruption)
                     if interruption is not None
                     else None
                 )
@@ -2680,8 +2645,12 @@ def _schedule_bg(
                         # E.g. a tool ran but its result commit failed: the
                         # settlement must say the effect is unknown.
                         classify_unknown_tool_effect = True
-                        # A checkpoint/event write or the database itself
-                        # failed: a recoverable run is paused, not failed.
+                        # A recoverable run that was interrupted (mostly
+                        # a checkpoint/event write or the database failing;
+                        # LLM failures arrive as results) is paused, not
+                        # failed. Known and narrow: a non-LLM transport
+                        # error escaping setup code (say an HTTP timeout)
+                        # can also match the LLM classifier here.
                         settlement_interruption = settlement_interruption_for_failure(
                             setup_or_run_err
                         )

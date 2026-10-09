@@ -24,6 +24,7 @@ from .channel_runtime import (
     _load_channel_owner_sync,
 )
 from .db_runtime import run_db_io_cancellation_safe
+from .execution_result_projection import interrupted_channel_result
 from .task_lease_service import TaskLeaseLostError
 
 logger = logging.getLogger(__name__)
@@ -135,7 +136,7 @@ def _claim(
     try:
         result = _read_channel_result(command_id, run_id)
     except TaskLeaseLostError:
-        result = {"success": True, "status": "interrupted"}
+        result = interrupted_channel_result()
     return delivery, result
 
 

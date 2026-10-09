@@ -16,8 +16,9 @@ Phase 1 has no executor, so a recorded interruption is never ``scheduled``.
 Its state says only that nothing automatic will act on the run: ``manual``
 (only the user can act -- resume a PAUSED task; a FAILED one is terminal and
 the row just records why), ``ineligible`` (a task kind automatic recovery will
-never touch) or ``disabled`` (the settling path is gated by
-``XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED`` and that switch is off).
+never touch) or ``disabled`` (the interruption would have paused the run but
+``XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED`` is off, see
+:func:`settlement_pause_enabled`).
 """
 
 from __future__ import annotations
@@ -57,9 +58,12 @@ from .task_lease_service import (
     TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR,
     CheckpointRecoveryResolution,
     CheckpointRecoveryVerdict,
+    TaskLease,
     TaskLeaseRecoveryCandidate,
+    lock_task_lease_for_settlement_no_commit,
     log_unknown_tool_effect_settlement,
     resolve_checkpoint_recovery_with_data,
+    task_lease_attempt_predicate,
     utc_now,
 )
 from .workforce_runtime import extract_workforce_run_id
@@ -168,7 +172,7 @@ def record_interruption_no_commit(
     task_status: TaskStatus,
     interrupted_at: datetime,
     progress_marker: str | None,
-    gated_by_infra_pause_switch: bool,
+    gated_by_settlement_switches: bool,
     last_error: str | None = None,
 ) -> TaskAutoRecovery | None:
     """Upsert ``task``'s recovery row for one interruption and log the event.
@@ -178,11 +182,11 @@ def record_interruption_no_commit(
     and fence. A run without an id is not recorded -- it cannot be fenced.
     ``last_error`` is an operator-only diagnostic, truncated to fit the row.
 
-    ``gated_by_infra_pause_switch`` says whether the caller's PAUSED outcome
-    depends on ``XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED``. Settlement paths
-    that pause instead of failing are; lease-expiry recovery is not (it paused
-    before this switch existed), so it never records ``disabled``. An
-    ineligible task records ``ineligible`` whatever the switch says.
+    ``gated_by_settlement_switches`` says whether the caller's PAUSED outcome
+    depends on :func:`settlement_pause_enabled`. Settlement paths that pause
+    instead of failing are; lease-expiry recovery is not (it paused before the
+    switch existed), so it never records ``disabled``. An ineligible task
+    records ``ineligible`` whatever the switch says.
 
     ``paused_state_version`` is the task's ``state_version`` after the
     settling write, PAUSED or FAILED; only a PAUSED row's fence is ever read.
@@ -201,10 +205,19 @@ def record_interruption_no_commit(
 
     eligibility = auto_recovery_eligibility(db, task)
     # Ineligibility is permanent and the switch is not, so it wins: a
-    # ``disabled`` row always means "turning the switch on would help".
+    # ``disabled`` row always means "turning the switch on would help". A
+    # reason settlement does not pause for yet is not disabled -- no switch
+    # helps it -- so it records ``manual``, like any FAILED run.
     if not eligibility.eligible:
         state, state_detail = TaskAutoRecoveryState.INELIGIBLE, eligibility.detail
-    elif gated_by_infra_pause_switch and not get_task_infra_failure_pause_enabled():
+    elif (
+        gated_by_settlement_switches
+        # The invariant, local to this line: ``disabled`` means turning the
+        # infra switch on would pause it -- false for a deferred reason, which
+        # no switch pauses yet.
+        and reason not in SETTLEMENT_PAUSE_DEFERRED_REASONS
+        and not get_task_infra_failure_pause_enabled()
+    ):
         state, state_detail = TaskAutoRecoveryState.DISABLED, None
     else:
         state, state_detail = TaskAutoRecoveryState.MANUAL, None
@@ -406,7 +419,7 @@ def record_lease_expiry_interruption_no_commit(
             task_status=task_status,
             interrupted_at=recovered_at,
             progress_marker=resolution_progress_marker(db, int(task.id), resolution),
-            gated_by_infra_pause_switch=False,
+            gated_by_settlement_switches=False,
         )
     except Exception:
         savepoint.rollback()
@@ -421,8 +434,46 @@ def record_lease_expiry_interruption_no_commit(
 
 # Interruption reasons the run-settling paths act on. Settlement keeps its
 # terminal FAILED outcome for every other reason, ``None`` included.
-# ``llm_unavailable`` and ``model_output_invalid`` join in a later phase.
-SETTLEMENT_INTERRUPTION_REASONS = frozenset({InterruptionReason.PERSISTENCE_FAILURE})
+#
+# Where they come from: an LLM call that exhausted its retries or kept
+# returning unusable output raises inside a pattern, and the runner turns
+# that into an unsuccessful result carrying ``interruption_reason``; a ReAct
+# run that gave up on the tool protocol returns ``invalid_tool_protocol``. So
+# both reach the result paths, not the exception path, which sees the
+# persistence failures the runner lets escape. A DAG run swallows its LLM
+# failures into an ordinary failed result without a reason, so it never
+# pauses for either (it still pauses for a persistence failure).
+#
+# Every one of them is recorded; ``SETTLEMENT_PAUSE_DEFERRED_REASONS`` says
+# which of them settlement does not pause for yet.
+SETTLEMENT_INTERRUPTION_REASONS = frozenset(
+    {
+        InterruptionReason.PERSISTENCE_FAILURE,
+        InterruptionReason.LLM_UNAVAILABLE,
+        InterruptionReason.MODEL_OUTPUT_INVALID,
+    }
+)
+
+
+# Recorded, but never paused for until the automatic-resume executor ships;
+# that change removes them from this set. ``model_output_invalid`` is not an
+# infrastructure failure: a run paused for it is worth stopping only when
+# something will resample it, and until then it fails exactly as before.
+SETTLEMENT_PAUSE_DEFERRED_REASONS = frozenset({InterruptionReason.MODEL_OUTPUT_INVALID})
+
+
+def settlement_pause_enabled(reason: InterruptionReason) -> bool:
+    """Whether settlement may pause an eligible run interrupted for ``reason``.
+
+    Never for a reason in ``SETTLEMENT_PAUSE_DEFERRED_REASONS``. Otherwise it
+    is ``XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED``, which is off by default
+    until automatic resume ships, so by default every reason settles as
+    before.
+    """
+
+    if reason in SETTLEMENT_PAUSE_DEFERRED_REASONS:
+        return False
+    return get_task_infra_failure_pause_enabled()
 
 
 def settlement_interruption_for_failure(
@@ -464,7 +515,7 @@ class InterruptionSettlementDeferred(RuntimeError):
 class InterruptionOutcome(str, Enum):
     """What a settling path writes for an interrupted run."""
 
-    # Automatic recovery does not apply (switch off, ineligible task): the
+    # Automatic recovery does not apply (a switch off, an ineligible task): the
     # caller settles exactly as it always has, its own classification
     # included.
     LEGACY = "legacy"
@@ -533,8 +584,9 @@ def decide_interruption(
     ``task`` must be the run's row, locked by the settling transaction. In
     order:
 
-    1. ``XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED`` off, or an ineligible
-       task: ``LEGACY``.
+    1. Settlement does not pause for ``reason`` (:func:`settlement_pause_enabled`:
+       the switch is off, or the reason is deferred), or an ineligible task:
+       ``LEGACY``.
     2. The run's checkpoint, resolved as lease recovery resolves it:
        ``UNKNOWN_TOOL_EFFECT`` and ``NOT_RECOVERABLE`` fail, ``RECOVERABLE``
        pauses -- as a user pause when the run was PAUSE_REQUESTED (the user
@@ -549,7 +601,7 @@ def decide_interruption(
        (FAILED) keeps it terminal and visible.
     """
 
-    if not get_task_infra_failure_pause_enabled():
+    if not settlement_pause_enabled(reason):
         return legacy_interruption_decision(reason)
     try:
         if not auto_recovery_eligibility(db, task).eligible:
@@ -589,6 +641,39 @@ def decide_interruption(
     )
 
 
+def decide_owned_run_interruption(
+    db: Session, lease: TaskLease, reason: InterruptionReason
+) -> InterruptionDecision | None:
+    """Decide the interruption of ``lease``'s run, if it is still RUNNING.
+
+    For a settling path that has not loaded the run's row. When settlement
+    does not pause for ``reason`` (:func:`settlement_pause_enabled`), the
+    decision is ``LEGACY`` without touching the row, so the settlement issues
+    the same statements as without an interruption (plus the metadata row).
+    Otherwise the run's row is locked and read first; ``None`` means the lease
+    no longer owns a RUNNING row, and the caller settles exactly as it always
+    has (its own fenced write decides whether anything changes).
+    """
+
+    if not settlement_pause_enabled(reason):
+        return legacy_interruption_decision(reason)
+    if not lock_task_lease_for_settlement_no_commit(db, lease):
+        return None
+    task = (
+        db.query(Task)
+        .filter(
+            Task.id == lease.task_id,
+            Task.runner_id == lease.runner_id,
+            task_lease_attempt_predicate(lease),
+            Task.run_id == lease.run_id,
+        )
+        .first()
+    )
+    if task is None or task.status != TaskStatus.RUNNING:
+        return None
+    return decide_interruption(db, task=task, reason=reason)
+
+
 def apply_interruption_outcome_no_commit(
     db: Session,
     *,
@@ -612,8 +697,8 @@ def apply_interruption_outcome_no_commit(
     propagates. Its preconditions hold here: the settling write has opened
     the transaction, and everything staged so far is flushed first.
     ``error`` becomes the row's operator-only ``last_error``. The row is
-    gated by ``XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED`` (``disabled`` when
-    an eligible task's switch is off).
+    gated by the settlement switch (``disabled`` when it is off for an eligible
+    task and a reason it would pause for).
     """
 
     if decision.outcome is InterruptionOutcome.FAIL_UNKNOWN_TOOL_EFFECT:
@@ -632,7 +717,7 @@ def apply_interruption_outcome_no_commit(
                 if decision.resolution is not None
                 else None
             ),
-            gated_by_infra_pause_switch=True,
+            gated_by_settlement_switches=True,
             last_error=error,
         )
     except Exception:

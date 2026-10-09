@@ -105,12 +105,16 @@ on:
       - 'src/xagent/web/models/task_interaction.py'
       - 'src/xagent/web/services/task_interaction_schema.py'
       - 'src/xagent/core/agent/checkpoint.py'
+      - 'src/xagent/core/agent/interruption.py'
       - 'src/xagent/web/services/task_lease_service.py'
       - 'tests/web/services/test_task_lease_heartbeat_batch.py'
       - 'tests/web/services/test_task_settlement_locking.py'
       - 'src/xagent/web/services/task_auto_recovery.py'
       - 'tests/web/services/test_task_lease_expiry_interruption.py'
       - 'tests/web/services/test_persistence_failure_pause.py'
+      - 'tests/web/services/test_provider_failure_pause.py'
+      - 'src/xagent/web/services/managed_task_lease.py'
+      - 'src/xagent/web/services/execution_result_projection.py'
       - 'tests/web/services/test_task_execution_event_store.py'
       - 'tests/web/services/task_database_shared.py'
       - 'src/xagent/web/services/chat_history_service.py'
@@ -311,12 +315,16 @@ jobs:
             src/xagent/web/models/task_interaction.py
             src/xagent/web/services/task_interaction_schema.py
             src/xagent/core/agent/checkpoint.py
+            src/xagent/core/agent/interruption.py
             src/xagent/web/services/task_lease_service.py
             tests/web/services/test_task_lease_heartbeat_batch.py
             tests/web/services/test_task_settlement_locking.py
             src/xagent/web/services/task_auto_recovery.py
             tests/web/services/test_task_lease_expiry_interruption.py
             tests/web/services/test_persistence_failure_pause.py
+            tests/web/services/test_provider_failure_pause.py
+            src/xagent/web/services/managed_task_lease.py
+            src/xagent/web/services/execution_result_projection.py
             tests/web/services/test_task_execution_event_store.py
             tests/web/services/task_database_shared.py
             src/xagent/web/services/chat_history_service.py
@@ -644,6 +652,13 @@ jobs:
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           pytest tests/web/services/test_persistence_failure_pause.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test provider and model-output failure pause settlement (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/services/test_provider_failure_pause.py -m postgresql -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 

@@ -13,6 +13,16 @@ from .client_error_messages import CLIENT_SAFE_TASK_FAILURE
 EMPTY_CHANNEL_OUTPUT_FALLBACK = "Task completed, but no output was generated."
 
 
+def interrupted_channel_result() -> dict[str, Any]:
+    """The channel result of a run that rests PAUSED without a result of its
+    own (lease recovery, a settlement that paused an interrupted run).
+
+    Channels show it as an interruption the user can continue from. A fresh
+    dict per call: it may be stored by reference in a command's result.
+    """
+    return {"success": True, "status": "interrupted"}
+
+
 def completion_outcome_for_status(
     result: Mapping[str, Any] | None, status: TaskStatus
 ) -> str | None:

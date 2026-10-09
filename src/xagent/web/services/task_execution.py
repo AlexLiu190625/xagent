@@ -2135,7 +2135,7 @@ def _finalize_task_execution_result_isolated(
                     else None
                 )
                 if interruption is not None and interruption.pause:
-                    # A recoverable run interrupted by infrastructure rests
+                    # A recoverable run interrupted by a system cause rests
                     # PAUSED for its user to resume, as lease recovery
                     # leaves it; the scheduler's settlement releases it.
                     final_control_snapshot = apply_task_control_transition(
@@ -4206,8 +4206,11 @@ async def execute_resume_background(
                 exc_info=True,
             )
             settlement_error = error_message
-            # A checkpoint/event write or the database itself failed: a
-            # recoverable run is paused, not failed.
+            # A recoverable run that was interrupted (mostly a
+            # checkpoint/event write or the database failing; LLM failures
+            # arrive as results) is paused, not failed. Known and narrow: a
+            # non-LLM transport error escaping setup code (say an HTTP
+            # timeout) can also match the LLM classifier here.
             settlement_interruption = settlement_interruption_for_failure(e)
             broadcast_error_message = client_safe_error_message(
                 e,

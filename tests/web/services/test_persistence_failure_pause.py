@@ -267,7 +267,7 @@ def _persistence_interruption() -> InterruptionReason:
 # ---------------------------------------------------------------- classifiers
 
 
-def test_settlement_acts_only_on_persistence_failures():
+def test_settlement_acts_on_persistence_failures():
     assert settlement_interruption_for_failure(
         OperationalError("SELECT 1", {}, Exception("connection reset"))
     ) is (InterruptionReason.PERSISTENCE_FAILURE)
@@ -277,17 +277,10 @@ def test_settlement_acts_only_on_persistence_failures():
         settlement_interruption_for_result(persistence)
         is InterruptionReason.PERSISTENCE_FAILURE
     )
-    # Later phases: unchanged today.
-    for reason in ("llm_unavailable", "model_output_invalid", "lease_expired"):
-        assert (
-            settlement_interruption_for_result(
-                {"success": False, "interruption_reason": reason}
-            )
-            is None
-        )
+    # Provider and model-output reasons: test_provider_failure_pause.py.
     assert (
         settlement_interruption_for_result(
-            {"success": False, "status": "invalid_tool_protocol"}
+            {"success": False, "interruption_reason": "lease_expired"}
         )
         is None
     )
@@ -565,15 +558,10 @@ def test_result_persistence_failure_pauses(canonical):
     "result",
     [
         {**PERSISTENCE_RESULT, "status": "quota_exceeded", "error_code": "quota"},
-        {**PERSISTENCE_RESULT, "interruption_reason": "llm_unavailable"},
-        {**PERSISTENCE_RESULT, "interruption_reason": "model_output_invalid"},
-        {
-            **PERSISTENCE_RESULT,
-            "status": "invalid_tool_protocol",
-            "interruption_reason": "model_output_invalid",
-        },
+        {**PERSISTENCE_RESULT, "interruption_reason": "lease_expired"},
+        {k: v for k, v in PERSISTENCE_RESULT.items() if k != "interruption_reason"},
     ],
-    ids=["quota_exceeded", "llm_unavailable", "model_output_invalid", "protocol"],
+    ids=["quota_exceeded", "lease_expired", "no_reason"],
 )
 def test_other_results_fail_as_before(canonical, result):
     factory, tid = canonical

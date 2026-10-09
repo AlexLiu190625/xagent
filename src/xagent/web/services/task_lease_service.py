@@ -1496,7 +1496,7 @@ def pause_and_release_task_lease_no_commit(db: Session, lease: TaskLease) -> boo
     """Atomically pause and release the exact live lease without committing.
 
     The PAUSED counterpart of ``fail_and_release_task_lease_no_commit`` for a
-    run interrupted by an infrastructure failure: same fence, same ownership
+    run interrupted by a system failure: same fence, same ownership
     release, but the row rests PAUSED with no error and keeps ``output``, as
     lease recovery leaves a recoverable run. The caller owns the transaction.
     """

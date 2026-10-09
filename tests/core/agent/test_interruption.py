@@ -147,6 +147,43 @@ def test_context_length_failures_are_terminal(error: BaseException) -> None:
     assert classify_run_failure(error) is None
 
 
+def _insufficient_quota_error() -> Exception:
+    response = httpx.Response(429, request=REQUEST)
+    return openai.RateLimitError(
+        "You exceeded your current quota, please check your plan and billing",
+        response=response,
+        body={"code": "insufficient_quota", "type": "insufficient_quota"},
+    )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        _insufficient_quota_error(),
+        # How openai.py re-raises an SDK rate-limit error.
+        _chained(
+            RuntimeError("OpenAI rate limit exceeded: quota"),
+            _insufficient_quota_error(),
+        ),
+        _chained(RuntimeError("chat failed"), _status_error(402, "pay up")),
+        _chained(RuntimeError("chat failed"), _status_error(401, "bad key")),
+    ],
+    ids=["quota", "quota_wrapped", "payment_required", "credential_wrapped"],
+)
+def test_quota_and_credential_refusals_are_terminal(error: BaseException) -> None:
+    assert classify_run_failure(error) is None
+
+
+def test_plain_rate_limit_stays_resumable() -> None:
+    assert classify_run_failure(_rate_limit_error()) is (
+        InterruptionReason.LLM_UNAVAILABLE
+    )
+    wrapped = _chained(
+        RuntimeError("OpenAI rate limit exceeded: slow down"), _rate_limit_error()
+    )
+    assert classify_run_failure(wrapped) is InterruptionReason.LLM_UNAVAILABLE
+
+
 def test_classifier_walks_explicit_cause_chain() -> None:
     db_down = sa_exc.OperationalError("SELECT 1", {}, Exception("server closed"))
     wrapped = _chained(
@@ -289,3 +326,28 @@ def test_is_database_unavailable_follows_the_cause_chain():
     context_only = RuntimeError("cleanup")
     context_only.__context__ = reset
     assert not is_database_unavailable(context_only)
+
+
+@pytest.mark.parametrize(
+    ("code", "transient", "expected"),
+    [
+        ("provider_quota", True, None),
+        ("credential_rejected", True, None),
+        ("rate_limited", False, InterruptionReason.LLM_UNAVAILABLE),
+        ("timeout", False, InterruptionReason.LLM_UNAVAILABLE),
+        ("provider_unavailable", False, InterruptionReason.LLM_UNAVAILABLE),
+        ("provider_error", True, InterruptionReason.LLM_UNAVAILABLE),
+        ("provider_error", False, None),
+    ],
+)
+def test_guarded_provider_failure_is_classified_by_its_code(code, transient, expected):
+    """A guard_llm_calls model raises a cause-less ProviderCallError, which
+    retry_on and the text markers cannot read; its code decides instead."""
+    from xagent.core.model.chat.basic.call_boundary import ProviderCallError
+
+    error = ProviderCallError(code, transient=transient)
+    assert error.__cause__ is None and error.__context__ is None
+    assert classify_run_failure(error) is expected
+    wrapped = RuntimeError("pattern failed")
+    wrapped.__cause__ = error
+    assert classify_run_failure(wrapped) is expected

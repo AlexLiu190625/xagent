@@ -20,7 +20,10 @@ from .db_runtime import (
     drain_async_task_cancellation_safe,
     run_db_io_cancellation_safe,
 )
-from .execution_result_projection import completion_outcome_for_status
+from .execution_result_projection import (
+    completion_outcome_for_status,
+    interrupted_channel_result,
+)
 from .task_lease_service import (
     TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR,
     TaskLease,
@@ -52,6 +55,7 @@ def finalize_managed_task_lease_result(
     # sensitive payloads; never pass the raw result to a logger or exception.
     execution_result: Mapping[str, Any] | None = None,
     completion: tuple[int, dict[str, Any]] | None = None,
+    settle_interruption: bool = False,
 ) -> bool:
     """Atomically persist one inline transport result under its exact lease.
 
@@ -60,16 +64,53 @@ def finalize_managed_task_lease_result(
     committed outcome, it is recorded as an unknown tool effect, the
     classification lease recovery applies; the tool is not automatically
     replayed.
+
+    With ``settle_interruption`` (the shared channel leaf; the combined bots
+    leave it off, their tasks are never eligible), a FAILED result that reports
+    an interruption is decided as the other result paths decide it: a
+    recoverable run rests PAUSED with no failure transcript, error or result,
+    and its channel result says it was interrupted (as lease recovery's does).
+    It needs ``XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED`` (off by default), as
+    on the other paths. A database connectivity failure while deciding raises
+    ``InterruptionSettlementDeferred`` after rolling back, keeping the lease
+    for TTL recovery; any other decision fault settles as before. Every
+    decided interruption is recorded in ``task_auto_recovery``.
     """
 
     if status == TaskStatus.RUNNING:
         raise ValueError("Cannot finalize a managed lease with RUNNING status")
 
     from .chat_history_service import persist_assistant_message_no_commit
+    from .task_auto_recovery import (
+        InterruptionDecision,
+        InterruptionOutcome,
+        apply_interruption_outcome_no_commit,
+        decide_owned_run_interruption,
+        interruption_pause_result,
+        settlement_interruption_for_result,
+    )
     from .task_execution_event_writer import stage_result_fact_no_commit
     from .task_orchestrator import invalidate_task_cache_best_effort
 
+    run_error = error_message
     try:
+        interruption: InterruptionDecision | None = None
+        if settle_interruption and status == TaskStatus.FAILED:
+            reason = settlement_interruption_for_result(execution_result)
+            if reason is not None:
+                interruption = decide_owned_run_interruption(db, lease, reason)
+        paused = interruption is not None and interruption.pause
+        if paused:
+            status = TaskStatus.PAUSED
+        elif (
+            interruption is not None
+            and interruption.outcome is InterruptionOutcome.FAIL_UNKNOWN_TOOL_EFFECT
+        ):
+            error_message = TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR
+        # For a pause this generic release is equivalent to
+        # ``pause_and_release_task_lease_no_commit``: it does not itself
+        # require RUNNING, but decide_owned_run_interruption has just locked
+        # the exact run and seen it RUNNING in this transaction.
         if not release_task_lease_no_commit(db, lease, status=status):
             db.rollback()
             return False
@@ -101,11 +142,23 @@ def finalize_managed_task_lease_result(
                 "error_message",
                 diagnostic_error or CLIENT_SAFE_TASK_FAILURE,
             )
-        sync_workforce_run_status(db, task, status)
-        if task.user_id is not None and (
-            (assistant_content is not None and assistant_content.strip())
-            or interactions
-            or status == TaskStatus.FAILED
+        if interruption is not None:
+            # Projects the workforce run itself for a pause.
+            if not paused:
+                sync_workforce_run_status(db, task, status)
+            apply_interruption_outcome_no_commit(
+                db, task=task, decision=interruption, error=run_error
+            )
+        else:
+            sync_workforce_run_status(db, task, status)
+        if (
+            not paused
+            and task.user_id is not None
+            and (
+                (assistant_content is not None and assistant_content.strip())
+                or interactions
+                or status == TaskStatus.FAILED
+            )
         ):
             persist_assistant_message_no_commit(
                 db,
@@ -117,7 +170,14 @@ def finalize_managed_task_lease_result(
                 turn_id=turn_id,
             )
         stage_result_fact_no_commit(
-            db, task, dict(execution_result or {"error": error_message})
+            db,
+            task,
+            # Like lease recovery's: the unsuccessful result would read as a
+            # failed execution when the transcript is projected for the next
+            # model call.
+            interruption_pause_result()
+            if paused
+            else dict(execution_result or {"error": error_message}),
         )
         if completion is not None:
             from ..models.task_command import TaskExecutionCommand
@@ -133,14 +193,18 @@ def finalize_managed_task_lease_result(
             ):
                 db.rollback()
                 return False
+            if paused:
+                channel_result = interrupted_channel_result()
             setattr(
                 command, "result", {**command.result, "channel_result": channel_result}
             )
-            setattr(
-                task,
-                "output",
-                history_content if status == TaskStatus.COMPLETED else None,
-            )
+            if not paused:
+                # A pause keeps the previous output, as lease recovery does.
+                setattr(
+                    task,
+                    "output",
+                    history_content if status == TaskStatus.COMPLETED else None,
+                )
         # A lost acknowledgement is not reconciled here: the lease is released
         # in this transaction, so only the result fact's witness can prove the
         # commit. That belongs with the same-identity retry work.
@@ -149,6 +213,15 @@ def finalize_managed_task_lease_result(
         db.rollback()
         raise
 
+    if paused and interruption is not None:
+        logger.warning(
+            "task_id=%s run_id=%s component=settlement paused interrupted "
+            "channel run (reason=%s): %s",
+            lease.task_id,
+            lease.run_id,
+            interruption.reason.value,
+            run_error,
+        )
     invalidate_task_cache_best_effort(lease.task_id)
     return True
 
