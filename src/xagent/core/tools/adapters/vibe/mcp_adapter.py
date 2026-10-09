@@ -274,9 +274,19 @@ _DURABLE_UPLOAD_FIELDS: dict[tuple[str, str], tuple[str, ...]] = {
     ("onedrive", "onedrive_upload_file"): ("local_file_path",),
     ("sharepoint", "sharepoint_upload_file"): ("local_file_path",),
     ("google-drive", "google_drive_upload_file"): ("file_path",),
+    # Replaces an existing Drive file's content; file_id there is the Drive
+    # file, and only the replacement in file_path is a durable FileRef.
+    ("google-drive", "google_drive_update_file_content"): ("file_path",),
     ("slack", "slack_upload_file"): ("file_path",),
     ("jira", "jira_add_attachment"): ("file_path",),
 }
+
+# Tools above whose own ``file_id`` argument names something other than a
+# workspace file. The generic FileRef wording says "file_id", so for these the
+# description and the staging error name the upload argument instead.
+_DURABLE_UPLOAD_OWN_FILE_ID_TOOLS: frozenset[tuple[str, str]] = frozenset(
+    {("google-drive", "google_drive_update_file_content")}
+)
 
 # Built-in connector tools that create a real binary under the current task
 # workspace. Their result is annotated with a durable FileRef at the host
@@ -288,6 +298,41 @@ _WORKSPACE_DOWNLOAD_FIELDS: dict[tuple[str, str], str] = {
 }
 
 
+_DURABLE_UPLOAD_NOTE = (
+    " A registered file_id (or file:<id>) may be supplied for "
+    "the local upload argument; it will be staged in the current "
+    "task workspace before this connector runs."
+)
+_DURABLE_UPLOAD_NOT_FOUND = "file_id not found or not accessible."
+
+
+def _durable_upload_note(fields: tuple[str, ...], *, own_file_id: bool) -> str:
+    """The description sentence for a tool that accepts a durable FileRef."""
+    if not own_file_id:
+        return _DURABLE_UPLOAD_NOTE
+    return (
+        " A registered workspace file (file:<id>) may be supplied for "
+        f"{' or '.join(fields)}; it will be staged in the current task workspace "
+        "before this connector runs. The file_id argument is not a workspace "
+        "file id."
+    )
+
+
+def _durable_upload_not_found_message(
+    fields: tuple[str, ...], *, own_file_id: bool
+) -> str:
+    """The error for a FileRef that could not be staged; the tool is not called."""
+    if not own_file_id:
+        return _DURABLE_UPLOAD_NOT_FOUND
+    names = " or ".join(fields)
+    return (
+        f"{names}: the registered workspace file (file:<id>) was not found or "
+        "is not accessible, so the tool was not called and nothing was "
+        f"changed. This is about the file passed as {names}, not the file_id "
+        "argument."
+    )
+
+
 def _durable_upload_fields(server_name: str, tool_name: str) -> tuple[str, ...]:
     # Use the catalog's collision normalizer rather than the generic selector
     # normalizer. In particular, ``Google_Drive`` is a valid custom name under
@@ -297,6 +342,15 @@ def _durable_upload_fields(server_name: str, tool_name: str) -> tuple[str, ...]:
     return _DURABLE_UPLOAD_FIELDS.get(
         (canonicalize_builtin_identity(server_name) or "", tool_name), ()
     )
+
+
+def _durable_upload_has_own_file_id(server_name: str, tool_name: str) -> bool:
+    from .....builtin_identity import canonicalize_builtin_identity
+
+    return (
+        canonicalize_builtin_identity(server_name) or "",
+        tool_name,
+    ) in _DURABLE_UPLOAD_OWN_FILE_ID_TOOLS
 
 
 def _workspace_download_field(server_name: str, tool_name: str) -> str | None:
@@ -1342,6 +1396,7 @@ class MCPToolAdapter(AbstractBaseTool):
         source_server: Optional[str] = None,
         workspace: Any | None = None,
         durable_upload_fields: tuple[str, ...] = (),
+        durable_upload_own_file_id: bool = False,
         workspace_download_field: str | None = None,
         concurrency_safe: bool = False,
         concurrent_tools: Optional[List[str]] = None,
@@ -1363,6 +1418,9 @@ class MCPToolAdapter(AbstractBaseTool):
                 for local-path upload connectors.
             durable_upload_fields: Host-owned scalar argument names that accept
                 a durable FileRef and need task-local staging.
+            durable_upload_own_file_id: Whether the tool's own ``file_id``
+                argument is not a workspace file, so the FileRef wording names
+                ``durable_upload_fields`` instead of "file_id".
             workspace_download_field: Host-owned result field for a built-in
                 connector download that should be registered as a durable
                 FileRef.
@@ -1388,6 +1446,7 @@ class MCPToolAdapter(AbstractBaseTool):
         self.source_server = source_server
         self._workspace = workspace
         self._durable_upload_fields = durable_upload_fields
+        self._durable_upload_own_file_id = durable_upload_own_file_id
         self._workspace_download_field = workspace_download_field
         self.concurrency_safe = _mcp_tool_is_concurrency_safe(
             self.mcp_tool.name,
@@ -1450,10 +1509,9 @@ class MCPToolAdapter(AbstractBaseTool):
             self.mcp_tool.description or f"Execute MCP tool: {self.mcp_tool.name}"
         )
         if self._workspace is not None and self._durable_upload_fields:
-            description += (
-                " A registered file_id (or file:<id>) may be supplied for "
-                "the local upload argument; it will be staged in the current "
-                "task workspace before this connector runs."
+            description += _durable_upload_note(
+                self._durable_upload_fields,
+                own_file_id=self._durable_upload_own_file_id,
             )
         if self._workspace is not None and self._workspace_download_field is not None:
             description += (
@@ -2217,10 +2275,11 @@ class MCPToolAdapter(AbstractBaseTool):
                     staged_upload_sources,
                 ) = await self._stage_external_upload_args(tool_args)
             except FileNotFoundError:
-                return {
-                    "content": [{"text": "file_id not found or not accessible."}],
-                    "is_error": True,
-                }
+                message = _durable_upload_not_found_message(
+                    self._durable_upload_fields,
+                    own_file_id=self._durable_upload_own_file_id,
+                )
+                return {"content": [{"text": message}], "is_error": True}
 
             logger.debug(
                 "Executing MCP tool %s with args keys: %s for user %s",
@@ -2800,6 +2859,9 @@ def _build_mcp_tool_adapter(
         source_server=normalize_mcp_server_name(server_name),
         workspace=workspace,
         durable_upload_fields=_durable_upload_fields(server_name, mcp_tool.name),
+        durable_upload_own_file_id=_durable_upload_has_own_file_id(
+            server_name, mcp_tool.name
+        ),
         workspace_download_field=_workspace_download_field(server_name, mcp_tool.name),
         concurrency_safe=concurrency_safe,
         concurrent_tools=concurrent_tools,

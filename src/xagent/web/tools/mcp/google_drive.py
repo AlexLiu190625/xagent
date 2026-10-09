@@ -1,4 +1,6 @@
 import base64
+import functools
+import hashlib
 import io
 import json
 import logging
@@ -7,7 +9,7 @@ import os
 import re
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 from urllib.parse import ParseResult, parse_qs, urlparse
 
 from google.oauth2.credentials import Credentials
@@ -17,11 +19,13 @@ from googleapiclient.http import (  # type: ignore[import-not-found]
     MediaIoBaseUpload,
 )
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from ....config import get_tool_max_output_length
 from .utils import (
     allowed_dirs_from_env,
     clamp_limit,
+    google_api_error_status,
     google_api_error_summary,
     is_google_file_access_error,
     is_google_file_unavailable_error,
@@ -1342,6 +1346,14 @@ def google_drive_download_file(
     given here must keep the file's own extension (e.g. "report.xlsx", not
     "report"), and a file whose Drive name has no extension needs a
     filename that adds one.
+
+    The result's "file" also carries modifiedTime, version, shared, driveId
+    and, for a stored (non-Google) file, headRevisionId. When saving an
+    edited copy back with google_drive_update_file_content, pass that
+    headRevisionId as expected_head_revision_id so a change made in Google
+    Drive meanwhile is not overwritten. "shared" is true when the file is
+    shared with others; a driveId means the file is in a shared drive
+    (where "shared" is not set), so every member of that drive sees it.
     """
     try:
         resolved_file_id = _resolve_file_id(file_id)
@@ -1350,7 +1362,10 @@ def google_drive_download_file(
         get_request = service.files().get(
             fileId=resolved_file_id,
             supportsAllDrives=True,
-            fields="id, name, mimeType",
+            fields=(
+                "id, name, mimeType, modifiedTime, version, headRevisionId, "
+                "shared, driveId"
+            ),
         )
         _attach_resource_key(get_request, resolved_file_id, resource_key)
         file_metadata = get_request.execute()
@@ -1518,6 +1533,1153 @@ def google_drive_upload_file(
     except Exception as e:
         logger.error(f"Error uploading file: {e}")
         return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+
+# google_drive_update_file_content's upload sizes. Google documents a simple
+# (single-request) upload as "5 MB or less"; staying just under that decimal
+# figure, as onedrive.py does for its own limit, means a wrong guess only costs
+# one extra round trip on the resumable path. Read at call time so tests can
+# lower them.
+_SIMPLE_UPLOAD_MAX_BYTES = 5_000_000
+# A resumable upload's chunks must be a multiple of 256 KiB.
+_RESUMABLE_CHUNK_BYTES = 16 * 1024 * 1024
+# A product guard-rail, not a Drive limit (Drive accepts far larger files),
+# matching onedrive.py's cap: a replacement this large is much more likely a
+# mistake than an edited document.
+_MAX_CONTENT_UPDATE_BYTES = 2 * 1024 * 1024 * 1024
+# The hash pass reads, and for a resumable upload records a digest of, one
+# block of this size at a time.
+_HASH_BLOCK_BYTES = 1024 * 1024
+# googleapiclient retries only 5xx, 429, rate-limit 403s and connection
+# errors. Replaying a content update cannot change the final bytes; at worst it
+# adds one more revision with the same content.
+_CONTENT_UPDATE_NUM_RETRIES = 2
+# The Content-Range of a resumable upload chunk: "bytes <first>-<last>/<size>".
+_CONTENT_RANGE_PATTERN = re.compile(r"bytes \d+-(?P<last>\d+)/(?P<size>\d+)")
+
+_OCTET_STREAM = "application/octet-stream"
+_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
+_SHORTCUT_MIME_TYPE = "application/vnd.google-apps.shortcut"
+
+# The shape of a workspace file id (a UUID). A Drive id never has this shape,
+# so a value like this in file_id is the replacement file put in the wrong
+# argument; sent to Drive it would come back as a misleading 404.
+_WORKSPACE_FILE_ID_PATTERN = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+# Only a short alphanumeric suffix with a letter counts as a file extension,
+# so a name like "Plan v1.2" is treated as having none.
+_FILE_EXTENSION_PATTERN = re.compile(r"\.(?=[a-z0-9]*[a-z])[a-z0-9]{1,10}")
+# Common formats missing from Python's built-in extension table (as of 3.12).
+_EXTRA_EXTENSION_TYPES = {
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".odt": "application/vnd.oasis.opendocument.text",
+    ".ods": "application/vnd.oasis.opendocument.spreadsheet",
+    ".odp": "application/vnd.oasis.opendocument.presentation",
+    ".yaml": "application/yaml",
+    ".yml": "application/yaml",
+}
+
+_CONTENT_UPDATE_GET_FIELDS = (
+    "id,name,mimeType,trashed,size,md5Checksum,headRevisionId,version,"
+    "modifiedTime,webViewLink,shared,driveId,"
+    "capabilities(canModifyContent),shortcutDetails(targetId,targetMimeType)"
+)
+_CONTENT_UPDATE_RESULT_FIELDS = (
+    "id,name,mimeType,size,md5Checksum,headRevisionId,version,modifiedTime,"
+    "webViewLink,shared,driveId"
+)
+# The metadata google_drive_update_file_content reports back about a file.
+_CONTENT_SUMMARY_KEYS = (
+    "id",
+    "name",
+    "mimeType",
+    "size",
+    "md5Checksum",
+    "headRevisionId",
+    "version",
+    "modifiedTime",
+    "webViewLink",
+    "shared",
+    "driveId",
+)
+
+_NOTHING_CHANGED = "Nothing was changed in Google Drive."
+_EARLIER_TURN_HINT = (
+    "If the replacement file was prepared in an earlier turn, pass the file id "
+    'recorded for it as file_path="file:<id>"; do not rebuild it without asking '
+    "the user again."
+)
+_LOCAL_FILE_CHANGED = (
+    "The local file changed while it was being read. Finish writing the "
+    "replacement file before calling this tool."
+)
+_UPLOAD_AS_NEW_FILE_OFFER = (
+    "offer to upload the edited file as a new file with google_drive_upload_file "
+    "(ask first: it gets a new link and does not keep the original's sharing or "
+    "version history)"
+)
+
+# Why a native Google file cannot take uploaded content, and where to edit it.
+# Uploading media onto one would make Drive convert the upload and replace the
+# whole document, losing formatting, comments and formulas.
+_NATIVE_CONTENT_REFUSALS = {
+    "application/vnd.google-apps.document": (
+        "is a Google Docs document, not a stored file, so its content cannot "
+        "be replaced with an uploaded file. Edit it with the Google Docs tools."
+    ),
+    "application/vnd.google-apps.spreadsheet": (
+        "is a Google Sheets spreadsheet, not a stored file, so its content "
+        "cannot be replaced with an uploaded file. Edit it with the Google "
+        "Sheets tools, for example by updating ranges or appending rows. An "
+        ".xlsx file is a separate file from this spreadsheet."
+    ),
+    "application/vnd.google-apps.presentation": (
+        "is a Google Slides presentation, not a stored file, so its content "
+        "cannot be replaced with an uploaded file. Edit it with the Google "
+        "Slides tools. To turn an edited .pptx into Google Slides, "
+        "google_slides_import_pptx creates a new presentation (ask the user "
+        "first: it gets a new link)."
+    ),
+    _FOLDER_MIME_TYPE: "is a folder, which has no content to replace.",
+}
+
+
+class _ChunkBytesUpload(MediaIoBaseUpload):  # type: ignore[no-any-unimported]
+    """A MediaIoBaseUpload whose resumable chunks are read into bytes.
+
+    For a stream, googleapiclient sends each chunk as a slice of the open
+    file, and when it retries a chunk (num_retries) it sends that slice
+    again after it has already been read: the retried request declares the
+    chunk's length but carries no body, and hangs until the connection times
+    out. Read into bytes, a chunk is resent intact, and memory still holds
+    only one chunk at a time.
+    """
+
+    def has_stream(self) -> bool:
+        return False
+
+
+class _ReplacementChangedError(ValueError):
+    """The replacement file no longer has the bytes that were hashed."""
+
+
+class _VerifiedChunkUpload(_ChunkBytesUpload):
+    """A resumable upload that sends only the bytes that were hashed.
+
+    A file too large to keep in memory is read again, one chunk at a time,
+    after the hash pass. Each chunk is checked block by block against that
+    pass before it is sent, and a difference stops the upload before its
+    last chunk, so Drive never completes it and keeps the file as it was.
+    The size is the hashed size, so bytes added to the file since then are
+    not sent either.
+    """
+
+    def __init__(
+        self, fd: BinaryIO, *, size: int, block_digests: list[bytes], **kwargs: Any
+    ) -> None:
+        super().__init__(fd, **kwargs)
+        self._hashed_size = size
+        self._block_digests = block_digests
+
+    def size(self) -> int:
+        return self._hashed_size
+
+    def getbytes(self, begin: int, length: int) -> bytes:
+        end = min(begin + length, self._hashed_size)
+        if begin >= end:
+            return b""
+        # Read whole blocks, since a digest covers a whole block.
+        first_block = begin // _HASH_BLOCK_BYTES
+        start = first_block * _HASH_BLOCK_BYTES
+        stop = min(-(-end // _HASH_BLOCK_BYTES) * _HASH_BLOCK_BYTES, self._hashed_size)
+        data: bytes = super().getbytes(start, stop - start)
+        if len(data) != stop - start:
+            raise _ReplacementChangedError(_LOCAL_FILE_CHANGED)
+        for index, offset in enumerate(
+            range(0, len(data), _HASH_BLOCK_BYTES), first_block
+        ):
+            block = data[offset : offset + _HASH_BLOCK_BYTES]
+            if _block_digest(block) != self._block_digests[index]:
+                raise _ReplacementChangedError(_LOCAL_FILE_CHANGED)
+        return data[begin - start : end - start]
+
+
+def _content_update_error(message: str, **extra: Any) -> str:
+    return json.dumps(
+        {"status": "error", "message": message, **extra}, ensure_ascii=False
+    )
+
+
+def _then_nothing_changed(reason: object) -> str:
+    """``reason`` as a sentence, followed by _NOTHING_CHANGED.
+
+    Some reasons, such as _resolve_file_id's errors, have no full stop.
+    """
+    sentence = str(reason).rstrip()
+    if not sentence:
+        return _NOTHING_CHANGED
+    if sentence[-1] not in ".!?":
+        sentence += "."
+    return f"{sentence} {_NOTHING_CHANGED}"
+
+
+def _content_summary(file: dict[str, Any]) -> dict[str, Any]:
+    return {key: file[key] for key in _CONTENT_SUMMARY_KEYS if key in file}
+
+
+def _as_int(value: Any) -> int | None:
+    # Drive returns int64 fields such as size and version as JSON strings.
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _file_extension(name: str) -> str:
+    suffix = _split_stem_suffix(name.strip())[1].lower()
+    return suffix if _FILE_EXTENSION_PATTERN.fullmatch(suffix) else ""
+
+
+@functools.cache
+def _builtin_mime_types() -> mimetypes.MimeTypes:
+    # A new MimeTypes holds only Python's built-in table, not the host's
+    # mime.types files that mimetypes.guess_type also reads, so the answer
+    # is the same on every host (see _KNOWN_TEXT_EXTENSIONS).
+    return mimetypes.MimeTypes()
+
+
+def _extension_type(extension: str) -> tuple[str | None, str | None] | None:
+    """The MIME type and compression a lowercase extension such as ".jpeg"
+    or ".tgz" names, or ``None`` when it names neither.
+
+    The compression is part of the type: ".svgz" is not an ".svg" file and
+    ".gz" is not the file it compresses.
+    """
+    if extension in _EXTRA_EXTENSION_TYPES:
+        return _EXTRA_EXTENSION_TYPES[extension], None
+    mime_type, encoding = _builtin_mime_types().guess_type(
+        f"file{extension}", strict=False
+    )
+    if mime_type is None and encoding is None:
+        return None
+    return mime_type, encoding
+
+
+def _name_type(name: str, extension: str) -> tuple[str | None, str | None] | None:
+    """What ``_extension_type`` says for ``extension``, the lowercase
+    extension of ``name``, except that a compression extension is read with
+    the part before it: "data.tar.gz" and "data.tgz" both name a gzipped
+    tar file, and "logo.svg.gz" and "logo.svgz" a gzipped SVG."""
+    extension_type = _extension_type(extension)
+    if extension_type is None or extension_type[1] is None:
+        return extension_type
+    # mimetypes reads no more than these two extensions. It takes its
+    # argument as a URL and matches ".gz" and the like case-sensitively, so
+    # it gets them lowercased after a fixed stem, not the name itself.
+    inner_extension = _file_extension(_split_stem_suffix(name.strip())[0])
+    return _builtin_mime_types().guess_type(
+        f"file{inner_extension}{extension}", strict=False
+    )
+
+
+def _content_extension_mismatch(
+    drive_name: str, stored_mime_type: str, local_name: str
+) -> tuple[str, str] | None:
+    """When the replacement looks like another type of file than the one in
+    Drive, its extension and what the Drive file is; otherwise ``None``.
+
+    Two spellings of one type (.jpeg and .jpg, .tar.gz and .tgz) match; a
+    compressed and a plain file (.csv.gz and .csv, .svgz and .svg) do not.
+    A dotted part of the Drive name is not taken as its type when the
+    replacement's extension names the type stored in Drive ("John.Smith"
+    stored as a PDF, replaced with "John.Smith.pdf"), or when neither that
+    part nor the stored type says what the file is.
+    """
+    drive_extension = _file_extension(drive_name)
+    local_extension = _file_extension(local_name)
+    if not drive_extension or not local_extension:
+        return None
+    if drive_extension == local_extension:
+        return None
+    drive_type = _name_type(drive_name, drive_extension)
+    local_type = _name_type(local_name, local_extension)
+    # A stored octet-stream type says nothing about the file.
+    known_stored_type = stored_mime_type not in ("", _OCTET_STREAM)
+    # A compressed file may be stored under the type of what it compresses
+    # (google_drive_upload_file stores "report.csv.gz" as text/csv), so the
+    # stored type does not stand in for a compression extension.
+    drive_compressed = drive_type is not None and drive_type[1] is not None
+    if local_type is not None and (
+        local_type == drive_type
+        or (
+            known_stored_type
+            and not drive_compressed
+            and local_type == (stored_mime_type, None)
+        )
+    ):
+        return None
+    if drive_type is not None:
+        return local_extension, f"a {drive_extension} file"
+    if not known_stored_type:
+        return None
+    return local_extension, f"stored as {stored_mime_type}"
+
+
+def _validated_content_update_target(file_id: str) -> tuple[str, str | None]:
+    """Resolve file_id, refusing a workspace file id before any request."""
+    if isinstance(file_id, str):
+        stripped = file_id.strip()
+        if stripped.lower().startswith("file:") or (
+            _WORKSPACE_FILE_ID_PATTERN.fullmatch(stripped)
+        ):
+            raise ValueError(
+                "file_id looks like a workspace file id, not a Google Drive "
+                'file. Pass the replacement file as file_path="file:<id>" and '
+                "pass the Google Drive file's id or link as file_id."
+            )
+    resolved_file_id = _resolve_file_id(file_id)
+    return resolved_file_id, _extract_resource_key(file_id)
+
+
+def _validated_content_mime_type(mime_type: str) -> str:
+    if not isinstance(mime_type, str):
+        raise ValueError("mime_type must be a string")
+    normalized = _normalize_mime_type(mime_type)
+    if _is_google_workspace_mime_type(normalized):
+        raise ValueError(
+            "mime_type must be the stored file's own type (for example "
+            '"application/vnd.openxmlformats-officedocument.presentationml.'
+            'presentation"), not a native Google type.'
+        )
+    return normalized
+
+
+def _validated_expected_head_revision_id(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("expected_head_revision_id must be a string")
+    stripped = value.strip()
+    if "\r" in stripped or "\n" in stripped:
+        raise ValueError("expected_head_revision_id must not contain line breaks")
+    return stripped
+
+
+def _block_digest(block: bytes) -> bytes:
+    return hashlib.sha256(block).digest()
+
+
+def _read_exactly(fh: BinaryIO, length: int) -> bytes:
+    data = fh.read(length)
+    while len(data) < length:
+        more = fh.read(length - len(data))
+        if not more:
+            raise ValueError(_LOCAL_FILE_CHANGED)
+        data += more
+    return data
+
+
+def _hash_replacement_file(
+    fh: BinaryIO, size: int, *, keep_bytes: bool
+) -> tuple[str, bytes | None, list[bytes]]:
+    """Return the MD5 of exactly ``size`` bytes of ``fh``, and either those
+    bytes (``keep_bytes``) or a digest of each _HASH_BLOCK_BYTES block for
+    _VerifiedChunkUpload to check the file against, then rewind ``fh``.
+
+    A short read, or more data after ``size`` bytes, means the file changed
+    since it was opened; the Drive checksum check after the upload could not
+    then tell which content was meant. Drive reports MD5 for stored files, so
+    this is a content fingerprint, not a security measure.
+    """
+    digest = hashlib.md5(usedforsecurity=False)
+    kept = bytearray() if keep_bytes else None
+    block_digests: list[bytes] = []
+    remaining = size
+    while remaining > 0:
+        block = _read_exactly(fh, min(_HASH_BLOCK_BYTES, remaining))
+        digest.update(block)
+        if kept is not None:
+            kept.extend(block)
+        else:
+            block_digests.append(_block_digest(block))
+        remaining -= len(block)
+    if fh.read(1):
+        raise ValueError(_LOCAL_FILE_CHANGED)
+    fh.seek(0)
+    return (
+        digest.hexdigest(),
+        bytes(kept) if kept is not None else None,
+        block_digests,
+    )
+
+
+def _unavailable_content_update_message(exc: Exception, lead: str | None = None) -> str:
+    """Guidance for a file this connection cannot open. ``lead`` replaces
+    the first sentence, which says that nothing was changed."""
+    if lead is None:
+        lead = (
+            "Google Drive could not open file_id: the file does not exist, or "
+            "this Drive connection cannot access it, so nothing was changed."
+        )
+    # Not _OPEN_BY_LINK_HINT: opening the file with the Docs, Sheets or Slides
+    # tools does not help for a stored .pptx, .xlsx or PDF.
+    return (
+        f"{lead} If this connection uses per-file Drive access, it can only "
+        "change files created through this app or explicitly granted to it, "
+        "so a file the user uploaded to Google Drive themselves may not be "
+        "reachable here. "
+        "Options to offer the user: (1) if Google Drive's file picker is "
+        "available for this connection, select the file there and ask again; "
+        "(2) replace the file themselves in Google Drive (Manage versions > "
+        "Upload new version) with the edited file attached in this "
+        "conversation, which keeps its link and sharing; (3) upload the "
+        "edited file as a new file with google_drive_upload_file (ask first: "
+        "it gets a new link and does not keep the original's sharing or "
+        "version history). Google API response: "
+        f"{google_api_error_summary(exc)}"
+    )
+
+
+def _content_permission_message(
+    name: str, exc: Exception | None = None, lead: str | None = None
+) -> str:
+    """Guidance for a file the connected account may not change. ``lead``
+    replaces the first sentence, which says that nothing was changed."""
+    if lead is None:
+        lead = (
+            "The connected Google account cannot change the content of "
+            f"'{name}' (for example, it has only view or comment access, or "
+            "the file is locked), so nothing was changed."
+        )
+    message = (
+        f"{lead} Ask the user to replace it in Google Drive or to ask the "
+        f"file's owner, or {_UPLOAD_AS_NEW_FILE_OFFER}."
+    )
+    if exc is not None:
+        message += (
+            f" Google API response: {google_api_error_summary(exc, with_reasons=True)}"
+        )
+    return message
+
+
+def _content_error_detail(exc: Exception) -> str:
+    """Drive's error without the request URI, or the transport error."""
+    summary = google_api_error_summary(exc, with_reasons=True)
+    if google_api_error_status(exc) is not None:
+        return f"Google API response: {summary}"
+    return f"Error: {summary or type(exc).__name__}"
+
+
+def _request_may_store_content(uri: str, headers: dict[str, str] | None) -> bool:
+    """Whether Drive may store the upload on this request of a files.update:
+    the one request of a simple upload, or the chunk that ends a resumable
+    upload. Starting a resumable session or sending an earlier chunk stores
+    nothing."""
+    for key, value in (headers or {}).items():
+        if key.lower() == "content-range":
+            match = _CONTENT_RANGE_PATTERN.fullmatch(str(value).strip())
+            return match is None or int(match["last"]) + 1 == int(match["size"])
+    return parse_qs(urlparse(uri).query).get("uploadType") != ["resumable"]
+
+
+class _UpdateAttempts:
+    """The http object one files.update sends its requests through, noting
+    whether a request that may store the content ended without a definite
+    answer.
+
+    googleapiclient retries a timeout, a dropped connection, a 5xx, a 429
+    and a rate-limit 403, so the error it finally raises may be a 4xx that
+    says nothing about an earlier attempt: that attempt may have timed out
+    or got a 5xx after Drive stored the content. Only the requests that
+    googleapiclient makes pass through here, not one that httplib2 sends
+    again on its own (see _content_update_request_error).
+    """
+
+    def __init__(self, http: Any) -> None:
+        self._http = http
+        self.unclear = False
+
+    def request(
+        self,
+        uri: str,
+        method: str = "GET",
+        body: Any = None,
+        headers: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        may_store = _request_may_store_content(uri, headers)
+        try:
+            response, content = self._http.request(
+                uri, method=method, body=body, headers=headers, **kwargs
+            )
+        except BaseException:
+            self.unclear = self.unclear or may_store
+            raise
+        status = _as_int(getattr(response, "status", None))
+        if may_store and (status is None or status >= 500 or status == 408):
+            self.unclear = True
+        return response, content
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._http, name)
+
+
+def _is_content_rejection(exc: Exception) -> bool:
+    """Whether Drive answered the update with a 4xx other than a timeout."""
+    status = google_api_error_status(exc)
+    return status is not None and 400 <= status < 500 and status != 408
+
+
+def _reread_unchanged_file(
+    service: Any, file_id: str, resource_key: str | None, previous: dict[str, Any]
+) -> tuple[dict[str, Any] | None, Exception | None]:
+    """Read the file again after a rejected update.
+
+    The first item is the file as Drive returns it now, when it still has
+    the content read before the update (the same checksum and head
+    revision), and ``None`` otherwise. The second is the error when the
+    file cannot be read, and ``None`` otherwise."""
+    request = service.files().get(
+        fileId=file_id,
+        supportsAllDrives=True,
+        fields=_CONTENT_UPDATE_RESULT_FIELDS,
+    )
+    _attach_resource_key(request, file_id, resource_key)
+    try:
+        now = request.execute(num_retries=_CONTENT_UPDATE_NUM_RETRIES)
+    except Exception as exc:
+        logger.warning(
+            "Could not read file %s again after the update: %s", file_id, exc
+        )
+        return None, exc
+    if not isinstance(now, dict):
+        return None, None
+    old_md5 = previous.get("md5Checksum")
+    new_md5 = now.get("md5Checksum")
+    if not (
+        isinstance(old_md5, str)
+        and old_md5
+        and isinstance(new_md5, str)
+        and new_md5.lower() == old_md5.lower()
+    ):
+        return None, None
+    if now.get("headRevisionId") != previous.get("headRevisionId"):
+        return None, None
+    return now, None
+
+
+def _content_update_request_error(
+    exc: Exception,
+    name: str,
+    current_summary: dict[str, Any],
+    *,
+    earlier_attempt_unclear: bool,
+    unchanged_file: dict[str, Any] | None,
+    reread_error: Exception | None = None,
+) -> str:
+    """The error result for a files.update request that raised.
+
+    A 4xx is a definite rejection only when ``unchanged_file``, the file
+    read again after it, still has the content read before the update; that
+    state is then the file's state. A 4xx on every attempt _UpdateAttempts
+    saw does not show this by itself: httplib2 sends a request again on its
+    own when the connection closes before any reply, so an attempt that
+    stored the content may never reach googleapiclient's retries or the
+    wrapper.
+
+    A 5xx left after retries, a timeout, a dropped connection, a 4xx after
+    an attempt that ended that way, or a 4xx that the re-read does not
+    settle may come after Drive stored the upload, so that result says the
+    outcome is unknown and keeps the pre-read state as "previous" rather
+    than as the file's current state.
+
+    When that re-read fails because the file is gone or out of this
+    connection's reach (``reread_error``), the result gives the guidance for
+    such a file instead, without saying whether the file changed or sending
+    the user to a version history they may not be able to open.
+    """
+    rejected = _is_content_rejection(exc)
+    if rejected and unchanged_file is not None:
+        file = _content_summary(unchanged_file)
+        if is_google_file_unavailable_error(exc):
+            return _content_update_error(
+                _unavailable_content_update_message(exc), file=file
+            )
+        if is_google_file_access_error(exc):
+            return _content_update_error(
+                _content_permission_message(name, exc), file=file
+            )
+        # Quota, rate limits and a missing OAuth scope keep Drive's own error.
+        return _content_update_error(
+            f"Google Drive did not accept the new content for '{name}'. Do "
+            "not report the file as updated. "
+            f"{_content_error_detail(exc)}",
+            file=file,
+        )
+    if rejected and reread_error is not None:
+        unknown = (
+            f"so it is not known whether '{name}' changed. Do not report it "
+            "as updated or as unchanged."
+        )
+        message: str | None = None
+        if is_google_file_unavailable_error(reread_error):
+            message = _unavailable_content_update_message(
+                reread_error,
+                lead=(
+                    "Google Drive refused the upload, and then could not open "
+                    "file_id to check it: the file no longer exists, or this "
+                    f"Drive connection can no longer access it, {unknown}"
+                ),
+            )
+        elif is_google_file_access_error(reread_error):
+            message = _content_permission_message(
+                name,
+                reread_error,
+                lead=(
+                    "Google Drive refused the upload, and then refused to let "
+                    f"the connected Google account read '{name}' again to "
+                    "check it (for example, the file is no longer shared with "
+                    f"it), {unknown}"
+                ),
+            )
+        if message is not None:
+            return _content_update_error(
+                f"{message} (when reading it again). Google API response to "
+                f"the update: {google_api_error_summary(exc, with_reasons=True)}",
+                previous=current_summary,
+            )
+    if not rejected:
+        what = "The upload to Google Drive did not finish normally"
+    elif earlier_attempt_unclear:
+        what = (
+            "Google Drive refused a retry of the upload after an earlier "
+            "attempt ended without a clear answer"
+        )
+    else:
+        what = (
+            "Google Drive refused the upload, but reading the file again did "
+            "not confirm that it is unchanged"
+        )
+    return _content_update_error(
+        f"{what}, so it is not known whether '{name}' changed. Do not report "
+        "it as updated or as unchanged; ask the user to check the file's "
+        "version history in Google Drive before trying again. "
+        f"{_content_error_detail(exc)}",
+        previous=current_summary,
+    )
+
+
+def _native_content_refusal(current: dict[str, Any], name: str) -> str | None:
+    mime_type = _normalize_mime_type(str(current.get("mimeType") or ""))
+    if mime_type == _SHORTCUT_MIME_TYPE:
+        details = current.get("shortcutDetails")
+        target_id = details.get("targetId") if isinstance(details, dict) else None
+        target = f" (target id {target_id})" if target_id else ""
+        return (
+            f"'{name}' is a shortcut to another file{target}. This tool does "
+            "not follow shortcuts, so it never changes a file the user did "
+            "not name. If the user means the target, confirm with the user "
+            "first, naming the target file (its name and link, and whether it "
+            "is shared), then call again with the target's id. "
+            f"{_NOTHING_CHANGED}"
+        )
+    if not _is_google_workspace_mime_type(mime_type):
+        return None
+    refusal = _NATIVE_CONTENT_REFUSALS.get(mime_type)
+    if refusal is None:
+        kind = mime_type.rsplit(".", 1)[-1]
+        refusal = (
+            f"is a native Google file ({kind}), not a stored file, so its "
+            "content cannot be replaced with an uploaded file."
+        )
+    return f"'{name}' {refusal} {_NOTHING_CHANGED}"
+
+
+def _content_update_refusal(
+    current: dict[str, Any],
+    name: str,
+    *,
+    requested_mime_type: str,
+    local_name: str,
+) -> str | None:
+    """Why the pre-read file must not be overwritten, or ``None``.
+
+    Covers native Google files, the trash, a missing edit permission and a
+    replacement of a different type. A missing canModifyContent is left to
+    the API. A change made in Drive since the download is checked separately,
+    after identical content, by ``_content_update_conflict``.
+    """
+    refusal = _native_content_refusal(current, name)
+    if refusal is not None:
+        return refusal
+    if current.get("trashed"):
+        return (
+            f"'{name}' is in the Google Drive trash. Ask the user to restore it "
+            f"first. {_NOTHING_CHANGED}"
+        )
+    capabilities = current.get("capabilities")
+    if isinstance(capabilities, dict) and capabilities.get("canModifyContent") is False:
+        return _content_permission_message(name)
+
+    # Replacing the content keeps the file's type. A stored octet-stream type
+    # carries no information, so an explicit mime_type may refine it.
+    stored_mime_type = _normalize_mime_type(str(current.get("mimeType") or ""))
+    if (
+        requested_mime_type
+        and stored_mime_type
+        and stored_mime_type != _OCTET_STREAM
+        and requested_mime_type != stored_mime_type
+    ):
+        return (
+            f"mime_type '{requested_mime_type}' does not match the type of "
+            f"'{name}' in Google Drive ('{stored_mime_type}'). Replacing the "
+            "content keeps the file's type; to store a different type, "
+            f"{_UPLOAD_AS_NEW_FILE_OFFER}. {_NOTHING_CHANGED}"
+        )
+    mismatch = _content_extension_mismatch(name, stored_mime_type, local_name)
+    if mismatch is not None:
+        local_extension, drive_kind = mismatch
+        return (
+            f"The replacement file is a {local_extension} file but '{name}' in "
+            f"Google Drive is {drive_kind}. Replacing the content keeps the "
+            f"file's type; check file_path, or {_UPLOAD_AS_NEW_FILE_OFFER}. "
+            f"{_NOTHING_CHANGED}"
+        )
+    return None
+
+
+def _content_update_conflict(
+    current: dict[str, Any], name: str, *, expected_head: str
+) -> str | None:
+    """Why the pre-read head revision does not allow the overwrite, or ``None``.
+
+    headRevisionId changes only with the content, so a rename or a sharing
+    change since the download is not reported as a conflict. The check and
+    the update are separate requests, so this narrows the window rather than
+    closing it.
+    """
+    if not expected_head:
+        return None
+    current_head = current.get("headRevisionId")
+    if not current_head:
+        return (
+            f"Google Drive did not return the head revision of '{name}', so it "
+            "could not be checked against expected_head_revision_id. Ask the "
+            "user to confirm that the file has not changed in Google Drive "
+            "since it was downloaded before calling again without "
+            f"expected_head_revision_id. {_NOTHING_CHANGED}"
+        )
+    if current_head == expected_head:
+        return None
+    # The two values differ, which is all this tool knows: the file may have
+    # changed, or the value passed may not be the latest headRevisionId this
+    # task has seen (for example the download's, after this tool's own save
+    # moved the head revision).
+    modified = current.get("modifiedTime") or "an unknown time"
+    return (
+        f"Google Drive was not modified: the head revision of '{name}' is "
+        f"{current_head} (last modified {modified}), which does not match "
+        f"expected_head_revision_id {expected_head}. It was not overwritten. "
+        "Either the file changed in Google Drive since this task last "
+        "downloaded or saved it, or the value passed is not the latest "
+        "headRevisionId this task has seen for it. That is the headRevisionId "
+        "that google_drive_download_file returned, unless a successful call "
+        "of this tool in this task saved the file after that download: then "
+        "it is the file.headRevisionId in that call's result. If a different "
+        "value was passed, call again with that one. Do not use the head "
+        "revision shown in this message instead: it is the file's current "
+        "state, which may include someone else's change in Google Drive. If "
+        "the value passed was right, tell the user that the file may have "
+        "changed in Google Drive since this task last downloaded or saved "
+        "it, and offer to download the current version again and redo the "
+        f"edit, or {_UPLOAD_AS_NEW_FILE_OFFER}."
+    )
+
+
+def _unchanged_content_message(
+    name: str, *, current_head: Any, expected_head: str
+) -> str:
+    """The message for a replacement identical to the file's current content.
+
+    Nothing is uploaded, but whether that means the edit is missing depends
+    on how the content got there: an earlier call may already have saved
+    exactly this replacement (a retry after an unclear failure, or a replay),
+    or file_path may point at the original download. A head revision other
+    than the expected one does not tell these apart, since the expected
+    value may itself be wrong or stale.
+    """
+    if expected_head and current_head and current_head == expected_head:
+        return (
+            "Google Drive was NOT modified: the replacement file is identical "
+            f"to the version of '{name}' named by expected_head_revision_id "
+            "(the version downloaded or last saved in this task), so nothing "
+            "was uploaded. Do not report it as updated. If an edited copy was "
+            "meant, check that file_path points to the edited file and not to "
+            "the original download or a copy that was already saved."
+        )
+    if expected_head and current_head:
+        return (
+            f"Google Drive was NOT modified by this call: '{name}' already has "
+            "exactly this content, so nothing was uploaded and nothing was "
+            f"overwritten. Its head revision is now {current_head}, not "
+            f"{expected_head}. If an earlier call in this task uploaded this "
+            "replacement, that save stands: say that the file already has "
+            "this content, without saying that this call saved it. Otherwise "
+            "do not report it as updated: check that file_path points to the "
+            "edited file, not the original download, and that "
+            "expected_head_revision_id is the latest headRevisionId this task "
+            "has seen for the file."
+        )
+    return (
+        f"Google Drive was NOT modified by this call: '{name}' already has "
+        "exactly this content, so nothing was uploaded. If an earlier call in "
+        "this task already uploaded this file, that save stands; otherwise do "
+        "not report it as updated, and check that file_path points to the "
+        "edited file, not the original download."
+    )
+
+
+def _content_update_mismatch(
+    updated: dict[str, Any],
+    previous: dict[str, Any],
+    *,
+    file_id: str,
+    local_md5: str,
+) -> str | None:
+    """Why ``updated`` does not show the uploaded bytes as the new head
+    revision of ``file_id``, or ``None`` when it does.
+
+    The checksum is the evidence, so a reply without one is not confirmed.
+    headRevisionId only changes with the content, while version also counts
+    renames and sharing changes, so each is compared only when Drive
+    returned it on both sides. modifiedTime is not used: a client can set
+    it ahead of Google's clock, and a content update then resets it to the
+    current time.
+    """
+    if updated.get("id") != file_id:
+        return "it returned a different file id"
+    new_md5 = updated.get("md5Checksum")
+    if not isinstance(new_md5, str) or not new_md5:
+        return "it returned no checksum to check"
+    new_md5 = new_md5.lower()
+    if new_md5 != local_md5:
+        return "its checksum does not match the uploaded file"
+
+    old_head = previous.get("headRevisionId")
+    new_head = updated.get("headRevisionId")
+    head_compared = bool(old_head) and bool(new_head)
+    if head_compared and old_head == new_head:
+        return "its head revision did not change"
+    old_version = _as_int(previous.get("version"))
+    new_version = _as_int(updated.get("version"))
+    version_compared = False
+    if old_version is not None and new_version is not None:
+        if new_version <= old_version:
+            return "its version did not advance"
+        version_compared = True
+    old_md5 = previous.get("md5Checksum")
+    md5_changed = (
+        isinstance(old_md5, str) and bool(old_md5) and old_md5.lower() != new_md5
+    )
+    if not (head_compared or version_compared or md5_changed):
+        return "it shows no sign that the content changed"
+    return None
+
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=True))
+def google_drive_update_file_content(
+    file_id: str,
+    file_path: str,
+    mime_type: str = "",
+    expected_head_revision_id: str = "",
+) -> str:
+    """
+    Replace the content of an existing Google Drive file with a local file.
+    The file keeps its id, link, sharing and version history; no second file
+    is created. Use it to save an edited .pptx, .xlsx, .docx, .pdf, image or
+    other stored file. Google Docs, Sheets and Slides, folders and shortcuts
+    are refused. To add a new file, use google_drive_upload_file.
+
+    file_id: the Drive file to overwrite (a Drive id or link), never a
+    workspace file id.
+    file_path: the replacement: an absolute path in the task workspace, or
+    file:<id> for a file registered in this task (not a Drive id). If it
+    cannot be found, do not rebuild the file without asking the user.
+    mime_type: optional; defaults to the file's current type, and a
+    different type is refused.
+    expected_head_revision_id: the latest headRevisionId this task has seen
+    for the file, from google_drive_download_file or, once this tool saved
+    it, from that save's result. Pass it whenever the file was downloaded
+    and edited in this task; the call is refused if the file has changed
+    since then.
+
+    Confirm with the user before calling: name the file (name and link), say
+    that its content will be replaced for everyone with access to it, and
+    attach the replacement. Do not promise that the old version can always
+    be restored. If approval may come in a later turn, end the confirmation
+    with the Drive file id, the replacement's file:<id> and the
+    headRevisionId, and call with exactly those.
+
+    "status" is "success" (uploaded and checked), "unchanged" (Drive already
+    had this content; nothing was uploaded) or "error" (the message says
+    whether anything changed).
+    """
+    update_sent = False
+    try:
+        try:
+            resolved_file_id, resource_key = _validated_content_update_target(file_id)
+            requested_mime_type = _validated_content_mime_type(mime_type)
+            expected_head = _validated_expected_head_revision_id(
+                expected_head_revision_id
+            )
+        except ValueError as exc:
+            return _content_update_error(_then_nothing_changed(exc))
+
+        # The upload tool's path guard, unchanged: containment before
+        # existence, with no host path in the message.
+        try:
+            local_path = _resolve_upload_file_path(file_path)
+        except (PermissionError, FileNotFoundError, ValueError) as exc:
+            return _content_update_error(
+                f"{_then_nothing_changed(exc)} {_EARLIER_TURN_HINT}"
+            )
+
+        try:
+            fh_ctx = local_path.open("rb")
+        except OSError as exc:
+            # str(OSError) embeds the absolute host path; see the matching
+            # note in google_drive_upload_file.
+            logger.warning("Failed to open replacement file %s: %s", local_path, exc)
+            return _content_update_error(
+                "Could not read the file at the given path. "
+                f"{_NOTHING_CHANGED} {_EARLIER_TURN_HINT}"
+            )
+        with fh_ctx as fh:
+            # Size comes from the handle that is read and uploaded, as in
+            # google_drive_upload_file.
+            local_size = os.fstat(fh.fileno()).st_size
+            if local_size == 0:
+                return _content_update_error(
+                    f"File is empty: {file_path}. {_NOTHING_CHANGED}"
+                )
+            if local_size > _MAX_CONTENT_UPDATE_BYTES:
+                return _content_update_error(
+                    f"The replacement file is {local_size} bytes, larger than "
+                    f"this connector's {_MAX_CONTENT_UPDATE_BYTES}-byte limit "
+                    "for replacing a file's content (a safety limit, not a "
+                    f"Google Drive limit). {_NOTHING_CHANGED}"
+                )
+            simple_upload = local_size <= _SIMPLE_UPLOAD_MAX_BYTES
+            try:
+                # A simple upload sends the bytes in one request, so keep the
+                # exact bytes that were hashed; a resumable upload reads the
+                # file again one chunk at a time instead of holding it in
+                # memory, and checks each chunk against the hash pass.
+                local_md5, local_bytes, block_digests = _hash_replacement_file(
+                    fh, local_size, keep_bytes=simple_upload
+                )
+            except ValueError as exc:
+                return _content_update_error(_then_nothing_changed(exc))
+            except OSError as exc:
+                logger.warning(
+                    "Failed to read replacement file %s: %s", local_path, exc
+                )
+                return _content_update_error(
+                    f"Could not read the file at the given path. {_NOTHING_CHANGED}"
+                )
+
+            service = get_drive_service()
+            get_request = service.files().get(
+                fileId=resolved_file_id,
+                supportsAllDrives=True,
+                fields=_CONTENT_UPDATE_GET_FIELDS,
+            )
+            _attach_resource_key(get_request, resolved_file_id, resource_key)
+            try:
+                current = get_request.execute()
+            except Exception as exc:
+                logger.error(f"Error updating file content: {exc}")
+                if is_google_file_unavailable_error(exc):
+                    return _content_update_error(
+                        _unavailable_content_update_message(exc)
+                    )
+                return _content_update_error(
+                    "Could not read the Google Drive file before replacing its "
+                    f"content. {_NOTHING_CHANGED} {_content_error_detail(exc)}"
+                )
+            if not isinstance(current, dict):
+                raise RuntimeError("Drive returned an invalid file response")
+            current_id = current.get("id")
+            if isinstance(current_id, str) and current_id:
+                resolved_file_id = current_id
+            name = str(current.get("name") or resolved_file_id)
+            current_summary = _content_summary(current)
+
+            refusal = _content_update_refusal(
+                current,
+                name,
+                requested_mime_type=requested_mime_type,
+                local_name=local_path.name,
+            )
+            if refusal is not None:
+                return _content_update_error(refusal, file=current_summary)
+            stored_mime_type = _normalize_mime_type(str(current.get("mimeType") or ""))
+
+            # Identical content is checked before the head revision: when
+            # Drive already holds exactly these bytes nothing would be
+            # overwritten, and a repeat of a call that already succeeded
+            # (which moved the head revision) is not a conflict.
+            current_md5 = current.get("md5Checksum")
+            current_size = _as_int(current.get("size"))
+            if (
+                isinstance(current_md5, str)
+                and current_md5.lower() == local_md5
+                and current_size in (None, local_size)
+            ):
+                return json.dumps(
+                    {
+                        "status": "unchanged",
+                        "changed": False,
+                        "message": _unchanged_content_message(
+                            name,
+                            current_head=current.get("headRevisionId"),
+                            expected_head=expected_head,
+                        ),
+                        "file": current_summary,
+                    },
+                    ensure_ascii=False,
+                )
+            conflict = _content_update_conflict(
+                current, name, expected_head=expected_head
+            )
+            if conflict is not None:
+                return _content_update_error(conflict, file=current_summary)
+
+            # No body: a metadata body (even an empty one) turns this into a
+            # multipart upload. Leaving it out keeps the name, parents and
+            # description exactly as they are.
+            upload_mime_type = requested_mime_type or stored_mime_type or _OCTET_STREAM
+            media: _ChunkBytesUpload
+            if local_bytes is not None:
+                media = _ChunkBytesUpload(
+                    io.BytesIO(local_bytes), mimetype=upload_mime_type, resumable=False
+                )
+            else:
+                media = _VerifiedChunkUpload(
+                    fh,
+                    size=local_size,
+                    block_digests=block_digests,
+                    mimetype=upload_mime_type,
+                    chunksize=_RESUMABLE_CHUNK_BYTES,
+                    resumable=True,
+                )
+            update_request = service.files().update(
+                fileId=resolved_file_id,
+                media_body=media,
+                supportsAllDrives=True,
+                fields=_CONTENT_UPDATE_RESULT_FIELDS,
+            )
+            _attach_resource_key(update_request, resolved_file_id, resource_key)
+            attempts = _UpdateAttempts(update_request.http)
+            update_sent = True
+            try:
+                updated = update_request.execute(
+                    http=attempts, num_retries=_CONTENT_UPDATE_NUM_RETRIES
+                )
+            except _ReplacementChangedError:
+                # Raised while reading a chunk, before it is sent, and Drive
+                # stores nothing until the last chunk arrives.
+                return _content_update_error(
+                    "The local file changed while it was being uploaded, so "
+                    "the upload was stopped before it completed and Google "
+                    "Drive kept the file as it was. Finish writing the "
+                    "replacement file before calling this tool. "
+                    f"{_NOTHING_CHANGED}",
+                    file=current_summary,
+                )
+            except Exception as exc:
+                logger.error(f"Error updating file content: {exc}")
+                unchanged_file = reread_error = None
+                if _is_content_rejection(exc) and not attempts.unclear:
+                    unchanged_file, reread_error = _reread_unchanged_file(
+                        service, resolved_file_id, resource_key, current
+                    )
+                return _content_update_request_error(
+                    exc,
+                    name,
+                    current_summary,
+                    earlier_attempt_unclear=attempts.unclear,
+                    unchanged_file=unchanged_file,
+                    reread_error=reread_error,
+                )
+
+        if not isinstance(updated, dict):
+            updated = {}
+        mismatch = _content_update_mismatch(
+            updated,
+            current,
+            file_id=resolved_file_id,
+            local_md5=local_md5,
+        )
+        if mismatch is not None:
+            return _content_update_error(
+                f"Google Drive accepted the upload for '{name}', but the file it "
+                f"returned does not confirm the new content ({mismatch}). Do "
+                "not report this as done; ask the user to check the file's "
+                "version history in Google Drive.",
+                file=_content_summary(updated),
+                previous=current_summary,
+            )
+
+        message = (
+            f"Replaced the content of '{name}' in Google Drive. Its id, link "
+            "and sharing are unchanged. Google Drive keeps the previous version "
+            "in the file's version history only for a limited time (about 30 "
+            "days unless it is kept forever)."
+        )
+        # Drive does not set "shared" for a file in a shared drive, whose
+        # members all see it.
+        if current.get("driveId"):
+            message += (
+                " It is in a shared drive, so everyone with access to it, "
+                "including the drive's members, now sees the new content."
+            )
+        elif current.get("shared"):
+            message += (
+                " It is shared, so everyone with access now sees the new content."
+            )
+        updated_mime_type = _normalize_mime_type(str(updated.get("mimeType") or ""))
+        if (
+            stored_mime_type
+            and updated_mime_type
+            and updated_mime_type != stored_mime_type
+        ):
+            message += (
+                f" Its type changed from '{stored_mime_type}' to '{updated_mime_type}'."
+            )
+        return json.dumps(
+            {
+                "status": "success",
+                "changed": True,
+                "message": message,
+                "file": _content_summary(updated),
+                "previous": current_summary,
+            },
+            ensure_ascii=False,
+        )
+    except Exception as e:
+        logger.error(f"Error updating file content: {e}")
+        if update_sent:
+            return _content_update_error(
+                "The update was sent to Google Drive, but its result could not "
+                f"be checked ({e}), so it is not known whether the file changed. "
+                "Do not report it as updated; ask the user to check its version "
+                "history in Google Drive."
+            )
+        return _content_update_error(_then_nothing_changed(e))
 
 
 @mcp.tool()
