@@ -17,11 +17,13 @@ from pydantic import BaseModel, ConfigDict
 
 from xagent.core.agent.context.execution import ExecutionContext
 from xagent.core.model.chat.basic.base import BaseLLM
+from xagent.core.model.chat.basic.call_boundary import classify_provider_failure
 from xagent.core.model.chat.basic.openai import (
     PROVIDER_STATE_METADATA_KEY,
     OpenAILLM,
     _format_openai_error,
     _model_provider_error,
+    _provider_failure_kind,
     field_content,
 )
 from xagent.core.model.chat.error import retry_on
@@ -3084,8 +3086,6 @@ def _status_error(
     error_class: type[openai.APIStatusError],
     status: int,
     body: object,
-    *,
-    message: str | None = None,
 ) -> openai.APIStatusError:
     """An SDK status error built the way the SDK builds one.
 
@@ -3094,7 +3094,7 @@ def _status_error(
     ``"Error code: NNN - ..."`` text.
     """
     return error_class(
-        message or f"Error code: {status} - {body}",
+        f"Error code: {status} - {body}",
         response=httpx.Response(status, request=_PROVIDER_REQUEST),
         body=body,
     )
@@ -3307,6 +3307,44 @@ class TestModelProviderError:
         assert re.search(r"\.\.\.<truncated \d+ chars>$", str(exc))
         assert exc.status_code == 503
 
+    def test_an_oversized_body_message_is_capped_in_provider_message(self):
+        error = _status_error(openai.InternalServerError, 503, {"message": "x" * 5000})
+
+        exc = _model_provider_error("OpenAI API error", error)
+
+        assert exc.provider_message is not None
+        assert re.search(r"\.\.\.<truncated \d+ chars>$", exc.provider_message)
+        assert len(exc.provider_message) < 4100
+
+    def test_format_openai_error_text_is_exact_with_and_without_status(self):
+        with_status = _status_error(
+            openai.PermissionDeniedError,
+            403,
+            {
+                "message": "Model is decommissioned",
+                "metadata": {"provider_name": "upstream-a", "raw": "raw body"},
+            },
+        )
+        without_status = openai.APIError(
+            "stream broke", request=_PROVIDER_REQUEST, body=None
+        )
+
+        assert _format_openai_error("OpenAI API error", with_status) == (
+            "OpenAI API error (403): Error code: 403 - {'message': "
+            "'Model is decommissioned', 'metadata': {'provider_name': 'upstream-a', "
+            "'raw': 'raw body'}} | provider_name=upstream-a | provider_raw=raw body"
+        )
+        assert _format_openai_error("OpenAI API error", without_status) == (
+            "OpenAI API error: stream broke"
+        )
+        # The raw status attribute is printed as received; validation of the
+        # status belongs to the typed exception, not to this text.
+        raw_status = openai.APIError("odd", request=_PROVIDER_REQUEST, body=None)
+        raw_status.status_code = 999  # type: ignore[attr-defined]
+        assert _format_openai_error("OpenAI API error", raw_status) == (
+            "OpenAI API error (999): odd"
+        )
+
     @pytest.mark.asyncio
     async def test_diagnostic_suffixes_are_kept_in_details_and_text(
         self, openai_llm_config, mocker
@@ -3506,6 +3544,58 @@ class TestModelProviderErrorFactory:
 
         assert exc.kind == kind
         assert exc.status_code == status
+
+    @pytest.mark.parametrize(
+        ("build", "kind", "boundary_code"),
+        [
+            (
+                lambda: _status_error(
+                    openai.AuthenticationError, 401, {"message": "m"}
+                ),
+                "authentication_failed",
+                "credential_rejected",
+            ),
+            (
+                lambda: _status_error(
+                    openai.PermissionDeniedError, 403, {"message": "m"}
+                ),
+                "access_denied",
+                "credential_rejected",
+            ),
+            (
+                lambda: _status_error(openai.NotFoundError, 404, {"message": "m"}),
+                "not_found",
+                "model_not_available",
+            ),
+            (
+                lambda: _status_error(openai.APIStatusError, 402, {"message": "m"}),
+                "rejected",
+                "provider_quota",
+            ),
+            (
+                lambda: _status_error(
+                    openai.InternalServerError, 503, {"message": "m"}
+                ),
+                "server_error",
+                "provider_unavailable",
+            ),
+            (
+                lambda: openai.APIConnectionError(request=_PROVIDER_REQUEST),
+                "connection_failed",
+                "provider_unavailable",
+            ),
+        ],
+        ids=["401", "403", "404", "402", "503", "connection"],
+    )
+    def test_the_failure_kind_is_distinct_from_the_call_boundary_code(
+        self, build, kind, boundary_code
+    ):
+        error = build()
+
+        assert (
+            _provider_failure_kind(error, getattr(error, "status_code", None)) == kind
+        )
+        assert classify_provider_failure(error) == boundary_code
 
     def test_an_error_without_a_status_is_unknown(self):
         error = openai.APIError("stream broke", request=_PROVIDER_REQUEST, body=None)

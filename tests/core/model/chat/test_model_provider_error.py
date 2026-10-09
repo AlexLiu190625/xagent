@@ -73,10 +73,10 @@ def test_text_covers_every_status_and_details_combination(
     assert exc.args == (expected,)
 
 
-def test_public_fields_is_a_literal_dict_and_a_fresh_object_each_call():
+def test_structured_fields_is_a_literal_dict_and_a_fresh_object_each_call():
     exc = _error()
 
-    first = exc.public_fields()
+    first = exc.structured_fields()
     assert first == {
         "kind": "access_denied",
         "status_code": 403,
@@ -85,7 +85,7 @@ def test_public_fields_is_a_literal_dict_and_a_fresh_object_each_call():
     }
 
     first["kind"] = "tampered"
-    second = exc.public_fields()
+    second = exc.structured_fields()
     assert second is not first
     assert second["kind"] == "access_denied"
 

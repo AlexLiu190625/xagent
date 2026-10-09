@@ -114,18 +114,39 @@ MODEL_PROVIDER_FAILURE_KINDS = frozenset(
 )
 
 
+def format_model_provider_error(
+    prefix: str,
+    status_code: object | None,
+    message: str,
+    details: list[str],
+) -> str:
+    """The text of a provider failure.
+
+    ``"<prefix> (<status_code>): <message>"``, or ``"<prefix>: <message>"``
+    when ``status_code`` is ``None``, followed by ``" | "`` and the ``details``
+    joined with ``" | "`` when ``details`` is not empty.
+    """
+    text = prefix
+    if status_code is not None:
+        text = f"{text} ({status_code})"
+    text = f"{text}: {message}"
+    if details:
+        text = f"{text} | " + " | ".join(details)
+    return text
+
+
 class ModelProviderError(RuntimeError):
     """The model provider rejected or failed a request; the response survives as fields.
 
     Fields: ``prefix``, ``kind`` (one of ``MODEL_PROVIDER_FAILURE_KINDS``),
     ``status_code`` (``int | None``), ``provider_code`` (``str | None``),
-    ``provider_message`` (``str | None``, the error body's own ``message``),
-    ``sdk_message`` (``str``, the SDK exception's message, capped) and
-    ``details`` (``list[str]``, the diagnostic suffixes the adapter builds).
+    ``provider_message`` (``str | None``, the error body's own ``message``,
+    capped), ``sdk_message`` (``str``, the SDK exception's message, capped)
+    and ``details`` (``list[str]``, the diagnostic suffixes the adapter
+    builds).
 
-    ``str()`` is ``"<prefix> (<status_code>): <sdk_message> | <details...>"``;
-    the ``" (<status_code>)"`` part is omitted when ``status_code`` is ``None``
-    and the ``" | ..."`` part is omitted when ``details`` is empty.
+    ``str()`` is :func:`format_model_provider_error` applied to ``prefix``,
+    ``status_code``, ``sdk_message`` and ``details``.
 
     Not retryable by class: the retry predicate reads ``__cause__``, which
     every raise site sets. Use :class:`ModelProviderRetryableError` where the
@@ -150,19 +171,18 @@ class ModelProviderError(RuntimeError):
         self.provider_message = provider_message
         self.sdk_message = sdk_message
         self.details = list(details)
-        text = prefix
-        if status_code is not None:
-            text = f"{text} ({status_code})"
-        text = f"{text}: {sdk_message}"
-        if self.details:
-            text = f"{text} | " + " | ".join(self.details)
-        super().__init__(text)
+        super().__init__(
+            format_model_provider_error(prefix, status_code, sdk_message, self.details)
+        )
 
-    def public_fields(self) -> dict[str, Any]:
+    def structured_fields(self) -> dict[str, Any]:
         """``kind``, ``status_code``, ``provider_code`` and ``message`` as a new dict.
 
-        ``message`` is ``provider_message``; ``prefix``, ``sdk_message`` and
-        ``details`` are deliberately left out.
+        ``message`` is ``provider_message``: the provider's own text as
+        received (capped), not rewritten for any audience. It is not
+        client-safe by itself, so every surface shown to an end user or to
+        another party must pass it through the web-layer projection first.
+        ``prefix``, ``sdk_message`` and ``details`` are deliberately left out.
         """
         return {
             "kind": self.kind,

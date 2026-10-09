@@ -21,12 +21,12 @@ from openai import AsyncOpenAI
 from ....runtime_performance import run_in_thread_with_telemetry
 from ....utils.security import redact_sensitive_text
 from ..exceptions import (
-    MODEL_PROVIDER_FAILURE_KINDS,
     LLMEmptyContentError,
     LLMRetryableError,
     LLMTimeoutError,
     ModelProviderError,
     ModelProviderRetryableError,
+    format_model_provider_error,
 )
 from ..stream_progress import (
     NO_PROGRESS_FINISH_REASON,
@@ -229,17 +229,12 @@ def _degrade_rejected_params(
 
 
 def _format_openai_error(prefix: str, error: BaseException) -> str:
-    message = str(getattr(error, "message", None) or error)
-    status_code = getattr(error, "status_code", None)
-    if status_code is not None:
-        formatted = f"{prefix} ({status_code}): {message}"
-    else:
-        formatted = f"{prefix}: {message}"
-
-    details = _openai_error_details(error)
-    if details:
-        formatted = f"{formatted} | " + " | ".join(details)
-    return formatted
+    return format_model_provider_error(
+        prefix,
+        getattr(error, "status_code", None),
+        str(getattr(error, "message", None) or error),
+        _openai_error_details(error),
+    )
 
 
 def _provider_failure_kind(error: BaseException, status_code: int | None) -> str:
@@ -248,6 +243,15 @@ def _provider_failure_kind(error: BaseException, status_code: int | None) -> str
     The class is checked first: ``APITimeoutError`` is an
     ``APIConnectionError``, and neither carries a status. No message text is
     read.
+
+    The kind is derived from the exception class and the HTTP status alone,
+    and the vocabulary is deliberately distinct from ``classify_provider_failure``
+    in ``call_boundary.py``. That classifier folds 401 and 403 into one
+    credential code, so a decommissioned-model 403 would read as a rejected
+    credential; it also reads message text markers, and its vocabulary
+    (``PROVIDER_CALL_FAILURE_CODES``) carries codes no provider returns, such
+    as ``call_scope_unavailable``. Here 401 and 403 stay separate kinds and
+    the message never influences the result.
     """
     if isinstance(error, openai.APITimeoutError):
         return "timeout"
@@ -290,8 +294,9 @@ def _model_provider_error(
     """The typed exception for a provider failure; never raises.
 
     Each field is extracted under its own guard, so one failing accessor
-    leaves the others intact. The text is the one ``_format_openai_error``
-    builds for the same ``prefix`` and ``error``.
+    leaves the others intact. The text has the same shape as
+    ``_format_openai_error``'s and is built by the same formatter, with the SDK
+    message capped and a non-integer or out-of-range status omitted.
     """
 
     def status_code_of() -> int | None:
@@ -301,7 +306,9 @@ def _model_provider_error(
     def provider_message_of() -> str | None:
         payload = _openai_error_payload(error)
         value = payload.get("message") if payload is not None else None
-        return value if type(value) is str and value.strip() else None
+        if type(value) is str and value.strip():
+            return _truncate_error_detail(value)
+        return None
 
     def sdk_message_of() -> str:
         return _truncate_error_detail(str(getattr(error, "message", None) or error))
@@ -314,8 +321,6 @@ def _model_provider_error(
 
     status_code = _guarded(status_code_of, None)
     kind = _guarded(lambda: _provider_failure_kind(error, status_code), "unknown")
-    if kind not in MODEL_PROVIDER_FAILURE_KINDS:
-        kind = "unknown"
     cls = ModelProviderRetryableError if retryable else ModelProviderError
     return cls(
         prefix=prefix,
