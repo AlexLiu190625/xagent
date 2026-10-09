@@ -314,3 +314,47 @@ async def test_drive_path_fields_say_they_are_not_workspace_paths(
         assert "not a local task-workspace path" in description, key
         # The adapter clips a longer description before the model sees it.
         assert len(description) <= _FIELD_TEXT_MAX_CHARS, key
+
+
+@pytest.mark.parametrize("value", [[], None], ids=["empty", "null"])
+def test_onedrive_search_miss_points_at_listing_the_folder(monkeypatch, value):
+    # In #2875 search returned no items for a file at the drive root, and the
+    # agent guessed a folder instead of listing one.
+    _patch_onedrive(monkeypatch, _Response({"value": value}))
+
+    result = json.loads(onedrive.onedrive_search_files("August2026.pptx"))
+
+    assert result["status"] == "success"
+    assert result["items"] == value
+    assert "can miss existing items" in result["hint"]
+    assert "onedrive_list_items" in result["hint"]
+
+
+def test_onedrive_search_hit_gets_no_hint(monkeypatch):
+    item = {"id": "1", "name": "deck.pptx"}
+    _patch_onedrive(monkeypatch, _Response({"value": [item]}))
+
+    result = json.loads(onedrive.onedrive_search_files("deck.pptx"))
+
+    assert result == {"status": "success", "items": [item]}
+
+
+async def test_onedrive_search_description_points_at_listing_the_folder():
+    tools = {tool.name: tool for tool in await onedrive.mcp.list_tools()}
+    description = tools["onedrive_search_files"].description
+
+    assert "can miss" in description
+    assert "onedrive_list_items" in description
+
+
+async def test_onedrive_download_prefers_editing_office_files_in_place():
+    # In #2875 the agent downloaded a deck and edited a local copy instead of
+    # calling the PowerPoint connector on the drive path it had just used.
+    tools = {tool.name: tool for tool in await onedrive.mcp.list_tools()}
+    description = tools["onedrive_download_file"].description
+
+    for prefix in ("powerpoint_", "word_", "excel_"):
+        assert prefix in description
+    assert "in place" in description
+    # The old wording recommended this tool for Office files to be edited.
+    assert "intended for Office files" not in description

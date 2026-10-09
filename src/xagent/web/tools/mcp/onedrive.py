@@ -90,6 +90,14 @@ _PATH_NOT_FOUND_HINT = (
     "with onedrive_list_items (omit folder_path for the root) to get the exact "
     "path."
 )
+# Returned with an empty search result. Search missed an existing root-level
+# file in #2875, and it cannot be relied on to locate an item.
+_SEARCH_MISS_HINT = (
+    "No items matched. onedrive_search_files can miss existing items, even "
+    "by their exact name. Before guessing a path, list the parent folder "
+    "with onedrive_list_items (omit folder_path for the root) to get the "
+    "exact path."
+)
 _DriveFilePath = Annotated[
     str,
     Field(
@@ -1269,7 +1277,11 @@ def onedrive_list_items(
 
 @mcp.tool()
 def onedrive_search_files(query: str, top: int = 25) -> str:
-    """Search files and folders in OneDrive by keyword."""
+    """Search files and folders in OneDrive by keyword.
+
+    Search can miss existing items. To find a file's exact path, list its
+    folder with onedrive_list_items instead of guessing one.
+    """
     try:
         if not query.strip():
             raise ValueError("query is required")
@@ -1279,7 +1291,10 @@ def onedrive_search_files(query: str, top: int = 25) -> str:
             f"/me/drive/root/search(q='{quote(escaped_query, safe='')}')",
             params={"$top": max(1, min(top, 100))},
         )
-        return _success(items=_caller_safe_drive_item(result.get("value", [])))
+        items = _caller_safe_drive_item(result.get("value", []))
+        if not items:
+            return _success(items=items, hint=_SEARCH_MISS_HINT)
+        return _success(items=items)
     except Exception as e:
         logger.error("Error searching OneDrive files: %s", e)
         return _error(str(e))
@@ -1338,12 +1353,17 @@ def onedrive_get_file_content(file_path: _DriveFilePath) -> str:
 def onedrive_download_file(file_path: _DriveFilePath, filename: str = "") -> str:
     """Download a OneDrive binary file into the current task workspace.
 
-    This tool is intended for Office files and other binary content that must
-    be passed to another connector or edited in a later turn. It writes a real
-    local file under the task's ``output/`` directory, enforces the download
-    limit, verifies available Graph metadata hashes, and computes its SHA-256
-    plus a workspace path. The MCP host also registers that path as a durable
-    FileRef before exposing the result to the agent.
+    This tool is intended for binary content that must be passed to another
+    connector or processed locally. To change a .pptx, .docx or .xlsx that
+    stays in OneDrive, edit it in place with the powerpoint_*, word_* or
+    excel_* tools when that connector is enabled; they take the same
+    drive-relative file_path. Download it for editing only when no such
+    connector can make the change.
+
+    It writes a real local file under the task's ``output/`` directory,
+    enforces the download limit, verifies available Graph metadata hashes, and
+    computes its SHA-256 plus a workspace path. The MCP host also registers
+    that path as a durable FileRef before exposing the result to the agent.
     """
     temporary_path: Path | None = None
     try:
