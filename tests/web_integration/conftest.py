@@ -6,6 +6,7 @@ This module provides common fixtures used across all E2E web integration tests.
 
 import os
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,9 @@ from tests.shared.auth_database import auth_db_override
 from xagent.core.model.embedding.base import BaseEmbedding
 from xagent.core.model.model import EmbeddingModelConfig
 from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
+    milvus_collection_name,
+)
 from xagent.web.api.auth import hash_password
 from xagent.web.api.kb import kb_router
 from xagent.web.models.auth_database import get_auth_db
@@ -56,6 +60,9 @@ class _StubEmbeddingAdapter(BaseEmbedding):
         return ["embedding"]
 
 
+STUB_EMBEDDING_MODEL_ID = "e2e-test-embedding"
+
+
 @pytest.fixture
 def stub_embedding_config() -> EmbeddingModelConfig:
     """Create stub embedding configuration for E2E tests.
@@ -65,11 +72,37 @@ def stub_embedding_config() -> EmbeddingModelConfig:
     their own stub_embedding_config fixture.
     """
     return EmbeddingModelConfig(
-        id="e2e-test-embedding",
+        id=STUB_EMBEDDING_MODEL_ID,
         model_name="e2e-test-embedding-model",
         model_provider="test",
         dimension=2,
     )
+
+
+@pytest.fixture(scope="module")
+def _drop_stub_milvus_collection() -> Iterator[None]:
+    """Keep the stub model's Milvus collection from outliving the module."""
+    yield
+    if uri := os.environ.get("MILVUS_URI"):
+        from pymilvus import MilvusClient
+
+        client = MilvusClient(uri=uri)
+        name = milvus_collection_name(STUB_EMBEDDING_MODEL_ID)
+        if client.has_collection(name):
+            client.drop_collection(name)
+
+
+@pytest.fixture(
+    params=["lancedb", pytest.param("milvus", marks=pytest.mark.milvus)],
+)
+def kb_engine(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    _drop_stub_milvus_collection: None,
+) -> str:
+    """Run the requesting module once per KB engine; the Milvus run needs MILVUS_URI."""
+    monkeypatch.setenv("XAGENT_VECTOR_BACKEND", request.param)
+    return str(request.param)
 
 
 # Provide a non-autouse version that test files can explicitly depend on
@@ -118,6 +151,11 @@ def _setup_rag_mocks(
         pipelines_module.document_ingestion,
         "_resolve_embedding_adapter",
         lambda cfg: (stub_embedding_config, stub_embedding_adapter),
+    )
+    monkeypatch.setattr(
+        pipelines_module.document_search,
+        "resolve_embedding_adapter",
+        mock_resolve_embedding_adapter,
     )
 
 

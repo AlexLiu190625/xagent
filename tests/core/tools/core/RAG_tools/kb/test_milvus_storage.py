@@ -63,11 +63,7 @@ def models(client: Any) -> Iterator[tuple[str, str]]:
 
 @pytest.fixture
 def milvus_deployment(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stand in for #2870, which lets the milvus setting start."""
     monkeypatch.setenv("XAGENT_VECTOR_BACKEND", "milvus")
-    monkeypatch.setattr(
-        collection_handle, "require_implemented_vector_backend", lambda _: None
-    )
 
 
 def _open(collection: str) -> KBCollectionHandle:

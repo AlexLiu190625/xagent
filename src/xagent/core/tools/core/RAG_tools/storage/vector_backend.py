@@ -88,11 +88,11 @@ def require_implemented_vector_backend(backend: VectorBackend) -> None:
     Raises:
         ConfigurationError: If the backend is known but not implemented yet.
     """
-    if backend is VectorBackend.LANCEDB:
+    if backend in (VectorBackend.LANCEDB, VectorBackend.MILVUS):
         return
     raise ConfigurationError(
         f"KB engine {backend.value!r} is not implemented yet. "
-        f"Set {VECTOR_BACKEND_ENV}=lancedb (default)."
+        f"Set {VECTOR_BACKEND_ENV} to lancedb (default) or milvus."
     )
 
 

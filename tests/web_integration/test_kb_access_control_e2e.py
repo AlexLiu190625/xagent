@@ -18,7 +18,11 @@ from fastapi.testclient import TestClient
 
 from tests.web_integration.http_helpers import http_detail
 
-pytestmark = [pytest.mark.e2e, pytest.mark.contract_stub]
+pytestmark = [
+    pytest.mark.e2e,
+    pytest.mark.contract_stub,
+    pytest.mark.usefixtures("kb_engine"),
+]
 
 
 def _register_and_login(

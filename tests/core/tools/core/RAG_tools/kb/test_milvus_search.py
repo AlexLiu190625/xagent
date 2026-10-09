@@ -94,11 +94,7 @@ def model(client: Any) -> Iterator[str]:
 
 @pytest.fixture(autouse=True)
 def milvus_deployment(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stand in for #2870, which lets the milvus setting start."""
     monkeypatch.setenv("XAGENT_VECTOR_BACKEND", "milvus")
-    monkeypatch.setattr(
-        collection_handle, "require_implemented_vector_backend", lambda _: None
-    )
 
 
 @pytest.fixture

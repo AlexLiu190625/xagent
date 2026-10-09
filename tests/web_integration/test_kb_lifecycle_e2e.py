@@ -18,7 +18,14 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-pytestmark = [pytest.mark.e2e, pytest.mark.contract_stub]
+from tests.web_integration.http_helpers import eventually, http_detail
+from xagent.core.tools.core.RAG_tools.kb.collection_handle import deployment_kb_backend
+
+pytestmark = [
+    pytest.mark.e2e,
+    pytest.mark.contract_stub,
+    pytest.mark.usefixtures("kb_engine"),
+]
 
 
 def _log(msg: str) -> None:
@@ -123,6 +130,59 @@ class TestKBLifecycleE2E:
         assert delete_doc_response.status_code == 200
         _log(f"Delete response status: {delete_doc_response.status_code}")
         _log("=== END test_complete_kb_lifecycle_single_document ===\n")
+
+    @pytest.mark.e2e
+    @pytest.mark.slow
+    def test_search_stops_finding_a_deleted_document_and_keeps_the_others(
+        self,
+        client: TestClient,
+        auth_headers: dict[str, str],
+        sample_lifecycle_files: tuple[dict[str, str], str],
+        kb_engine: str,
+    ):
+        """Keyword search finds each ingested text; a delete removes only its own."""
+        assert deployment_kb_backend().value == kb_engine
+        files, _ = sample_lifecycle_files
+        collection_name = "e2e_lifecycle_search"
+        for filename in ("document1.txt", "document2.md"):
+            with open(files[filename], "rb") as f:
+                ingest_response = client.post(
+                    "/api/kb/ingest",
+                    files={"file": (filename, f, "text/plain")},
+                    data={"collection": collection_name},
+                    headers=auth_headers,
+                )
+            assert ingest_response.status_code == 200
+            assert ingest_response.json()["status"] == "success"
+
+        def found(query: str) -> list[str]:
+            response = client.post(
+                "/api/kb/search",
+                data={
+                    "collection": collection_name,
+                    "query_text": query,
+                    "embedding_model_id": "e2e-test-embedding",
+                    "search_type": "sparse",
+                },
+                headers=auth_headers,
+            )
+            assert response.status_code == 200, http_detail(response)
+            assert response.json()["status"] == "success", http_detail(response)
+            return [hit["text"] for hit in response.json()["results"]]
+
+        eventually(lambda: bool(found("important information")))
+        eventually(lambda: bool(found("markdown document")))
+        assert found("important information") == [
+            "First document with important information about testing."
+        ]
+
+        delete_response = client.delete(
+            f"/api/kb/collections/{collection_name}/documents/document1.txt",
+            headers=auth_headers,
+        )
+        assert delete_response.status_code == 200
+        eventually(lambda: not found("important information"))
+        assert found("markdown document")
 
     @pytest.mark.e2e
     @pytest.mark.slow

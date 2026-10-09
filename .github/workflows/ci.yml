@@ -743,7 +743,6 @@ jobs:
     needs: [changes, pre-commit]
     env:
       MILVUS_URI: http://localhost:19530
-      MILVUS_VERSION: v2.6.25
       XAGENT_REQUIRE_MILVUS: "1"
 
     steps:
@@ -760,11 +759,14 @@ jobs:
         shell: bash
         run: |
           set -e
-          compose="$RUNNER_TEMP/milvus-standalone.yml"
-          curl -fsSL --retry 3 --retry-all-errors --retry-delay 5 -o "$compose" \
-            "https://github.com/milvus-io/milvus/releases/download/${MILVUS_VERSION}/milvus-standalone-docker-compose.yml"
-          docker compose -f "$compose" config --images | xargs .github/scripts/docker-pull-retry.sh
-          docker compose -f "$compose" up -d --wait --wait-timeout 300
+          # The base file's env_file needs .env while Compose loads it; tests must not see it.
+          touch .env
+          trap 'rm -f .env' EXIT
+          printf 'services:\n  milvus:\n    ports:\n      - "19530:19530"\n' > "$RUNNER_TEMP/milvus-ports.yml"
+          export COMPOSE_FILE="docker-compose.yml:docker/docker-compose.milvus.yml:$RUNNER_TEMP/milvus-ports.yml"
+          echo "COMPOSE_FILE=$COMPOSE_FILE" >> "$GITHUB_ENV"
+          docker compose config --images milvus | xargs .github/scripts/docker-pull-retry.sh
+          docker compose up -d --wait --wait-timeout 300 milvus
 
       - name: Ensure uv is available
         if: needs.changes.outputs.code == 'true'
@@ -797,12 +799,14 @@ jobs:
         shell: bash
         run: |
           set -e
-          python3 -m uv run python -m pytest tests/core/tools/core/RAG_tools tests/web/api/test_kb_milvus_rollback.py -m milvus -v
+          python3 -m uv run python -m pytest tests/core/tools/core/RAG_tools tests/web/api/test_kb_milvus_rollback.py tests/web_integration -m milvus -v
 
       - name: Show Milvus logs
         if: needs.changes.outputs.code == 'true' && failure()
         shell: bash
-        run: docker compose -f "$RUNNER_TEMP/milvus-standalone.yml" logs --tail 200
+        run: |
+          touch .env
+          docker compose logs --tail 200 milvus-etcd milvus-minio milvus
 
   e2e:
     name: e2e (${{ matrix.shard }})

@@ -218,9 +218,8 @@ def test_lancedb_list_stats_are_one_global_aggregate() -> None:
         ) == store.aggregate_collection_stats(user_id=user_id, is_admin=is_admin)
 
 
-@pytest.mark.parametrize("engine", ["milvus", "qdrant"])
-def test_list_stats_reject_an_unimplemented_engine(monkeypatch, engine) -> None:
-    monkeypatch.setenv("XAGENT_VECTOR_BACKEND", engine)
+def test_list_stats_reject_an_unimplemented_engine(monkeypatch) -> None:
+    monkeypatch.setenv("XAGENT_VECTOR_BACKEND", "qdrant")
 
     with pytest.raises(ConfigurationError, match="not implemented"):
         KBHandleProvider().aggregate_collection_stats(user_id=None, is_admin=True)

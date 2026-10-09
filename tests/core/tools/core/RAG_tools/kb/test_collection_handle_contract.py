@@ -49,7 +49,6 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
     ParsedParagraph,
     RegisterDocumentRequest,
 )
-from xagent.core.tools.core.RAG_tools.kb import collection_handle
 from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
     KBCollectionHandle,
     KBHandleProvider,
@@ -186,9 +185,6 @@ def open_handle(
 ) -> OpenHandle:
     if request.param == "milvus":
         monkeypatch.setenv("XAGENT_VECTOR_BACKEND", "milvus")
-        monkeypatch.setattr(
-            collection_handle, "require_implemented_vector_backend", lambda _: None
-        )
         if uri := os.environ.get("MILVUS_URI"):
             from pymilvus import MilvusClient
 

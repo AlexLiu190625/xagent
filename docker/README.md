@@ -339,6 +339,29 @@ Rollback also requires a maintenance window. Drain and stop the namespaced
 backends and their v2 containers before starting pre-namespace code; the old
 backend cannot see v2 containers and otherwise double-provisions sandboxes.
 
+### Milvus Knowledge-Base Engine
+
+Knowledge bases are stored in LanceDB by default. On a new deployment, the Milvus
+add-on starts a Milvus standalone server and makes it the knowledge-base engine:
+
+```bash
+docker compose \
+  -f docker-compose.yml \
+  -f docker/docker-compose.milvus.yml \
+  up -d
+```
+
+The image tags in `docker-compose.yml` (`0.8.1`) do not contain the Milvus engine:
+that release predates it, so the add-on needs images built from `main` (see
+[Building Individual Images](#building-individual-images)) or from a later release.
+With the `0.8.1` images the add-on starts and Milvus idles, but the first
+knowledge-base request fails with `Vector backend 'milvus' is not implemented yet`.
+
+A deployment that already holds LanceDB knowledge-base data is refused at startup,
+and Milvus's official guidance is 8 GB of RAM. Resources, the engine lock, the
+consistency window, the chunk size limit, backup and restore, and the differences
+from LanceDB are in [README.milvus.md](README.milvus.md).
+
 ## Docker Files
 
 - `Dockerfile.backend` - Backend image (FastAPI, Python, Node.js)
@@ -347,6 +370,8 @@ backend cannot see v2 containers and otherwise double-provisions sandboxes.
 - `../docker-compose.yml` - Base multi-service orchestration
 - `docker-compose.sandbox.boxlite.yml` - Boxlite/KVM sandbox overlay
 - `docker-compose.sandbox.docker.yml` - Docker sibling sandbox overlay
+- `docker-compose.milvus.yml` - Milvus knowledge-base engine add-on
+- `README.milvus.md` - Milvus add-on deployment notes
 - `.dockerignore` - Backend build exclusions
 - `.dockerignore.frontend` - Frontend build exclusions
 - `nginx.conf` - Frontend nginx configuration

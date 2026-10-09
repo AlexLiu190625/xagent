@@ -21,7 +21,11 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
     IngestionResult,
 )
 
-pytestmark = [pytest.mark.e2e, pytest.mark.contract_stub]
+pytestmark = [
+    pytest.mark.e2e,
+    pytest.mark.contract_stub,
+    pytest.mark.usefixtures("kb_engine"),
+]
 
 # Note: _StubEmbeddingAdapter, stub_embedding_adapter, and mock_rag_pipeline
 # are provided by conftest.py with autouse=True

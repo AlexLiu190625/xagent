@@ -10,14 +10,21 @@ whenever schema changes are made to ensure forward compatibility is maintained.
 
 from __future__ import annotations
 
+import os
 import tempfile
 from pathlib import Path
-from typing import Generator
+from typing import Any, Generator
 
 import pytest
 from fastapi.testclient import TestClient
 
-pytestmark = [pytest.mark.e2e, pytest.mark.contract_stub]
+from tests.web_integration.http_helpers import eventually, http_detail
+
+pytestmark = [
+    pytest.mark.e2e,
+    pytest.mark.contract_stub,
+    pytest.mark.usefixtures("kb_engine"),
+]
 
 
 @pytest.fixture
@@ -40,6 +47,62 @@ def sample_search_files() -> Generator[tuple[dict[str, str], str], None, None]:
             files[filename] = str(file_path)
 
         yield files, temp_dir
+
+
+def _ingest(
+    client: TestClient, headers: dict[str, str], path: str | Path, collection: str
+) -> None:
+    with open(path, "rb") as f:
+        response = client.post(
+            "/api/kb/ingest",
+            files={"file": (Path(path).name, f, "text/plain")},
+            data={"collection": collection},
+            headers=headers,
+        )
+    assert response.status_code == 200, http_detail(response)
+    assert response.json()["status"] == "success", http_detail(response)
+
+
+def _search(
+    client: TestClient,
+    headers: dict[str, str],
+    collection: str,
+    query: str,
+    top_k: int = 5,
+    min_hits: int = 1,
+    search_type: str = "hybrid",
+) -> list[dict[str, Any]]:
+    """Search until ``min_hits`` come back. A write is visible at once on LanceDB
+    and within Milvus's Bounded window on Milvus; an error status fails at once."""
+    hits: list[dict[str, Any]] = []
+    status = ""
+
+    def settled() -> bool:
+        nonlocal hits, status
+        response = client.post(
+            "/api/kb/search",
+            data={
+                "collection": collection,
+                "query_text": query,
+                "top_k": top_k,
+                "search_type": search_type,
+            },
+            headers=headers,
+        )
+        assert response.status_code == 200, http_detail(response)
+        body = response.json()
+        status = body["status"]
+        assert status == "success", http_detail(response)
+        hits = body["results"]
+        return len(hits) >= min_hits
+
+    milvus = os.environ["XAGENT_VECTOR_BACKEND"] == "milvus"
+    eventually(
+        settled,
+        timeout=10.0 if milvus else 0.0,
+        detail=lambda: f"status {status}, {len(hits)} of {min_hits} hits",
+    )
+    return hits
 
 
 # ==========================================
@@ -66,36 +129,17 @@ class TestBasicSearch:
         auth_headers: dict[str, str],
         sample_search_files: tuple[dict[str, str], str],
     ) -> None:
-        """Test that search works immediately after document ingestion."""
+        """Test that search works immediately after document ingestion.
+
+        LanceDB returns the document on the first search; Milvus within its window.
+        """
         files, temp_dir = sample_search_files
         collection_name = "e2e_search_immediate"
-        file_path = files["python_tutorial.txt"]
 
-        # Ingest a document
-        with open(file_path, "rb") as f:
-            ingest_response = client.post(
-                "/api/kb/ingest",
-                files={"file": ("python_tutorial.txt", f, "text/plain")},
-                data={"collection": collection_name},
-                headers=auth_headers,
-            )
+        _ingest(client, auth_headers, files["python_tutorial.txt"], collection_name)
 
-        if ingest_response.status_code == 200:
-            # Search immediately after ingestion
-            search_response = client.post(
-                "/api/kb/search",
-                data={
-                    "collection": collection_name,
-                    "query_text": "Python programming",
-                    "top_k": "5",
-                },
-                headers=auth_headers,
-            )
-
-            # Search should work
-            assert search_response.status_code == 200
-            result = search_response.json()
-            assert "results" in result or "status" in result
+        hits = _search(client, auth_headers, collection_name, "Python programming")
+        assert any("Python" in hit["text"] for hit in hits)
 
     @pytest.mark.e2e
     @pytest.mark.slow
@@ -109,38 +153,20 @@ class TestBasicSearch:
         files, temp_dir = sample_search_files
         collection_name = "e2e_search_relevance"
 
-        # Ingest documents with specific content
-        keywords_docs = [
-            ("python_tutorial.txt", "Python"),
-            ("machine_learning.md", "machine learning"),
-            ("cooking_guide.txt", "cooking"),
-        ]
+        for filename in [
+            "cooking_guide.txt",
+            "machine_learning.md",
+            "python_tutorial.txt",
+        ]:
+            _ingest(client, auth_headers, files[filename], collection_name)
 
-        for filename, keyword in keywords_docs:
-            file_path = files[filename]
-            with open(file_path, "rb") as f:
-                client.post(
-                    "/api/kb/ingest",
-                    files={"file": (filename, f, "text/plain")},
-                    data={"collection": collection_name},
-                    headers=auth_headers,
-                )
+        hits = _search(client, auth_headers, collection_name, "Python", top_k=3)
+        assert "Python" in hits[0]["text"]
 
-        # Search for specific term and verify relevance
-        search_response = client.post(
-            "/api/kb/search",
-            data={
-                "collection": collection_name,
-                "query_text": "Python",
-                "top_k": 3,
-            },
-            headers=auth_headers,
+        keyword_hits = _search(
+            client, auth_headers, collection_name, "Python", search_type="sparse"
         )
-
-        # Should return relevant results
-        assert search_response.status_code == 200
-        result = search_response.json()
-        assert "results" in result or "status" in result
+        assert all("Python" in hit["text"] for hit in keyword_hits)
 
     @pytest.mark.e2e
     @pytest.mark.slow
@@ -154,41 +180,18 @@ class TestBasicSearch:
         files, temp_dir = sample_search_files
         collection_name = "e2e_search_pagination"
 
-        # Create multiple documents
         for i in range(5):
-            content = f"Document {i} with searchable content about topic {i % 3}."
-            with tempfile.NamedTemporaryFile(
-                suffix=".txt", delete=False, mode="w"
-            ) as tmp:
-                tmp.write(content)
-                tmp.flush()
+            path = Path(temp_dir) / f"doc{i}.txt"
+            path.write_text(
+                f"Document {i} with searchable content about topic {i % 3}.",
+                encoding="utf-8",
+            )
+            _ingest(client, auth_headers, path, collection_name)
 
-                try:
-                    with open(tmp.name, "rb") as f:
-                        client.post(
-                            "/api/kb/ingest",
-                            files={"file": (f"doc{i}.txt", f, "text/plain")},
-                            data={"collection": collection_name},
-                            headers=auth_headers,
-                        )
-                finally:
-                    import os
-
-                    os.unlink(tmp.name)
-
-        # Test pagination
-        search_response = client.post(
-            "/api/kb/search",
-            data={
-                "collection": collection_name,
-                "query_text": "document",
-                "top_k": 3,
-            },
-            headers=auth_headers,
+        hits = _search(
+            client, auth_headers, collection_name, "document", top_k=3, min_hits=3
         )
-
-        # Should handle pagination
-        assert search_response.status_code == 200
+        assert len(hits) == 3
 
     @pytest.mark.e2e
     @pytest.mark.slow
@@ -202,31 +205,10 @@ class TestBasicSearch:
         files, temp_dir = sample_search_files
         collection_name = "e2e_search_filters"
 
-        # Ingest documents
         for filename in ["python_tutorial.txt", "machine_learning.md"]:
-            file_path = files[filename]
-            with open(file_path, "rb") as f:
-                client.post(
-                    "/api/kb/ingest",
-                    files={"file": (filename, f, "text/plain")},
-                    data={"collection": collection_name},
-                    headers=auth_headers,
-                )
+            _ingest(client, auth_headers, files[filename], collection_name)
 
-        # Search with filters
-        search_response = client.post(
-            "/api/kb/search",
-            data={
-                "collection": collection_name,
-                "query_text": "document",
-                "top_k": 5,
-                # Add any available filters
-            },
-            headers=auth_headers,
-        )
-
-        # Should handle search
-        assert search_response.status_code == 200
+        _search(client, auth_headers, collection_name, "document", min_hits=2)
 
 
 # ==========================================
@@ -255,32 +237,11 @@ class TestMultiTenantSearch:
         """Test that regular users can only search their own documents."""
         files, temp_dir = sample_search_files
         collection_name = "e2e_search_isolation"
-        file_path = files["python_tutorial.txt"]
 
-        # Ingest a document
-        with open(file_path, "rb") as f:
-            client.post(
-                "/api/kb/ingest",
-                files={"file": ("python_tutorial.txt", f, "text/plain")},
-                data={"collection": collection_name},
-                headers=auth_headers,
-            )
+        _ingest(client, auth_headers, files["python_tutorial.txt"], collection_name)
 
-        # Search as regular user
-        search_response = client.post(
-            "/api/kb/search",
-            data={
-                "collection": collection_name,
-                "query_text": "Python",
-                "top_k": "5",
-            },
-            headers=auth_headers,
-        )
-
-        # Search should respect tenant isolation
-        assert search_response.status_code == 200
-        result = search_response.json()
-        assert "results" in result or "status" in result
+        hits = _search(client, auth_headers, collection_name, "Python")
+        assert any("Python" in hit["text"] for hit in hits)
 
 
 # ==========================================
@@ -309,29 +270,11 @@ class TestSearchAfterSchemaChanges:
         """Test that search works correctly after schema migration."""
         files, temp_dir = sample_search_files
         collection_name = "e2e_search_migration"
-        file_path = files["python_tutorial.txt"]
 
-        # Ingest document (simulating post-migration state)
-        with open(file_path, "rb") as f:
-            client.post(
-                "/api/kb/ingest",
-                files={"file": ("python_tutorial.txt", f, "text/plain")},
-                data={"collection": collection_name},
-                headers=auth_headers,
-            )
+        _ingest(client, auth_headers, files["python_tutorial.txt"], collection_name)
 
-        # Search should work after migration
-        search_response = client.post(
-            "/api/kb/search",
-            data={
-                "collection": collection_name,
-                "query_text": "Python",
-                "top_k": "5",
-            },
-            headers=auth_headers,
-        )
-
-        assert search_response.status_code == 200
+        hits = _search(client, auth_headers, collection_name, "Python")
+        assert any("Python" in hit["text"] for hit in hits)
 
 
 # ==========================================
@@ -360,31 +303,13 @@ class TestSearchAccuracy:
         """Test that search returns relevant results."""
         files, temp_dir = sample_search_files
         collection_name = "e2e_search_accuracy"
-        file_path = files["python_tutorial.txt"]
 
-        # Ingest document with specific content
-        with open(file_path, "rb") as f:
-            client.post(
-                "/api/kb/ingest",
-                files={"file": ("python_tutorial.txt", f, "text/plain")},
-                data={"collection": collection_name},
-                headers=auth_headers,
-            )
+        _ingest(client, auth_headers, files["python_tutorial.txt"], collection_name)
 
-        # Search for specific term from the document
-        search_response = client.post(
-            "/api/kb/search",
-            data={
-                "collection": collection_name,
-                "query_text": "Python programming language",
-                "top_k": 5,
-            },
-            headers=auth_headers,
+        hits = _search(
+            client, auth_headers, collection_name, "Python programming language"
         )
-
-        assert search_response.status_code == 200
-        result = search_response.json()
-        assert "results" in result or "status" in result
+        assert any("Python" in hit["text"] for hit in hits)
 
     @pytest.mark.e2e
     @pytest.mark.slow
@@ -398,17 +323,8 @@ class TestSearchAccuracy:
         files, temp_dir = sample_search_files
         collection_name = "e2e_search_query_types"
 
-        # Ingest document
-        file_path = files["python_tutorial.txt"]
-        with open(file_path, "rb") as f:
-            client.post(
-                "/api/kb/ingest",
-                files={"file": ("python_tutorial.txt", f, "text/plain")},
-                data={"collection": collection_name},
-                headers=auth_headers,
-            )
+        _ingest(client, auth_headers, files["python_tutorial.txt"], collection_name)
 
-        # Test different query types
         queries = [
             "Python",  # Single word
             "Python programming",  # Phrase
@@ -416,18 +332,7 @@ class TestSearchAccuracy:
         ]
 
         for query in queries:
-            search_response = client.post(
-                "/api/kb/search",
-                data={
-                    "collection": collection_name,
-                    "query_text": query,
-                    "top_k": 3,
-                },
-                headers=auth_headers,
-            )
-
-            # All query types should work
-            assert search_response.status_code == 200
+            _search(client, auth_headers, collection_name, query, top_k=3)
 
 
 # ==========================================
@@ -457,40 +362,17 @@ class TestRealTimeSearch:
         files, temp_dir = sample_search_files
         collection_name = "e2e_search_realtime"
 
-        # Initial search should be empty
-        client.post(
+        before = client.post(
             "/api/kb/search",
-            data={
-                "collection": collection_name,
-                "query_text": "Python",
-                "top_k": "5",
-            },
+            data={"collection": collection_name, "query_text": "Python"},
             headers=auth_headers,
         )
+        assert before.status_code == 404, http_detail(before)
 
-        # Ingest document
-        file_path = files["python_tutorial.txt"]
-        with open(file_path, "rb") as f:
-            ingest_response = client.post(
-                "/api/kb/ingest",
-                files={"file": ("python_tutorial.txt", f, "text/plain")},
-                data={"collection": collection_name},
-                headers=auth_headers,
-            )
+        _ingest(client, auth_headers, files["python_tutorial.txt"], collection_name)
 
-        if ingest_response.status_code == 200:
-            # Search again should now return results
-            final_search = client.post(
-                "/api/kb/search",
-                data={
-                    "collection": collection_name,
-                    "query_text": "Python",
-                    "top_k": 5,
-                },
-                headers=auth_headers,
-            )
-
-            assert final_search.status_code == 200
+        hits = _search(client, auth_headers, collection_name, "Python")
+        assert any("Python" in hit["text"] for hit in hits)
 
     @pytest.mark.e2e
     @pytest.mark.slow
@@ -504,33 +386,18 @@ class TestRealTimeSearch:
         files, temp_dir = sample_search_files
         collection_name = "e2e_search_multiple"
 
-        # Ingest and search for multiple documents sequentially
-        results = []
-        for filename in ["python_tutorial.txt", "machine_learning.md"]:
-            file_path = files[filename]
-            with open(file_path, "rb") as f:
-                ingest_response = client.post(
-                    "/api/kb/ingest",
-                    files={"file": (filename, f, "text/plain")},
-                    data={"collection": collection_name},
-                    headers=auth_headers,
-                )
-
-            if ingest_response.status_code == 200:
-                # Search for content
-                search_response = client.post(
-                    "/api/kb/search",
-                    data={
-                        "collection": collection_name,
-                        "query_text": "content",
-                        "top_k": 3,
-                    },
-                    headers=auth_headers,
-                )
-                results.append(search_response.status_code)
-
-        # All operations should succeed
-        assert all(code == 200 for code in results)
+        for count, filename in enumerate(
+            ["python_tutorial.txt", "machine_learning.md"], start=1
+        ):
+            _ingest(client, auth_headers, files[filename], collection_name)
+            _search(
+                client,
+                auth_headers,
+                collection_name,
+                "content",
+                top_k=3,
+                min_hits=count,
+            )
 
 
 # ==========================================
@@ -596,18 +463,9 @@ class TestSearchErrorHandling:
         """Test that search handles special characters in queries."""
         files, temp_dir = sample_search_files
         collection_name = "e2e_search_special"
-        file_path = files["python_tutorial.txt"]
 
-        # Ingest document
-        with open(file_path, "rb") as f:
-            client.post(
-                "/api/kb/ingest",
-                files={"file": ("python_tutorial.txt", f, "text/plain")},
-                data={"collection": collection_name},
-                headers=auth_headers,
-            )
+        _ingest(client, auth_headers, files["python_tutorial.txt"], collection_name)
 
-        # Search with special characters
         special_queries = [
             "Python & programming",  # Ampersand
             "Python, data, science",  # Commas
@@ -615,15 +473,4 @@ class TestSearchErrorHandling:
         ]
 
         for query in special_queries:
-            search_response = client.post(
-                "/api/kb/search",
-                data={
-                    "collection": collection_name,
-                    "query_text": query,
-                    "top_k": 3,
-                },
-                headers=auth_headers,
-            )
-
-            # Special characters should be handled normally
-            assert search_response.status_code == 200
+            _search(client, auth_headers, collection_name, query, top_k=3)

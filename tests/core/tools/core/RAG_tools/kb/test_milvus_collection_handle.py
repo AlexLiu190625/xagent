@@ -150,11 +150,7 @@ PENDING = (
 
 @pytest.fixture
 def milvus_deployment(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stand in for step 8 (#2870), which lets the milvus setting start."""
     monkeypatch.setenv("XAGENT_VECTOR_BACKEND", "milvus")
-    monkeypatch.setattr(
-        collection_handle, "require_implemented_vector_backend", lambda _: None
-    )
 
 
 def _context(backend: KBStorageBackend, collection: str = "kb") -> KBCollectionContext:
@@ -1105,9 +1101,11 @@ def test_stats_without_kb_ids_never_reach_milvus(
 
 
 def test_batched_stats_refuse_an_unsupported_engine(
-    milvus_deployment: None, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("XAGENT_VECTOR_BACKEND", "qdrant")
+    monkeypatch.setattr(
+        collection_handle, "deployment_kb_backend", lambda: KBStorageBackend.QDRANT
+    )
     with pytest.raises(ValueError, match="'qdrant' is not supported"):
         KBHandleProvider().aggregate_collection_stats(user_id=None, is_admin=True)
 
@@ -1117,12 +1115,10 @@ def test_lancedb_only_paths_follow_the_deployment_engine(
 ) -> None:
     assert ledger_holds_vectors()
     monkeypatch.setenv("XAGENT_VECTOR_BACKEND", "milvus")
+    assert not ledger_holds_vectors()
+    monkeypatch.setenv("XAGENT_VECTOR_BACKEND", "qdrant")
     with pytest.raises(ConfigurationError, match="not implemented"):
         ledger_holds_vectors()
-    monkeypatch.setattr(
-        collection_handle, "require_implemented_vector_backend", lambda _: None
-    )
-    assert not ledger_holds_vectors()
 
 
 async def test_metadata_rebuild_keeps_the_model_without_lancedb_vectors(

@@ -22,7 +22,6 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
     IngestionResult,
     RegisterDocumentRequest,
 )
-from xagent.core.tools.core.RAG_tools.kb import collection_handle
 from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
     KBCollectionHandle,
     KBHandleProvider,
@@ -214,9 +213,6 @@ def model() -> Iterator[str]:
 @pytest.fixture
 def milvus(monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setenv("XAGENT_VECTOR_BACKEND", "milvus")
-    monkeypatch.setattr(
-        collection_handle, "require_implemented_vector_backend", lambda _: None
-    )
     return _client()
 
 

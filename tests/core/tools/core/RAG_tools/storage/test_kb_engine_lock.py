@@ -16,11 +16,7 @@ from filelock import FileLock, Timeout
 
 from xagent.core.tools.core.RAG_tools.core.exceptions import ConfigurationError
 from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
-from xagent.core.tools.core.RAG_tools.kb import (
-    KBContextRequest,
-    collection_handle,
-    get_kb_coordinator,
-)
+from xagent.core.tools.core.RAG_tools.kb import KBContextRequest, get_kb_coordinator
 from xagent.core.tools.core.RAG_tools.storage import vector_backend
 from xagent.core.tools.core.RAG_tools.storage.factory import get_metadata_store
 from xagent.core.tools.core.RAG_tools.storage.vector_backend import (
@@ -39,13 +35,8 @@ def lancedb_setting(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 
 
 @pytest.fixture
-def milvus_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stand in for step 8 (#2870), which lets the milvus setting start."""
+def milvus_setting(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("XAGENT_VECTOR_BACKEND", "milvus")
-    for module in (vector_backend, collection_handle):
-        monkeypatch.setattr(
-            module, "require_implemented_vector_backend", lambda _: None
-        )
 
 
 def _record() -> Path:
@@ -76,7 +67,7 @@ def test_upgraded_lancedb_deployment_keeps_starting() -> None:
     ["documents", "collection_config", "collection_metadata", "embeddings_model_a"],
 )
 def test_kb_rows_without_a_record_mean_lancedb(
-    milvus_allowed: None, table: str
+    milvus_setting: None, table: str
 ) -> None:
     _seed(table)
 
@@ -90,7 +81,7 @@ def test_kb_rows_without_a_record_mean_lancedb(
     assert _record().read_text() == "lancedb\n"
 
 
-def test_deleted_rows_do_not_count_as_data(milvus_allowed: None) -> None:
+def test_deleted_rows_do_not_count_as_data(milvus_setting: None) -> None:
     _seed("documents").delete("id = 'x'")
 
     assert lock_deployment_kb_engine() is KBStorageBackend.MILVUS
@@ -103,7 +94,7 @@ def test_an_empty_kb_ids_table_is_not_milvus() -> None:
     assert lock_deployment_kb_engine() is KBStorageBackend.LANCEDB
 
 
-def test_an_unreadable_table_counts_as_data(milvus_allowed: None) -> None:
+def test_an_unreadable_table_counts_as_data(milvus_setting: None) -> None:
     broken = Path(os.environ["LANCEDB_DIR"]) / "embeddings_broken.lance"
     broken.mkdir()
     (broken / "junk").write_text("x")
@@ -138,15 +129,35 @@ def test_a_setting_that_differs_from_the_record_is_refused() -> None:
     assert _record().read_text() == "milvus\n"
 
 
-@pytest.mark.parametrize("engine", ["milvus", "qdrant"])
-def test_an_unimplemented_engine_is_refused_before_recording(
-    monkeypatch: pytest.MonkeyPatch, engine: str
+def test_a_reserved_engine_is_refused_before_recording(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("XAGENT_VECTOR_BACKEND", engine)
+    monkeypatch.setenv("XAGENT_VECTOR_BACKEND", "qdrant")
 
     with pytest.raises(ConfigurationError, match="not implemented"):
         lock_deployment_kb_engine()
     assert not _record().exists()
+
+
+def test_a_fresh_deployment_starts_with_milvus_and_records_it(
+    milvus_setting: None,
+) -> None:
+    assert lock_deployment_kb_engine() is KBStorageBackend.MILVUS
+    assert _record().read_text() == "milvus\n"
+    assert lock_deployment_kb_engine() is KBStorageBackend.MILVUS
+
+
+def test_a_lancedb_record_refuses_the_milvus_setting(milvus_setting: None) -> None:
+    _record().write_text("lancedb\n")
+
+    with pytest.raises(ConfigurationError) as raised:
+        lock_deployment_kb_engine()
+
+    message = str(raised.value)
+    assert "KB engine is lancedb, recorded in" in message
+    assert "XAGENT_VECTOR_BACKEND is milvus" in message
+    assert "delete the record file and restart" in message
+    assert _record().read_text() == "lancedb\n"
 
 
 @pytest.mark.parametrize("content", [b"", b"postgres\n", b"\xff\xfe"])
@@ -470,7 +481,7 @@ async def _context_backend(collection: CollectionInfo) -> KBStorageBackend:
     ],
 )
 def test_a_binding_wins_and_a_missing_one_means_the_deployment_engine(
-    milvus_allowed: None, binding: dict[str, str] | None, expected: KBStorageBackend
+    milvus_setting: None, binding: dict[str, str] | None, expected: KBStorageBackend
 ) -> None:
     extra = {} if binding is None else {"kb_storage": binding}
     collection = CollectionInfo(name="kb", extra_metadata=extra)
@@ -479,7 +490,7 @@ def test_a_binding_wins_and_a_missing_one_means_the_deployment_engine(
 
 
 def test_a_missing_collection_resolves_to_the_deployment_engine(
-    milvus_allowed: None,
+    milvus_setting: None,
 ) -> None:
     request = KBContextRequest(collection="new", hide_missing=True)
     context = asyncio.run(get_kb_coordinator().get_context(request))
@@ -489,7 +500,7 @@ def test_a_missing_collection_resolves_to_the_deployment_engine(
 
 
 def test_the_three_binding_writers_record_the_deployment_engine(
-    milvus_allowed: None,
+    milvus_setting: None,
 ) -> None:
     coordinator = get_kb_coordinator()
     writers = {
@@ -511,7 +522,7 @@ def test_the_three_binding_writers_record_the_deployment_engine(
 
 
 def test_a_binding_to_another_engine_blocks_search_and_ingest_not_delete(
-    milvus_allowed: None,
+    milvus_setting: None,
 ) -> None:
     asyncio.run(
         get_metadata_store().save_collection(
