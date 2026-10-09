@@ -251,8 +251,9 @@ def test_create_exact_name_in_other_table_is_a_folded_conflict(
     assert exc.value.status_code == 400
     assert exc.value.detail == (
         "'jira' conflicts with an existing connector name. Connector names are "
-        "compared ignoring letter case, spaces, hyphens and underscores, and "
-        "must be unique across MCP servers and custom APIs."
+        "compared case-insensitively, treating spaces, hyphens and underscores "
+        "as the same character, and must be unique across MCP servers and "
+        "custom APIs."
     )
 
 
@@ -311,6 +312,64 @@ def test_rename_excludes_only_same_type_same_id(
         _rename(db, user, entry, 5, "foo_bar")
 
     assert exc.value.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "name", ["\tGmail", "Gmail\n", "\u00a0Gmail", "Gmail\r\n", " \tGmail", "Gmail\n "]
+)
+@pytest.mark.parametrize("action", ["create", "rename"])
+def test_custom_api_rejects_edge_whitespace_other_than_spaces(
+    db: Session, user: User, action: str, name: str
+) -> None:
+    target = _insert(db, _API, "renamed_row", owner=user)
+    target_id = target.id
+    before = _counts(db)
+
+    with pytest.raises(HTTPException) as exc:
+        if action == "create":
+            _create(db, user, _API, name)
+        else:
+            _rename(db, user, _API, target_id, name)
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail == (
+        "Connector names cannot start or end with tabs, line breaks or other "
+        "whitespace besides spaces."
+    )
+    assert not db.new and not db.dirty
+    assert _counts(db) == before
+
+
+@pytest.mark.parametrize("name", [" Gmail ", "Google Maps", "a\tb"])
+@pytest.mark.parametrize("action", ["create", "rename"])
+def test_custom_api_allows_space_padding_and_inner_whitespace(
+    db: Session, user: User, action: str, name: str
+) -> None:
+    target = _insert(db, _API, "renamed_row", owner=user)
+
+    if action == "create":
+        result = _create(db, user, _API, name)
+    else:
+        result = _rename(db, user, _API, target.id, name)
+
+    assert result.name == name
+
+
+@pytest.mark.parametrize("sent_name", [None, "\tGmail"])
+def test_existing_edge_whitespace_name_stays_editable(
+    db: Session, user: User, sent_name: str | None
+) -> None:
+    row = _insert(db, _API, "\tGmail", owner=user)
+
+    result = update_custom_api(
+        row.id,
+        CustomApiUpdate(name=sent_name, description="edited"),
+        current_user=user,
+        db=db,
+    )
+
+    assert result.name == "\tGmail"
+    assert result.description == "edited"
 
 
 @pytest.mark.parametrize("entry", [_MCP, _API])

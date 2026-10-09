@@ -27,7 +27,10 @@ rejection:
 
 * The comparison runs in SQL so no table is read into memory. SQL ``trim``
   removes only spaces, while Python ``str.strip`` also removes tabs,
-  newlines and other Unicode whitespace.
+  newlines and other Unicode whitespace. Create and rename refuse Custom API
+  names whose edge whitespace includes anything besides spaces, and no MCP
+  name starts or ends with whitespace other than spaces, so this difference
+  only affects rows written before that check existed.
 * SQLite ``lower`` folds ASCII only, and PostgreSQL ``lower`` folds ASCII
   only under a C/POSIX ctype; Python ``str.lower`` folds all of Unicode.
 * The check reads before the caller writes, so two concurrent writers can both
@@ -86,6 +89,27 @@ def folded_name_conflict_detail(name: str) -> str:
     """The error text for a rejected name; echoes only the requested name."""
     return (
         f"'{name}' conflicts with an existing connector name. Connector names "
-        "are compared ignoring letter case, spaces, hyphens and underscores, "
-        "and must be unique across MCP servers and custom APIs."
+        "are compared case-insensitively, treating spaces, hyphens and "
+        "underscores as the same character, and must be unique across MCP "
+        "servers and custom APIs."
+    )
+
+
+def has_unfoldable_edge_whitespace(name: str) -> bool:
+    """Whether leading or trailing whitespace of ``name`` contains anything
+    other than plain spaces (U+0020).
+
+    A Custom API create or rename must not store such a name: SQL ``trim``
+    removes only spaces, so the stored name would fold differently in the
+    database than ``normalize_mcp_server_name`` folds it in task selection,
+    and the folded uniqueness check would miss collisions with it.
+    """
+    return name.strip() != name.strip(" ")
+
+
+def unfoldable_edge_whitespace_detail() -> str:
+    """The error text for a name rejected by ``has_unfoldable_edge_whitespace``."""
+    return (
+        "Connector names cannot start or end with tabs, line breaks or other "
+        "whitespace besides spaces."
     )

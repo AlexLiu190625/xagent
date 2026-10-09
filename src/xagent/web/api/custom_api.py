@@ -26,6 +26,8 @@ from ..models.user import User
 from ..services.connector_name_policy import (
     folded_name_conflict_detail,
     has_folded_connector_name_conflict,
+    has_unfoldable_edge_whitespace,
+    unfoldable_edge_whitespace_detail,
 )
 
 if TYPE_CHECKING:
@@ -239,6 +241,11 @@ async def create_custom_api(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Custom API with name '{api_data.name}' already exists",
+        )
+    if has_unfoldable_edge_whitespace(api_data.name):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=unfoldable_edge_whitespace_detail(),
         )
     if has_folded_connector_name_conflict(db, api_data.name):
         raise HTTPException(
@@ -753,6 +760,11 @@ def update_custom_api(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Custom API with name '{api_data.name}' already exists",
+            )
+        if has_unfoldable_edge_whitespace(api_data.name):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=unfoldable_edge_whitespace_detail(),
             )
         if has_folded_connector_name_conflict(
             db,
