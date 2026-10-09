@@ -79,7 +79,9 @@ from ..models.public_mcp import PublicMCPApp
 from ..models.user import User
 from ..models.user_oauth import UserOAuth
 from ..services.connector_name_policy import (
+    catalog_app_name_detail,
     folded_name_conflict_detail,
+    folds_to_catalog_app_name,
     has_folded_connector_name_conflict,
 )
 from ..services.google_picker import get_google_picker_config
@@ -4313,6 +4315,11 @@ def create_mcp_server(
                 detail=f"Invalid configuration: {str(e)}",
             )
 
+        if folds_to_catalog_app_name(db, server_data.name):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=catalog_app_name_detail(server_data.name),
+            )
         if has_folded_connector_name_conflict(db, server_data.name):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -4656,6 +4663,11 @@ def update_mcp_server(
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"MCP server '{server_data.name}' already exists",
+                )
+            if folds_to_catalog_app_name(db, server_data.name):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=catalog_app_name_detail(server_data.name),
                 )
             if has_folded_connector_name_conflict(
                 db,

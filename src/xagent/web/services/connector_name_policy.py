@@ -13,6 +13,11 @@ a name the user typed. Provisioning that derives the name from the connector
 catalog must not call it, because an existing folded twin would otherwise keep
 every user from connecting the official app.
 
+Catalog apps get their server row only when someone first connects them, so a
+typed name is also checked against the catalog itself
+(``folds_to_catalog_app_name``): otherwise a name taken before that first
+connect would collide with the row provisioning creates later.
+
 The check is global. One tenant's name blocks every tenant from using any
 case, space, hyphen or underscore variant of it, across both connector types.
 It has to be global because team sharing makes a row visible to a team without
@@ -55,6 +60,7 @@ from ...core.tools.adapters.vibe.connector_runtime import (
 from ...core.tools.adapters.vibe.selection_spec import normalize_mcp_server_name
 from ..models.custom_api import CustomApi
 from ..models.mcp import MCPServer
+from ..models.public_mcp import PublicMCPApp
 
 
 def _sql_fold(column: ColumnElement) -> ColumnElement:
@@ -92,6 +98,33 @@ def folded_name_conflict_detail(name: str) -> str:
         "are compared case-insensitively, treating spaces, hyphens and "
         "underscores as the same character, and must be unique across MCP "
         "servers and custom APIs."
+    )
+
+
+def folds_to_catalog_app_name(db: Session, name: str) -> bool:
+    """Whether ``name`` folds to the same key as the app id or display name
+    of any catalog app, including apps hidden from the connector list.
+
+    Provisioning names a catalog app's server row after one of those two
+    spellings, so the app reserves both whether or not its row exists yet.
+    The catalog table is the source because provisioning only creates rows
+    for apps it can read from it; built-in apps are seeded into it. Read
+    failures propagate to the caller.
+    """
+    key = normalize_mcp_server_name(name)
+    if not key:
+        return False
+    columns = PublicMCPApp.__table__.c
+    condition = (_sql_fold(columns.app_id) == key) | (_sql_fold(columns.name) == key)
+    return db.query(PublicMCPApp.id).filter(condition).first() is not None
+
+
+def catalog_app_name_detail(name: str) -> str:
+    """The error text for a name rejected by ``folds_to_catalog_app_name``."""
+    return (
+        f"'{name}' is reserved for a catalog app; connect it from the catalog "
+        "instead. Connector names are compared case-insensitively, treating "
+        "spaces, hyphens and underscores as the same character."
     )
 
 

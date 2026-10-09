@@ -46,7 +46,9 @@ from xagent.web.models.user import User
 from xagent.web.services import connector_team_scope
 from xagent.web.services.connector_name_policy import (
     _sql_fold,
+    catalog_app_name_detail,
     folded_name_conflict_detail,
+    folds_to_catalog_app_name,
     has_folded_connector_name_conflict,
 )
 
@@ -435,24 +437,30 @@ def test_name_scan_failure_propagates_and_writes_nothing(
     assert _counts(db) == before
 
 
-def test_catalog_provisioning_is_not_checked(db: Session) -> None:
+def _insert_catalog_app(
+    db: Session, app_id: str, name: str, *, visible: bool = True
+) -> None:
     db.add(
         PublicMCPApp(
-            app_id="google-maps",
-            name="Google Maps",
+            app_id=app_id,
+            name=name,
             description="A catalog app",
             icon="",
             category="Productivity",
             transport="stdio",
             launch_config={
                 "command": "npx",
-                "args": ["-y", "google-maps-mcp"],
+                "args": ["-y", f"{app_id}-mcp"],
                 "required_env": ["API_KEY"],
             },
-            is_visible_in_connector=True,
+            is_visible_in_connector=visible,
         )
     )
     db.commit()
+
+
+def test_catalog_provisioning_is_not_checked(db: Session) -> None:
+    _insert_catalog_app(db, "google-maps", "Google Maps")
     _insert_api(db, "google_maps")
 
     server, _ = _ensure_catalog_app_server(db, "google-maps")
@@ -515,16 +523,14 @@ def test_name_check_call_sites() -> None:
     assert checked <= defined
     assert not_checked <= defined
 
-    callers: set[tuple[Path, str]] = set()
-    for path, func, name in _web_functions():
-        for node in ast.walk(func):
-            if (
-                isinstance(node, ast.Call)
-                and _called_name(node) == "has_folded_connector_name_conflict"
-            ):
-                callers.add((path, name))
+    for check in ("has_folded_connector_name_conflict", "folds_to_catalog_app_name"):
+        callers: set[tuple[Path, str]] = set()
+        for path, func, name in _web_functions():
+            for node in ast.walk(func):
+                if isinstance(node, ast.Call) and _called_name(node) == check:
+                    callers.add((path, name))
 
-    assert callers == checked
+        assert callers == checked, check
 
 
 def test_conflict_is_checked_in_sql(db: Session) -> None:
@@ -546,3 +552,109 @@ def test_conflict_is_checked_in_sql(db: Session) -> None:
     assert len(scans) == 2
     for statement in scans:
         assert re.search(r"\bWHERE\b", statement, re.IGNORECASE)
+
+
+# (requested name, catalog app id, catalog display name). The MCP routes also
+# run an older catalog check under a different fold, which already refuses
+# "GitHub" and "Google Maps"; "google_maps" is the variant only this check
+# catches there.
+_CATALOG_NAMES = [
+    pytest.param("GitHub", "github", "GitHub", id="display-name"),
+    pytest.param("github", "github", "GitHub", id="app-id"),
+    pytest.param("google_maps", "google-maps", "Google Maps", id="underscore"),
+    pytest.param("Google Maps", "google-maps", "Google Maps", id="space"),
+]
+
+
+@pytest.mark.parametrize("provisioned", [False, True])
+@pytest.mark.parametrize("requested,app_id,app_name", _CATALOG_NAMES)
+@pytest.mark.parametrize("action", ["create", "rename"])
+def test_custom_api_rejects_catalog_app_name(
+    db: Session,
+    user: User,
+    action: str,
+    requested: str,
+    app_id: str,
+    app_name: str,
+    provisioned: bool,
+) -> None:
+    _insert_catalog_app(db, app_id, app_name)
+    if provisioned:
+        # The row provisioning names after the app id. Inserted directly:
+        # some ids here belong to built-in OAuth apps, which connect through
+        # a different flow.
+        _insert_mcp(db, app_id)
+    target = _insert_api(db, "renamed_row", owner=user)
+    target_id = target.id
+    before = _counts(db)
+
+    with patch.object(connector_team_scope, "rename_team_connector") as hook:
+        with pytest.raises(HTTPException) as exc:
+            if action == "create":
+                _create(db, user, _API, requested)
+            else:
+                _rename(db, user, _API, target_id, requested)
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail == catalog_app_name_detail(requested)
+    assert not db.new and not db.dirty
+    assert _counts(db) == before
+    hook.assert_not_called()
+
+
+@pytest.mark.parametrize("action", ["create", "rename"])
+def test_mcp_rejects_catalog_app_name_under_the_selection_fold(
+    db: Session, user: User, action: str
+) -> None:
+    _insert_catalog_app(db, "google-maps", "Google Maps")
+    target = _insert_mcp(db, "renamed_row", owner=user)
+    target_id = target.id
+    before = _counts(db)
+
+    with pytest.raises(HTTPException) as exc:
+        if action == "create":
+            _create(db, user, _MCP, "google_maps")
+        else:
+            _rename(db, user, _MCP, target_id, "google_maps")
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail == catalog_app_name_detail("google_maps")
+    assert _counts(db) == before
+
+
+@pytest.mark.parametrize("entry", [_MCP, _API])
+def test_hidden_catalog_app_still_reserves_its_names(
+    db: Session, user: User, entry: str
+) -> None:
+    _insert_catalog_app(db, "google-maps", "Google Maps", visible=False)
+
+    with pytest.raises(HTTPException) as exc:
+        _create(db, user, entry, "google_maps")
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail == catalog_app_name_detail("google_maps")
+
+
+@pytest.mark.parametrize("entry", [_MCP, _API])
+@pytest.mark.parametrize("action", ["create", "rename"])
+def test_name_that_only_resembles_a_catalog_app_is_accepted(
+    db: Session, user: User, entry: str, action: str
+) -> None:
+    _insert_catalog_app(db, "hubspot", "HubSpot")
+    target = _insert(db, entry, "renamed_row", owner=user)
+    target_id = target.id
+
+    if action == "create":
+        result = _create(db, user, entry, "hub-spot")
+    else:
+        result = _rename(db, user, entry, target_id, "hub-spot")
+
+    assert result.name == "hub-spot"
+
+
+def test_catalog_check_ignores_unrelated_names(db: Session) -> None:
+    _insert_catalog_app(db, "google-maps", "Google Maps")
+
+    assert folds_to_catalog_app_name(db, "Google-Maps")
+    assert not folds_to_catalog_app_name(db, "google_maps_extra")
+    assert not folds_to_catalog_app_name(db, "")
