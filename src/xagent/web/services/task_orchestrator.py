@@ -1774,9 +1774,9 @@ async def publish_interruption_pause(
 ) -> None:
     """Broadcast a committed interruption pause, as an input pause is.
 
-    The message says whether the user's own pause request or a system
-    interruption stopped the run. Best effort: the PAUSED row is already
-    committed, so a failed broadcast is only logged.
+    The message and ``interruption_reason`` say whether the user's own pause
+    request or a system interruption stopped the run. Best effort: the PAUSED
+    row is already committed, so a failed broadcast is only logged.
     """
     from .task_events import publish_task_event
 
@@ -1790,6 +1790,8 @@ async def publish_interruption_pause(
                     if reason is InterruptionReason.USER_PAUSE
                     else TASK_INTERRUPTION_PAUSED_MESSAGE
                 ),
+                # Lets a client say why the run stopped (an InterruptionReason).
+                "interruption_reason": reason.value,
                 "timestamp": datetime.now(timezone.utc).timestamp(),
                 **control_state,
             },

@@ -70,6 +70,7 @@ from ..services.llm_utils import AutoModelUnavailableError, resolve_llms_from_na
 from ..services.managed_file_ref import async_ensure_uploaded_file_local_path
 from ..services.model_service import _get_visible_user_ids
 from ..services.public_trace_events import public_task_trace_filter
+from ..services.task_auto_recovery import current_auto_recovery_view
 from ..services.task_cleanup_obligations import (
     CleanupObligation,
     CleanupObligationStatus,
@@ -1057,6 +1058,13 @@ def _raise_task_expired_or_not_found(db: Session, user: User, task_id: int) -> N
     raise HTTPException(status_code=404, detail="Task not found")
 
 
+def _with_auto_recovery(
+    response: Dict[str, Any], auto_recovery: Dict[str, Any] | None
+) -> Dict[str, Any]:
+    """A task detail/status response with its current interruption, if any."""
+    return {**response, "auto_recovery": auto_recovery}
+
+
 @chat_router.get("/task/{task_id}")
 async def get_task(
     task_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)
@@ -1077,6 +1085,9 @@ async def get_task(
             if not task:
                 _raise_task_expired_or_not_found(db, user, task_id)
 
+            # Read on every request, outside the cached response: the row's
+            # state can change without the task row it is fenced against.
+            auto_recovery = current_auto_recovery_view(db, task)
             cache_key = web_task_detail_key(task_id)
             task_updated_at = cache_version_token(task.updated_at)
 
@@ -1107,12 +1118,12 @@ async def get_task(
                 and cached.get("dag_updated_at") == dag_updated_at
             ):
                 if task.status in _TERMINAL_CACHE_STATUSES:
-                    return cast(Dict[str, Any], cached["response"])
+                    return _with_auto_recovery(cached["response"], auto_recovery)
                 activity_ids = _get_task_activity_ids(db, task_id)
                 if cached.get("max_trace_event_id") == int(
                     activity_ids[0]
                 ) and cached.get("max_chat_message_id") == int(activity_ids[1]):
-                    return cast(Dict[str, Any], cached["response"])
+                    return _with_auto_recovery(cached["response"], auto_recovery)
 
             if task.status not in _TERMINAL_CACHE_STATUSES and activity_ids is None:
                 activity_ids = _get_task_activity_ids(db, task_id)
@@ -1209,7 +1220,7 @@ async def get_task(
                 },
                 ttl_seconds=task_cache_ttl_seconds(),
             )
-            return response
+            return _with_auto_recovery(response, auto_recovery)
 
         # Execute in thread pool to avoid blocking
         return await asyncio.to_thread(_get_task_sync)
@@ -1259,18 +1270,21 @@ async def get_task_status(
             if not task:
                 _raise_task_expired_or_not_found(db, user, task_id)
 
+            # Read on every request, outside the cached response: the row's
+            # state can change without the task row it is fenced against.
+            auto_recovery = current_auto_recovery_view(db, task)
             cache_key = web_task_status_key(task_id)
             task_updated_at = cache_version_token(task.updated_at)
             activity_ids: tuple[int, int] | None = None
             cached = cache_get(cache_key)
             if isinstance(cached, dict) and cached.get("updated_at") == task_updated_at:
                 if task.status in _TERMINAL_CACHE_STATUSES:
-                    return cast(Dict[str, Any], cached["response"])
+                    return _with_auto_recovery(cached["response"], auto_recovery)
                 activity_ids = _get_task_activity_ids(db, task_id)
                 if cached.get("max_trace_event_id") == int(
                     activity_ids[0]
                 ) and cached.get("max_chat_message_id") == int(activity_ids[1]):
-                    return cast(Dict[str, Any], cached["response"])
+                    return _with_auto_recovery(cached["response"], auto_recovery)
 
             if task.status not in _TERMINAL_CACHE_STATUSES and activity_ids is None:
                 activity_ids = _get_task_activity_ids(db, task_id)
@@ -1343,7 +1357,7 @@ async def get_task_status(
                 },
                 ttl_seconds=task_cache_ttl_seconds(),
             )
-            return response
+            return _with_auto_recovery(response, auto_recovery)
 
         # Execute in thread pool to avoid blocking
         return await asyncio.to_thread(_get_task_status_sync)

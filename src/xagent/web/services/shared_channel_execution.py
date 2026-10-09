@@ -16,6 +16,7 @@ from sqlalchemy.exc import TimeoutError as DatabaseTimeoutError
 from sqlalchemy.orm import Session
 
 from ...config import get_task_reply_wait_timeout_seconds
+from ...core.agent.interruption import InterruptionReason
 from ...core.agent.trace import (
     TraceAction,
     TraceCategory,
@@ -752,6 +753,9 @@ async def execute_channel_background(
             },
         }
 
+        paused_for: list[InterruptionReason] = []
+        paused_state: dict[str, Any] = {}
+
         def finalize() -> bool:
             with get_session_local()() as db:
                 return finalize_managed_task_lease_result(
@@ -768,10 +772,21 @@ async def execute_channel_background(
                     # An interrupted run may rest PAUSED instead; its channel
                     # then reads "interrupted", as after lease recovery.
                     settle_interruption=True,
+                    paused_for=paused_for,
+                    terminal_event_state=paused_state,
                 )
 
         if not await run_db_io_cancellation_safe(finalize):
             raise TaskLeaseLostError("Channel result no longer owns its execution")
+        if paused_for:
+            # The channel has its "interrupted" reply; a web viewer of the
+            # task learns of the committed pause here. Best effort, as on
+            # the other settlement paths: a failed broadcast is only logged.
+            from .task_orchestrator import publish_interruption_pause
+
+            await publish_interruption_pause(
+                command.task_id, paused_state, paused_for[0]
+            )
     finally:
         service.tracer.remove_handler(forwarder)
         try:

@@ -1150,6 +1150,8 @@ async def test_shared_channel_turn_pauses_and_its_channel_reads_interrupted(
     channel gets the same "interrupted" reply a lease-expiry pause produces
     (until a later change holds the reply across an automatic resume)."""
 
+    published = _capture_task_events(monkeypatch)
+
     command = await _run_shared_channel_turn(selected, monkeypatch, RESULTS[reason])
 
     tid = selected.selection.task_id
@@ -1186,6 +1188,68 @@ async def test_shared_channel_turn_pauses_and_its_channel_reads_interrupted(
         assert [
             fact.payload for fact in facts(db, tid) if fact.kind == "execution_settled"
         ] == [PAUSED_FACT]
+        state_version = task.state_version
+    # A web viewer of the task learns of the pause, with the committed
+    # control identity and why the run stopped.
+    paused = [event for event in published if event["type"] == "task_paused"]
+    assert len(paused) == 1
+    assert paused[0]["interruption_reason"] == reason
+    assert (
+        paused[0]["task_id"],
+        paused[0]["status"],
+        paused[0]["control_state"],
+        paused[0]["run_id"],
+        paused[0]["state_version"],
+    ) == (tid, "paused", "paused", selected.run_id, state_version)
+    assert RESULTS[reason]["error"] not in str(paused)
+
+
+@pytest.mark.asyncio
+async def test_shared_channel_pause_broadcast_failure_keeps_the_pause(
+    selected, monkeypatch, caplog
+):
+    """The pause is committed before it is announced: a failed broadcast is
+    only logged, and the run, its channel reply and its row stand."""
+
+    publish = AsyncMock(side_effect=RuntimeError("event bus down"))
+    monkeypatch.setattr("xagent.web.services.task_events.publish_task_event", publish)
+
+    with caplog.at_level("WARNING", logger=task_orchestrator.__name__):
+        command = await _run_shared_channel_turn(
+            selected, monkeypatch, RESULTS["llm_unavailable"]
+        )
+
+    tid = selected.selection.task_id
+    assert [
+        call.args[0]["type"]
+        for call in publish.await_args_list
+        if call.args[0].get("type") == "task_paused"
+    ] == ["task_paused"]
+    assert "broadcast failed" in caplog.text
+    assert (
+        shared._read_channel_result(command.id, selected.run_id)
+        == interrupted_channel_result()
+    )
+    with get_session_local()() as db:
+        task = db.get(Task, tid)
+        assert (task.status, task.control_state) == (TaskStatus.PAUSED, "paused")
+        assert task.runner_id is None
+        row = db.get(TaskAutoRecovery, tid)
+        assert (row.reason, row.paused_state_version) == (
+            "llm_unavailable",
+            task.state_version,
+        )
+
+
+def _capture_task_events(monkeypatch) -> list[dict[str, Any]]:
+    """Record every task event published from here on."""
+    published: list[dict[str, Any]] = []
+
+    async def publish(event: dict[str, Any], _task_id: int) -> None:
+        published.append(event)
+
+    monkeypatch.setattr("xagent.web.services.task_events.publish_task_event", publish)
+    return published
 
 
 def _leaf_failed_channel_result(result: dict[str, Any]) -> dict[str, Any]:
@@ -1217,8 +1281,10 @@ async def test_shared_channel_turn_that_does_not_pause_fails_as_before(
     written for a FAILED result."""
 
     monkeypatch.setenv(PAUSE_SWITCH, switch)
+    published = _capture_task_events(monkeypatch)
 
     command = await _run_shared_channel_turn(selected, monkeypatch, RESULTS[reason])
+    assert [event for event in published if event["type"] == "task_paused"] == []
 
     tid = selected.selection.task_id
     channel_result = shared._read_channel_result(command.id, selected.run_id)

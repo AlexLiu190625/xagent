@@ -5,6 +5,12 @@ const en = {
     blocked: "Blocked — see the answer for what is needed to continue.",
   },
   sharedStream: { interrupted: "Live updates were interrupted. The displayed answer may be incomplete; saved results will appear when available." },
+  taskInterruption: {
+    paused: "This task was paused by a system interruption. Click resume to continue.",
+    leaseExpired: "This task was paused because the server running it stopped. Click resume to continue.",
+    persistenceFailure: "This task was paused because the database was unavailable. Click resume to continue.",
+    llmUnavailable: "This task was paused because the model provider was unavailable. Click resume to continue.",
+  },
   clientErrors: {
     executionQueueFull: "The team execution queue is full. Please retry shortly.",
     messageProcessingFailed: "The message could not be processed. Please try again.",

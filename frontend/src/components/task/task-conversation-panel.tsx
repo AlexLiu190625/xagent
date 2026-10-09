@@ -63,6 +63,17 @@ type CombinedItem = {
   isSystemNotice?: boolean
 }
 
+// Notice text for a task a system interruption paused, by its reason.
+const INTERRUPTION_NOTICE_KEYS = {
+  lease_expired: "taskInterruption.leaseExpired",
+  persistence_failure: "taskInterruption.persistenceFailure",
+  llm_unavailable: "taskInterruption.llmUnavailable",
+} as const
+
+const interruptionNoticeKey = (reason: string) =>
+  INTERRUPTION_NOTICE_KEYS[reason as keyof typeof INTERRUPTION_NOTICE_KEYS]
+  ?? "taskInterruption.paused"
+
 const toTimestampMs = (timestamp: unknown): number => {
   let time: number
   if (typeof timestamp === "number") {
@@ -721,6 +732,15 @@ export function TaskConversationPanel({
   const shouldShowHistoryLoading =
     timelineItems.length === 0 &&
     state.isHistoryLoading
+  // A user's own pause needs no explanation; a system interruption does.
+  // Only for the viewed task: right after a switch currentTask can still be
+  // the previous one.
+  const interruptionReason = state.currentTask?.id === String(state.taskId)
+    && state.currentTask.status === "paused"
+    && state.currentTask.autoRecovery?.reason
+    && state.currentTask.autoRecovery.reason !== "user_pause"
+    ? state.currentTask.autoRecovery.reason
+    : undefined
   const shouldShowVirtualMessage =
     (state.isProcessing ||
       state.currentTask?.status === "paused" ||
@@ -746,6 +766,11 @@ export function TaskConversationPanel({
         {state.streamRecoveryTaskId === state.taskId && state.taskId !== null && (
           <div role="status" className="mx-4 mt-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100">
             {t("sharedStream.interrupted")}
+          </div>
+        )}
+        {interruptionReason && (
+          <div role="status" data-testid="task-interruption-notice" className="mx-4 mt-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100">
+            {t(interruptionNoticeKey(interruptionReason))}
           </div>
         )}
         <div className="flex-1 overflow-y-auto">

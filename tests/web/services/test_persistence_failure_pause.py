@@ -1487,6 +1487,7 @@ async def test_pause_broadcast_says_who_paused(reason, message):
         message,
         "paused",
     )
+    assert event["interruption_reason"] == reason.value
 
 
 @pytest.mark.asyncio

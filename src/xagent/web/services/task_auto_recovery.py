@@ -53,6 +53,7 @@ from ..models.task_auto_recovery import (
 )
 from ..models.trigger import TriggerType
 from ..models.workforce import WorkforceRun
+from ..utils.db_timezone import format_datetime_for_api
 from .task_execution_controller import TaskControlState
 from .task_lease_service import (
     TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR,
@@ -282,6 +283,51 @@ def record_interruption_no_commit(
         state.value,
     )
     return row
+
+
+def current_auto_recovery_view(db: Session, task: Task) -> dict[str, Any] | None:
+    """Why a PAUSED ``task``'s run stopped, for clients, or ``None``.
+
+    The row is not cleared when its run is resumed; it goes stale as the
+    task's ``run_id`` or ``state_version`` moves on. Only a PAUSED task's row
+    that still describes the task as it stands -- same run, fenced at the
+    current ``state_version`` -- is shown; a FAILED run's row (``manual`` or
+    ``disabled``) is bookkeeping, not something its user can act on.
+
+    Deliberately minimal: ``reason`` and ``interrupted_at`` are written by the
+    same transaction as the task's own PAUSED write, so a cache keyed on the
+    task's ``updated_at`` (the legacy history replay's) cannot serve a stale
+    view. ``state`` is left out on purpose -- it changes without a task write
+    and is not a client contract yet -- as are the operator-only
+    ``last_error``, ``state_detail``, counters and command ids.
+
+    Informational only: a failed read is logged and reads as ``None``, inside
+    a SAVEPOINT so the caller's transaction stays usable (on PostgreSQL a
+    failed statement would otherwise abort it for the rest of the request).
+    """
+
+    if task.status != TaskStatus.PAUSED:
+        return None
+    try:
+        with db.begin_nested():
+            row = db.get(TaskAutoRecovery, task.id)
+    except Exception:
+        logger.warning(
+            "Reading the auto-recovery row of task %s failed; reporting none",
+            task.id,
+            exc_info=True,
+        )
+        return None
+    if (
+        row is None
+        or row.run_id != task.run_id
+        or row.paused_state_version != int(task.state_version or 0)
+    ):
+        return None
+    return {
+        "reason": row.reason,
+        "interrupted_at": format_datetime_for_api(row.interrupted_at),
+    }
 
 
 def lease_expiry_interruption_reason(

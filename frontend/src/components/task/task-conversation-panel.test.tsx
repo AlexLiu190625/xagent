@@ -285,6 +285,36 @@ describe("TaskConversationPanel", () => {
     expect(screen.queryByText(`taskCompletion.${completionOutcome}`)).not.toBeInTheDocument()
   })
 
+  it.each([
+    ["lease_expired", "taskInterruption.leaseExpired"],
+    ["persistence_failure", "taskInterruption.persistenceFailure"],
+    ["llm_unavailable", "taskInterruption.llmUnavailable"],
+    ["shutdown", "taskInterruption.paused"],
+  ])("explains a %s pause and drops the notice once the task leaves paused", (reason, key) => {
+    appState.currentTask = { id: "42", status: "paused", autoRecovery: { reason } }
+    const { rerender } = render(<TaskConversationPanel mode="page" />)
+    expect(screen.getByTestId("task-interruption-notice")).toHaveTextContent(key)
+    appState.currentTask = { ...appState.currentTask, status: "running" }
+    rerender(<TaskConversationPanel mode="page" />)
+    expect(screen.queryByTestId("task-interruption-notice")).not.toBeInTheDocument()
+  })
+
+  it("does not show the previous task's interruption notice after a switch", () => {
+    appState.currentTask = { id: "41", status: "paused", autoRecovery: { reason: "lease_expired" } }
+    appState.taskId = 42
+    render(<TaskConversationPanel mode="page" />)
+    expect(screen.queryByTestId("task-interruption-notice")).not.toBeInTheDocument()
+  })
+
+  it("shows no interruption notice for the user's own pause or an unexplained one", () => {
+    appState.currentTask = { id: "42", status: "paused", autoRecovery: { reason: "user_pause" } }
+    const { rerender } = render(<TaskConversationPanel mode="page" />)
+    expect(screen.queryByTestId("task-interruption-notice")).not.toBeInTheDocument()
+    appState.currentTask = { id: "42", status: "paused" }
+    rerender(<TaskConversationPanel mode="page" />)
+    expect(screen.queryByTestId("task-interruption-notice")).not.toBeInTheDocument()
+  })
+
   it("marks user turns with the task's Local browser context", () => {
     appState.messages = [{
       id: "user-1",
