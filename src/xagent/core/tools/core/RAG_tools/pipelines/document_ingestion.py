@@ -1462,7 +1462,6 @@ def _process_document_impl(
             document_name = os.path.basename(source_path)
             update_collection_stats_sync(
                 collection_name=collection,
-                documents_delta=1,  # Added one document
                 processed_documents_delta=1,  # Success!
                 parses_delta=1,  # One parse operation
                 chunks_delta=chunk_count,
