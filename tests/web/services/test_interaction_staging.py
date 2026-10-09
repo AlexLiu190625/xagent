@@ -2788,6 +2788,12 @@ def test_sp1_slot_taken_rolls_back_cleanly(tmp_path: Path) -> None:
         **_stage_kwargs(anchor, request_idempotency_key=_next_key()),
     )
     db.commit()
+    before = db.execute(
+        sa.select(sa.func.count())
+        .select_from(TaskInteractionRequest)
+        .where(TaskInteractionRequest.task_id == task_id)
+    ).scalar_one()
+    assert before == 1
     _mark_caller_write(db, task_id, "sp1-write")
 
     with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
@@ -2799,6 +2805,12 @@ def test_sp1_slot_taken_rolls_back_cleanly(tmp_path: Path) -> None:
             expires_at=_now() + timedelta(minutes=15),
         )
     db.commit()
+    after = db.execute(
+        sa.select(sa.func.count())
+        .select_from(TaskInteractionRequest)
+        .where(TaskInteractionRequest.task_id == task_id)
+    ).scalar_one()
+    assert after == before
     assert _caller_write_survived(db, task_id, "sp1-write")
     # Exact-set, not `in`, scoped to this module's own signal names -- same
     # idiom as T-CM-1 (test_cm1_seven_cell_exit_matrix): the module-global
