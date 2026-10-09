@@ -100,6 +100,7 @@ from datetime import datetime, timedelta
 from typing import Any, Literal, Mapping
 
 from ...core.agent.clarification import ClarificationDraft
+from ...core.agent.pattern.react.react import _normalize_interaction_text
 from ...core.tools.adapters.vibe.mcp_approval_gate import (
     is_gate_issued_interaction_id,
 )
@@ -310,6 +311,15 @@ def build_clarification_payload(draft: ClarificationDraft) -> dict[str, Any]:
     characters a truncated tail happened to contain -- the same input must
     always truncate to the same length.
 
+    Between those two steps, ``message`` and each interaction's ``field``
+    go through ``_normalize_interaction_text`` (``react.py``), the same
+    trim function the write-side rules (``validate_v1_write_payload``)
+    judge them with, so a control character removed next to an edge space
+    cannot leave that space behind for the write side to refuse. Option
+    ``label`` / ``value``, ``message_type`` and ``requests`` are not
+    normalized: trimming option text would change option values that are
+    valid today.
+
     Every step here degrades rather than raises: a control character is
     dropped silently (it was never visible to begin with), an over-length
     ``question`` is cut with a fixed suffix and flagged, and an over-length
@@ -364,6 +374,11 @@ def build_clarification_payload(draft: ClarificationDraft) -> dict[str, Any]:
             },
         )
 
+    # After the warning above, which counts control characters only: a
+    # message made only of trim characters such as U+FEFF is not "empty
+    # after removing control characters" and must not be logged as such.
+    cleaned_question = _normalize_interaction_text(cleaned_question)
+
     message_truncated = False
     question = cleaned_question
     if len(cleaned_question.encode("utf-8")) > _QUESTION_MAX_BYTES:
@@ -377,6 +392,13 @@ def build_clarification_payload(draft: ClarificationDraft) -> dict[str, Any]:
         message_truncated = True
 
     interactions_cleaned = [_clean_leaves(dict(item)) for item in draft.interactions]
+    # Only the ``field`` key: ``_clean_leaves`` cannot see key names, and
+    # option ``label`` / ``value`` keep their edge whitespace on purpose.
+    # A non-string ``field`` is left as is for the v1 parser to refuse.
+    for item in interactions_cleaned:
+        field_value = item.get("field")
+        if isinstance(field_value, str):
+            item["field"] = _normalize_interaction_text(field_value)
     interactions_dropped = False
     interactions_payload: list[Any] = interactions_cleaned
     if _serialized_byte_length(interactions_cleaned) > _INTERACTIONS_MAX_BYTES:
