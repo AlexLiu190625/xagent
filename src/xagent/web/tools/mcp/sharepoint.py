@@ -525,11 +525,28 @@ def _drive_content_path(
     return f"{base}/root:/{quote(normalized, safe='/')}:/content"
 
 
-def _caller_safe_drive_item(item: dict[str, Any]) -> dict[str, Any]:
-    """Copy a driveItem without Graph's short-lived preauthenticated URL."""
-    safe_item = dict(item)
-    safe_item.pop("@microsoft.graph.downloadUrl", None)
-    return safe_item
+def _caller_safe_drive_item(item: Any) -> Any:
+    """Copy a driveItem (or a list of them) without any short-lived
+    preauthenticated download URL.
+
+    The signed link's field name differs per endpoint (Graph's
+    "@microsoft.graph.downloadUrl"; upload-session completions can name it
+    "@content.downloadUrl" or "@content.downloadUrlNoAuth") and a shared item
+    nests another driveItem under "remoteItem", so every key naming a
+    download URL is dropped at any depth rather than one known name at the
+    top level -- a name pattern rather than powerpoint.py's allowlist,
+    because callers rely on the rest of the driveItem. Matches onedrive.py's
+    identical _caller_safe_drive_item; change both together.
+    """
+    if isinstance(item, dict):
+        return {
+            key: _caller_safe_drive_item(value)
+            for key, value in item.items()
+            if "downloadurl" not in key.lower()
+        }
+    if isinstance(item, list):
+        return [_caller_safe_drive_item(value) for value in item]
+    return item
 
 
 def _decode_bytes(content: bytes) -> tuple[str | None, str | None]:

@@ -3230,3 +3230,160 @@ def test_get_item_by_item_id_still_works_for_a_normal_id(monkeypatch):
 
     assert result["status"] == "success"
     assert result["item"]["id"] == "abc123"
+
+
+# ---------------------------------------------------------------------------
+# preauthenticated download URLs never reach a tool result
+# ---------------------------------------------------------------------------
+
+# Graph names the signed link "@microsoft.graph.downloadUrl" on item, children
+# and search responses; OneDrive Personal's upload-session completion response
+# (served by my.microsoftpersonalcontent.com) names it "@content.downloadUrl"
+# and adds "@content.downloadUrlNoAuth". Shared items nest a "remoteItem".
+_SIGNED_URL = (
+    "https://my.microsoftpersonalcontent.com/personal/abc/_layouts/15/download.aspx"
+    "?UniqueId=item-1&tempauth=v1e.signed-bearer-secret"
+)
+
+
+def _signed_drive_item(item_id: str = "item-1") -> dict:
+    return {
+        "id": item_id,
+        "name": "report.bin",
+        "size": 4_500_000,
+        "file": {"mimeType": "application/octet-stream"},
+        "parentReference": {"driveId": "drive-1", "path": "/drive/root:"},
+        "@microsoft.graph.downloadUrl": _SIGNED_URL,
+        "@content.downloadUrl": _SIGNED_URL,
+        "@content.downloadUrlNoAuth": (
+            "https://my.microsoftpersonalcontent.com/personal/abc/_layouts/15/"
+            "download.aspx?UniqueId=item-1"
+        ),
+        # The match is case-insensitive; pin that with an off-case variant.
+        "@Content.DownloadURL": _SIGNED_URL,
+        "remoteItem": {"id": "remote-1", "@microsoft.graph.downloadUrl": _SIGNED_URL},
+        # A list nested inside a dict is scrubbed too.
+        "children": [{"id": "child-1", "@microsoft.graph.downloadUrl": _SIGNED_URL}],
+    }
+
+
+def _caller_visible_item(item_id: str = "item-1") -> dict:
+    return {
+        "id": item_id,
+        "name": "report.bin",
+        "size": 4_500_000,
+        "file": {"mimeType": "application/octet-stream"},
+        "parentReference": {"driveId": "drive-1", "path": "/drive/root:"},
+        "remoteItem": {"id": "remote-1"},
+        "children": [{"id": "child-1"}],
+    }
+
+
+def _assert_no_download_urls(raw: str) -> dict:
+    assert "tempauth" not in raw
+    assert "downloadurl" not in raw.lower()
+    result = json.loads(raw)
+    assert result["status"] == "success"
+    return result
+
+
+def test_caller_safe_drive_item_drops_every_download_url_field():
+    item = _signed_drive_item()
+
+    assert onedrive._caller_safe_drive_item(item) == _caller_visible_item()
+    assert item == _signed_drive_item()
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: onedrive.onedrive_list_items(),
+        lambda: onedrive.onedrive_search_files("report"),
+    ],
+    ids=["onedrive_list_items", "onedrive_search_files"],
+)
+def test_listing_tools_omit_download_urls(monkeypatch, call):
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                {"value": [_signed_drive_item("a"), _signed_drive_item("b")]}
+            )
+        ),
+    )
+
+    result = _assert_no_download_urls(call())
+
+    assert result["items"] == [_caller_visible_item("a"), _caller_visible_item("b")]
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: onedrive.onedrive_list_items(),
+        lambda: onedrive.onedrive_search_files("report"),
+    ],
+    ids=["onedrive_list_items", "onedrive_search_files"],
+)
+def test_listing_tools_keep_null_value_as_null_items(monkeypatch, call):
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(return_value=MockResponse({"value": None})),
+    )
+
+    result = json.loads(call())
+
+    assert result["status"] == "success"
+    assert result["items"] is None
+
+
+@pytest.mark.parametrize(
+    ("call", "field"),
+    [
+        (lambda: onedrive.onedrive_get_item(path="report.bin"), "item"),
+        (lambda: onedrive.onedrive_upload_text_file("notes.txt", "hello"), "item"),
+        (lambda: onedrive.onedrive_rename_item("item-1", "report.bin"), "item"),
+        (lambda: onedrive.onedrive_create_folder("reports"), "folder"),
+    ],
+    ids=[
+        "onedrive_get_item",
+        "onedrive_upload_text_file",
+        "onedrive_rename_item",
+        "onedrive_create_folder",
+    ],
+)
+def test_single_item_tools_omit_download_urls(monkeypatch, call, field):
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(return_value=MockResponse(_signed_drive_item())),
+    )
+
+    result = _assert_no_download_urls(call())
+
+    assert result[field] == _caller_visible_item()
+
+
+def test_upload_session_omits_personal_onedrive_download_url(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    local_file = _upload_allowed_dirs_env / "report.bin"
+    local_file.write_bytes(b"\x01" * (onedrive._UPLOAD_SESSION_CHUNK_SIZE + 10))
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(return_value=MockResponse({"uploadUrl": "https://upload.example/s"})),
+    )
+    mock_put = Mock(
+        side_effect=[
+            MockResponse({}, status_code=202, content=b""),
+            MockResponse(_signed_drive_item(), status_code=201),
+        ]
+    )
+    _patch_session(monkeypatch, _FakeSession(put=mock_put))
+
+    result = _assert_no_download_urls(onedrive.onedrive_upload_file(str(local_file)))
+
+    assert result["item"] == _caller_visible_item()

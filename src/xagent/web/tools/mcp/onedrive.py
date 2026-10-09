@@ -272,11 +272,30 @@ def _success(**payload: Any) -> str:
     return json.dumps({"status": "success", **payload}, ensure_ascii=False)
 
 
-def _caller_safe_drive_item(item: dict[str, Any]) -> dict[str, Any]:
-    """Copy a driveItem without Graph's short-lived preauthenticated URL."""
-    safe_item = dict(item)
-    safe_item.pop("@microsoft.graph.downloadUrl", None)
-    return safe_item
+def _caller_safe_drive_item(item: Any) -> Any:
+    """Copy a driveItem (or a list of them) without any short-lived
+    preauthenticated download URL.
+
+    The signed link's field name differs per endpoint -- Graph's
+    "@microsoft.graph.downloadUrl" on item and children responses, OneDrive
+    Personal's upload-session "@content.downloadUrl" and
+    "@content.downloadUrlNoAuth" -- and a shared item nests another driveItem
+    under "remoteItem", so every key naming a download URL is dropped at any
+    depth rather than one known name at the top level. This removes a name
+    pattern instead of projecting an allowlist like powerpoint.py does,
+    because list and search callers rely on the rest of the driveItem
+    (file/folder facets, parentReference). sharepoint.py keeps an identical
+    copy; change both together.
+    """
+    if isinstance(item, dict):
+        return {
+            key: _caller_safe_drive_item(value)
+            for key, value in item.items()
+            if "downloadurl" not in key.lower()
+        }
+    if isinstance(item, list):
+        return [_caller_safe_drive_item(value) for value in item]
+    return item
 
 
 def _error(message: str, *, details: Any = None) -> str:
@@ -1175,7 +1194,7 @@ def onedrive_list_items(folder_path: str | None = None, top: int = 50) -> str:
             _children_path(folder_path),
             params={"$top": max(1, min(top, 200))},
         )
-        return _success(items=result.get("value", []))
+        return _success(items=_caller_safe_drive_item(result.get("value", [])))
     except Exception as e:
         logger.error("Error listing OneDrive items under %s: %s", folder_path, e)
         return _error(str(e))
@@ -1193,7 +1212,7 @@ def onedrive_search_files(query: str, top: int = 25) -> str:
             f"/me/drive/root/search(q='{quote(escaped_query, safe='')}')",
             params={"$top": max(1, min(top, 100))},
         )
-        return _success(items=result.get("value", []))
+        return _success(items=_caller_safe_drive_item(result.get("value", [])))
     except Exception as e:
         logger.error("Error searching OneDrive files: %s", e)
         return _error(str(e))
@@ -1519,7 +1538,7 @@ def onedrive_create_folder(
                 "@microsoft.graph.conflictBehavior": normalized_behavior,
             },
         )
-        return _success(folder=result)
+        return _success(folder=_caller_safe_drive_item(result))
     except Exception as e:
         logger.error("Error creating OneDrive folder %s: %s", folder_name, e)
         return _error(str(e))
@@ -1536,7 +1555,7 @@ def onedrive_rename_item(item_id: str, new_name: str) -> str:
             f"/me/drive/items/{url_path_id(item_id, 'item_id')}",
             body={"name": new_name},
         )
-        return _success(item=result)
+        return _success(item=_caller_safe_drive_item(result))
     except Exception as e:
         logger.error("Error renaming OneDrive item %s: %s", item_id, e)
         return _error(str(e))

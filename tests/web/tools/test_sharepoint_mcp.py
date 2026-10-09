@@ -421,6 +421,104 @@ def test_list_items_strips_download_url(monkeypatch):
     assert "@microsoft.graph.downloadUrl" not in item
 
 
+# The signed link's field name differs per endpoint (Graph's v1.0 name, the
+# upload-session "@content.*" names, matched case-insensitively) and shared
+# items nest a remoteItem.
+_SIGNED_URL = (
+    "https://contoso.sharepoint.com/_layouts/15/download.aspx"
+    "?UniqueId=1&tempauth=v1.signed-bearer-secret"
+)
+_CALLER_VISIBLE_ITEM = {
+    "id": "item-1",
+    "name": "report.pdf",
+    "remoteItem": {"id": "remote-1"},
+    "children": [{"id": "child-1"}],
+}
+
+
+def _signed_drive_item() -> dict:
+    return {
+        "id": "item-1",
+        "name": "report.pdf",
+        "@microsoft.graph.downloadUrl": _SIGNED_URL,
+        "@content.downloadUrl": _SIGNED_URL,
+        "@content.downloadUrlNoAuth": (
+            "https://contoso.sharepoint.com/_layouts/15/download.aspx?UniqueId=1"
+        ),
+        "@Content.DownloadURL": _SIGNED_URL,
+        "remoteItem": {"id": "remote-1", "@microsoft.graph.downloadUrl": _SIGNED_URL},
+        # A list nested inside a dict is scrubbed too.
+        "children": [{"id": "child-1", "@microsoft.graph.downloadUrl": _SIGNED_URL}],
+    }
+
+
+def _assert_no_download_urls(raw: str) -> dict:
+    assert "tempauth" not in raw
+    assert "downloadurl" not in raw.lower()
+    result = json.loads(raw)
+    assert result["status"] == "success"
+    return result
+
+
+def test_caller_safe_drive_item_drops_every_download_url_field():
+    item = _signed_drive_item()
+
+    assert sharepoint._caller_safe_drive_item(item) == _CALLER_VISIBLE_ITEM
+    assert item == _signed_drive_item()
+
+
+@pytest.mark.parametrize(
+    ("call", "payload", "field"),
+    [
+        (
+            lambda: sharepoint.sharepoint_list_items("root"),
+            {"value": [_signed_drive_item()]},
+            "items",
+        ),
+        (
+            lambda: sharepoint.sharepoint_search_files("root", "report"),
+            {"value": [_signed_drive_item()]},
+            "items",
+        ),
+        (
+            lambda: sharepoint.sharepoint_upload_text_file("root", "notes.txt", "hi"),
+            _signed_drive_item(),
+            "item",
+        ),
+    ],
+    ids=[
+        "sharepoint_list_items",
+        "sharepoint_search_files",
+        "sharepoint_upload_text_file",
+    ],
+)
+def test_drive_item_tools_omit_download_urls(monkeypatch, call, payload, field):
+    monkeypatch.setattr(
+        sharepoint.requests, "request", Mock(return_value=MockResponse(payload))
+    )
+
+    result = _assert_no_download_urls(call())
+
+    returned = result[field][0] if field == "items" else result[field]
+    assert returned == _CALLER_VISIBLE_ITEM
+
+
+def test_upload_file_omits_download_urls(monkeypatch, _upload_allowed_dirs_env):
+    local_file = _upload_allowed_dirs_env / "report.pdf"
+    local_file.write_bytes(b"%PDF-1.4 report")
+    monkeypatch.setattr(
+        sharepoint.requests,
+        "request",
+        Mock(return_value=MockResponse(_signed_drive_item())),
+    )
+
+    result = _assert_no_download_urls(
+        sharepoint.sharepoint_upload_file("root", str(local_file))
+    )
+
+    assert result["item"] == _CALLER_VISIBLE_ITEM
+
+
 def test_search_files_success(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse({"value": [{"id": "item-1", "name": "report.pdf"}]})
