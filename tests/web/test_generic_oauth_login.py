@@ -31,6 +31,7 @@ from xagent.web.api.auth import (
 from xagent.web.builtin_mcp_registry import (
     get_builtin_oauth_provider_rows,
     get_builtin_public_mcp_app,
+    get_builtin_public_mcp_app_rows,
 )
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer
@@ -936,7 +937,11 @@ def test_planner_catalog_login_requests_tasks_scope(db_session):
     )
 
     query = parse_qs(urlparse(_location(response)).query)
-    assert set(query["scope"][0].split()) == {"Tasks.ReadWrite", "User.Read"}
+    assert set(query["scope"][0].split()) == {
+        "Tasks.ReadWrite",
+        "User.Read",
+        "offline_access",
+    }
 
 
 def test_excel_login_requests_refresh_permission(db_session):
@@ -964,6 +969,60 @@ def test_excel_login_requests_refresh_permission(db_session):
     assert resp.status_code == 307
     scopes = parse_qs(urlparse(_location(resp)).query)["scope"][0].split()
     assert set(scopes) == {"User.Read", "Files.ReadWrite", "offline_access"}
+
+
+MICROSOFT_APP_IDS = sorted(
+    row["app_id"]
+    for row in get_builtin_public_mcp_app_rows()
+    if row["provider_name"] == "microsoft"
+)
+
+
+def test_microsoft_app_id_discovery_is_not_empty():
+    # Guard against the registry filter silently matching nothing, which
+    # would let the parametrized test below pass vacuously.
+    assert {
+        "excel",
+        "onedrive",
+        "outlook",
+        "planner",
+        "powerpoint",
+        "sharepoint",
+        "teams",
+        "word",
+    } <= set(MICROSOFT_APP_IDS)
+
+
+@pytest.mark.parametrize("app_id", MICROSOFT_APP_IDS)
+def test_every_microsoft_app_login_requests_refresh_permission(db_session, app_id):
+    """Microsoft only issues a refresh_token when offline_access is requested,
+    and the provider's default_scopes (User.Read) do not include it, so every
+    Microsoft connector must ask for it itself or its grant dies with the
+    first access token."""
+    db, user = db_session
+    token = _token_for(user)
+    app_row = get_builtin_public_mcp_app(app_id)
+    assert app_row is not None
+    db.add(PublicMCPApp(**app_row))
+    db.commit()
+    provider = _provider(
+        auth_url="https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+        default_scopes=["User.Read"],
+        redirect_uri="https://app.example.com/api/auth/microsoft/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="microsoft",
+        token=token,
+        app_id=app_id,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    assert resp.status_code == 307
+    scopes = parse_qs(urlparse(_location(resp)).query)["scope"][0].split()
+    assert "offline_access" in scopes
 
 
 def test_bare_microsoft_callback_skips_excel_but_connects_eligible_sibling(

@@ -206,7 +206,7 @@ def test_teams_admin_consent_required_surfaces_a_forwardable_link(db_session):
     # users blocked again on their very next connect attempt.
     assert qs["scope"] == [
         "User.Read Channel.ReadBasic.All ChannelMessage.Read.All ChannelMessage.Send "
-        "Chat.ReadWrite Team.ReadBasic.All TeamMember.Read.All"
+        "Chat.ReadWrite Team.ReadBasic.All TeamMember.Read.All offline_access"
     ]
 
     state_payload = verify_token(qs["state"][0])

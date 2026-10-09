@@ -674,6 +674,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "ChannelMessage.Read.All",
                 "ChannelMessage.Send",
                 "Chat.ReadWrite",
+                "offline_access",
             ],
             "is_visible_in_connector": True,
             "launch_config": {
@@ -695,6 +696,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "Mail.Send",
                 "Calendars.ReadWrite",
                 "Contacts.Read",
+                "offline_access",
             ],
             "is_visible_in_connector": True,
             "launch_config": {
@@ -711,7 +713,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "transport": "oauth",
             "provider_name": "microsoft",
             "category": "Storage",
-            "oauth_scopes": ["Files.ReadWrite"],
+            "oauth_scopes": ["Files.ReadWrite", "offline_access"],
             "is_visible_in_connector": True,
             "launch_config": {
                 "command": "python",
@@ -727,7 +729,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "transport": "oauth",
             "provider_name": "microsoft",
             "category": "Productivity",
-            "oauth_scopes": ["Tasks.ReadWrite"],
+            "oauth_scopes": ["Tasks.ReadWrite", "offline_access"],
             "is_visible_in_connector": True,
             "launch_config": {
                 "command": "python",
@@ -748,7 +750,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "transport": "oauth",
             "provider_name": "microsoft",
             "category": "Productivity",
-            "oauth_scopes": ["Files.ReadWrite"],
+            "oauth_scopes": ["Files.ReadWrite", "offline_access"],
             "is_visible_in_connector": True,
             "launch_config": {
                 "command": "python",
@@ -769,7 +771,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "transport": "oauth",
             "provider_name": "microsoft",
             "category": "Storage",
-            "oauth_scopes": ["Sites.ReadWrite.All"],
+            "oauth_scopes": ["Sites.ReadWrite.All", "offline_access"],
             "is_visible_in_connector": True,
             "launch_config": {
                 "command": "python",
@@ -800,7 +802,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "transport": "oauth",
             "provider_name": "microsoft",
             "category": "Productivity",
-            "oauth_scopes": ["Files.ReadWrite.All"],
+            "oauth_scopes": ["Files.ReadWrite.All", "offline_access"],
             "is_visible_in_connector": True,
             "launch_config": {
                 "command": "python",

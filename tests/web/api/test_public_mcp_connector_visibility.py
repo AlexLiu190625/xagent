@@ -761,6 +761,7 @@ def test_init_db_seeds_builtin_oauth_and_microsoft_graph_public_apps() -> None:
             "ChannelMessage.Read.All",
             "ChannelMessage.Send",
             "Chat.ReadWrite",
+            "offline_access",
         ]
         assert teams_app.launch_config == {
             "command": "python",
@@ -775,6 +776,7 @@ def test_init_db_seeds_builtin_oauth_and_microsoft_graph_public_apps() -> None:
             "Mail.Send",
             "Calendars.ReadWrite",
             "Contacts.Read",
+            "offline_access",
         ]
         assert outlook_app.launch_config == {
             "command": "python",
@@ -784,7 +786,7 @@ def test_init_db_seeds_builtin_oauth_and_microsoft_graph_public_apps() -> None:
 
         assert onedrive_app is not None
         assert onedrive_app.provider_name == "microsoft"
-        assert onedrive_app.oauth_scopes == ["Files.ReadWrite"]
+        assert onedrive_app.oauth_scopes == ["Files.ReadWrite", "offline_access"]
         assert onedrive_app.launch_config == {
             "command": "python",
             "args": ["-m", "xagent.web.tools.mcp.onedrive"],

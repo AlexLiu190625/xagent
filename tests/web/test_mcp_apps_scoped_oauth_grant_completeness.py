@@ -89,7 +89,10 @@ def test_whatsapp_scopes_actually_exceed_the_meta_providers_default_scopes():
 
 
 def test_planner_scopes_exceed_the_microsoft_providers_default_scopes():
-    assert _app_scopes_beyond_provider_defaults("planner") == {"Tasks.ReadWrite"}
+    assert _app_scopes_beyond_provider_defaults("planner") == {
+        "Tasks.ReadWrite",
+        "offline_access",
+    }
 
 
 def test_sharepoint_scopes_actually_exceed_the_microsoft_providers_default_scopes():
@@ -109,7 +112,7 @@ def test_word_scopes_actually_exceed_the_microsoft_providers_default_scopes():
     word_app = next(
         row for row in get_builtin_public_mcp_app_rows() if row["app_id"] == "word"
     )
-    assert word_app["oauth_scopes"] == ["Files.ReadWrite.All"]
+    assert word_app["oauth_scopes"] == ["Files.ReadWrite.All", "offline_access"]
     assert word_app["launch_config"]["static_env"] == {
         "XAGENT_TOOL_MAX_OUTPUT_LENGTH": "XAGENT_TOOL_MAX_OUTPUT_LENGTH"
     }

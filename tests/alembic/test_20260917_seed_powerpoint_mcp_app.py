@@ -133,7 +133,9 @@ def test_seed_row_matches_registry(tmp_path):
     registry_row = next(
         r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "powerpoint"
     )
-    assert migration.ROW == registry_row
+    # offline_access was added after this seed by 20261008_microsoft_offline_access.
+    registry_scopes = [s for s in registry_row["oauth_scopes"] if s != "offline_access"]
+    assert migration.ROW == {**registry_row, "oauth_scopes": registry_scopes}
 
 
 def test_downgrade_removes_powerpoint(tmp_path):
