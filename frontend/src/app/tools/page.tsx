@@ -141,6 +141,7 @@ function ToolsPageContent() {
   const [configurableTools, setConfigurableTools] = useState<ConfigurableTool[]>([])
   const [sqlConnections, setSqlConnections] = useState<SqlConnectionItem[]>([])
   const [isLoading, setIsLoading] = useState(false)
+  const [isDeletingServer, setIsDeletingServer] = useState(false)
   const [isConnectMcpOpen, setIsConnectMcpOpen] = useState(false)
   const [isOfficialAppDialogOpen, setIsOfficialAppDialogOpen] = useState(false)
   const [editingOfficialApp, setEditingOfficialApp] = useState<AppIntegration | null>(null)
@@ -704,6 +705,46 @@ function ToolsPageContent() {
     }
   }
 
+  // can_edit_global is only true for viewers the DELETE routes also accept:
+  // the MCP route allows owners and admins, and a Custom API owner's row
+  // carries can_edit and can_delete together. Remaining refusals (team
+  // admin rules, live OAuth connections) come back as the toast below. Team
+  // tools the viewer does not own never reach this dialog: their card is
+  // not clickable.
+  const canDeleteServer = (server: MCPServer) => server.can_edit_global === true
+
+  const handleDeleteMcpServer = async () => {
+    const server = editingServer
+    if (!server || isDeletingServer) return
+    if (!confirm(t('tools.mcp.dialog.deleteConfirm', { name: server.name }))) return
+
+    setIsDeletingServer(true)
+    try {
+      const url = server.transport === 'custom_api'
+        ? `${getApiUrl()}/api/custom-apis/${server.id}`
+        : `${getApiUrl()}/api/mcp/servers/${server.id}`
+      const response = await apiRequest(url, { method: 'DELETE' })
+      if (!response.ok) {
+        const err = await response.json().catch(() => null)
+        toast.error(
+          typeof err?.detail === 'string' && err.detail
+            ? err.detail
+            : t('tools.mcp.dialog.deleteFailed', { name: server.name })
+        )
+        return
+      }
+
+      setIsMcpDialogOpen(false)
+      await loadMCPServers()
+      toast.success(t('tools.mcp.dialog.deleteSuccess', { name: server.name }))
+    } catch (error) {
+      console.error("Failed to delete connector:", error)
+      toast.error(t('tools.mcp.dialog.deleteFailed', { name: server.name }))
+    } finally {
+      setIsDeletingServer(false)
+    }
+  }
+
   const handleToggleToolEnabled = async (tool: Tool) => {
     if (pendingToolToggles[tool.name]) return
 
@@ -1130,6 +1171,17 @@ function ToolsPageContent() {
             )}
           </div>
           <DialogFooter>
+            {editingServer && canDeleteServer(editingServer) && (
+              <Button
+                variant="destructive"
+                className="sm:mr-auto"
+                onClick={handleDeleteMcpServer}
+                disabled={isDeletingServer || isLoading}
+              >
+                {isDeletingServer ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Trash2 className="h-4 w-4 mr-2" />}
+                {t('tools.mcp.buttons.delete')}
+              </Button>
+            )}
             <Button variant="outline" onClick={() => setIsMcpDialogOpen(false)}>
               {t('tools.mcp.buttons.cancel')}
             </Button>
@@ -1137,6 +1189,7 @@ function ToolsPageContent() {
               onClick={handleSaveMcpServer}
               disabled={
                 isLoading ||
+                isDeletingServer ||
                 !mcpFormData.name.trim() ||
                 (mcpFormData.transport === 'custom_api' && customApiEnv.length > 0 && customApiEnv.some(env => !env.key.trim() || !env.value.trim()))
               }

@@ -230,3 +230,146 @@ describe("ToolsPage official settings dialog ownership badge (#1623)", () => {
     expect(dialogQueries.getByRole("button", { name: "tools.mcp.sharing.share" })).toBeInTheDocument()
   })
 })
+
+describe("ToolsPage connector delete from the edit dialog", () => {
+  function customMcpServer(overrides: Partial<MCPServer> = {}): MCPServer {
+    return officialMcpServer({
+      id: 5,
+      name: "Records MCP",
+      transport: "stdio",
+      transport_display: "stdio",
+      can_edit_global: true,
+      ...overrides,
+    })
+  }
+
+  function mcpDetail(server: MCPServer) {
+    return {
+      id: server.id,
+      user_id: server.user_id,
+      name: server.name,
+      transport: server.transport,
+      description: server.description,
+      config: { command: "run", args: [] },
+      user_env: null,
+      runtime_input_schema: null,
+      runtime_bindings: null,
+      allow_delegated_authorization: false,
+      can_edit_global: server.can_edit_global ?? false,
+    }
+  }
+
+  function customApiDetail(server: MCPServer) {
+    return {
+      id: server.id,
+      name: server.name,
+      description: server.description,
+      url: "https://api.example.com",
+      method: "GET",
+      headers: null,
+      body: null,
+      env: null,
+      runtime_input_schema: null,
+      runtime_bindings: null,
+      allow_delegated_authorization: false,
+    }
+  }
+
+  function installDeleteApiMock(
+    server: MCPServer,
+    deleteResponse: () => Response = () => new Response(null, { status: 204 }),
+  ) {
+    let deleted = false
+    apiRequestMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (init?.method === "DELETE") {
+        const response = deleteResponse()
+        if (response.ok) deleted = true
+        return response
+      }
+      if (url.endsWith("/api/tools/available")) return jsonResponse({ tools: [] })
+      if (url.endsWith("/api/mcp/servers")) return jsonResponse(deleted ? [] : [server])
+      if (url.endsWith("/api/connectors/status")) return jsonResponse({})
+      if (url.endsWith("/api/tools/configurable")) return jsonResponse({ tools: [] })
+      if (url.endsWith("/api/tools/sql-connections")) return jsonResponse({ connections: [] })
+      if (url.endsWith(`/api/mcp/servers/${server.id}`)) return jsonResponse(mcpDetail(server))
+      if (url.endsWith(`/api/custom-apis/${server.id}`)) return jsonResponse(customApiDetail(server))
+      throw new Error(`Unexpected request: ${url}`)
+    })
+  }
+
+  async function openEditDialog() {
+    await renderPage()
+    fireEvent.click(screen.getByText("Records MCP"))
+    return within(await screen.findByRole("dialog"))
+  }
+
+  function deleteCalls() {
+    return apiRequestMock.mock.calls.filter(([, init]) => init?.method === "DELETE")
+  }
+
+  it("deletes an owned MCP server after confirmation and refreshes the list", async () => {
+    const { toast } = await import("@/components/ui/sonner")
+    vi.mocked(toast.success).mockClear()
+    vi.stubGlobal("confirm", vi.fn(() => true))
+    installDeleteApiMock(customMcpServer())
+
+    const dialog = await openEditDialog()
+    fireEvent.click(dialog.getByRole("button", { name: /tools\.mcp\.buttons\.delete/ }))
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+    expect(deleteCalls().map(([url]) => url)).toEqual(["http://api.local/api/mcp/servers/5"])
+    await waitFor(() => expect(screen.queryByText("Records MCP")).not.toBeInTheDocument())
+    expect(toast.success).toHaveBeenCalledWith(
+      'tools.mcp.dialog.deleteSuccess:{"name":"Records MCP"}',
+    )
+  })
+
+  it("deletes a Custom API through the Custom API route", async () => {
+    vi.stubGlobal("confirm", vi.fn(() => true))
+    installDeleteApiMock(customMcpServer({ id: 7, transport: "custom_api" }))
+
+    const dialog = await openEditDialog()
+    fireEvent.click(dialog.getByRole("button", { name: /tools\.mcp\.buttons\.delete/ }))
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+    expect(deleteCalls().map(([url]) => url)).toEqual(["http://api.local/api/custom-apis/7"])
+  })
+
+  it("sends nothing when the confirmation is declined", async () => {
+    vi.stubGlobal("confirm", vi.fn(() => false))
+    installDeleteApiMock(customMcpServer())
+
+    const dialog = await openEditDialog()
+    fireEvent.click(dialog.getByRole("button", { name: /tools\.mcp\.buttons\.delete/ }))
+
+    expect(deleteCalls()).toHaveLength(0)
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+  })
+
+  it("shows the backend refusal and keeps the dialog open", async () => {
+    const { toast } = await import("@/components/ui/sonner")
+    vi.mocked(toast.error).mockClear()
+    vi.stubGlobal("confirm", vi.fn(() => true))
+    installDeleteApiMock(customMcpServer(), () =>
+      jsonResponse({ detail: "MCP server has actor-owned OAuth connections" }, 409),
+    )
+
+    const dialog = await openEditDialog()
+    fireEvent.click(dialog.getByRole("button", { name: /tools\.mcp\.buttons\.delete/ }))
+
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith("MCP server has actor-owned OAuth connections"),
+    )
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+    expect(screen.getAllByText("Records MCP").length).toBeGreaterThan(0)
+  })
+
+  it("hides the delete button when the viewer cannot edit the shared config", async () => {
+    installDeleteApiMock(customMcpServer({ can_edit_global: false }))
+
+    const dialog = await openEditDialog()
+
+    expect(dialog.getByRole("button", { name: /tools\.mcp\.buttons\.cancel/ })).toBeInTheDocument()
+    expect(dialog.queryByRole("button", { name: /tools\.mcp\.buttons\.delete/ })).not.toBeInTheDocument()
+  })
+})
