@@ -24,7 +24,9 @@ from ..models.custom_api import CustomApi, UserCustomApi
 from ..models.database import get_db
 from ..models.user import User
 from ..services.connector_name_policy import (
+    catalog_app_name_detail,
     folded_name_conflict_detail,
+    folds_to_catalog_app_name,
     has_folded_connector_name_conflict,
     has_unfoldable_edge_whitespace,
     unfoldable_edge_whitespace_detail,
@@ -246,6 +248,11 @@ async def create_custom_api(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=unfoldable_edge_whitespace_detail(),
+        )
+    if folds_to_catalog_app_name(db, api_data.name):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=catalog_app_name_detail(api_data.name),
         )
     if has_folded_connector_name_conflict(db, api_data.name):
         raise HTTPException(
@@ -765,6 +772,11 @@ def update_custom_api(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=unfoldable_edge_whitespace_detail(),
+            )
+        if folds_to_catalog_app_name(db, api_data.name):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=catalog_app_name_detail(api_data.name),
             )
         if has_folded_connector_name_conflict(
             db,
