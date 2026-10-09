@@ -61,16 +61,17 @@ class KBBackendCapabilities:
     def milvus(cls) -> KBBackendCapabilities:
         """Return what ``MilvusCollectionHandle`` supports.
 
-        Documents, parses and chunks are served by the LanceDB ledger. Embeddings
-        and search are off until Milvus rows are written and searched. Versions,
-        which here include cascade cleanup, and async search stay off.
+        Documents, parses and chunks are served by the LanceDB ledger, sync search
+        by Milvus. Embeddings stay off until the family's delete, snapshot and
+        restore methods are implemented. Versions, which here include cascade
+        cleanup, and async search stay off.
         """
         return cls(
             supports_documents=True,
             supports_parses=True,
             supports_chunks=True,
             supports_embeddings=False,
-            supports_search=False,
+            supports_search=True,
             supports_versions=False,
             supports_raw_connection=False,
             supports_async_search=False,

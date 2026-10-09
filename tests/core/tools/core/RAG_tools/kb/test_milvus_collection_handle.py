@@ -121,6 +121,10 @@ IMPLEMENTED = {
     "read_chunks_needing_embedding",
     "write_embeddings",
     "commit_embeddings",
+    "validate_query_vector",
+    "search_dense",
+    "search_sparse",
+    "search_hybrid",
 }
 PENDING = (
     set(
@@ -181,8 +185,8 @@ def test_every_interface_method_is_delegated_refused_pending_or_implemented() ->
     assert (len(LEDGER), len(UNSUPPORTED), len(PENDING), len(IMPLEMENTED)) == (
         44,
         12,
-        14,
-        5,
+        10,
+        9,
     )
     assert LEDGER | set(UNSUPPORTED) | PENDING | IMPLEMENTED == interface
     for name in interface:
@@ -236,7 +240,8 @@ def test_capabilities_report_exactly_what_the_handle_serves() -> None:
         "supports_raw_connection",
     }
     for flag, names in FAMILIES.items():
-        assert getattr(capabilities, flag) == (set(names.split()) <= LEDGER), flag
+        served = set(names.split()) <= LEDGER | IMPLEMENTED
+        assert getattr(capabilities, flag) == served, flag
     assert capabilities.supports_raw_connection is False
     assert KBCoordinator._capabilities_for_backend(KBStorageBackend.MILVUS) == (
         capabilities

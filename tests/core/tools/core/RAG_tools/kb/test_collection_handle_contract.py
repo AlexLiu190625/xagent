@@ -1,12 +1,14 @@
 """Behavior contract every ``KBCollectionHandle`` engine must satisfy.
 
 Tests drive the handle only through the abstract interface; an engine joins by
-adding an ``ENGINES`` entry. On Milvus the ledger cases in ``MILVUS_SKELETON``
-run, the cases in ``MILVUS_ROWS`` run against the server at ``MILVUS_URI``, the
-cascade cases in ``MILVUS_UNSUPPORTED`` are skipped because Milvus does not
-support cascade cleanup by design, and every other case needs Milvus search or
-delete: those are not implemented yet, so the cases are strict xfails on
-``NotImplementedError`` until they are. Not covered here:
+adding an ``ENGINES`` entry. On Milvus the cases in ``MILVUS_SKELETON`` (the ledger
+and the query-vector check) run, the cases in ``MILVUS_ROWS`` run against the server
+at ``MILVUS_URI``, the cascade cases in ``MILVUS_UNSUPPORTED`` are skipped because
+Milvus does not support cascade cleanup by design, and every other case needs Milvus
+delete, snapshot or restore: those are not implemented yet, so the cases are strict
+xfails on ``NotImplementedError`` until they are. The rename case is a strict xfail on
+``AssertionError``: it reads the renamed collection through search and finds no rows.
+Not covered here:
 
 - async search: LanceDB async search returns no rows today;
 - untagged main pointers and ``list_main_pointers``: on LanceDB the untagged
@@ -120,8 +122,14 @@ MILVUS_SKELETON = {
     "test_rename_collection_status_moves_only_the_callers_rows",
     "test_rename_collection_metadata_moves_only_the_callers_config",
     "test_delete_collection_config_follows_tenant_scope",
+    "test_validate_query_vector_rejects_malformed_vectors",
 }
 MILVUS_ROWS = {
+    "test_rewriting_embeddings_does_not_duplicate_rows",
+    "test_search_returns_only_rows_the_caller_may_see",
+    "test_search_never_crosses_collections",
+    "test_dense_search_ranks_nearest_first_with_unit_scores",
+    "test_hybrid_results_carry_per_route_scores",
     "test_chunk_rows_round_trip_in_index_order",
     "test_chunks_needing_embedding_resume_after_partial_write",
     "test_stats_and_listings_follow_owner_scope",
@@ -130,6 +138,7 @@ MILVUS_UNSUPPORTED = {
     "test_cascade_deletes_its_scope_only_when_confirmed",
     "test_cascade_leaves_other_owners_rows",
 }
+MILVUS_RENAME = "test_rename_collection_data_moves_rows_to_new_name"
 
 
 def _engine_marks(engine: str, case: str) -> tuple[pytest.MarkDecorator, ...]:
@@ -139,12 +148,21 @@ def _engine_marks(engine: str, case: str) -> tuple[pytest.MarkDecorator, ...]:
         return (pytest.mark.skip(reason="Milvus does not support cascade cleanup"),)
     if case in MILVUS_ROWS:
         return (pytest.mark.milvus,)
+    if case == MILVUS_RENAME:
+        return (
+            pytest.mark.milvus,
+            pytest.mark.xfail(
+                strict=True,
+                raises=AssertionError,
+                reason="the rename does not move the Milvus rows yet",
+            ),
+        )
     return (
         pytest.mark.milvus,
         pytest.mark.xfail(
             strict=True,
             raises=NotImplementedError,
-            reason="needs Milvus search or delete, which are not implemented yet",
+            reason="needs Milvus delete, snapshot or restore, which are not implemented yet",
         ),
     )
 
@@ -295,11 +313,11 @@ def _search(
     vector = VECTORS["kiwi apple"]
     scope = {"top_k": 10, "user_id": user_id, "is_admin": is_admin}
     if mode == "dense":
-        response = handle.search_dense(TAG, vector, **scope)
+        response = handle.search_dense(MODEL, vector, **scope)
     elif mode == "sparse":
-        response = handle.search_sparse(TAG, query, **scope)
+        response = handle.search_sparse(MODEL, query, **scope)
     else:
-        response = handle.search_hybrid(TAG, query, vector, **scope)
+        response = handle.search_hybrid(MODEL, query, vector, **scope)
     assert response.status == "success", response.warnings
     return {result.chunk_id: result.doc_id for result in response.results}
 
@@ -501,7 +519,9 @@ def test_search_never_crosses_collections(
 def test_dense_search_ranks_nearest_first_with_unit_scores(
     seeded: KBCollectionHandle,
 ) -> None:
-    response = seeded.search_dense(TAG, VECTORS["cherry plum"], top_k=10, is_admin=True)
+    response = seeded.search_dense(
+        MODEL, VECTORS["cherry plum"], top_k=10, is_admin=True
+    )
 
     top = response.results[0]
     assert (top.chunk_id, top.doc_id, top.text) == ("doc-1-c1", "doc-1", "cherry plum")
@@ -513,7 +533,7 @@ def test_dense_search_ranks_nearest_first_with_unit_scores(
 
 def test_hybrid_results_carry_per_route_scores(seeded: KBCollectionHandle) -> None:
     response = seeded.search_hybrid(
-        TAG, "apple", VECTORS["kiwi apple"], top_k=10, is_admin=True
+        MODEL, "apple", VECTORS["kiwi apple"], top_k=10, is_admin=True
     )
 
     top = response.results[0]
