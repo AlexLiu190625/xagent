@@ -658,3 +658,58 @@ def test_catalog_check_ignores_unrelated_names(db: Session) -> None:
     assert folds_to_catalog_app_name(db, "Google-Maps")
     assert not folds_to_catalog_app_name(db, "google_maps_extra")
     assert not folds_to_catalog_app_name(db, "")
+
+
+@pytest.mark.parametrize("name_in_update", [True, False])
+@pytest.mark.parametrize(
+    "entry,stored",
+    [
+        pytest.param(_MCP, "google-maps", id="provisioned-mcp-row"),
+        pytest.param(_API, "google_maps", id="custom-api-named-before-the-check"),
+    ],
+)
+def test_row_named_after_catalog_app_stays_editable(
+    db: Session, user: User, entry: str, stored: str, name_in_update: bool
+) -> None:
+    _insert_catalog_app(db, "google-maps", "Google Maps")
+    row = _insert(db, entry, stored, owner=user)
+    row_id = row.id
+    name = stored if name_in_update else None
+
+    if entry == _MCP:
+        result = update_mcp_server(
+            row_id,
+            MCPServerUpdate(name=name, description="edited"),
+            current_user=user,
+            db=db,
+        )
+    else:
+        result = update_custom_api(
+            row_id,
+            CustomApiUpdate(name=name, description="edited"),
+            current_user=user,
+            db=db,
+        )
+
+    assert result.name == stored
+    assert result.description == "edited"
+
+
+@pytest.mark.parametrize("action", ["create", "rename"])
+def test_mcp_catalog_rejections_share_one_message(
+    db: Session, user: User, action: str
+) -> None:
+    # "Google-Maps" is caught by the older catalog-key check and "google_maps"
+    # only by the selection-fold check; both answer with the same text.
+    _insert_catalog_app(db, "google-maps", "Google Maps")
+    target = _insert_mcp(db, "renamed_row", owner=user)
+    target_id = target.id
+
+    for requested in ("Google-Maps", "google_maps"):
+        with pytest.raises(HTTPException) as exc:
+            if action == "create":
+                _create(db, user, _MCP, requested)
+            else:
+                _rename(db, user, _MCP, target_id, requested)
+        assert exc.value.status_code == 400
+        assert exc.value.detail == catalog_app_name_detail(requested)

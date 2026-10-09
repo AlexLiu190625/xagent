@@ -4292,10 +4292,7 @@ def create_mcp_server(
         if _is_reserved_catalog_name(db, server_data.name):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=(
-                    f"'{server_data.name}' is reserved for a catalog app; "
-                    "connect it from the catalog instead"
-                ),
+                detail=catalog_app_name_detail(server_data.name),
             )
 
         # Build and validate config
@@ -4649,10 +4646,7 @@ def update_mcp_server(
             if _is_reserved_catalog_name(db, server_data.name):
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=(
-                        f"'{server_data.name}' is reserved for a catalog app; "
-                        "connect it from the catalog instead"
-                    ),
+                    detail=catalog_app_name_detail(server_data.name),
                 )
             existing = (
                 db.query(MCPServer)
