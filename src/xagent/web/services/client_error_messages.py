@@ -61,11 +61,12 @@ class ClientErrorCode(StrEnum):
     MESSAGE_OUTCOME_UNKNOWN = "message_outcome_unknown"
     # The turn ended interrupted after an external stop was requested (that
     # stop, or a shutdown that settled the turn first). Only the external
-    # cancel core's dedicated builder puts it on a frame; the shared terminal
-    # builder drops it. TerminalTaskEventMessageCode has a member with the
-    # same value and a different meaning: on a cancel command's audit record
-    # it means the command ended in failure while its task was already
-    # COMPLETED or FAILED. That record never reaches a client.
+    # cancel core puts it on a frame, by passing it to the shared terminal
+    # builder as ``asserted_code``; passed as ``code`` it is dropped.
+    # TerminalTaskEventMessageCode has a member with the same value and a
+    # different meaning: on a cancel command's audit record it means the
+    # command ended in failure while its task was already COMPLETED or
+    # FAILED. That record never reaches a client.
     EXTERNAL_TURN_INTERRUPTED = "external_turn_interrupted"
 
 

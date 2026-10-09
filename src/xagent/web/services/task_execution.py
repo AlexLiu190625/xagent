@@ -51,6 +51,7 @@ from typing import (
     Optional,
     Union,
     cast,
+    get_args,
     overload,
 )
 from urllib.parse import unquote
@@ -250,26 +251,62 @@ def _task_error_payload(
     return payload
 
 
+# Codes a caller states from an outcome it proved itself, as opposed to
+# ``code``, which is projected from an exception. Add a member in the change
+# that adds the call site asserting it; the runtime set is derived from this.
+CallerAssertedTerminalCode = Literal[ClientErrorCode.EXTERNAL_TURN_INTERRUPTED]
+_CALLER_ASSERTED_TERMINAL_CODES: frozenset[ClientErrorCode] = frozenset(
+    get_args(CallerAssertedTerminalCode)
+)
+
+
 def create_terminal_task_error_event(
     task_id: int,
     message: str,
     *,
     code: str | None = None,
+    asserted_code: CallerAssertedTerminalCode | None = None,
 ) -> dict[str, Any]:
     """Shape an error event after the exact lease owner commits FAILED.
 
     ``code`` is written only when it survives validation, so a caller that
-    passes none still gets the same six-key frame, and a caller that passes
-    something unusable gets that same frame rather than an exception. This
-    runs on the reporting path of an already-failed task, and the one call
-    site that passes this argument evaluates it inside the ``except
-    Exception`` that only logs a failed broadcast -- so raising here would
-    cost the terminal frame outright and leave the user on the silent
+    passes neither argument still gets the same six-key frame, and a caller
+    that passes something unusable gets that same frame rather than an
+    exception. This runs on the reporting path of an already-failed task,
+    and the one call site that passes ``code`` evaluates it inside the
+    ``except Exception`` that only logs a failed broadcast -- so raising here
+    would cost the terminal frame outright and leave the user on the silent
     failure this path exists to remove. A bad optional argument costs that
     argument and nothing else. The rejection is logged with its stack.
 
     ``code`` must be a connector-runtime code or ``AUTO_MODEL_UNAVAILABLE``.
+
+    ``asserted_code`` is the other way a code reaches this frame: the caller
+    states an outcome it proved itself, for example the external cancel core
+    once its target turn ended interrupted. It must be a
+    ``ClientErrorCode`` member listed in ``CallerAssertedTerminalCode``; an
+    equal plain string or a same-valued member of another enum is dropped.
+    The two arguments are exclusive: when both are passed, ``asserted_code``
+    is dropped and ``code`` is validated as usual, so a projected failure is
+    never relabelled by an assertion.
     """
+
+    # The exclusivity check reads ``code`` as passed, before its own gate
+    # below can clear it: an assertion never rides along with a projected
+    # failure, valid or not.
+    if asserted_code is not None and (
+        not isinstance(asserted_code, ClientErrorCode)
+        or asserted_code not in _CALLER_ASSERTED_TERMINAL_CODES
+        or code is not None
+    ):
+        logger.error(
+            "task_id=%s component=terminal-error-frame dropped=asserted_code "
+            "value=%r; the frame is still sent without it",
+            task_id,
+            asserted_code,
+            stack_info=True,
+        )
+        asserted_code = None
 
     # Python annotations are not enforced at run time, so the mypy gate on the
     # signature above is not the whole door: a caller that routes through Any
@@ -312,6 +349,8 @@ def create_terminal_task_error_event(
     }
     if code is not None:
         event["code"] = code
+    elif asserted_code is not None:
+        event["code"] = asserted_code.value
     return event
 
 

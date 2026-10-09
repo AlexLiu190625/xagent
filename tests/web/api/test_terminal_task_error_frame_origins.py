@@ -11,8 +11,8 @@ client-visible code. Anything else (a literal, ``str(exc)``, a field read off
 the exception directly) is an unauthorized source, even if the value it
 produces happens to be a real closed-set member today.
 
-The second test pins ``external_turn_interrupted``, which bypasses the
-projector through the external cancel core's own builder.
+The second test pins the other way a code reaches the frame: a caller
+asserting it through ``asserted_code=``.
 """
 
 from __future__ import annotations
@@ -139,64 +139,54 @@ def test_every_code_argument_traces_to_the_projector() -> None:
     assert recognized_bindings == 1
 
 
-# Static half of "only the cancel core's builder emits the interruption code";
-# the shared builder dropping it is the runtime half. Values built at run time
-# are outside this scan.
 PACKAGE_ROOT = Path(xagent.__path__[0])
-DEDICATED_BUILDER = "create_external_cancel_terminal_event"
-CODE_MEMBER = "EXTERNAL_TURN_INTERRUPTED"
-CODE_SPELLINGS = {"external_turn_interrupted", CODE_MEMBER}
+ASSERTED_KEYWORD = "asserted_code"
 
 
-def _interruption_code_sites() -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
-    """(functions naming the dedicated builder, functions spelling the code)."""
+def _asserted_code_sites() -> list[tuple[str, str, str]]:
+    """Every ``asserted_code=`` keyword in the package, one entry per call.
 
-    builder_sites: set[tuple[str, str]] = set()
-    code_sites: set[tuple[str, str]] = set()
+    Matched on the keyword, not on the callee's name, so an aliased import of
+    the builder is still seen. The value must be spelled
+    ``ClientErrorCode.<MEMBER>``; anything else is a hard failure.
+    """
+
+    sites: list[tuple[str, str, str]] = []
 
     def visit(node: ast.AST, rel_path: str, scope: str) -> None:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             scope = node.name
-        if (
-            (isinstance(node, ast.Name) and node.id == DEDICATED_BUILDER)
-            or (isinstance(node, ast.Attribute) and node.attr == DEDICATED_BUILDER)
-            or (isinstance(node, ast.alias) and node.name == DEDICATED_BUILDER)
-        ):
-            builder_sites.add((rel_path, scope))
-        # Any receiver: an import alias of ClientErrorCode, or the same-valued
-        # TerminalTaskEventMessageCode member, spells the same wire value.
-        if (isinstance(node, ast.Attribute) and node.attr == CODE_MEMBER) or (
-            isinstance(node, ast.Constant) and node.value in CODE_SPELLINGS
-        ):
-            code_sites.add((rel_path, scope))
+        if isinstance(node, ast.Call):
+            for keyword in node.keywords:
+                if keyword.arg != ASSERTED_KEYWORD:
+                    continue
+                value = keyword.value
+                if not (
+                    isinstance(value, ast.Attribute)
+                    and isinstance(value.value, ast.Name)
+                    and value.value.id == "ClientErrorCode"
+                ):
+                    raise AssertionError(
+                        f"asserted_code= at {rel_path}:{node.lineno} in {scope} "
+                        f"is not a literal ClientErrorCode member: {ast.dump(value)}"
+                    )
+                sites.append((rel_path, scope, value.attr))
         for child in ast.iter_child_nodes(node):
             visit(child, rel_path, scope)
 
     for path in sorted(PACKAGE_ROOT.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         visit(tree, path.relative_to(PACKAGE_ROOT).as_posix(), "<module>")
-    return builder_sites, code_sites
+    return sites
 
 
-def test_only_the_cancel_core_emits_the_interruption_code() -> None:
-    """The builder has one caller; the code is spelled only at these sites.
+def test_every_asserted_code_has_a_pinned_caller() -> None:
+    """Each caller-asserted code is asserted once, by the caller that proved it."""
 
-    The audit classifier is listed on purpose: its member has the same value
-    and a different meaning, so a new reader of it must be added here.
-    """
-
-    builder_sites, code_sites = _interruption_code_sites()
-
-    assert builder_sites == {
+    assert _asserted_code_sites() == [
         (
             "web/services/external_task_cancel.py",
             "_broadcast_external_cancel_terminal_event",
+            "EXTERNAL_TURN_INTERRUPTED",
         )
-    }
-    assert code_sites == {
-        ("web/services/client_error_messages.py", "<module>"),
-        ("web/services/client_error_messages.py", "client_error_message"),
-        ("web/services/external_task_cancel.py", DEDICATED_BUILDER),
-        ("web/services/task_command_terminal_events.py", "<module>"),
-        ("web/services/task_command_execution.py", "_terminal_command_event_draft"),
-    }
+    ]

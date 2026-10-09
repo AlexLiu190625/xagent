@@ -13,6 +13,7 @@ from xagent.web.services.client_error_messages import (
     client_error_message,
     required_mcp_unavailable_client_message,
 )
+from xagent.web.services.external_task_cancel import EXTERNAL_TURN_INTERRUPTED_MESSAGE
 
 
 def test_client_error_codes_have_fixed_safe_fallbacks() -> None:
@@ -31,6 +32,12 @@ def test_client_error_codes_have_fixed_safe_fallbacks() -> None:
     assert (
         client_error_message(ClientErrorCode.GUIDANCE_IN_PROGRESS)
         == CLIENT_SAFE_GUIDANCE_IN_PROGRESS
+    )
+    # The cancel core broadcasts and persists its own constant; this table
+    # keeps an independent literal, so the two are tied here.
+    assert (
+        client_error_message(ClientErrorCode.EXTERNAL_TURN_INTERRUPTED)
+        == EXTERNAL_TURN_INTERRUPTED_MESSAGE
     )
     assert {code.value: client_error_message(code) for code in ClientErrorCode} == {
         "message_processing_failed": "The message could not be processed. Please try again.",

@@ -1,8 +1,9 @@
 """Frame-shape contracts for ``create_terminal_task_error_event``.
 
-Pinned here: the four call sites that pass no ``code`` still get the same
-six-key frame, and a ``code`` that survives validation is written onto the
-frame under its own key with nothing else alongside it.
+Pinned here: the three call sites that pass neither ``code`` nor
+``asserted_code`` still get the same six-key frame, and a ``code`` or an
+``asserted_code`` that survives validation is written onto the frame under
+the ``code`` key with nothing else alongside it.
 """
 
 from __future__ import annotations
@@ -24,6 +25,9 @@ from xagent.web.services.client_error_messages import (
     CONNECTOR_RUNTIME_CLIENT_ERROR_CODES,
     ClientErrorCode,
 )
+from xagent.web.services.task_command_terminal_events import (
+    TerminalTaskEventMessageCode,
+)
 from xagent.web.services.task_execution import create_terminal_task_error_event
 
 BASE_FIELDS = {"type", "message", "task_id", "task", "error", "timestamp"}
@@ -43,7 +47,7 @@ RAISE_CALL_NAMES = {"_raise_runtime_error", "ConnectorRuntimeError"}
     ids=["neither"],
 )
 def test_terminal_error_event_shape_unchanged(kwargs: dict[str, Any]) -> None:
-    """A caller that passes no code gets the same six-key frame."""
+    """A caller that passes neither code argument gets the same six-key frame."""
 
     event = create_terminal_task_error_event(1, "x", **kwargs)
 
@@ -170,9 +174,8 @@ def test_a_non_connector_v1_code_is_dropped_and_logged(
     ``invalid_api_key`` is a real member of ``V1ErrorCode`` -- the /v1 error
     surface -- but it is not a connector-runtime code, so it must not reach
     this frame. ``external_turn_interrupted`` is a real client error code,
-    but only the external cancel core's own builder may put it on a frame;
-    any other caller handing it to this builder loses it, so a real failure
-    cannot read as a stop.
+    but it reaches a frame only as ``asserted_code``; passed as ``code`` it is
+    dropped, so a projected failure cannot read as a stop.
     """
 
     with caplog.at_level(logging.ERROR):
@@ -268,3 +271,56 @@ def test_every_client_code_is_named_at_a_producer_site() -> None:
         if hasattr(connector_runtime_module, name)
     }
     assert CONNECTOR_RUNTIME_CLIENT_ERROR_CODES <= resolved_codes
+
+
+def test_an_asserted_code_is_written_onto_the_frame() -> None:
+    event = create_terminal_task_error_event(
+        1, "x", asserted_code=ClientErrorCode.EXTERNAL_TURN_INTERRUPTED
+    )
+
+    assert set(event.keys()) == BASE_FIELDS | {"code"}
+    assert event["code"] == "external_turn_interrupted"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "kept_code"),
+    [
+        ({"asserted_code": "external_turn_interrupted"}, None),
+        (
+            {"asserted_code": TerminalTaskEventMessageCode.EXTERNAL_TURN_INTERRUPTED},
+            None,
+        ),
+        ({"asserted_code": ClientErrorCode.TASK_EXECUTION_FAILED}, None),
+        ({"asserted_code": ["not", "hashable"]}, None),
+        (
+            {
+                "code": "missing_runtime_context",
+                "asserted_code": ClientErrorCode.EXTERNAL_TURN_INTERRUPTED,
+            },
+            "missing_runtime_context",
+        ),
+    ],
+    ids=[
+        "plain_string",
+        "audit_enum_member",
+        "unlisted_member",
+        "unhashable",
+        "both_arguments",
+    ],
+)
+def test_an_unusable_asserted_code_is_dropped_and_logged(
+    kwargs: dict[str, Any],
+    kept_code: str | None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.ERROR):
+        event = create_terminal_task_error_event(1, "x", **kwargs)
+
+    assert event.get("code") == kept_code
+    dropped = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.ERROR
+        and "dropped=asserted_code" in record.getMessage()
+    ]
+    assert len(dropped) == 1

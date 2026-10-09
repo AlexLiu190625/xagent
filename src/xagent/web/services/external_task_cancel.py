@@ -458,33 +458,26 @@ def _finalize_external_cancel_sync(
         _invalidate_task_cache_after_commit(task_id)
 
 
-def create_external_cancel_terminal_event(task_id: int) -> dict[str, Any]:
-    """The terminal frame for a cancel target this core found interrupted.
-
-    It is the shared terminal frame plus ``code: external_turn_interrupted``.
-    The shared builder drops this code for every other caller, and a static
-    test pins the known ways to spell it in this package; a value computed
-    at run time is outside that test. Call it only once the exact cancel
-    target is FAILED with one of the two sentences a cancellation settles
-    with.
-    """
-    from .client_error_messages import ClientErrorCode
-    from .task_execution import create_terminal_task_error_event
-
-    event = create_terminal_task_error_event(task_id, EXTERNAL_TURN_INTERRUPTED_MESSAGE)
-    event["code"] = ClientErrorCode.EXTERNAL_TURN_INTERRUPTED.value
-    return event
-
-
 async def _broadcast_external_cancel_terminal_event(
     task_id: int, terminal_event_state: dict[str, Any]
 ) -> None:
+    """Broadcast the interruption frame for a cancel target already FAILED.
+
+    Call it only once the exact cancel target is FAILED with one of the
+    sentences this module persists; the frame asserts the interruption code.
+    """
+    from .client_error_messages import ClientErrorCode
     from .task_event_display import publish_task_result
+    from .task_execution import create_terminal_task_error_event
 
     try:
         await publish_task_result(
             {
-                **create_external_cancel_terminal_event(task_id),
+                **create_terminal_task_error_event(
+                    task_id,
+                    EXTERNAL_TURN_INTERRUPTED_MESSAGE,
+                    asserted_code=ClientErrorCode.EXTERNAL_TURN_INTERRUPTED,
+                ),
                 **terminal_event_state,
             },
             task_id,
