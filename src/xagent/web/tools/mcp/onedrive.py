@@ -1561,6 +1561,184 @@ def onedrive_rename_item(item_id: str, new_name: str) -> str:
         return _error(str(e))
 
 
+_CROSS_DRIVE_MOVE_MESSAGE = (
+    "destination_folder_id is in another drive (for example a folder shared "
+    "with you); OneDrive cannot move items between drives"
+)
+
+
+def _read_move_item(item_id: str, field_name: str) -> dict[str, Any]:
+    """Read the source or destination of a move, turning 403/404 into an
+    error that names which of the two ids failed."""
+    try:
+        item = _graph_request(
+            "GET", f"/me/drive/items/{url_path_id(item_id, field_name)}"
+        )
+    except _GraphRequestError as exc:
+        if exc.status_code == 404:
+            raise ValueError(
+                f"{field_name} was not found in this OneDrive: {item_id}"
+            ) from None
+        if exc.status_code == 403:
+            raise ValueError(
+                f"The connected account has no permission to access {field_name}: "
+                f"{item_id}"
+            ) from None
+        raise
+    if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+        raise RuntimeError(f"OneDrive returned an invalid item for {field_name}")
+    return item
+
+
+def _parent_reference(item: dict[str, Any], key: str) -> str | None:
+    parent = item.get("parentReference")
+    value = parent.get(key) if isinstance(parent, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
+def _same_graph_id(left: str | None, right: str | None) -> bool:
+    """Compare drive or item ids ignoring letter case: OneDrive Personal has
+    been seen to report the same driveId in different case across
+    responses, which must not turn a same-drive move into a refusal."""
+    return (
+        left is not None and right is not None and left.casefold() == right.casefold()
+    )
+
+
+@mcp.tool()
+def onedrive_move_item(
+    item_id: str, destination_folder_id: str, new_name: str = ""
+) -> str:
+    """Move a OneDrive file or folder into another folder of the same drive.
+
+    ``item_id`` and ``destination_folder_id`` are OneDrive item ids (from
+    onedrive_list_items, onedrive_search_files or onedrive_get_item); use
+    "root" as ``destination_folder_id`` for the top level of the drive. The
+    item keeps its id, sharing links and version history. ``new_name``
+    optionally renames it in the same request; leave it empty to keep the
+    current name.
+
+    Both ids are read before anything changes, so a missing item, a
+    destination that is not a folder, or a folder in another drive (such as
+    one shared with the user) fails without moving anything. If OneDrive
+    reports that the destination already holds an item with that name, the
+    error says so; retry with a different ``new_name``.
+
+    On success the response holds ``item`` (the item after the call),
+    ``destination_folder_id``, ``already_in_destination`` (true when the item
+    was already in that folder, so it was not moved) and ``renamed``.
+
+    Moving can change who can access the item, because an item can pick up
+    the sharing of the folder it is moved into. Confirm the destination and
+    this possible access change with the user before calling this tool.
+    """
+    try:
+        if not isinstance(new_name, str):
+            raise ValueError("new_name must be a string")
+        requested_name = new_name.strip()
+        if new_name and not requested_name:
+            raise ValueError(
+                "new_name must not be blank; leave it empty to keep the current name"
+            )
+        url_path_id(item_id, "item_id")
+        url_path_id(destination_folder_id, "destination_folder_id")
+        if item_id == destination_folder_id:
+            raise ValueError("An item cannot be moved into itself.")
+
+        source = _read_move_item(item_id, "item_id")
+        if "root" in source:
+            raise ValueError("The drive root folder cannot be moved")
+        destination = _read_move_item(destination_folder_id, "destination_folder_id")
+        if "remoteItem" in destination:
+            raise ValueError(_CROSS_DRIVE_MOVE_MESSAGE)
+        if "folder" not in destination:
+            raise ValueError("destination_folder_id must refer to a folder")
+        source_drive_id = _parent_reference(source, "driveId")
+        destination_drive_id = _parent_reference(destination, "driveId")
+        # Graph refuses a cross-drive move on its own; this check only turns
+        # that refusal into a clear message before anything is sent, so it
+        # is skipped when either side leaves driveId out.
+        if (
+            source_drive_id
+            and destination_drive_id
+            and not _same_graph_id(source_drive_id, destination_drive_id)
+        ):
+            raise ValueError(_CROSS_DRIVE_MOVE_MESSAGE)
+
+        # Graph rejects the "root" alias in parentReference.id, so the move
+        # always sends the id Graph returned for the destination.
+        resolved_destination_id = destination["id"]
+        if _same_graph_id(source["id"], resolved_destination_id):
+            raise ValueError("An item cannot be moved into itself.")
+
+        already_in_destination = _same_graph_id(
+            _parent_reference(source, "id"), resolved_destination_id
+        )
+        body: dict[str, Any] = {}
+        if not already_in_destination:
+            body["parentReference"] = {"id": resolved_destination_id}
+        if requested_name and requested_name != source.get("name"):
+            body["name"] = requested_name
+        if not body:
+            return _success(
+                item=_caller_safe_drive_item(source),
+                destination_folder_id=resolved_destination_id,
+                already_in_destination=True,
+                renamed=False,
+            )
+
+        try:
+            result = _graph_request(
+                "PATCH",
+                f"/me/drive/items/{url_path_id(source['id'], 'item_id')}",
+                body=body,
+            )
+        except _GraphRequestError as exc:
+            # Graph also answers 409 for other conflicts (its error docs give
+            # a missing parent folder as the example), so only its
+            # nameAlreadyExists code is reported as a name clash; any other
+            # 409 keeps Graph's own error.
+            if exc.status_code == 409 and "nameAlreadyExists" in str(exc):
+                target_name = body.get("name", source.get("name"))
+                raise ValueError(
+                    f"The destination folder already contains an item named "
+                    f"{target_name!r}; retry with a different new_name"
+                ) from None
+            if exc.status_code == 403:
+                raise ValueError(
+                    "The connected account has no permission to move this item "
+                    "or to write to the destination folder"
+                ) from None
+            if exc.status_code == 404:
+                raise ValueError(
+                    "The item or the destination folder no longer exists"
+                ) from None
+            raise
+        if not isinstance(result, dict):
+            raise RuntimeError("OneDrive move returned an invalid item")
+        # The PATCH has already been applied here, so only a response that
+        # names a different parent is reported, and the message says the
+        # item may have moved rather than claiming the move failed.
+        result_parent_id = _parent_reference(result, "id")
+        if result_parent_id is not None and not _same_graph_id(
+            result_parent_id, resolved_destination_id
+        ):
+            raise RuntimeError(
+                "OneDrive accepted the move but reported a different parent "
+                "folder; the item may have moved. Check its location with "
+                "onedrive_get_item before retrying"
+            )
+        return _success(
+            item=_caller_safe_drive_item(result),
+            destination_folder_id=resolved_destination_id,
+            already_in_destination=already_in_destination,
+            renamed="name" in body,
+        )
+    except Exception as e:
+        logger.error("Error moving OneDrive item %s: %s", item_id, e)
+        return _error(str(e))
+
+
 @mcp.tool()
 def onedrive_delete_item(item_id: str) -> str:
     """Delete a OneDrive file or folder by item_id."""
