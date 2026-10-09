@@ -869,9 +869,11 @@ def _resolve_upload_file_path(local_file_path: str) -> Path:
             ", ".join(str(path) for path in allowed_dirs),
         )
         raise PermissionError(
-            "local_file_path is outside the allowed upload directories; ask the "
-            "user for a file inside the task workspace or another allowed "
-            "location"
+            "local_file_path is outside the allowed upload directories; pass "
+            "an absolute path inside the task workspace, or, if this tool's "
+            "description says a registered file_id may be supplied, pass the "
+            "xagent file_id as file:<file_id> (from list_all_user_files or a "
+            "file reference; not a OneDrive item id)"
         )
 
     if local_path.exists() and not local_path.is_file():
