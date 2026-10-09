@@ -39,6 +39,7 @@ from xagent.core.agent.clarification import (
     ClarificationRequestItem,
     draft_from_waiting_request,
 )
+from xagent.core.tools.adapters.vibe.mcp_approval_gate import _gated_interaction_id
 from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task
@@ -385,6 +386,86 @@ def test_cross_run_anchor_mismatch_still_resolves_as_publishable() -> None:
         anchor=_anchor(resume_run_partition="a-different-run"),
         now=_now(),
     )
+    assert isinstance(resolution, Publishable)
+
+
+# ---------------------------------------------------------------------------
+# The host's MCP approval prompt is never published
+# ---------------------------------------------------------------------------
+
+
+def _resolve_with_passing_fence_and_anchor(draft: ClarificationDraft) -> Any:
+    result = {"status": "waiting_for_user", "clarification_draft": draft}
+    return resolve_publishable_clarification(
+        result, task=_task(), lease=_lease(), anchor=_anchor(), now=_now()
+    )
+
+
+def test_tool_waiting_draft_issued_by_the_approval_gate_is_not_published() -> None:
+    gated = _gated_interaction_id("slack", "host-1")
+    draft = _draft(
+        source="tool_waiting",
+        message_type="question",
+        requests=(ClarificationRequestItem("mcp_tool", "call-1", gated),),
+    )
+
+    resolution = _resolve_with_passing_fence_and_anchor(draft)
+
+    assert resolution == NotApplicable("host_approval_prompt")
+    assert ops_signals.active_degradations() == {}
+
+
+def test_multi_tool_draft_with_any_gate_issued_item_is_not_published() -> None:
+    """One gate-issued item among several is enough: the whole draft is
+    published as one row, so publishing it would hand the approval to the
+    structured-answer path."""
+
+    gated = _gated_interaction_id("slack", "host-1")
+    draft = _draft(
+        source="tool_waiting",
+        message_type="question",
+        requests=(
+            ClarificationRequestItem("mcp_tool", "call-1", gated),
+            ClarificationRequestItem("other_tool", "call-2", "call-2"),
+        ),
+    )
+
+    resolution = _resolve_with_passing_fence_and_anchor(draft)
+
+    assert resolution == NotApplicable("host_approval_prompt")
+
+
+def test_tool_waiting_draft_with_no_gate_issued_item_is_publishable() -> None:
+    draft = _draft(
+        source="tool_waiting",
+        message_type="question",
+        requests=(
+            ClarificationRequestItem("mcp_tool", "call-1", "call-1"),
+            ClarificationRequestItem("other_tool", "call-2", "call-2"),
+        ),
+    )
+
+    resolution = _resolve_with_passing_fence_and_anchor(draft)
+
+    assert isinstance(resolution, Publishable)
+
+
+def test_ask_user_question_draft_with_a_gate_shaped_call_id_is_publishable() -> None:
+    """The id here is a complete id the gate itself can parse, not merely a
+    string that starts with the gate prefix, so this pins that the exclusion
+    applies only to ``tool_waiting`` drafts -- not that a malformed id fails
+    to parse. An ``ask_user_question`` item's id is the model's tool call
+    id, and is never treated as an approval prompt."""
+
+    gated = _gated_interaction_id("slack", "host-1")
+    draft = _draft(
+        source="ask_user_question",
+        message_type="question",
+        requests=(ClarificationRequestItem("ask_user_question", gated, gated),),
+    )
+
+    resolution = _resolve_with_passing_fence_and_anchor(draft)
+
     assert isinstance(resolution, Publishable)
 
 
