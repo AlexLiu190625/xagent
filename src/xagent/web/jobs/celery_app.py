@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import contextlib
+import logging
+import re
+import subprocess
+import sys
 from importlib import import_module
 from typing import Any
 
@@ -12,6 +17,8 @@ from ...config import (
     get_celery_broker_url,
     get_celery_result_backend,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def create_celery_app() -> Any:
@@ -58,17 +65,74 @@ def create_celery_app() -> Any:
 celery_app = create_celery_app()
 
 
+_REFUSED = 3
+_LOCK_KB_ENGINE = f"""
+import logging
+import sys
+
+from xagent.core.tools.core.RAG_tools.storage.vector_backend import (
+    lock_deployment_kb_engine,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s\\t%(message)s",
+    stream=sys.stderr,
+    force=True,
+)
+try:
+    lock_deployment_kb_engine()
+except Exception as exc:
+    print(exc)
+    raise SystemExit({_REFUSED})
+"""
+_LOG_LINE = re.compile(r"^(DEBUG|INFO|WARNING|ERROR|CRITICAL)\t(.*)$")
+
+
+def _parse(line: str, default: int) -> tuple[int, str]:
+    match = _LOG_LINE.match(line)
+    return (getattr(logging, match[1]), match[2]) if match else (default, line)
+
+
+def _relay(output: str, default: int) -> None:
+    for line in output.splitlines():
+        level, text = _parse(line, default)
+        with contextlib.suppress(Exception):
+            logger.log(level, "KB engine check: %s", text)
+
+
 @worker_init.connect
 def lock_kb_engine_at_worker_start(**_: Any) -> None:
-    from ...core.tools.core.RAG_tools.storage.vector_backend import (
-        lock_deployment_kb_engine,
-    )
-
-    # Celery logs and swallows an Exception from a signal handler.
+    # A prefork parent that opened LanceDB has pool children that segfault in it.
     try:
-        lock_deployment_kb_engine()
+        proc = subprocess.run(
+            [sys.executable, "-c", _LOCK_KB_ENGINE],
+            capture_output=True,
+            text=True,
+            errors="replace",
+        )
     except Exception as exc:
-        raise SystemExit(f"Refusing to start the Celery worker: {exc}") from exc
+        detail = f"cannot run the engine check: {exc}"
+    else:
+        _relay(proc.stdout, logging.INFO)
+        _relay(proc.stderr, logging.WARNING)
+        code = proc.returncode
+        if code == 0:
+            return
+        stdout = proc.stdout.strip().splitlines()
+        stderr = proc.stderr.strip().splitlines()
+        if code == _REFUSED and stdout:
+            detail = stdout[-1]
+        else:
+            how = (
+                f"was killed by signal {-code}"
+                if code < 0
+                else f"exited with code {code}"
+            )
+            tail = f": {_parse(stderr[-1], logging.WARNING)[1]}" if stderr else ""
+            detail = f"the engine check {how}{tail}"
+    # Celery logs and swallows an Exception from a signal handler.
+    raise SystemExit(f"Refusing to start the Celery worker: {detail}")
 
 
 def register_celery_tasks() -> None:

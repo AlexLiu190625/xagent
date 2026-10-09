@@ -123,7 +123,7 @@ def _detect_engine(
 
     conn = None
     try:
-        # Uncached, so a Celery parent does not fork with an open connection.
+        # Not the cached connection: the finally below closes this one.
         conn = lancedb.connect(db_dir)
         names = list_table_names(conn)
     except Exception as exc:  # noqa: BLE001 - unlistable KB data is unreachable
