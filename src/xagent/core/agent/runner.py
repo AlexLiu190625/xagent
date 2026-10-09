@@ -21,6 +21,7 @@ from ..context_materializer import WorkspaceContextReferenceResolver
 from ..context_ref import CONTEXT_REFS_KEY, ContextReference
 from ..file_ref import build_file_id_ref
 from ..inline_file_delivery import InlineFileDelivery
+from ..model.chat.exceptions import ModelProviderError
 from ..model.chat.token_context import token_usage_observer
 from ..model.intent import enter_goal, exit_goal
 from ..task_runtime import (
@@ -578,6 +579,9 @@ class AgentRunner:
 
             tools = [*getattr(self.agent, "tools", []), *(extra_tools or [])]
             pattern_errors: list[dict[str, Any]] = []
+            # The model-provider failure a pattern raised, kept so a run with
+            # exactly one pattern can report it on the result (see below).
+            sole_model_error: ModelProviderError | None = None
             teardown_status: str | None = "failed"
 
             try:
@@ -660,6 +664,8 @@ class AgentRunner:
                                 ),
                             }
                         )
+                        if isinstance(exc, ModelProviderError):
+                            sole_model_error = exc
                         continue
 
                     if runtime.budget_stopped:
@@ -784,6 +790,14 @@ class AgentRunner:
             reasons = {entry.get(INTERRUPTION_REASON_KEY) for entry in pattern_errors}
             if len(reasons) == 1 and None not in reasons:
                 result[INTERRUPTION_REASON_KEY] = reasons.pop()
+            # ``error`` above stays the aggregate sentence: it is what callers
+            # fall back to as the user-visible output. A lone pattern that
+            # failed on a model-provider error reports the provider details in
+            # their own keys instead. With several patterns the failure is one
+            # of many, so neither key is set.
+            if len(patterns) == 1 and sole_model_error is not None:
+                result["diagnostic_error"] = str(sole_model_error)
+                result["model_error"] = sole_model_error.public_fields()
             await self._finish_run(context, result, runtime=runtime)
             return result
         finally:

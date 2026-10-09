@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from ....file_ref import final_deliverable_file_reference_instructions
+from ....model.chat.exceptions import ModelProviderError
 from ....model.intent import goal_scope
 from ....task_runtime import (
     PREFERRED_INPUT_MODALITIES_METADATA_KEY,
@@ -602,12 +603,19 @@ class DAGPattern(AgentPattern):
             # see it instead, same as the step-execution catch above.
             raise
         except Exception as exc:  # noqa: BLE001
+            extra_metadata: dict[str, Any] | None = None
+            if isinstance(exc, ModelProviderError):
+                extra_metadata = {
+                    "model_error": exc.public_fields(),
+                    "diagnostic_error": str(exc),
+                }
             return await self._fail(
                 context=context,
                 runtime=runtime,
                 error=str(exc),
                 failure_reason="plan_generation_error",
                 checkpoint_label="dag_plan_generation_failed",
+                extra_metadata=extra_metadata,
             )
 
         while True:

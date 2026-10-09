@@ -53,6 +53,7 @@ from xagent.core.agent.pattern.react import ReActPattern
 from xagent.core.agent.pattern.react.react import ToolCallRecord
 from xagent.core.memory.core import MemoryNote as StoredMemoryNote
 from xagent.core.memory.core import MemoryResponse
+from xagent.core.model.chat.exceptions import ModelProviderError
 from xagent.core.model.chat.types import ChunkType, StreamChunk
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 
@@ -6648,6 +6649,67 @@ async def test_dag_pattern_returns_failed_result_for_plan_generator_exception() 
     assert (
         runtime.last_checkpoint["metadata"]["failure_reason"] == "plan_generation_error"
     )
+
+
+class RaisingPlanGenerator(PlanGenerator):
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    async def generate_plan(
+        self,
+        *,
+        request: PlanGenerationRequest,
+        llm: Any,
+    ) -> ExecutionPlan:
+        del request, llm
+        raise self.error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        ModelProviderError(
+            prefix="Provider API error",
+            kind="access_denied",
+            status_code=403,
+            provider_code="provider_code_4204",
+            provider_message="Model is decommissioned",
+            sdk_message="Error code: 403 - Model is decommissioned",
+            details=["request_id=req-1"],
+        ),
+        ValueError("planner exploded"),
+    ],
+    ids=["model_provider_error", "value_error"],
+)
+async def test_dag_plan_generation_failure_carries_model_error_only_for_provider_errors(
+    error: Exception,
+) -> None:
+    tracer = TracerCheckpointStore()
+    runtime = PatternRuntime(tracer=tracer, execution_id="dag-plan-model-error")
+    pattern = DAGPattern(RaisingPlanGenerator(error))
+
+    result = await pattern.run(
+        context=ExecutionContext(execution_id="dag-plan-model-error"),
+        tools=[],
+        llm=SequenceLLM([]),
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["failure_reason"] == "plan_generation_error"
+    assert result["error"] == str(error)
+    assert runtime.last_checkpoint is not None
+    metadata = runtime.last_checkpoint["metadata"]
+    if isinstance(error, ModelProviderError):
+        assert result["model_error"] == error.public_fields()
+        assert result["diagnostic_error"] == str(error)
+        assert metadata["model_error"] == error.public_fields()
+        assert metadata["diagnostic_error"] == str(error)
+    else:
+        for key in ("model_error", "diagnostic_error"):
+            assert key not in result
+            assert key not in metadata
 
 
 @pytest.mark.asyncio
