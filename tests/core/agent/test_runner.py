@@ -1006,7 +1006,7 @@ async def test_runner_single_pattern_model_provider_error_carries_details(
 
     assert result["success"] is False
     assert result["diagnostic_error"] == str(error)
-    assert result["model_error"] == error.public_fields()
+    assert result["model_error"] == error.structured_fields()
     assert result["error"].startswith("All 1 patterns failed")
     entry = result["pattern_errors"][0]
     assert entry["exception_type"] == type(error).__name__

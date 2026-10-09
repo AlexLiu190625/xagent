@@ -3394,7 +3394,7 @@ async def test_on_pattern_error_attaches_model_error_only_for_provider_failures(
     assert data["error_type"] == "agent_pattern_error"
     assert data["error_message"] == str(error)
     if isinstance(error, ModelProviderError):
-        assert data["model_error"] == error.public_fields()
+        assert data["model_error"] == error.structured_fields()
     else:
         assert "model_error" not in data
 

@@ -1284,7 +1284,7 @@ class PatternRuntime:
             "pattern": pattern.__class__.__name__,
         }
         if isinstance(error, ModelProviderError):
-            data["model_error"] = error.public_fields()
+            data["model_error"] = error.structured_fields()
         await self._emit_trace_event(
             TraceEventType(TraceScope.TASK, TraceAction.ERROR, TraceCategory.GENERAL),
             task_id=self._task_id(context),

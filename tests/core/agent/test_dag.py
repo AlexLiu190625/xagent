@@ -6702,9 +6702,9 @@ async def test_dag_plan_generation_failure_carries_model_error_only_for_provider
     assert runtime.last_checkpoint is not None
     metadata = runtime.last_checkpoint["metadata"]
     if isinstance(error, ModelProviderError):
-        assert result["model_error"] == error.public_fields()
+        assert result["model_error"] == error.structured_fields()
         assert result["diagnostic_error"] == str(error)
-        assert metadata["model_error"] == error.public_fields()
+        assert metadata["model_error"] == error.structured_fields()
         assert metadata["diagnostic_error"] == str(error)
     else:
         for key in ("model_error", "diagnostic_error"):

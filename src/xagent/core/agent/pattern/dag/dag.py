@@ -606,7 +606,7 @@ class DAGPattern(AgentPattern):
             extra_metadata: dict[str, Any] | None = None
             if isinstance(exc, ModelProviderError):
                 extra_metadata = {
-                    "model_error": exc.public_fields(),
+                    "model_error": exc.structured_fields(),
                     "diagnostic_error": str(exc),
                 }
             return await self._fail(

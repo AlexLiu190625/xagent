@@ -797,7 +797,7 @@ class AgentRunner:
             # of many, so neither key is set.
             if len(patterns) == 1 and sole_model_error is not None:
                 result["diagnostic_error"] = str(sole_model_error)
-                result["model_error"] = sole_model_error.public_fields()
+                result["model_error"] = sole_model_error.structured_fields()
             await self._finish_run(context, result, runtime=runtime)
             return result
         finally:
