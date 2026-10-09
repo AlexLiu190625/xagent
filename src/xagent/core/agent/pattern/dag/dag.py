@@ -81,6 +81,18 @@ _COMPLETED_RESULT_RANK: dict[str, int] = {
 }
 
 
+def _model_failure_metadata(exc: BaseException) -> dict[str, Any] | None:
+    """The result keys that carry a model-provider failure, or ``None``.
+
+    A failed DAG result is returned to the runner as it is, so these keys
+    are how a provider failure in planning, completion assessment or a step
+    reaches the web layer's projection instead of the raw ``error`` text.
+    """
+    if not isinstance(exc, ModelProviderError):
+        return None
+    return {"model_error": exc.structured_fields(), "diagnostic_error": str(exc)}
+
+
 @dataclass
 class DAGCompletionAssessment:
     complete: bool
@@ -452,6 +464,9 @@ class DAGPattern(AgentPattern):
         # one being written for the step that staged it.
         self._staged_step_pattern_states: dict[str, dict[str, Any]] = {}
         self._staged_step_contexts: dict[str, dict[str, Any]] = {}
+        # Model-provider failures of steps in this run, by step id. Not
+        # checkpointed: after a restore a failed step reports only its error text.
+        self._step_model_failures: dict[str, dict[str, Any]] = {}
         self.step_results: dict[str, Any] = {}
         # Failed-step observations are evidence only, never dependency results.
         self.failed_step_evidence: dict[str, Any] = {}
@@ -603,19 +618,13 @@ class DAGPattern(AgentPattern):
             # see it instead, same as the step-execution catch above.
             raise
         except Exception as exc:  # noqa: BLE001
-            extra_metadata: dict[str, Any] | None = None
-            if isinstance(exc, ModelProviderError):
-                extra_metadata = {
-                    "model_error": exc.structured_fields(),
-                    "diagnostic_error": str(exc),
-                }
             return await self._fail(
                 context=context,
                 runtime=runtime,
                 error=str(exc),
                 failure_reason="plan_generation_error",
                 checkpoint_label="dag_plan_generation_failed",
-                extra_metadata=extra_metadata,
+                extra_metadata=_model_failure_metadata(exc),
             )
 
         while True:
@@ -667,6 +676,7 @@ class DAGPattern(AgentPattern):
                             error=str(exc),
                             failure_reason="replan_generation_error",
                             checkpoint_label="dag_plan_generation_failed",
+                            extra_metadata=_model_failure_metadata(exc),
                         )
 
             interrupted = await self._interrupt_if_requested(
@@ -1043,6 +1053,9 @@ class DAGPattern(AgentPattern):
         self.status = "running"
         self._mark_step_active(step.id)
         step.status = "running"
+        # A step id can run again after a replan; the failure recorded for its
+        # earlier attempt must not be attached to a later, different failure.
+        self._step_model_failures.pop(step.id, None)
 
         active_context = self.active_step_contexts.get(step.id)
         output_language = self._output_language(root_context)
@@ -1147,6 +1160,9 @@ class DAGPattern(AgentPattern):
         except Exception as exc:
             step.status = "failed"
             step.error = str(exc)
+            metadata = _model_failure_metadata(exc)
+            if metadata is not None:
+                self._step_model_failures[step.id] = metadata
             self._retain_failed_step_evidence(step.id, child_context, react_pattern)
             self._clear_active_step(step.id)
             await runtime.on_dag_step_end(
@@ -1444,6 +1460,9 @@ class DAGPattern(AgentPattern):
             metadata.update(extra_metadata)
         if failed_step_id is not None:
             metadata["failed_step_id"] = failed_step_id
+            # A step that failed on a model-provider error carries the same
+            # keys as a failed plan or completion call.
+            metadata.update(self._step_model_failures.get(failed_step_id, {}))
         await runtime.checkpoint(
             checkpoint_label,
             context=context,
@@ -1675,6 +1694,7 @@ class DAGPattern(AgentPattern):
                 error=str(exc),
                 failure_reason="completion_assessment_error",
                 checkpoint_label="dag_completion_assessment_failed",
+                extra_metadata=_model_failure_metadata(exc),
             )
 
         if assessment.complete:
@@ -1756,6 +1776,7 @@ class DAGPattern(AgentPattern):
                 error=str(exc),
                 failure_reason="completion_replan_generation_error",
                 checkpoint_label="dag_plan_generation_failed",
+                extra_metadata=_model_failure_metadata(exc),
             )
         return None
 

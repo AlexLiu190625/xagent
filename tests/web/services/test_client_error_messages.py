@@ -384,6 +384,77 @@ def test_projection_ignores_an_empty_or_non_text_message(message: object) -> Non
             "model proj-*** missing",
             id="proj-prefixed-model-name-masked-as-accepted-trade-off",
         ),
+        pytest.param(
+            "key gsk_abcdefghijklmnopqrstuvwxyz0123", "key gsk-***", id="gsk-prefix"
+        ),
+        pytest.param(
+            "token hf_abcdefghijklmnopqrstuvwxyzABCDEF rejected",
+            "token hf-*** rejected",
+            id="hf-prefix",
+        ),
+        pytest.param(
+            "key xai-abcdefghijklmnopqrstuvwxyz0123456789",
+            "key xai-***",
+            id="xai-prefix",
+        ),
+        pytest.param(
+            "key nvapi-abcdefghijklmnopqrstuvwxyz0123456789",
+            "key nvapi-***",
+            id="nvapi-prefix",
+        ),
+        pytest.param(
+            "AWS key AKIAIOSFODNN7EXAMPLE denied",
+            "AWS key *** denied",
+            id="aws-access-key",
+        ),
+        pytest.param(
+            "Bearer abcdefghijklmnopqrstuvwxyz0123456789",
+            "Bearer ***",
+            id="bare-bearer",
+        ),
+        pytest.param(
+            "Bearer authentication required",
+            "Bearer authentication required",
+            id="bearer-word-kept",
+        ),
+        pytest.param(
+            "Bearer authentication_required_here",
+            "Bearer authentication_required_here",
+            id="bearer-long-word-without-digit-kept",
+        ),
+        pytest.param(
+            "Bearer abc123",
+            "Bearer abc123",
+            id="bearer-short-token-kept",
+        ),
+        pytest.param(
+            "AWS key ASIAIOSFODNN7EXAMPLE denied",
+            "AWS key *** denied",
+            id="aws-temporary-access-key",
+        ),
+        pytest.param(
+            "Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123456789",
+            "Authorization: Bearer ***6789",
+            id="authorization-header-masked-once",
+        ),
+        pytest.param(
+            '{"api_key": "abcdefghij0123456789"}',
+            '{"api_key": "***"}',
+            id="json-double-quoted",
+        ),
+        pytest.param(
+            "{'api_key': 'abcdefghij0123456789'}",
+            "{'api_key': '***'}",
+            id="json-single-quoted",
+        ),
+        pytest.param(
+            "my_sk-abcdefghijklmnop1234", "my_sk-***", id="underscore-joined-prefix"
+        ),
+        pytest.param(
+            "task-1234567890 failed",
+            "task-1234567890 failed",
+            id="ordinary-dash-word-kept",
+        ),
     ],
 )
 def test_projection_cleans_the_provider_message(message: str, expected: str) -> None:

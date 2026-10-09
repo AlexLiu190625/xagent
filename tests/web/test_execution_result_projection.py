@@ -2,10 +2,6 @@ import pytest
 
 from xagent.core.agent.execution_adapter import INTERRUPTED_USER_MESSAGE
 from xagent.web.models.task import TaskStatus
-from xagent.web.services.assistant_history_safety import (
-    CLIENT_SAFE_FAILURE_MESSAGE_TYPE,
-    TASK_FAILURE_MESSAGE_TYPE,
-)
 from xagent.web.services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
 from xagent.web.services.execution_result_projection import (
     EMPTY_CHANNEL_OUTPUT_FALLBACK,
@@ -221,6 +217,52 @@ def test_execution_result_diagnostic_error(
     assert execution_result_diagnostic_error(result) == expected
 
 
+_ECHOED_KEY_DIAGNOSTIC = (
+    "OpenAI authentication failed (401): Error code: 401 - "
+    "{'error': {'message': 'Incorrect API key provided: "
+    "sk-live-ECHOEDKEY1234567890'}} | "
+    'provider_raw={"api_key": "rawsecretvalue123"} | '
+    "org-testorgid12345 proj-assistant-v2-large"
+)
+
+
+def test_diagnostic_error_masks_credentials_but_keeps_the_diagnosis() -> None:
+    masked = execution_result_diagnostic_error(
+        {"diagnostic_error": _ECHOED_KEY_DIAGNOSTIC, "error": "aggregate"}
+    )
+
+    assert "ECHOEDKEY1234567890" not in masked
+    assert "rawsecretvalue123" not in masked
+    assert "sk-***" in masked
+    assert "org-testorgid12345" in masked
+    assert "proj-assistant-v2-large" in masked
+    assert "provider_raw=" in masked
+    assert masked.startswith("OpenAI authentication failed (401)")
+
+
+def test_diagnostic_error_returns_the_error_fallback_unmasked() -> None:
+    result = {"error": "plain sk-live-ECHOEDKEY1234567890"}
+
+    assert execution_result_diagnostic_error(result) == (
+        "plain sk-live-ECHOEDKEY1234567890"
+    )
+
+
+def test_channel_projection_masks_credentials_in_the_dedicated_diagnostic() -> None:
+    projection = project_execution_result_for_channel(
+        {
+            "success": False,
+            "status": "error",
+            "output": "All 1 patterns failed",
+            "error": "All 1 patterns failed",
+            "diagnostic_error": _ECHOED_KEY_DIAGNOSTIC,
+        }
+    )
+
+    assert projection.diagnostic_error is not None
+    assert "ECHOEDKEY1234567890" not in projection.diagnostic_error
+
+
 _FORBIDDEN_MODEL_ERROR = {
     "kind": "access_denied",
     "status_code": 403,
@@ -246,8 +288,6 @@ def test_present_failed_result_projects_a_model_error() -> None:
         "OpenAI API error (403): provider_raw=RAW_MARKER"
     )
     assert presentation.visible_text == _PROJECTED_TEXT
-    assert presentation.history_content == _PROJECTED_TEXT
-    assert presentation.history_message_type == CLIENT_SAFE_FAILURE_MESSAGE_TYPE
     assert presentation.error_code == "model_error"
     assert presentation.error_details == {
         "kind": "access_denied",
@@ -288,10 +328,19 @@ def test_present_failed_result_forces_the_generic_text_when_the_projection_is_wi
 
     assert presentation.diagnostic_error == raw
     assert presentation.visible_text == CLIENT_SAFE_TASK_FAILURE
-    assert presentation.history_content == CLIENT_SAFE_TASK_FAILURE
-    assert presentation.history_message_type == TASK_FAILURE_MESSAGE_TYPE
     assert presentation.error_code is None
     assert presentation.error_details is None
+
+
+def test_present_failed_result_projects_a_malformed_model_error_to_the_fallback() -> (
+    None
+):
+    presentation = present_failed_result(
+        {"success": False, "error": "x", "model_error": {"status_code": "403"}}
+    )
+
+    assert presentation.visible_text == "Model provider call failed."
+    assert presentation.error_code == "model_error"
 
 
 @pytest.mark.parametrize("model_error", ["text", ["a"], 7, None])
@@ -304,8 +353,6 @@ def test_present_failed_result_keeps_the_callers_text_when_model_error_is_not_a_
 
     assert presentation.diagnostic_error == "failure text"
     assert presentation.visible_text is None
-    assert presentation.history_content == CLIENT_SAFE_TASK_FAILURE
-    assert presentation.history_message_type == TASK_FAILURE_MESSAGE_TYPE
     assert presentation.error_code is None
     assert presentation.error_details is None
 
@@ -327,8 +374,6 @@ def test_present_failed_result_lets_an_existing_error_code_take_precedence() -> 
 
     assert presentation.diagnostic_error == "Quota reached"
     assert presentation.visible_text is None
-    assert presentation.history_content == CLIENT_SAFE_TASK_FAILURE
-    assert presentation.history_message_type == TASK_FAILURE_MESSAGE_TYPE
     assert presentation.error_code == "quota_exceeded"
     assert presentation.error_details == details
 

@@ -2218,17 +2218,13 @@ def _finalize_task_execution_result_isolated(
                         f"Task {task_id}: cannot persist assistant message "
                         "without a resolved user_id"
                     )
-                if presentation is not None:
-                    history_content = presentation.history_content
-                    history_message_type = presentation.history_message_type
-                else:
-                    history_content, history_message_type = (
-                        assistant_history_values_for_persistence(
-                            content=safe_str(ai_response),
-                            message_type=ASSISTANT_RESPONSE_MESSAGE_TYPE,
-                            is_failure=task_updated.status == TaskStatus.FAILED,
-                        )
+                history_content, history_message_type = (
+                    assistant_history_values_for_persistence(
+                        content=safe_str(ai_response),
+                        message_type=ASSISTANT_RESPONSE_MESSAGE_TYPE,
+                        is_failure=task_updated.status == TaskStatus.FAILED,
                     )
+                )
                 # Shared readers may observe completion before scheduler
                 # cleanup runs. Publish its durable output in this same
                 # fenced transaction as the terminal state and transcript.
@@ -3091,8 +3087,8 @@ def _finalize_resumed_task(
                     db,
                     task_id=task_id,
                     user_id=task_owner_user_id,
-                    content=presentation.history_content,
-                    message_type=presentation.history_message_type,
+                    content=CLIENT_SAFE_TASK_FAILURE,
+                    message_type=TASK_FAILURE_MESSAGE_TYPE,
                     turn_id=_latest_result_user_turn_id(result),
                     content_is_reconciled=True,
                 )

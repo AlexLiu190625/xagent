@@ -7,6 +7,7 @@ from tests.web.services.task_database_shared import engine as engine_fixture
 from tests.web.services.task_database_shared import task_id as task_id_fixture
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.task_execution_event import TaskExecutionEvent
 from xagent.web.services import task_coordinator_service as coordinator
 from xagent.web.services import task_execution as execution
 from xagent.web.services import task_lease_service as leases
@@ -350,7 +351,11 @@ _MODEL_ERROR_403 = {
     "message": "Model is decommissioned",
 }
 _OWNER_DIAGNOSTIC_403 = (
-    "OpenAI API error (403): Model is decommissioned | provider_raw=RAW_MARKER"
+    "OpenAI API error (403): Model is decommissioned | "
+    "provider_raw=RAW_MARKER sk-live-ECHOEDKEY1234567890"
+)
+_OWNER_DIAGNOSTIC_403_STORED = (
+    "OpenAI API error (403): Model is decommissioned | provider_raw=RAW_MARKER sk-***"
 )
 _RAW_400 = "OpenAI bad request (400): plan rejected RAW_MARKER"
 _QUOTA_REASON = "Monthly quota reached for this agent."
@@ -394,13 +399,15 @@ def _model_failure_result(scenario: str) -> dict:
     }
 
 
-def _finalize_failed_result(engine, task_id, monkeypatch, route, result):
+def _finalize_failed_result(
+    engine, task_id, monkeypatch, route, result, storage_version
+):
     """Run one finalizer and return its client-facing fields as a dict."""
     factory = sessionmaker(engine)
     monkeypatch.setattr(execution, "get_session_local", lambda: factory)
     with factory() as db:
         task = db.get(Task, task_id)
-        task.conversation_storage_version = 1
+        task.conversation_storage_version = storage_version
         task.status = TaskStatus.COMPLETED
         task.control_state = TaskControlState.COMPLETED.value
         uid = task.user_id
@@ -454,19 +461,37 @@ def _finalize_failed_result(engine, task_id, monkeypatch, route, result):
         assert len(rows) == 1
         fields["error_message"] = task.error_message
         fields["row"] = (rows[0].content, rows[0].message_type)
+        if storage_version == 2:
+            events = (
+                db.query(TaskExecutionEvent)
+                .filter(TaskExecutionEvent.task_id == task_id)
+                .filter(TaskExecutionEvent.kind == "assistant_message")
+                .all()
+            )
+            assert len(events) == 1
+            assert (
+                events[0].payload["content"],
+                events[0].payload["message_type"],
+            ) == fields["row"]
     fields["repr"] = repr(finalized)
     return fields
 
 
 @pytest.mark.parametrize("route", ["initial", "resume"])
+@pytest.mark.parametrize("storage_version", [1, 2])
 def test_failed_model_error_reaches_clients_as_the_projection_and_owners_as_full_text(
-    engine, task_id, monkeypatch, route
+    engine, task_id, monkeypatch, route, storage_version
 ):
     fields = _finalize_failed_result(
-        engine, task_id, monkeypatch, route, _model_failure_result("forbidden-403")
+        engine,
+        task_id,
+        monkeypatch,
+        route,
+        _model_failure_result("forbidden-403"),
+        storage_version,
     )
 
-    assert fields["error_message"] == _OWNER_DIAGNOSTIC_403
+    assert fields["error_message"] == _OWNER_DIAGNOSTIC_403_STORED
     assert fields["output"] == _PROJECTED_MODEL_FAILURE
     assert fields["error_code"] == "model_error"
     assert fields["error_details"] == {
@@ -475,17 +500,23 @@ def test_failed_model_error_reaches_clients_as_the_projection_and_owners_as_full
         "provider_code": "provider_code_4204",
         "message": _PROJECTED_MODEL_FAILURE,
     }
-    assert fields["row"] == (_PROJECTED_MODEL_FAILURE, "client_safe_failure")
+    assert fields["row"] == (CLIENT_SAFE_TASK_FAILURE, "task_failure")
     assert "RAW_MARKER" not in fields["repr"]
     assert "RAW_MARKER" not in repr(fields["row"])
 
 
 @pytest.mark.parametrize("route", ["initial", "resume"])
+@pytest.mark.parametrize("storage_version", [1, 2])
 def test_failed_http_400_keeps_the_generic_sentence_even_when_output_holds_the_raw_text(
-    engine, task_id, monkeypatch, route
+    engine, task_id, monkeypatch, route, storage_version
 ):
     fields = _finalize_failed_result(
-        engine, task_id, monkeypatch, route, _model_failure_result("bad-request-400")
+        engine,
+        task_id,
+        monkeypatch,
+        route,
+        _model_failure_result("bad-request-400"),
+        storage_version,
     )
 
     assert fields["error_message"] == _RAW_400
@@ -498,11 +529,17 @@ def test_failed_http_400_keeps_the_generic_sentence_even_when_output_holds_the_r
 
 
 @pytest.mark.parametrize("route", ["initial", "resume"])
+@pytest.mark.parametrize("storage_version", [1, 2])
 def test_failed_quota_gate_code_takes_precedence_over_a_recorded_model_error(
-    engine, task_id, monkeypatch, route
+    engine, task_id, monkeypatch, route, storage_version
 ):
     fields = _finalize_failed_result(
-        engine, task_id, monkeypatch, route, _model_failure_result("quota-gate")
+        engine,
+        task_id,
+        monkeypatch,
+        route,
+        _model_failure_result("quota-gate"),
+        storage_version,
     )
 
     assert fields["error_message"] == _QUOTA_REASON
@@ -514,8 +551,9 @@ def test_failed_quota_gate_code_takes_precedence_over_a_recorded_model_error(
 
 
 @pytest.mark.parametrize("route", ["initial", "resume"])
+@pytest.mark.parametrize("storage_version", [1, 2])
 def test_failed_result_without_a_model_error_is_unchanged(
-    engine, task_id, monkeypatch, route
+    engine, task_id, monkeypatch, route, storage_version
 ):
     fields = _finalize_failed_result(
         engine,
@@ -528,6 +566,7 @@ def test_failed_result_without_a_model_error_is_unchanged(
             "output": "display text",
             "error": "plain failure text",
         },
+        storage_version,
     )
 
     assert fields["error_message"] == "plain failure text"
@@ -535,3 +574,31 @@ def test_failed_result_without_a_model_error_is_unchanged(
     assert fields["error_code"] is None
     assert fields["error_details"] is None
     assert fields["row"] == (CLIENT_SAFE_TASK_FAILURE, "task_failure")
+
+
+@pytest.mark.parametrize("route", ["initial", "resume"])
+@pytest.mark.parametrize("storage_version", [1, 2])
+def test_failed_model_error_stays_out_of_the_next_turn_model_context(
+    engine, task_id, monkeypatch, route, storage_version
+):
+    from xagent.web.services.chat_history_service import load_task_transcript_window
+
+    _finalize_failed_result(
+        engine,
+        task_id,
+        monkeypatch,
+        route,
+        _model_failure_result("forbidden-403"),
+        storage_version,
+    )
+
+    with sessionmaker(engine)() as db:
+        messages = load_task_transcript_window(db, task_id).messages
+
+    for message in messages:
+        assert "Model provider call failed" not in message["content"]
+    if storage_version == 1:
+        assistant_contents = [
+            message["content"] for message in messages if message["role"] == "assistant"
+        ]
+        assert assistant_contents == [CLIENT_SAFE_TASK_FAILURE]

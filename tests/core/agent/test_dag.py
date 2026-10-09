@@ -43,7 +43,7 @@ from xagent.core.agent.language import (
 )
 from xagent.core.agent.pattern.base import RequiredToolCallError
 from xagent.core.agent.pattern.dag import dag as dag_module
-from xagent.core.agent.pattern.dag.dag import _DAGStepRuntime
+from xagent.core.agent.pattern.dag.dag import DAGCompletionAssessment, _DAGStepRuntime
 from xagent.core.agent.pattern.dag.plan_generator import (
     PLAN_GENERATION_REQUIRED_TOOL_MESSAGE,
     PRESUPPOSED_ANSWER_CLAUSE,
@@ -2813,6 +2813,18 @@ def test_dag_completion_assessment_keeps_user_request_as_scope_authority() -> No
     assert "intermediate step proposed extra work" in system_prompt
 
 
+def _provider_error() -> ModelProviderError:
+    return ModelProviderError(
+        prefix="Provider API error",
+        kind="access_denied",
+        status_code=403,
+        provider_code="provider_code_4204",
+        provider_message="Model is decommissioned",
+        sdk_message="Error code: 403 - Model is decommissioned",
+        details=["request_id=req-1"],
+    )
+
+
 class ReplanningPlanGenerator(PlanGenerator):
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
@@ -2848,6 +2860,10 @@ class ReplanningPlanGenerator(PlanGenerator):
 
 
 class FailingReplanGenerator(ReplanningPlanGenerator):
+    def __init__(self, error: Exception | None = None) -> None:
+        super().__init__()
+        self.error = error or RuntimeError("replan exploded")
+
     async def generate_plan(
         self,
         *,
@@ -2865,7 +2881,7 @@ class FailingReplanGenerator(ReplanningPlanGenerator):
                     "request": request.to_dict(),
                 }
             )
-            raise RuntimeError("replan exploded")
+            raise self.error
         return await super().generate_plan(request=request, llm=llm)
 
 
@@ -6844,6 +6860,149 @@ async def test_dag_pattern_reraises_checkpoint_persistence_error_from_completion
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("site", ["assessment", "replan"])
+@pytest.mark.parametrize(
+    "error",
+    [_provider_error(), ValueError("boom")],
+    ids=["model_provider_error", "value_error"],
+)
+async def test_dag_completion_failures_carry_model_error_only_for_provider_errors(
+    site: str, error: Exception
+) -> None:
+    async def raise_error(**_: Any) -> Any:
+        raise error
+
+    async def incomplete_assessment(**_: Any) -> DAGCompletionAssessment:
+        return DAGCompletionAssessment(complete=False, reason="more work")
+
+    plan = build_plan(PlanStep(id="step_1", task="already done", status="completed"))
+    pattern = DAGPattern(ReplanningPlanGenerator())
+    pattern.plan = plan
+    pattern.step_results = {"step_1": "already done result"}
+    if site == "assessment":
+        pattern._assess_completion = raise_error  # type: ignore[method-assign]
+    else:
+        pattern._assess_completion = incomplete_assessment  # type: ignore[method-assign]
+        pattern._generate_plan = raise_error  # type: ignore[method-assign]
+    execution_id = "dag-completion-model-error"
+    runtime = PatternRuntime(tracer=TracerCheckpointStore(), execution_id=execution_id)
+
+    result = await pattern._handle_completed_plan(
+        context=ExecutionContext(execution_id=execution_id),
+        tools=[],
+        llm=SequenceLLM([]),
+        runtime=runtime,
+    )
+
+    assert result is not None
+    assert result["success"] is False
+    assert result["failure_reason"] == (
+        "completion_assessment_error"
+        if site == "assessment"
+        else "completion_replan_generation_error"
+    )
+    assert result["error"] == str(error)
+    assert runtime.last_checkpoint is not None
+    metadata = runtime.last_checkpoint["metadata"]
+    if isinstance(error, ModelProviderError):
+        assert result["model_error"] == error.structured_fields()
+        assert result["diagnostic_error"] == str(error)
+        assert metadata["model_error"] == error.structured_fields()
+        assert metadata["diagnostic_error"] == str(error)
+    else:
+        for key in ("model_error", "diagnostic_error"):
+            assert key not in result
+            assert key not in metadata
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [_provider_error(), RuntimeError("child exploded")],
+    ids=["model_provider_error", "runtime_error"],
+)
+@pytest.mark.parametrize(
+    "step_ids",
+    [
+        pytest.param(["bad"], id="single-step"),
+        pytest.param(["bad", "other"], id="parallel-batch"),
+    ],
+)
+async def test_dag_step_failure_carries_model_error_only_for_provider_errors(
+    error: Exception, step_ids: list[str]
+) -> None:
+    class RaisingLLM:
+        async def chat(self, **kwargs: Any) -> dict[str, Any]:
+            del kwargs
+            raise error
+
+    runtime = PatternRuntime(
+        tracer=TracerCheckpointStore(), execution_id="dag-step-model-error"
+    )
+    pattern = DAGPattern(
+        lambda **_: build_plan(
+            *(PlanStep(id=step_id, task="Raise") for step_id in step_ids)
+        ),
+        max_concurrency=len(step_ids),
+    )
+
+    result = await pattern.run(
+        context=ExecutionContext(execution_id="dag-step-model-error"),
+        tools=[],
+        llm=RaisingLLM(),
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["failure_reason"] == "step_failed"
+    assert result["failed_step_id"] in step_ids
+    assert result["error"] == str(error)
+    assert runtime.last_checkpoint is not None
+    metadata = runtime.last_checkpoint["metadata"]
+    if isinstance(error, ModelProviderError):
+        assert result["model_error"] == error.structured_fields()
+        assert result["diagnostic_error"] == str(error)
+        assert metadata["model_error"] == error.structured_fields()
+        assert metadata["diagnostic_error"] == str(error)
+    else:
+        for key in ("model_error", "diagnostic_error"):
+            assert key not in result
+            assert key not in metadata
+
+
+@pytest.mark.asyncio
+async def test_dag_step_rerun_drops_the_earlier_attempts_model_failure() -> None:
+    class RaisingLLM:
+        async def chat(self, **kwargs: Any) -> dict[str, Any]:
+            del kwargs
+            raise RuntimeError("tool exploded")
+
+    runtime = PatternRuntime(
+        tracer=TracerCheckpointStore(), execution_id="dag-step-rerun"
+    )
+    pattern = DAGPattern(lambda **_: build_plan(PlanStep(id="bad", task="Raise")))
+    stale = _provider_error()
+    pattern._step_model_failures["bad"] = {
+        "model_error": stale.structured_fields(),
+        "diagnostic_error": str(stale),
+    }
+
+    result = await pattern.run(
+        context=ExecutionContext(execution_id="dag-step-rerun"),
+        tools=[],
+        llm=RaisingLLM(),
+        runtime=runtime,
+    )
+
+    assert result["failure_reason"] == "step_failed"
+    assert result["error"] == "tool exploded"
+    assert runtime.last_checkpoint is not None
+    for key in ("model_error", "diagnostic_error"):
+        assert key not in result
+        assert key not in runtime.last_checkpoint["metadata"]
+
+
+@pytest.mark.asyncio
 async def test_dag_pattern_returns_friendly_missing_required_tool_failure() -> None:
     runtime = PatternRuntime(execution_id="dag-plan-tool-missing")
     pattern = DAGPattern(LLMPlanGenerator())
@@ -7417,11 +7576,16 @@ async def test_dag_pattern_live_user_message_interrupt_replans_in_same_run(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [RuntimeError("replan exploded"), _provider_error()],
+    ids=["runtime_error", "model_provider_error"],
+)
 async def test_dag_pattern_returns_failed_result_when_replan_generation_fails(
-    tmp_path: Path,
+    tmp_path: Path, error: Exception
 ) -> None:
     tracer = TracerCheckpointStore()
-    plan_generator = FailingReplanGenerator()
+    plan_generator = FailingReplanGenerator(error)
     execution_id = "dag-replan-fails"
     first_llm = SequenceLLM(
         [
@@ -7491,10 +7655,19 @@ async def test_dag_pattern_returns_failed_result_when_replan_generation_fails(
     assert failed["success"] is False
     assert failed["status"] == "failed"
     assert failed["failure_reason"] == "replan_generation_error"
-    assert failed["error"] == "replan exploded"
+    assert failed["error"] == str(error)
     checkpoint = tracer.by_execution_id[execution_id]
     assert checkpoint["label"] == "dag_plan_generation_failed"
     assert checkpoint["metadata"]["failure_reason"] == "replan_generation_error"
+    if isinstance(error, ModelProviderError):
+        assert failed["model_error"] == error.structured_fields()
+        assert failed["diagnostic_error"] == str(error)
+        assert checkpoint["metadata"]["model_error"] == error.structured_fields()
+        assert checkpoint["metadata"]["diagnostic_error"] == str(error)
+    else:
+        for key in ("model_error", "diagnostic_error"):
+            assert key not in failed
+            assert key not in checkpoint["metadata"]
     assert checkpoint["pattern_state"]["step_results"] == {"step_1": "first step done"}
     assert checkpoint["pattern_state"]["plan"]["steps"][1]["id"] == "step_2"
     assert plan_generator.calls[1]["request"]["replan"] is True
