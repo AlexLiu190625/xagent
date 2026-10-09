@@ -1273,6 +1273,7 @@ const zh = {
         deleteService: "删除服务",
         deleteSuccess: "已成功删除 {name}",
         deleteFailed: "删除 {name} 失败",
+        deleteConfirm: "确定要移除 {name} 吗？",
         fetchFailed: "获取 MCP 应用失败",
         fetchError: "获取 MCP 应用时发生错误",
         customApiDetailFetchError: "无法加载已保存的 Custom API 配置",
@@ -1389,6 +1390,7 @@ const zh = {
         update: "更新",
         create: "创建",
         save: "保存",
+        delete: "删除",
       },
       empty: {
         title: "暂无 MCP 服务器配置",
