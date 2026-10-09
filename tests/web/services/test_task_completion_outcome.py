@@ -5,12 +5,14 @@ from sqlalchemy.orm import sessionmaker
 
 from tests.web.services.task_database_shared import engine as engine_fixture
 from tests.web.services.task_database_shared import task_id as task_id_fixture
+from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.services import task_coordinator_service as coordinator
 from xagent.web.services import task_execution as execution
 from xagent.web.services import task_lease_service as leases
 from xagent.web.services import task_orchestrator as orchestrator
 from xagent.web.services import task_stream_snapshot as snapshots
+from xagent.web.services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
 from xagent.web.services.execution_result_projection import (
     project_execution_result_for_channel,
 )
@@ -336,3 +338,200 @@ def test_execution_start_writers_clear_outcome(engine, task_id, monkeypatch, wri
         task = db.get(Task, task_id)
         assert task.status == TaskStatus.RUNNING
         assert task.completion_outcome is None
+
+
+_PROJECTED_MODEL_FAILURE = (
+    "Model provider call failed (403 provider_code_4204): Model is decommissioned"
+)
+_MODEL_ERROR_403 = {
+    "kind": "access_denied",
+    "status_code": 403,
+    "provider_code": "provider_code_4204",
+    "message": "Model is decommissioned",
+}
+_OWNER_DIAGNOSTIC_403 = (
+    "OpenAI API error (403): Model is decommissioned | provider_raw=RAW_MARKER"
+)
+_RAW_400 = "OpenAI bad request (400): plan rejected RAW_MARKER"
+_QUOTA_REASON = "Monthly quota reached for this agent."
+_QUOTA_DETAILS = {"limit": 5, "used": 5}
+
+
+def _model_failure_result(scenario: str) -> dict:
+    if scenario == "forbidden-403":
+        return {
+            "status": "error",
+            "success": False,
+            "output": "All 1 patterns failed",
+            "error": "All 1 patterns failed",
+            "diagnostic_error": _OWNER_DIAGNOSTIC_403,
+            "model_error": dict(_MODEL_ERROR_403),
+        }
+    if scenario == "bad-request-400":
+        # Plan generation puts the provider text in ``output`` and ``error``.
+        return {
+            "status": "error",
+            "success": False,
+            "output": _RAW_400,
+            "error": _RAW_400,
+            "diagnostic_error": _RAW_400,
+            "model_error": {
+                "kind": "bad_request",
+                "status_code": 400,
+                "provider_code": "invalid_request",
+                "message": "plan rejected RAW_MARKER",
+            },
+        }
+    return {
+        "status": "quota_exceeded",
+        "success": False,
+        "output": _QUOTA_REASON,
+        "error": _QUOTA_REASON,
+        "error_code": "quota_exceeded",
+        "error_details": dict(_QUOTA_DETAILS),
+        "diagnostic_error": _OWNER_DIAGNOSTIC_403,
+        "model_error": dict(_MODEL_ERROR_403),
+    }
+
+
+def _finalize_failed_result(engine, task_id, monkeypatch, route, result):
+    """Run one finalizer and return its client-facing fields as a dict."""
+    factory = sessionmaker(engine)
+    monkeypatch.setattr(execution, "get_session_local", lambda: factory)
+    with factory() as db:
+        task = db.get(Task, task_id)
+        task.conversation_storage_version = 1
+        task.status = TaskStatus.COMPLETED
+        task.control_state = TaskControlState.COMPLETED.value
+        uid = task.user_id
+        db.commit()
+        lease = leases.acquire_task_lease(
+            db, task_id, runner_id="failure-test", new_run=True
+        )
+        assert lease is not None
+    empty = execution._PreparedTaskFileOutputs((), (), ())
+    if route == "initial":
+        finalized = execution._finalize_task_execution_result_isolated(
+            task_id=task_id,
+            task_user_id=uid,
+            pre_run_status=TaskStatus.RUNNING,
+            result=result,
+            expected_run_id=lease.run_id,
+            task_lease=lease,
+            resolved_scope_segments=(),
+            prepared_outputs=empty,
+        )
+        fields = {
+            "output": finalized.ai_response,
+            "error_code": finalized.error_code,
+            "error_details": finalized.error_details,
+        }
+    else:
+        finalized = execution._finalize_resumed_task(
+            task_id,
+            status=str(result.get("status") or ""),
+            success=bool(result.get("success", False)),
+            output=str(result.get("output") or result.get("error") or ""),
+            task_owner_user_id=uid,
+            result=result,
+            task_lease=lease,
+            prepared_outputs=empty,
+        )
+        fields = {
+            "output": finalized["output"],
+            "error_code": finalized["error_code"],
+            "error_details": finalized["error_details"],
+        }
+    with factory() as db:
+        task = db.get(Task, task_id)
+        assert task.status == TaskStatus.FAILED
+        rows = (
+            db.query(TaskChatMessage)
+            .filter(TaskChatMessage.task_id == task_id)
+            .filter(TaskChatMessage.role == "assistant")
+            .all()
+        )
+        assert len(rows) == 1
+        fields["error_message"] = task.error_message
+        fields["row"] = (rows[0].content, rows[0].message_type)
+    fields["repr"] = repr(finalized)
+    return fields
+
+
+@pytest.mark.parametrize("route", ["initial", "resume"])
+def test_failed_model_error_reaches_clients_as_the_projection_and_owners_as_full_text(
+    engine, task_id, monkeypatch, route
+):
+    fields = _finalize_failed_result(
+        engine, task_id, monkeypatch, route, _model_failure_result("forbidden-403")
+    )
+
+    assert fields["error_message"] == _OWNER_DIAGNOSTIC_403
+    assert fields["output"] == _PROJECTED_MODEL_FAILURE
+    assert fields["error_code"] == "model_error"
+    assert fields["error_details"] == {
+        "kind": "access_denied",
+        "status_code": 403,
+        "provider_code": "provider_code_4204",
+        "message": _PROJECTED_MODEL_FAILURE,
+    }
+    assert fields["row"] == (_PROJECTED_MODEL_FAILURE, "client_safe_failure")
+    assert "RAW_MARKER" not in fields["repr"]
+    assert "RAW_MARKER" not in repr(fields["row"])
+
+
+@pytest.mark.parametrize("route", ["initial", "resume"])
+def test_failed_http_400_keeps_the_generic_sentence_even_when_output_holds_the_raw_text(
+    engine, task_id, monkeypatch, route
+):
+    fields = _finalize_failed_result(
+        engine, task_id, monkeypatch, route, _model_failure_result("bad-request-400")
+    )
+
+    assert fields["error_message"] == _RAW_400
+    assert fields["output"] == CLIENT_SAFE_TASK_FAILURE
+    assert fields["error_code"] is None
+    assert fields["error_details"] is None
+    assert fields["row"] == (CLIENT_SAFE_TASK_FAILURE, "task_failure")
+    assert "RAW_MARKER" not in fields["repr"]
+    assert "RAW_MARKER" not in repr(fields["row"])
+
+
+@pytest.mark.parametrize("route", ["initial", "resume"])
+def test_failed_quota_gate_code_takes_precedence_over_a_recorded_model_error(
+    engine, task_id, monkeypatch, route
+):
+    fields = _finalize_failed_result(
+        engine, task_id, monkeypatch, route, _model_failure_result("quota-gate")
+    )
+
+    assert fields["error_message"] == _QUOTA_REASON
+    assert fields["output"] == _QUOTA_REASON
+    assert fields["error_code"] == "quota_exceeded"
+    assert fields["error_details"] == _QUOTA_DETAILS
+    assert fields["row"] == (CLIENT_SAFE_TASK_FAILURE, "task_failure")
+    assert "RAW_MARKER" not in fields["repr"]
+
+
+@pytest.mark.parametrize("route", ["initial", "resume"])
+def test_failed_result_without_a_model_error_is_unchanged(
+    engine, task_id, monkeypatch, route
+):
+    fields = _finalize_failed_result(
+        engine,
+        task_id,
+        monkeypatch,
+        route,
+        {
+            "status": "error",
+            "success": False,
+            "output": "display text",
+            "error": "plain failure text",
+        },
+    )
+
+    assert fields["error_message"] == "plain failure text"
+    assert fields["output"] == "display text"
+    assert fields["error_code"] is None
+    assert fields["error_details"] is None
+    assert fields["row"] == (CLIENT_SAFE_TASK_FAILURE, "task_failure")

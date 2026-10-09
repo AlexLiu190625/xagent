@@ -145,7 +145,11 @@ from .db_runtime import (
     propagate_deferred_cancellation,
     run_db_io_cancellation_safe,
 )
-from .execution_result_projection import completion_outcome_for_status
+from .execution_result_projection import (
+    FailedResultPresentation,
+    completion_outcome_for_status,
+    present_failed_result,
+)
 from .file_reference_output_service import (
     reconcile_assistant_file_references,
 )
@@ -1758,6 +1762,8 @@ class _TaskExecutionFinalization:
     late_result: bool = False
     # Set when an interruption paused the run: the reason it records.
     interruption_pause_reason: InterruptionReason | None = None
+    error_code: str | None = None
+    error_details: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -2038,6 +2044,8 @@ def _finalize_task_execution_result_isolated(
         interruption_pause_reason: InterruptionReason | None = None
         final_control_snapshot: TaskControlSnapshot | None = None
         final_task_status = pre_run_status.value
+        # Set only when this transaction settles the result as FAILED.
+        presentation: FailedResultPresentation | None = None
 
         if task_updated is not None:
             task_agent_config: dict[str, Any] = (
@@ -2171,14 +2179,16 @@ def _finalize_task_execution_result_isolated(
                         completion_outcome_for_status(result, final_status),
                     )
                     if final_status == TaskStatus.FAILED:
-                        diagnostic_error = safe_str(result.get("error")).strip()
+                        presentation = present_failed_result(result)
                         setattr(
                             task_updated,
                             "error_message",
-                            diagnostic_error
+                            presentation.diagnostic_error
                             or safe_str(ai_response).strip()
                             or CLIENT_SAFE_TASK_FAILURE,
                         )
+                        if presentation.visible_text is not None:
+                            ai_response = presentation.visible_text
                     sync_workforce_run_status(
                         finalize_db,
                         task_updated,
@@ -2208,13 +2218,17 @@ def _finalize_task_execution_result_isolated(
                         f"Task {task_id}: cannot persist assistant message "
                         "without a resolved user_id"
                     )
-                history_content, history_message_type = (
-                    assistant_history_values_for_persistence(
-                        content=safe_str(ai_response),
-                        message_type=ASSISTANT_RESPONSE_MESSAGE_TYPE,
-                        is_failure=task_updated.status == TaskStatus.FAILED,
+                if presentation is not None:
+                    history_content = presentation.history_content
+                    history_message_type = presentation.history_message_type
+                else:
+                    history_content, history_message_type = (
+                        assistant_history_values_for_persistence(
+                            content=safe_str(ai_response),
+                            message_type=ASSISTANT_RESPONSE_MESSAGE_TYPE,
+                            is_failure=task_updated.status == TaskStatus.FAILED,
+                        )
                     )
-                )
                 # Shared readers may observe completion before scheduler
                 # cleanup runs. Publish its durable output in this same
                 # fenced transaction as the terminal state and transcript.
@@ -2300,6 +2314,16 @@ def _finalize_task_execution_result_isolated(
             final_task_status=final_task_status,
             broadcast_meta=broadcast_meta,
             interruption_pause_reason=interruption_pause_reason,
+            error_code=(
+                presentation.error_code
+                if presentation is not None
+                else result.get("error_code")
+            ),
+            error_details=(
+                presentation.error_details
+                if presentation is not None
+                else result.get("error_details")
+            ),
         )
     finally:
         try:
@@ -2601,11 +2625,12 @@ async def execute_task_background(
                     "output": ai_response,
                     "file_outputs": normalized_outputs,
                     "success": result.get("success", False),
-                    # Machine-readable failure classification (e.g. "quota_exceeded")
-                    # plus its structured details, so the client can localise and
-                    # branch instead of parsing the message. Absent for normal turns.
-                    "error_code": result.get("error_code"),
-                    "error_details": result.get("error_details"),
+                    # Machine-readable failure classification (e.g. "quota_exceeded"
+                    # or "model_error") plus its structured details, so the client
+                    # can localise and branch instead of parsing the message. Absent
+                    # for normal turns.
+                    "error_code": finalized.error_code,
+                    "error_details": finalized.error_details,
                     **control_event_state,
                     "type": "task_completed",
                     "chat_response": chat_response
@@ -2928,6 +2953,10 @@ def _finalize_resumed_task(
         "control_event_state": {},
         "normalized_outputs": [],
         "output": output,
+        # A failed result's presentation replaces these; every other outcome
+        # forwards the result's own coded fields.
+        "error_code": result.get("error_code"),
+        "error_details": result.get("error_details"),
         "late_result": False,
         "interruption_pause_reason": None,
     }
@@ -3056,23 +3085,29 @@ def _finalize_resumed_task(
             orm_task.output = output
             orm_task.error_message = None
         elif final_task_status == TaskStatus.FAILED:
+            presentation = present_failed_result(result)
             if task_owner_user_id is not None:
                 persist_assistant_message_no_commit(
                     db,
                     task_id=task_id,
                     user_id=task_owner_user_id,
-                    content=CLIENT_SAFE_TASK_FAILURE,
-                    message_type=TASK_FAILURE_MESSAGE_TYPE,
+                    content=presentation.history_content,
+                    message_type=presentation.history_message_type,
                     turn_id=_latest_result_user_turn_id(result),
                     content_is_reconciled=True,
                 )
             orm_task = cast(Any, task)
             orm_task.output = None
             orm_task.error_message = (
-                str(result.get("error") or "").strip()
-                or output
-                or CLIENT_SAFE_TASK_FAILURE
+                presentation.diagnostic_error or output or CLIENT_SAFE_TASK_FAILURE
             )
+            finalized["output"] = (
+                presentation.visible_text
+                if presentation.visible_text is not None
+                else output
+            )
+            finalized["error_code"] = presentation.error_code
+            finalized["error_details"] = presentation.error_details
 
         if interruption is not None:
             # Projects the workforce run itself for a pause.
@@ -4051,9 +4086,10 @@ async def execute_resume_background(
                 "file_outputs": normalized_outputs,
                 "success": success,
                 # Forward the coded reason so a mid-run quota interrupt on a
-                # resumed run pops the same dialog as the start-gate path.
-                "error_code": result.get("error_code"),
-                "error_details": result.get("error_details"),
+                # resumed run pops the same dialog as the start-gate path. A
+                # recorded model-provider failure carries "model_error" here.
+                "error_code": finalized.get("error_code"),
+                "error_details": finalized.get("error_details"),
                 **control_event_state,
                 "type": "task_completed",
                 # The owner's socket, not the operator trace: fold the raw

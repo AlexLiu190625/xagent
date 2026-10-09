@@ -53,6 +53,15 @@ from xagent.web.services.task_setup_snapshot import (
     _TaskFields,
 )
 
+MODEL_ERROR_DETAILS = {
+    "kind": "access_denied",
+    "status_code": 403,
+    "provider_code": "provider_code_4204",
+    "message": (
+        "Model provider call failed (403 provider_code_4204): Model is decommissioned"
+    ),
+}
+
 
 def _make_task_orm() -> Task:
     """Fake ORM Task row used only in the legacy / WS fallback path."""
@@ -179,6 +188,8 @@ def _common_patches(db: Any, agent_service: Any) -> list[Any]:
                     "updated_at": None,
                 },
                 late_result=False,
+                error_code=None,
+                error_details=None,
             ),
         ),
         patch(
@@ -388,6 +399,8 @@ async def test_cancellation_during_finalization_broadcasts_committed_result(
                 "updated_at": None,
             },
             late_result=False,
+            error_code=None,
+            error_details=None,
         )
 
     patches = [
@@ -472,6 +485,8 @@ async def test_cancellation_after_uncommitted_finalization_always_propagates(
                 "updated_at": None,
             },
             late_result=False,
+            error_code=None,
+            error_details=None,
         )
 
     patches = [
@@ -636,6 +651,74 @@ async def test_execute_task_background_accepts_missing_context() -> None:
         agent_manager.get_agent_for_task.await_args.kwargs["connector_runtime_turn_id"]
         is None
     )
+
+
+@pytest.mark.asyncio
+async def test_task_completed_frame_carries_the_finalized_error_fields() -> None:
+    """The published frame reads the finalization's code and details.
+
+    The run result carries no ``error_code``; the model-provider failure
+    classification only exists on the finalized outcome, so a frame built
+    from the raw result would drop it.
+    """
+    snapshot = _make_snapshot()
+    agent_service = _build_fake_agent_service()
+    agent_manager = MagicMock(
+        get_agent_for_task=AsyncMock(return_value=agent_service),
+        execute_task=AsyncMock(
+            return_value={"success": False, "output": "", "status": "failed"}
+        ),
+    )
+    finalized = SimpleNamespace(
+        normalized_outputs=[],
+        ai_response="failed",
+        chat_response=None,
+        waiting_for_control=False,
+        terminal_state_committed=True,
+        final_control_snapshot=None,
+        final_task_status=TaskStatus.FAILED.value,
+        broadcast_meta={
+            "id": 42,
+            "title": "exec-bg test",
+            "description": "x",
+            "execution_mode": "flash",
+            "updated_at": None,
+        },
+        late_result=False,
+        error_code="model_error",
+        error_details=MODEL_ERROR_DETAILS,
+    )
+    publish = AsyncMock()
+
+    with _Patches(
+        [
+            *_common_patches(MagicMock(), agent_service),
+            patch(
+                "xagent.web.services.task_execution."
+                "_finalize_task_execution_result_isolated",
+                return_value=finalized,
+            ),
+            patch(
+                "xagent.web.services.task_event_display.publish_task_result",
+                new=publish,
+            ),
+        ]
+    ):
+        await execute_task_background(
+            task_id=42,
+            user_message="hi",
+            context={},
+            agent_manager=agent_manager,
+            task_owner_user_id=1,
+            task_setup_snapshot=snapshot,
+            resolved_execution_scope=None,
+        )
+
+    publish.assert_awaited_once()
+    frame = publish.await_args.args[0]
+    assert frame["type"] == "task_completed"
+    assert frame["error_code"] == "model_error"
+    assert frame["error_details"] == MODEL_ERROR_DETAILS
 
 
 @pytest.mark.asyncio

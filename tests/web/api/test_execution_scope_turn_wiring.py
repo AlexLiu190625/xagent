@@ -136,6 +136,8 @@ def _bg_patches(db: Any) -> list[Any]:
                     "updated_at": None,
                 },
                 late_result=False,
+                error_code=None,
+                error_details=None,
             ),
         ),
         patch(
@@ -561,6 +563,86 @@ async def test_resume_background_adopts_preacquired_lease_without_reacquiring() 
         "42", metadata={"task_source": None, "run_id": "run-a"}
     )
     assert heartbeat_task.done()
+
+
+@pytest.mark.asyncio
+async def test_resumed_task_completed_frame_carries_the_finalized_error_fields() -> (
+    None
+):
+    """The resume frame reads the finalization's code and details.
+
+    The resumed run result carries no ``error_code``; the model-provider
+    failure classification only exists on the finalized outcome.
+    """
+    details = {
+        "kind": "access_denied",
+        "status_code": 403,
+        "provider_code": "provider_code_4204",
+        "message": (
+            "Model provider call failed (403 provider_code_4204): "
+            "Model is decommissioned"
+        ),
+    }
+    lease = TaskLease(task_id=42, runner_id="runner-a", run_id="run-a")
+    heartbeat_stop = asyncio.Event()
+
+    async def transferred_heartbeat() -> TaskLeaseHeartbeatOutcome:
+        await heartbeat_stop.wait()
+        return TaskLeaseHeartbeatOutcome()
+
+    heartbeat_task = asyncio.create_task(transferred_heartbeat())
+    agent_service = MagicMock()
+    agent_service.resume_execution_by_id = AsyncMock(
+        return_value={"status": "failed", "success": False, "output": ""}
+    )
+    publish = AsyncMock()
+
+    with _Patches(
+        [
+            patch(
+                "xagent.web.services.task_execution._finalize_resumed_task",
+                return_value={
+                    "task_title": "prelease",
+                    "task_description": "x",
+                    "task_execution_mode": "flash",
+                    "task_agent_id": None,
+                    "agent_name": None,
+                    "agent_logo_url": None,
+                    "final_status": TaskStatus.FAILED.value,
+                    "lease_released": True,
+                    "control_event_state": {},
+                    "normalized_outputs": [],
+                    "output": "failed",
+                    "late_result": False,
+                    "error_code": "model_error",
+                    "error_details": details,
+                },
+            ),
+            patch(
+                "xagent.web.services.task_event_display.publish_task_result",
+                new=publish,
+            ),
+            patch(
+                "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
+            ),
+        ]
+    ):
+        await execute_resume_background(
+            task_id=42,
+            agent_service=agent_service,
+            task_owner_user_id=1,
+            expected_run_id="run-a",
+            resolved_execution_scope=None,
+            preacquired_lease=lease,
+            preacquired_heartbeat_stop=heartbeat_stop,
+            preacquired_heartbeat_task=heartbeat_task,
+        )
+
+    publish.assert_awaited_once()
+    frame = publish.await_args.args[0]
+    assert frame["type"] == "task_completed"
+    assert frame["error_code"] == "model_error"
+    assert frame["error_details"] == details
 
 
 @pytest.mark.asyncio

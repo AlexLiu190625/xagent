@@ -97,6 +97,7 @@ def test_client_error_codes_have_fixed_safe_fallbacks() -> None:
             "conversation before sending it again."
         ),
         "external_turn_interrupted": "This response was interrupted.",
+        "model_error": "Model provider call failed.",
     }
 
 

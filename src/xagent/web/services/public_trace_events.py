@@ -9,7 +9,10 @@ from sqlalchemy import or_
 from ...core.tools.adapters.vibe.connector_runtime import (
     redact_runtime_sensitive_payload,
 )
-from .client_error_messages import CLIENT_SAFE_TASK_FAILURE
+from .client_error_messages import (
+    CLIENT_SAFE_TASK_FAILURE,
+    model_error_client_projection,
+)
 from .memory_availability import caller_facing_trace_data
 from .trace_event_types import GENERAL_ERROR_EVENT_TYPES
 
@@ -134,7 +137,15 @@ def normalize_public_trace_event(
             if isinstance(data, dict)
             else {}
         )
-        public_data["error_message"] = CLIENT_SAFE_TASK_FAILURE
+        projection = (
+            model_error_client_projection(data.get("model_error"))
+            if isinstance(data, dict)
+            else None
+        )
+        if projection is None:
+            public_data["error_message"] = CLIENT_SAFE_TASK_FAILURE
+        else:
+            public_data.update(projection)
         data = public_data
         event_type = "trace_error"
     elif event_type in PATTERN_END_EVENT_TYPES and isinstance(data, dict):
