@@ -138,6 +138,7 @@ function ToolsPageContent() {
   const [tools, setTools] = useState<Tool[]>([])
   const [mcpServers, setMcpServers] = useState<MCPServer[]>([])
   const [connectorStatus, setConnectorStatus] = useState<Record<string, { shared: boolean; is_owner: boolean; needs_config: boolean }>>({})
+  const [isConnectorStatusLoaded, setIsConnectorStatusLoaded] = useState(false)
   const [configurableTools, setConfigurableTools] = useState<ConfigurableTool[]>([])
   const [sqlConnections, setSqlConnections] = useState<SqlConnectionItem[]>([])
   const [isLoading, setIsLoading] = useState(false)
@@ -294,8 +295,10 @@ function ToolsPageContent() {
     // /api/connectors/status route, so skip the call entirely when not in a team.
     if (!inTeam) {
       setConnectorStatus({})
+      setIsConnectorStatusLoaded(true)
       return
     }
+    setIsConnectorStatusLoaded(false)
     try {
       const refs = servers.map((s) => ({
         type: s.transport === "custom_api" ? "custom_api" : "mcp",
@@ -303,6 +306,7 @@ function ToolsPageContent() {
       }))
       if (refs.length === 0) {
         setConnectorStatus({})
+        setIsConnectorStatusLoaded(true)
         return
       }
       const response = await apiRequest(`${getApiUrl()}/api/connectors/status`, {
@@ -312,6 +316,7 @@ function ToolsPageContent() {
       })
       if (response.ok) {
         setConnectorStatus(await response.json())
+        setIsConnectorStatusLoaded(true)
       }
     } catch (error) {
       console.error("Failed to load connector status:", error)
@@ -705,13 +710,22 @@ function ToolsPageContent() {
     }
   }
 
-  // can_edit_global is only true for viewers the DELETE routes also accept:
-  // the MCP route allows owners and admins, and a Custom API owner's row
-  // carries can_edit and can_delete together. Remaining refusals (team
-  // admin rules, live OAuth connections) come back as the toast below. Team
-  // tools the viewer does not own never reach this dialog: their card is
-  // not clickable.
-  const canDeleteServer = (server: MCPServer) => server.can_edit_global === true
+  // Delete is offered to owners and admins only (can_edit_global). The
+  // DELETE routes also accept non-owner rows that carry can_delete, such as
+  // catalog connections, but the list does not expose that flag, so those
+  // keep their existing disconnect paths. In a team, an admin's list also
+  // holds team connectors without a personal row; DELETE answers 404 for
+  // those, so the button waits for the ownership status and hides it for
+  // team tools the viewer does not own. Other refusals (team admin rules,
+  // live OAuth connections) come back as the toast below.
+  const canDeleteServer = (server: MCPServer) => {
+    if (server.can_edit_global !== true) return false
+    if (!inTeam) return true
+    if (!isConnectorStatusLoaded) return false
+    const connType = server.transport === 'custom_api' ? 'custom_api' : 'mcp'
+    const status = connectorStatus[`${connType}:${server.id}`]
+    return !(status?.shared && status.is_owner !== true)
+  }
 
   const handleDeleteMcpServer = async () => {
     const server = editingServer
@@ -1131,6 +1145,9 @@ function ToolsPageContent() {
       <Dialog
         open={isMcpDialogOpen}
         onOpenChange={(nextOpen) => {
+          // Keep the dialog open until a pending delete settles, so its
+          // completion cannot close an editor opened for another connector.
+          if (!nextOpen && isDeletingServer) return
           setIsMcpDialogOpen(nextOpen)
           if (!nextOpen) {
             connectorEditRequestRef.current += 1
@@ -1182,7 +1199,7 @@ function ToolsPageContent() {
                 {t('tools.mcp.buttons.delete')}
               </Button>
             )}
-            <Button variant="outline" onClick={() => setIsMcpDialogOpen(false)}>
+            <Button variant="outline" onClick={() => setIsMcpDialogOpen(false)} disabled={isDeletingServer}>
               {t('tools.mcp.buttons.cancel')}
             </Button>
             <Button

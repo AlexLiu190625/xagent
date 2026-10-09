@@ -1273,7 +1273,7 @@ const zh = {
         deleteService: "删除服务",
         deleteSuccess: "已成功删除 {name}",
         deleteFailed: "删除 {name} 失败",
-        deleteConfirm: "确定要删除 {name} 吗？此操作无法撤销。",
+        deleteConfirm: "确定要移除 {name} 吗？",
         fetchFailed: "获取 MCP 应用失败",
         fetchError: "获取 MCP 应用时发生错误",
         customApiDetailFetchError: "无法加载已保存的 Custom API 配置",

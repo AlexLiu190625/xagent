@@ -277,18 +277,19 @@ describe("ToolsPage connector delete from the edit dialog", () => {
 
   function installDeleteApiMock(
     server: MCPServer,
-    deleteResponse: () => Response = () => new Response(null, { status: 204 }),
+    deleteResponse: () => Response | Promise<Response> = () => new Response(null, { status: 204 }),
+    statusResponse: () => Response | Promise<Response> = () => jsonResponse({}),
   ) {
     let deleted = false
     apiRequestMock.mockImplementation(async (url: string, init?: RequestInit) => {
       if (init?.method === "DELETE") {
-        const response = deleteResponse()
+        const response = await deleteResponse()
         if (response.ok) deleted = true
         return response
       }
       if (url.endsWith("/api/tools/available")) return jsonResponse({ tools: [] })
       if (url.endsWith("/api/mcp/servers")) return jsonResponse(deleted ? [] : [server])
-      if (url.endsWith("/api/connectors/status")) return jsonResponse({})
+      if (url.endsWith("/api/connectors/status")) return statusResponse()
       if (url.endsWith("/api/tools/configurable")) return jsonResponse({ tools: [] })
       if (url.endsWith("/api/tools/sql-connections")) return jsonResponse({ connections: [] })
       if (url.endsWith(`/api/mcp/servers/${server.id}`)) return jsonResponse(mcpDetail(server))
@@ -325,6 +326,8 @@ describe("ToolsPage connector delete from the edit dialog", () => {
   })
 
   it("deletes a Custom API through the Custom API route", async () => {
+    const { toast } = await import("@/components/ui/sonner")
+    vi.mocked(toast.success).mockClear()
     vi.stubGlobal("confirm", vi.fn(() => true))
     installDeleteApiMock(customMcpServer({ id: 7, transport: "custom_api" }))
 
@@ -333,6 +336,64 @@ describe("ToolsPage connector delete from the edit dialog", () => {
 
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
     expect(deleteCalls().map(([url]) => url)).toEqual(["http://api.local/api/custom-apis/7"])
+    await waitFor(() => expect(screen.queryByText("Records MCP")).not.toBeInTheDocument())
+    expect(toast.success).toHaveBeenCalledWith(
+      'tools.mcp.dialog.deleteSuccess:{"name":"Records MCP"}',
+    )
+  })
+
+  it("keeps the dialog and its buttons locked while a delete is in flight", async () => {
+    vi.stubGlobal("confirm", vi.fn(() => true))
+    let finishDelete: (response: Response) => void = () => {}
+    installDeleteApiMock(
+      customMcpServer(),
+      () => new Promise<Response>((resolve) => { finishDelete = resolve }),
+    )
+
+    const dialog = await openEditDialog()
+    const deleteButton = dialog.getByRole("button", { name: /tools\.mcp\.buttons\.delete/ })
+    fireEvent.click(deleteButton)
+
+    await waitFor(() => expect(deleteButton).toBeDisabled())
+    expect(dialog.getByRole("button", { name: /tools\.mcp\.buttons\.cancel/ })).toBeDisabled()
+    expect(dialog.getByRole("button", { name: /tools\.mcp\.buttons\.save/ })).toBeDisabled()
+    fireEvent.click(deleteButton)
+    expect(deleteCalls()).toHaveLength(1)
+
+    finishDelete(new Response(null, { status: 204 }))
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+    expect(deleteCalls()).toHaveLength(1)
+  })
+
+  it.each([
+    ["a network error", () => Promise.reject(new Error("offline"))],
+    ["a non-string detail", () => jsonResponse({ detail: [{ msg: "bad id" }] }, 422)],
+    ["a body without detail", () => new Response("upstream failure", { status: 502 })],
+  ])("falls back to the generic failure message on %s", async (_label, respond) => {
+    const { toast } = await import("@/components/ui/sonner")
+    vi.mocked(toast.error).mockClear()
+    vi.stubGlobal("confirm", vi.fn(() => true))
+    installDeleteApiMock(customMcpServer(), respond)
+
+    const dialog = await openEditDialog()
+    fireEvent.click(dialog.getByRole("button", { name: /tools\.mcp\.buttons\.delete/ }))
+
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith('tools.mcp.dialog.deleteFailed:{"name":"Records MCP"}'),
+    )
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+  })
+
+  it.each([
+    ["has not answered yet", () => new Promise<Response>(() => {})],
+    ["failed", () => jsonResponse({ detail: "unavailable" }, 500)],
+  ])("hides delete in a team while the ownership status %s", async (_label, respondStatus) => {
+    installDeleteApiMock(customMcpServer(), undefined, respondStatus)
+
+    const dialog = await openEditDialog()
+
+    expect(dialog.getByRole("button", { name: /tools\.mcp\.buttons\.cancel/ })).toBeInTheDocument()
+    expect(dialog.queryByRole("button", { name: /tools\.mcp\.buttons\.delete/ })).not.toBeInTheDocument()
   })
 
   it("sends nothing when the confirmation is declined", async () => {
