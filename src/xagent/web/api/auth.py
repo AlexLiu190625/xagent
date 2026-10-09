@@ -59,7 +59,7 @@ from ..auth_config import (
 from ..auth_dependencies import get_current_user
 from ..builtin_mcp_registry import GOOGLE_RESTRICTED_SCOPES
 from ..first_admin_setup import FirstAdminIdentity, run_first_admin_setup_hook
-from ..mcp_apps import get_app_by_id
+from ..mcp_apps import BuiltinOAuthServerDefinitionError, get_app_by_id
 from ..models.actor_oauth_flow import ActorOAuthFlowState
 from ..models.auth_database import (
     SyncAuthSessionFactory,
@@ -2576,6 +2576,263 @@ def _lock_actor_link(db: Session, *, user_id: int, provider: str, app_id: str) -
     _require_one_actor_link(links, app_id)
 
 
+# Only values of this shape are shown or logged from a callback request. An
+# OAuth `error` is a short ASCII code by spec (RFC 6749 section 4.1.2.1), so
+# anything else is replaced instead of being echoed back.
+_OAUTH_CALLBACK_CODE_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+_MICROSOFT_ERROR_CODE_RE = re.compile(r"\bAADSTS[0-9]{1,10}\b", re.ASCII)
+_MAX_MICROSOFT_ERROR_CODES = 3
+_OAUTH_ACCESS_NOT_GRANTED_ERRORS = frozenset({"access_denied", "consent_required"})
+# AADSTS65004 is an ordinary "user declined to consent"; the admin-consent
+# codes mean the tenant requires an administrator to approve the app first.
+_MICROSOFT_ACCESS_NOT_GRANTED_CODES = (
+    frozenset({"AADSTS65004"}) | _MICROSOFT_ADMIN_CONSENT_ERROR_CODES
+)
+_OAUTH_TEMPORARY_ERRORS = frozenset({"server_error", "temporarily_unavailable"})
+_OAUTH_REQUEST_REJECTED_ERRORS = frozenset(
+    {
+        "invalid_client",
+        "invalid_request",
+        "invalid_scope",
+        "unauthorized_client",
+        "unsupported_response_type",
+    }
+)
+
+
+class _OAuthCallbackProviderError(NamedTuple):
+    """Display- and log-safe summary of a provider's error redirect."""
+
+    error: str
+    provider_codes: tuple[str, ...]
+
+
+def _safe_oauth_callback_code(value: object, fallback: str) -> str:
+    """Return ``value`` only when it is a short, code-shaped string."""
+    if isinstance(value, str) and _OAUTH_CALLBACK_CODE_RE.fullmatch(value):
+        return value
+    return fallback
+
+
+def _oauth_callback_provider_error(
+    provider: str, error: str | None, error_description: str | None
+) -> _OAuthCallbackProviderError | None:
+    """Reduce a provider error redirect to codes that are safe to show and log.
+
+    The free-text ``error_description`` is never kept: for Microsoft only the
+    AADSTS codes are extracted from it, because they are what an
+    administrator or support needs to identify the failure.
+    """
+    if not error:
+        return None
+    provider_codes: tuple[str, ...] = ()
+    if error_description and matches_provider_family(provider, "microsoft"):
+        found = _MICROSOFT_ERROR_CODE_RE.findall(error_description.upper())
+        provider_codes = tuple(dict.fromkeys(found))[:_MAX_MICROSOFT_ERROR_CODES]
+    return _OAuthCallbackProviderError(
+        error=_safe_oauth_callback_code(error, "unknown_error"),
+        provider_codes=provider_codes,
+    )
+
+
+def _log_oauth_callback_rejection(
+    provider: str,
+    reason: str,
+    *,
+    app_id: object = None,
+    actor_flow: bool | None = None,
+    provider_error: _OAuthCallbackProviderError | None = None,
+) -> None:
+    """Record why an OAuth callback did not connect.
+
+    Only code-shaped values are logged. The state, authorization code, flow
+    nonce, browser cookie, owner key, tokens and the provider's free-text
+    error_description never reach the log.
+    """
+    logger.warning(
+        "OAuth callback did not connect: provider=%s app_id=%s actor_flow=%s "
+        "reason=%s provider_error=%s provider_error_code=%s",
+        _safe_oauth_callback_code(provider, "invalid"),
+        "-" if app_id is None else _safe_oauth_callback_code(app_id, "invalid"),
+        "unknown" if actor_flow is None else str(actor_flow).lower(),
+        reason,
+        provider_error.error if provider_error is not None else "-",
+        ",".join(provider_error.provider_codes)
+        if provider_error is not None and provider_error.provider_codes
+        else "-",
+    )
+
+
+def _oauth_popup_feedback_response(title: str, *paragraphs: str) -> HTMLResponse:
+    """Render an actionable, uncacheable 400 page for the OAuth popup.
+
+    ``title`` and ``paragraphs`` are trusted HTML; callers escape every
+    request-derived value they include.
+    """
+    body = "".join(f"<p>{paragraph}</p>" for paragraph in paragraphs)
+    return HTMLResponse(
+        content=(
+            '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            f"<title>{title}</title></head><body>"
+            f"<h1>{title}</h1>{body}"
+            '<p><button type="button" onclick="window.close()">'
+            "Close this window</button></p>"
+            "<p>If this window doesn't close, close it from your browser.</p>"
+            "</body></html>"
+        ),
+        status_code=400,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+def _actor_oauth_provider_error_response(
+    provider: str, provider_error: _OAuthCallbackProviderError
+) -> HTMLResponse:
+    """Explain a provider error on an actor flow and say what to do next."""
+    is_microsoft = matches_provider_family(provider, "microsoft")
+    codes = ", ".join((provider_error.error, *provider_error.provider_codes))
+    code_line = f"Error code: <code>{html.escape(codes)}</code>"
+    if provider_error.error in _OAUTH_ACCESS_NOT_GRANTED_ERRORS or not (
+        _MICROSOFT_ACCESS_NOT_GRANTED_CODES.isdisjoint(provider_error.provider_codes)
+    ):
+        next_step = (
+            "Close this window, select Connect again, and choose Accept on the "
+            "Microsoft permission screen. If your organization requires an "
+            "administrator to approve new apps, ask your Microsoft 365 admin "
+            "to approve it."
+            if is_microsoft
+            else "Close this window, select Connect again, and approve the "
+            "requested access."
+        )
+        return _oauth_popup_feedback_response(
+            "Permission was not granted",
+            "The app was not connected because the requested access was not granted.",
+            next_step,
+            code_line,
+        )
+    if provider_error.error in _OAUTH_TEMPORARY_ERRORS:
+        return _oauth_popup_feedback_response(
+            "The sign-in service is temporarily unavailable",
+            "The sign-in service could not complete the request right now.",
+            "Close this window and select Connect again in a few minutes.",
+            code_line,
+        )
+    if (
+        provider_error.error in _OAUTH_REQUEST_REJECTED_ERRORS
+        or provider_error.provider_codes
+    ):
+        admin = "your Microsoft 365 admin" if is_microsoft else "your administrator"
+        return _oauth_popup_feedback_response(
+            "The sign-in request was rejected",
+            "The sign-in service rejected this connection request.",
+            "Close this window and select Connect again. If it keeps "
+            f"happening, contact {admin} or support and include the error "
+            "code below.",
+            code_line,
+        )
+    return _oauth_popup_feedback_response(
+        "The sign-in did not complete",
+        "The sign-in service did not finish connecting the app.",
+        "Close this window and select Connect again.",
+        code_line,
+    )
+
+
+def _actor_oauth_flow_used_response() -> HTMLResponse:
+    """Explain a sign-in window whose single-use flow is gone."""
+    return _oauth_popup_feedback_response(
+        "This sign-in window has already been used",
+        "This sign-in link has already been used or has expired, so it can't "
+        "connect the app.",
+        "Close this window and select Connect again. If the app already shows "
+        "as connected, there is nothing else to do.",
+    )
+
+
+# Actor checks that fail when the callback does not come back to the browser
+# that started the flow.
+_ACTOR_OAUTH_BROWSER_CHECK_REASONS = frozenset({"cookie_missing", "cookie_mismatch"})
+# Actor checks on the user, the personal link and the catalog definition.
+# Starting the flow requires all of them, so they only fail when one of them
+# changed while the member was signing in.
+_ACTOR_OAUTH_CONNECTION_CHECK_REASONS = frozenset(
+    {"user_missing", "link_invalid", "catalog_invalid", "link_changed_after_exchange"}
+)
+
+
+def _actor_oauth_flow_rejected_response(reason: str) -> HTMLResponse:
+    """Explain an actor flow that failed one of its checks.
+
+    Only a failed browser check is fixed by connecting again from the same
+    browser. A connection that changed during the sign-in must be available
+    again before a new Connect can succeed. The remaining checks (the flow's
+    own claims and owner) get a plain retry.
+    """
+    if reason in _ACTOR_OAUTH_BROWSER_CHECK_REASONS:
+        explanation = (
+            "This sign-in could not be matched to this browser, so the app was "
+            "not connected. This can happen when it was started in a different "
+            "browser or browser profile."
+        )
+        next_step = "Close this window and select Connect again from the same browser."
+    elif reason in _ACTOR_OAUTH_CONNECTION_CHECK_REASONS:
+        explanation = (
+            "The connection this sign-in was started for was turned off, "
+            "removed or changed while you were signing in, so the app was "
+            "not connected."
+        )
+        next_step = (
+            "Close this window. If the app is still available to you, select "
+            "Connect again. Otherwise, contact your administrator."
+        )
+    else:
+        explanation = (
+            "This sign-in could not be verified, so the app was not connected."
+        )
+        next_step = (
+            "Close this window and select Connect again. If it keeps "
+            "happening, contact your administrator."
+        )
+    return _oauth_popup_feedback_response(
+        "This sign-in window can't finish connecting", explanation, next_step
+    )
+
+
+def _expired_actor_oauth_state(state: str, provider: str) -> dict[str, Any] | None:
+    """Return the claims of an actor OAuth state that is genuine but expired.
+
+    The state, its browser cookie and its single-use flow all expire together,
+    so a sign-in window that comes back after that fails ``verify_token``
+    before it can be recognized as an actor flow. The signature is still
+    checked here; only the expiry is not. The result only chooses which page
+    that window shows: it never authorizes a token exchange or a database
+    change.
+    """
+    try:
+        payload: dict[str, Any] = jwt.decode(
+            state,
+            JWT_SECRET_KEY,
+            algorithms=[JWT_ALGORITHM],
+            options={"verify_exp": False},
+        )
+    except JWTError:
+        return None
+    expires_at = payload.get("exp")
+    if (
+        payload.get("type") != "oauth_state"
+        or payload.get("provider") != provider
+        or (
+            payload.get("actor_flow_nonce") is None
+            and payload.get("resource_owner_key") is None
+        )
+        or not isinstance(expires_at, (int, float))
+        or expires_at > time.time()
+    ):
+        return None
+    return payload
+
+
 def _google_gmail_error(provider: str, app_id: str | None) -> HTMLResponse | None:
     """Block Gmail even when its persisted catalog row is absent."""
     if (
@@ -3441,6 +3698,9 @@ def generic_oauth_callback(
         if is_myob
         else None
     )
+    provider_error = _oauth_callback_provider_error(
+        provider, error, request.query_params.get("error_description")
+    )
     provider_error_response = (
         HTMLResponse(
             content=f"<h1>Error: {html.escape(str(error))}</h1>", status_code=400
@@ -3450,8 +3710,14 @@ def generic_oauth_callback(
     )
 
     if provider_error_response is not None and not state:
+        _log_oauth_callback_rejection(
+            provider, "provider_error", provider_error=provider_error
+        )
         return provider_error_response
     if not state or (not code and provider_error_response is None):
+        _log_oauth_callback_rejection(
+            provider, "code_missing" if state else "state_missing"
+        )
         return HTMLResponse(
             content="<h1>Error: Missing code or state</h1>", status_code=400
         )
@@ -3462,6 +3728,26 @@ def generic_oauth_callback(
         or payload.get("type") != "oauth_state"
         or payload.get("provider") != provider
     ):
+        expired_actor_state = (
+            None if payload else _expired_actor_oauth_state(state, provider)
+        )
+        if expired_actor_state is not None:
+            # An actor sign-in window that came back after its flow expired
+            # (a reload, or a permission screen left open too long). Nothing
+            # is read or written: the page only says what to do next.
+            _log_oauth_callback_rejection(
+                provider,
+                "state_expired",
+                app_id=expired_actor_state.get("app_id"),
+                actor_flow=True,
+                provider_error=provider_error,
+            )
+            if provider_error is not None:
+                return _actor_oauth_provider_error_response(provider, provider_error)
+            return _actor_oauth_flow_used_response()
+        _log_oauth_callback_rejection(
+            provider, "state_invalid", provider_error=provider_error
+        )
         if provider_error_response is not None:
             return provider_error_response
         return HTMLResponse(
@@ -3472,6 +3758,13 @@ def generic_oauth_callback(
     actor_owner_claim = payload.get("resource_owner_key")
     is_actor_flow = actor_flow_nonce is not None or actor_owner_claim is not None
     if provider_error_response is not None and not is_actor_flow:
+        _log_oauth_callback_rejection(
+            provider,
+            "provider_error",
+            app_id=payload.get("app_id"),
+            actor_flow=False,
+            provider_error=provider_error,
+        )
         if (
             provider.lower() == "microsoft"
             and error == "access_denied"
@@ -3524,12 +3817,26 @@ def generic_oauth_callback(
         # Reject malformed state before exchanging the provider code or
         # mutating OAuth rows. ``User.id`` uses a signed database integer, so
         # values accepted only by SQLite must also fail at this boundary.
+        _log_oauth_callback_rejection(
+            provider,
+            "state_invalid",
+            app_id=payload.get("app_id"),
+            actor_flow=is_actor_flow,
+            provider_error=provider_error,
+        )
         return HTMLResponse(
             content="<h1>Error: Invalid or expired state</h1>", status_code=400
         )
     user_id = user_id_claim
     app_id = payload.get("app_id")
     if error_response := _google_gmail_error(provider, app_id):
+        _log_oauth_callback_rejection(
+            provider,
+            "app_restricted",
+            app_id=app_id,
+            actor_flow=is_actor_flow,
+            provider_error=provider_error,
+        )
         return error_response
 
     encrypted_code_verifier = payload.get("code_verifier")
@@ -3550,6 +3857,13 @@ def generic_oauth_callback(
         try:
             code_verifier = decrypt_value_strict(encrypted_code_verifier)
         except ValueError:
+            _log_oauth_callback_rejection(
+                provider,
+                "verifier_invalid",
+                app_id=app_id,
+                actor_flow=is_actor_flow,
+                provider_error=provider_error,
+            )
             return HTMLResponse(
                 content=(
                     "<h1>Error: Session expired</h1><p>Please try connecting again.</p>"
@@ -3559,6 +3873,9 @@ def generic_oauth_callback(
     resource_owner_key: str | None = None
 
     if is_actor_flow:
+        # Each step names the check it is about to make, so a rejection can
+        # be logged by reason without logging any value of the flow itself.
+        rejection_reason = "claims_invalid"
         try:
             if (
                 not isinstance(actor_flow_nonce, str)
@@ -3572,6 +3889,7 @@ def generic_oauth_callback(
                 or user_id is None
             ):
                 raise ValueError("invalid actor OAuth claims")
+            rejection_reason = "owner_invalid"
             if not isinstance(actor_owner_claim, str):
                 raise ValueError("missing actor owner")
             resource_owner_key = normalize_user_oauth_resource_owner_key(
@@ -3582,6 +3900,11 @@ def generic_oauth_callback(
             cookie_value = request.cookies.get(
                 _actor_oauth_cookie_name(actor_flow_nonce)
             )
+            rejection_reason = (
+                "cookie_mismatch"
+                if isinstance(cookie_value, str) and cookie_value
+                else "cookie_missing"
+            )
             cookie_digest = (
                 hashlib.sha256(cookie_value.encode()).hexdigest()
                 if isinstance(cookie_value, str)
@@ -3589,20 +3912,28 @@ def generic_oauth_callback(
             )
             if not secrets.compare_digest(cookie_digest, actor_flow_nonce):
                 raise ValueError("actor OAuth browser cookie mismatch")
+            rejection_reason = "user_missing"
             if db.query(User.id).filter(User.id == user_id).one_or_none() is None:
                 raise ValueError("actor OAuth user no longer exists")
+            rejection_reason = "link_invalid"
             _require_actor_oauth_personal_link(
                 db,
                 user_id=user_id,
                 provider=provider,
                 app_id=app_id,
             )
-        except ValueError:
+        except ValueError as exc:
             db.rollback()
-            return HTMLResponse(
-                content="<h1>Error: Invalid or expired actor OAuth flow</h1>",
-                status_code=400,
+            if isinstance(exc, BuiltinOAuthServerDefinitionError):
+                rejection_reason = "catalog_invalid"
+            _log_oauth_callback_rejection(
+                provider,
+                rejection_reason,
+                app_id=app_id,
+                actor_flow=True,
+                provider_error=provider_error,
             )
+            return _actor_oauth_flow_rejected_response(rejection_reason)
 
         deleted = (
             db.query(ActorOAuthFlowState)
@@ -3614,16 +3945,30 @@ def generic_oauth_callback(
         )
         if deleted != 1:
             db.rollback()
-            return HTMLResponse(
-                content="<h1>Error: Invalid or expired actor OAuth flow</h1>",
-                status_code=400,
+            _log_oauth_callback_rejection(
+                provider,
+                "flow_used_or_expired",
+                app_id=app_id,
+                actor_flow=True,
+                provider_error=provider_error,
             )
+            return _actor_oauth_flow_used_response()
         # The nonce claim is durable before any provider exchange. A failed
         # exchange cannot make the authorization code replayable.
         db.commit()
 
-        if provider_error_response is not None:
-            return provider_error_response
+        if provider_error is not None:
+            # The flow is already consumed, so this page is the only answer
+            # this sign-in window will get: it says what to do next instead
+            # of a bare error code.
+            _log_oauth_callback_rejection(
+                provider,
+                "provider_error",
+                app_id=app_id,
+                actor_flow=True,
+                provider_error=provider_error,
+            )
+            return _actor_oauth_provider_error_response(provider, provider_error)
 
     if not app_id:
         from ..mcp_apps import requires_app_scoped_oauth_grant
@@ -3637,6 +3982,9 @@ def generic_oauth_callback(
         # delete-then-recreate UserOAuth write below, so a bare grant can
         # never replace an existing app-scoped one for these providers.
         if requires_app_scoped_oauth_grant(provider):
+            _log_oauth_callback_rejection(
+                provider, "app_id_missing", actor_flow=is_actor_flow
+            )
             return HTMLResponse(
                 content=(
                     "<h1>Cannot Connect</h1>"
@@ -3677,6 +4025,9 @@ def generic_oauth_callback(
             try:
                 _reject_hidden_catalog_app(target_app_info)
             except HTTPException:
+                _log_oauth_callback_rejection(
+                    provider, "app_hidden", app_id=app_id, actor_flow=is_actor_flow
+                )
                 return HTMLResponse(
                     content=(
                         "<h1>Cannot Connect</h1>"
@@ -3686,6 +4037,9 @@ def generic_oauth_callback(
                 )
 
     if not db_provider:
+        _log_oauth_callback_rejection(
+            provider, "provider_not_configured", app_id=app_id, actor_flow=is_actor_flow
+        )
         return HTMLResponse(
             content="<h1>Error: Provider not configured</h1>", status_code=500
         )
@@ -3700,6 +4054,9 @@ def generic_oauth_callback(
     if not client_secret:
         missing_config.append(_oauth_env_name(provider, "CLIENT_SECRET"))
     if missing_config:
+        _log_oauth_callback_rejection(
+            provider, "provider_config_missing", app_id=app_id, actor_flow=is_actor_flow
+        )
         return _oauth_provider_config_error(provider, missing_config)
 
     if is_myob and not myob_business_id:
@@ -3714,6 +4071,9 @@ def generic_oauth_callback(
         # the token exchange even starts, so a doomed connection attempt
         # doesn't burn a network round trip to MYOB or consume the
         # single-use authorization code for an outcome already decided.
+        _log_oauth_callback_rejection(
+            provider, "business_id_missing", app_id=app_id, actor_flow=is_actor_flow
+        )
         return HTMLResponse(
             content=(
                 "<h1>Error exchanging token</h1>"
@@ -4346,10 +4706,14 @@ def generic_oauth_callback(
                 )
             except ValueError:
                 db.rollback()
-                return HTMLResponse(
-                    content="<h1>Error: Invalid or expired actor OAuth flow</h1>",
-                    status_code=400,
+                rejection_reason = "link_changed_after_exchange"
+                _log_oauth_callback_rejection(
+                    provider,
+                    rejection_reason,
+                    app_id=app_id,
+                    actor_flow=True,
                 )
+                return _actor_oauth_flow_rejected_response(rejection_reason)
 
         if user_id:
             if is_actor_flow:
