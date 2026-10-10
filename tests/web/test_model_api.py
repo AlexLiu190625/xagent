@@ -7,11 +7,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 from urllib.parse import quote
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from tests.shared.auth_database import auth_db_override
+from xagent.core.model.chat.basic.claude import AnthropicAuthenticationError
 from xagent.core.model.model import ChatModelConfig, EmbeddingModelConfig
 from xagent.web.api import model as model_module
 from xagent.web.api.auth import auth_router
@@ -51,6 +53,14 @@ test_app.dependency_overrides[get_auth_db] = auth_db_override(override_get_db)
 
 # Create test client
 client = TestClient(test_app)
+
+
+def _http_status_error(status_code: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("GET", "https://compatible.example.com/v1/models")
+    response = httpx.Response(status_code, request=request)
+    return httpx.HTTPStatusError(
+        f"upstream returned {status_code}", request=request, response=response
+    )
 
 
 def ensure_system_initialized() -> None:
@@ -451,6 +461,54 @@ def test_ordinary_model_create_update_delete_remains_compatible(
 
     deleted = client.delete("/api/models/test-openai-model", headers=admin_headers)
     assert deleted.status_code == 200
+
+
+def test_long_model_credential_round_trips_through_runtime_adapter(
+    test_db, admin_headers, sample_model_data
+):
+    """Exercise encrypted credential lifecycle; schema width is tested on Postgres."""
+    first_key = "a" * 1000
+    payload = {
+        **sample_model_data,
+        "model_id": "long-credential-model",
+        "model_provider": "claude",
+        "model_name": "au.anthropic.claude-opus-5-5",
+        "base_url": "https://bedrock.example.com/anthropic/v1",
+        "api_key": first_key,
+    }
+
+    created = client.post("/api/models/", headers=admin_headers, json=payload)
+    assert created.status_code == 200
+
+    db = next(get_db())
+    try:
+        stored = db.query(DBModel).filter_by(model_id="long-credential-model").one()
+        assert len(stored._api_key_encrypted) > 500
+        assert stored.api_key == first_key
+        runtime = CoreStorage(db, DBModel).get_llm_by_id("long-credential-model")
+        assert runtime is not None
+        assert runtime.api_key == first_key
+        assert runtime.base_url == "https://bedrock.example.com/anthropic/v1"
+    finally:
+        db.close()
+
+    second_key = "b" * 1200
+    updated = client.put(
+        "/api/models/long-credential-model",
+        headers=admin_headers,
+        json={"api_key": second_key},
+    )
+    assert updated.status_code == 200
+
+    db = next(get_db())
+    try:
+        stored = db.query(DBModel).filter_by(model_id="long-credential-model").one()
+        assert len(stored._api_key_encrypted) > 500
+        assert stored.api_key == second_key
+        loaded = CoreStorage(db, DBModel).load("long-credential-model")
+        assert loaded.api_key == second_key
+    finally:
+        db.close()
 
 
 @pytest.mark.asyncio
@@ -1936,6 +1994,140 @@ class TestModelAPI:
         assert captured["api_key"] == "test-api-key"
         assert captured["base_url"] == "https://custom.example.com/v1"
 
+    def test_claude_compatible_endpoint_without_catalog_allows_manual_entry(
+        self, test_db, regular_user, regular_headers, monkeypatch
+    ):
+        from xagent.core.model.chat.basic.claude import ModelCatalogUnavailableError
+
+        fetch = AsyncMock(
+            side_effect=ModelCatalogUnavailableError("catalog is unavailable")
+        )
+        monkeypatch.setattr(
+            "xagent.web.services.model_list_service.fetch_models_from_provider",
+            fetch,
+        )
+
+        response = client.post(
+            "/api/models/providers/claude/models",
+            json={
+                "api_key": "synthetic-secret",
+                "base_url": "https://bedrock.example.com/anthropic/v1",
+            },
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "provider": "claude",
+            "models": [],
+            "count": 0,
+            "catalog_unavailable": True,
+            "warning": (
+                "This compatible endpoint does not provide a model catalog. "
+                "Enter the model name manually, then test the model connection."
+            ),
+        }
+        fetch.assert_awaited_once_with(
+            "claude",
+            "synthetic-secret",
+            "https://bedrock.example.com/anthropic/v1",
+            raise_on_error=True,
+        )
+
+    @pytest.mark.parametrize("upstream_status", [401, 403])
+    def test_claude_catalog_auth_failure_uses_provider_error_semantics(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        monkeypatch,
+        upstream_status,
+    ):
+        error = AnthropicAuthenticationError(
+            "Invalid Anthropic API key", upstream_status
+        )
+        fetch = AsyncMock(side_effect=error)
+        monkeypatch.setattr(
+            "xagent.web.services.model_list_service.fetch_models_from_provider",
+            fetch,
+        )
+
+        response = client.post(
+            "/api/models/providers/claude/models",
+            json={
+                "api_key": "synthetic-secret",
+                "base_url": "https://compatible.example.com/anthropic/v1",
+            },
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 422
+        assert response.json()["detail"] == {
+            "code": "provider_auth_failed",
+            "message": "Invalid Anthropic API key",
+            "upstream_status": upstream_status,
+        }
+        assert response.json().get("catalog_unavailable") is None
+        assert "synthetic-secret" not in response.text
+
+    @pytest.mark.parametrize(
+        "error",
+        [httpx.ReadTimeout("timed out"), _http_status_error(503)],
+        ids=["timeout", "upstream-503"],
+    )
+    def test_claude_catalog_operational_failure_returns_bad_gateway(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        monkeypatch,
+        error,
+    ):
+        fetch = AsyncMock(side_effect=error)
+        monkeypatch.setattr(
+            "xagent.web.services.model_list_service.fetch_models_from_provider",
+            fetch,
+        )
+
+        response = client.post(
+            "/api/models/providers/claude/models",
+            json={
+                "api_key": "synthetic-secret",
+                "base_url": "https://compatible.example.com/anthropic/v1",
+            },
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 502
+        assert response.json().get("catalog_unavailable") is None
+        assert "synthetic-secret" not in response.text
+
+    def test_claude_compatible_provider_uses_strict_catalog_errors(
+        self, test_db, regular_user, regular_headers, monkeypatch
+    ):
+        fetch = AsyncMock(side_effect=httpx.ReadTimeout("timed out"))
+        monkeypatch.setattr(
+            "xagent.web.services.model_list_service.fetch_models_from_provider",
+            fetch,
+        )
+
+        response = client.post(
+            "/api/models/providers/kimi-for-coding/models",
+            json={
+                "api_key": "synthetic-secret",
+                "base_url": "https://api.kimi.com/coding",
+            },
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 502
+        fetch.assert_awaited_once_with(
+            "kimi-for-coding",
+            "synthetic-secret",
+            "https://api.kimi.com/coding",
+            raise_on_error=True,
+        )
+
     def test_fetch_provider_models_requires_base_url_for_openai_compatible(
         self, test_db, regular_user, regular_headers
     ):
@@ -2041,7 +2233,9 @@ class TestModelAPI:
             headers=regular_headers,
         )
         assert response.status_code == 200
-        fetch.assert_awaited_once_with("azure_openai", "test-api-key", endpoint)
+        fetch.assert_awaited_once_with(
+            "azure_openai", "test-api-key", endpoint, raise_on_error=False
+        )
 
     def test_list_supported_providers_includes_elevenlabs_audio_generation(
         self, test_db, regular_user, regular_headers

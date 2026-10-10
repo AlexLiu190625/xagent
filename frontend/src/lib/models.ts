@@ -448,6 +448,11 @@ export interface ProviderModel {
   default_base_url?: string;
 }
 
+export interface ProviderModelCatalog {
+  models: ProviderModel[];
+  catalogUnavailable: boolean;
+}
+
 /**
  * Get list of supported model providers
  */
@@ -475,7 +480,7 @@ export async function getSupportedProviders(): Promise<Provider[]> {
 export async function getProviderModels(
   provider: string,
   config?: { api_key?: string; base_url?: string; category?: string }
-): Promise<ProviderModel[]> {
+): Promise<ProviderModelCatalog> {
   const apiUrl = getApiUrl()
 
   const response = await apiRequest(`${apiUrl}/api/models/providers/${provider}/models`, {
@@ -492,12 +497,23 @@ export async function getProviderModels(
 
   if (!response.ok) {
     const errorData = await response.json().catch(() => ({}));
-    throw new Error(errorData.detail || 'Failed to fetch provider models');
+    const detail = errorData?.detail;
+    const message = typeof detail === 'string'
+      ? detail
+      : typeof detail?.message === 'string'
+        ? detail.message
+        : 'Failed to fetch provider models';
+    throw new Error(message);
   }
 
   const data = await response.json();
-  if (data && Array.isArray(data.models)) {
-    return data.models;
-  }
-  return Array.isArray(data) ? data : [];
+  const models = Array.isArray(data?.models)
+    ? data.models
+    : Array.isArray(data)
+      ? data
+      : [];
+  return {
+    models,
+    catalogUnavailable: data?.catalog_unavailable === true,
+  };
 }

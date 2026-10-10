@@ -36,6 +36,7 @@ from xagent.core.model.providers import (
     canonical_provider_name,
     default_base_url_for_provider,
     is_auto_router_model,
+    provider_compatibility_for_provider,
     provider_endpoint_kind,
     provider_requires_base_url,
 )
@@ -2364,7 +2365,15 @@ async def fetch_provider_models(
         )
 
     try:
-        models = await fetch_models_from_provider(provider_to_use, api_key, base_url)
+        models = await fetch_models_from_provider(
+            provider_to_use,
+            api_key,
+            base_url,
+            raise_on_error=(
+                provider_compatibility_for_provider(provider_to_use)
+                == "claude_compatible"
+            ),
+        )
 
         return {
             "provider": provider,
@@ -2372,6 +2381,35 @@ async def fetch_provider_models(
             "count": len(models),
         }
     except Exception as e:
+        from ...core.model.chat.basic.claude import (
+            AnthropicAuthenticationError,
+            ModelCatalogUnavailableError,
+        )
+
+        if isinstance(e, ModelCatalogUnavailableError):
+            return {
+                "provider": provider,
+                "models": [],
+                "count": 0,
+                "catalog_unavailable": True,
+                "warning": (
+                    "This compatible endpoint does not provide a model catalog. "
+                    "Enter the model name manually, then test the model connection."
+                ),
+            }
+        if isinstance(e, AnthropicAuthenticationError):
+            safe_error = redact_sensitive_text(str(e))
+            logger.warning(
+                "Provider %s rejected its credentials: %s", provider, safe_error
+            )
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "provider_auth_failed",
+                    "message": safe_error,
+                    "upstream_status": e.status_code,
+                },
+            ) from e
         safe_error = redact_sensitive_text(str(e))
         logger.error(
             "Error fetching models from %s: %s",
@@ -2379,9 +2417,9 @@ async def fetch_provider_models(
             safe_error,
         )
         raise HTTPException(
-            status_code=500,
+            status_code=502,
             detail=f"Failed to fetch models from {provider}: {safe_error}",
-        )
+        ) from e
 
 
 @model_router.post("/providers/fetch")
