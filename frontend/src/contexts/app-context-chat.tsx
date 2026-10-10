@@ -5870,9 +5870,11 @@ export function AppProvider({
           const failureReason =
             getString(taskData.output) ||
             getString(taskData.errorDetails?.message)
-          // Coded failures (e.g. a quota-gate refusal) also notify the app
-          // layer so it can surface them richly (see task-error-events). Stock
-          // xagent has a no-op controller and only an app layer ever sets a code.
+          // Coded failures (for example a quota-gate refusal, or "model_error"
+          // for a model-provider failure) also notify the app layer so it can
+          // surface them richly (see task-error-events). Stock xagent mounts a
+          // no-op controller, so in stock xagent the bubble below is what the
+          // user sees.
           // Not gated on failureReason: the coded dialog carries its own copy
           // and must still fire when the reason is empty. Tag it with the
           // event's own task id (not the currently-viewed one) so a dialog

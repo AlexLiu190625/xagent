@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+import httpx
+import openai
 import pytest
 
 from xagent.core.agent import (
@@ -36,7 +38,12 @@ from xagent.core.agent.language import (
 )
 from xagent.core.agent.runner import AgentRunner, UserMessageInjectionOutcome
 from xagent.core.agent.runtime import LLMCallInterrupted
-from xagent.core.model.chat.exceptions import LLMEmptyContentError, LLMTimeoutError
+from xagent.core.model.chat.exceptions import (
+    LLMEmptyContentError,
+    LLMTimeoutError,
+    ModelProviderError,
+    ModelProviderRetryableError,
+)
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 
 
@@ -957,6 +964,88 @@ async def test_runner_single_raising_pattern_reports_reason(tmp_path: Path) -> N
     assert result["pattern_errors"][0]["interruption_reason"] == "model_output_invalid"
     assert result["pattern_errors"][0]["exception_type"] == "LLMEmptyContentError"
     assert result["interruption_reason"] == "model_output_invalid"
+
+
+def _model_provider_error(
+    status_code: int = 403, *, cls: type[ModelProviderError] = ModelProviderError
+) -> ModelProviderError:
+    return cls(
+        prefix="Provider API error",
+        kind="access_denied",
+        status_code=status_code,
+        provider_code="provider_code_4204",
+        provider_message="Model is decommissioned",
+        sdk_message=f"Error code: {status_code} - Model is decommissioned",
+        details=["request_id=req-1"],
+    )
+
+
+def _rate_limited_provider_error() -> ModelProviderError:
+    error = _model_provider_error(429, cls=ModelProviderRetryableError)
+    request = httpx.Request("POST", "https://provider.example/v1/chat/completions")
+    error.__cause__ = openai.RateLimitError(
+        "slow down", response=httpx.Response(429, request=request), body=None
+    )
+    return error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "build_error",
+    [_model_provider_error, _rate_limited_provider_error],
+    ids=["non_retryable", "retryable_rate_limit"],
+)
+async def test_runner_single_pattern_model_provider_error_carries_details(
+    tmp_path: Path, build_error: Any
+) -> None:
+    error = build_error()
+    agent = Agent(name="writer", patterns=[ErrorRaisingPattern(error)])
+    runner = AgentRunner(agent=agent, workspace_manager=FakeWorkspaceManager(tmp_path))
+
+    result = await runner.run(task="Impossible", execution_id="exec-model-error")
+
+    assert result["success"] is False
+    assert result["diagnostic_error"] == str(error)
+    assert result["model_error"] == error.structured_fields()
+    assert result["error"].startswith("All 1 patterns failed")
+    entry = result["pattern_errors"][0]
+    assert entry["exception_type"] == type(error).__name__
+    assert entry["error"] == str(error)
+    if isinstance(error, ModelProviderRetryableError):
+        assert result["interruption_reason"] == "llm_unavailable"
+    else:
+        assert result.get("interruption_reason") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "build_patterns",
+    [
+        lambda: [ErrorRaisingPattern(RuntimeError("chat failed"))],
+        lambda: [
+            ErrorRaisingPattern(_model_provider_error()),
+            FailingPattern("structured failure"),
+        ],
+        lambda: [
+            ErrorRaisingPattern(_model_provider_error()),
+            ErrorRaisingPattern(_model_provider_error()),
+        ],
+    ],
+    ids=["other_exception", "two_patterns_one_provider_error", "two_provider_errors"],
+)
+async def test_runner_omits_model_error_keys_unless_sole_pattern_raised_it(
+    tmp_path: Path, build_patterns: Any
+) -> None:
+    patterns = build_patterns()
+    agent = Agent(name="writer", patterns=patterns)
+    runner = AgentRunner(agent=agent, workspace_manager=FakeWorkspaceManager(tmp_path))
+
+    result = await runner.run(task="Impossible", execution_id="exec-no-model-error")
+
+    assert result["success"] is False
+    assert result["error"].startswith(f"All {len(patterns)} patterns failed")
+    assert "diagnostic_error" not in result
+    assert "model_error" not in result
 
 
 @pytest.mark.asyncio

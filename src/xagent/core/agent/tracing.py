@@ -194,6 +194,10 @@ class TraceEventCallback:
             # TASK_END_GENERAL to task_completion, so do not emit it here.
             return
 
+        model_error = result.get("model_error")
+        if type(model_error) is dict:
+            data["model_error"] = model_error
+
         await trace_error(
             tracer,
             execution_id,

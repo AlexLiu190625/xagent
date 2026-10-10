@@ -29,7 +29,11 @@ from ..model.chat.basic.call_boundary import (
     ProviderCallError,
 )
 from ..model.chat.error import is_context_length_error, retry_on
-from ..model.chat.exceptions import LLMContextLengthError, LLMToolProtocolError
+from ..model.chat.exceptions import (
+    LLMContextLengthError,
+    LLMToolProtocolError,
+    ModelProviderError,
+)
 from ..model.chat.stream_progress import (
     NO_PAYLOAD_STREAM_FALLBACK,
     STREAM_ABORTED_KEY,
@@ -1274,15 +1278,18 @@ class PatternRuntime:
         # ``CheckpointPersistenceError`` guard) checks this to decide
         # whether it still needs to report the abort itself.
         self.pattern_error_reported = True
+        data: dict[str, Any] = {
+            "error_type": "agent_pattern_error",
+            "error_message": str(error),
+            "pattern": pattern.__class__.__name__,
+        }
+        if isinstance(error, ModelProviderError):
+            data["model_error"] = error.structured_fields()
         await self._emit_trace_event(
             TraceEventType(TraceScope.TASK, TraceAction.ERROR, TraceCategory.GENERAL),
             task_id=self._task_id(context),
             step_id=self._step_id(context),
-            data={
-                "error_type": "agent_pattern_error",
-                "error_message": str(error),
-                "pattern": pattern.__class__.__name__,
-            },
+            data=data,
         )
         if pattern.__class__.__name__ == "ReActPattern":
             self.active_react_step_id = None

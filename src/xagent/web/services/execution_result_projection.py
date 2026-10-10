@@ -8,7 +8,11 @@ from typing import Any, Mapping
 from ...core.agent.execution_adapter import INTERRUPTED_USER_MESSAGE
 from ..models.task import TaskStatus
 from .assistant_history_safety import ASSISTANT_RESPONSE_MESSAGE_TYPE
-from .client_error_messages import CLIENT_SAFE_TASK_FAILURE
+from .client_error_messages import (
+    CLIENT_SAFE_TASK_FAILURE,
+    mask_provider_secrets,
+    model_error_client_projection,
+)
 
 EMPTY_CHANNEL_OUTPUT_FALLBACK = "Task completed, but no output was generated."
 
@@ -34,6 +38,85 @@ def completion_outcome_for_status(
         outcome
         if isinstance(outcome, str) and outcome in {"completed", "partial", "blocked"}
         else None
+    )
+
+
+def execution_result_diagnostic_error(result: Mapping[str, Any]) -> str:
+    """Owner-facing diagnostic text for a failed result: the dedicated key first, then ``error``.
+
+    A result that carries a coded failure (``error_code`` is a string, today only
+    the quota gate) reports the coded ``error`` text even when a model failure was
+    also recorded: the gate describes why the turn ended.
+
+    The dedicated key holds the provider exception text, which holders of the
+    agent's API key read through the v1 task API, its event stream and A2A, so
+    credential-shaped tokens in it are masked. The ``error`` fallback is returned
+    as it is.
+    """
+    if type(result.get("error_code")) is str:
+        return str(result.get("error") or "").strip()
+    diagnostic = result.get("diagnostic_error")
+    if type(diagnostic) is str and diagnostic.strip():
+        return mask_provider_secrets(diagnostic.strip())
+    return str(result.get("error") or "").strip()
+
+
+@dataclass(frozen=True)
+class FailedResultPresentation:
+    """How one failed result is shown to its owner and on the task stream.
+
+    The persisted transcript row is not part of it: a failed turn always stores
+    the generic task-failure row, which the v2 context builder skips and the v1
+    history reader replays as the generic sentence, so provider text never
+    re-enters the model's context.
+    """
+
+    # -> ``tasks.error_message``; the caller applies its own empty fallback.
+    diagnostic_error: str
+    # -> chat bubble and ``task_completed.output``; ``None`` keeps the caller's text.
+    visible_text: str | None
+    # -> ``task_completed.error_code`` and ``task_completed.error_details``.
+    error_code: str | None
+    error_details: dict[str, Any] | None
+
+
+def present_failed_result(result: Mapping[str, Any]) -> FailedResultPresentation:
+    """Decide how one failed result is shown to its owner and on the task stream.
+
+    A coded failure already on the result (the quota gate) takes precedence: its
+    fields pass through and no model failure is projected. Otherwise a recorded
+    model-provider failure is projected through ``model_error_client_projection``.
+    """
+    diagnostic_error = execution_result_diagnostic_error(result)
+    existing_code = result.get("error_code")
+    projection = (
+        model_error_client_projection(result.get("model_error"))
+        if existing_code is None
+        else None
+    )
+    if projection is None:
+        # A recorded model failure whose projection is withheld (an HTTP 400
+        # record: ``model_error_client_projection`` returns ``None`` only for a
+        # non-dict or an HTTP 400, and a malformed dict still projects to the
+        # fixed fallback sentence) must not fall back to the caller's text: that
+        # text is the adapter's ``output`` backfill, i.e. the raw ``error`` string
+        # (plan generation puts the provider text there). Force the generic
+        # sentence for every task-stream surface.
+        withheld = type(result.get("model_error")) is dict and existing_code is None
+        error_details = result.get("error_details")
+        return FailedResultPresentation(
+            diagnostic_error=diagnostic_error,
+            visible_text=CLIENT_SAFE_TASK_FAILURE if withheld else None,
+            error_code=existing_code if type(existing_code) is str else None,
+            error_details=error_details if type(error_details) is dict else None,
+        )
+    details = {key: projection[key] for key in ("kind", "status_code", "provider_code")}
+    details["message"] = projection["error_message"]
+    return FailedResultPresentation(
+        diagnostic_error=diagnostic_error,
+        visible_text=projection["error_message"],
+        error_code=projection["error_code"],
+        error_details=details,
     )
 
 
@@ -70,7 +153,7 @@ def project_execution_result_for_channel(
     diagnostic_error = None
     if task_status == TaskStatus.FAILED:
         diagnostic_error = (
-            str(result.get("error") or "").strip() or base_text.strip() or None
+            execution_result_diagnostic_error(result) or base_text.strip() or None
         )
     if status == "interrupted":
         # An interruption is control state, not an assistant answer. Show a

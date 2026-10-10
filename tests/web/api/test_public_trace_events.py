@@ -71,6 +71,143 @@ def test_normalize_public_trace_event_redacts_general_failure_diagnostics(
     }
 
 
+_MODEL_FAILURE_RAW = "Model is decommissioned"
+_MODEL_FAILURE_PUBLIC_BASE = {
+    "status": "failed",
+    "execution_id": "execution-1730",
+    "pattern": "ReActPattern",
+    "success": False,
+}
+
+
+def _model_failure_event_data(model_error: object) -> dict[str, object]:
+    raw_error = "OpenAI API error (403): provider_raw=RAW_MARKER"
+    return {
+        **_MODEL_FAILURE_PUBLIC_BASE,
+        "error_type": "agent_error",
+        "error": raw_error,
+        "error_message": raw_error,
+        "provider_raw": "RAW_MARKER",
+        "model_error": model_error,
+    }
+
+
+_MODEL_FAILURE_403 = (
+    {
+        "kind": "access_denied",
+        "status_code": 403,
+        "provider_code": "provider_code_4204",
+        "message": _MODEL_FAILURE_RAW,
+    },
+    {
+        "error_code": "model_error",
+        "error_message": (
+            "Model provider call failed (403 provider_code_4204): "
+            "Model is decommissioned"
+        ),
+        "kind": "access_denied",
+        "status_code": 403,
+        "provider_code": "provider_code_4204",
+    },
+)
+_MODEL_FAILURE_400 = (
+    {
+        "kind": "bad_request",
+        "status_code": 400,
+        "provider_code": "invalid_request",
+        "message": _MODEL_FAILURE_RAW,
+    },
+    {"error_message": "Task execution failed."},
+)
+_MODEL_FAILURE_401 = (
+    {
+        "kind": "authentication_failed",
+        "status_code": 401,
+        "provider_code": "invalid_api_key",
+        "message": "Incorrect API key provided: sk-test-key-echo",
+    },
+    {
+        "error_code": "model_error",
+        "error_message": (
+            "Model provider call failed (401 invalid_api_key): "
+            "the credential was rejected."
+        ),
+        "kind": "authentication_failed",
+        "status_code": 401,
+        "provider_code": "invalid_api_key",
+    },
+)
+_MODEL_FAILURE_TIMEOUT = (
+    {
+        "kind": "timeout",
+        "status_code": None,
+        "provider_code": None,
+        "message": None,
+    },
+    {
+        "error_code": "model_error",
+        "error_message": "Model provider call failed: the request timed out.",
+        "kind": "timeout",
+        "status_code": None,
+        "provider_code": None,
+    },
+)
+_MODEL_FAILURE_MALFORMED = (
+    "not a dict",
+    {"error_message": "Task execution failed."},
+)
+
+
+@pytest.mark.parametrize(
+    "event_type, model_error, expected_extra",
+    [
+        *(
+            pytest.param(event_type, *case, id=f"{event_type}-{name}")
+            for event_type in (
+                "trace_error",
+                "task_error_general",
+                "step_error_general",
+            )
+            for name, case in (
+                ("403-with-body", _MODEL_FAILURE_403),
+                ("400-keeps-the-generic-shape", _MODEL_FAILURE_400),
+            )
+        ),
+        pytest.param(
+            "trace_error", *_MODEL_FAILURE_401, id="trace_error-401-body-withheld"
+        ),
+        pytest.param("trace_error", *_MODEL_FAILURE_TIMEOUT, id="trace_error-timeout"),
+        pytest.param(
+            "trace_error", *_MODEL_FAILURE_MALFORMED, id="trace_error-malformed"
+        ),
+    ],
+)
+def test_normalize_public_trace_event_projects_model_failures(
+    event_type: str,
+    model_error: object,
+    expected_extra: dict[str, object],
+) -> None:
+    normalized_event_type, data = normalize_public_trace_event(
+        event_type, _model_failure_event_data(model_error)
+    )
+
+    assert normalized_event_type == "trace_error"
+    assert data == {**_MODEL_FAILURE_PUBLIC_BASE, **expected_extra}
+    assert "RAW_MARKER" not in repr(data)
+    assert "sk-test-key-echo" not in repr(data)
+    assert "OpenAI API error" not in repr(data)
+
+
+@pytest.mark.parametrize("data", [None, "failed", ["model_error"]])
+def test_normalize_public_trace_event_without_a_dict_payload_stays_generic(
+    data: object,
+) -> None:
+    normalized_event_type, public = normalize_public_trace_event("trace_error", data)
+
+    assert normalized_event_type == "trace_error"
+    assert public == {"error_message": "Task execution failed."}
+
+
 @pytest.mark.parametrize(
     "trace_event_type",
     ["task", "step"],
@@ -250,3 +387,34 @@ def test_mcp_load_summary_audit_event_is_not_fanned_out() -> None:
     )
 
     assert TaskEventTraceHandler(42)._convert_trace_event_to_stream_event(event) is None
+
+
+def test_live_model_failure_trace_carries_the_model_error_projection() -> None:
+    from xagent.core.agent.trace import TASK_ERROR, TraceEvent
+    from xagent.web.services.task_event_trace_handler import TaskEventTraceHandler
+
+    event = TraceEvent(
+        TASK_ERROR,
+        task_id="42",
+        step_id=None,
+        data={
+            "status": "failed",
+            "error_message": "OpenAI API error (403): provider_raw=RAW_MARKER",
+            "model_error": {
+                "kind": "access_denied",
+                "status_code": 403,
+                "provider_code": "provider_code_4204",
+                "message": _MODEL_FAILURE_RAW,
+            },
+        },
+    )
+
+    stream_event = TaskEventTraceHandler(42)._convert_trace_event_to_stream_event(event)
+
+    assert stream_event is not None
+    assert stream_event["event_type"] == "trace_error"
+    assert stream_event["data"]["error_code"] == "model_error"
+    assert stream_event["data"]["error_message"] == (
+        "Model provider call failed (403 provider_code_4204): Model is decommissioned"
+    )
+    assert "RAW_MARKER" not in repr(stream_event)

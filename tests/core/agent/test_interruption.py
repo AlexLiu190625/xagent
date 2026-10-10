@@ -23,6 +23,7 @@ from xagent.core.model.chat.exceptions import (
     LLMInvalidResponseError,
     LLMTimeoutError,
     LLMToolProtocolError,
+    ModelProviderError,
 )
 from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from xagent.web.services.llm_utils import AutoModelUnavailableError
@@ -43,6 +44,24 @@ def _rate_limit_error() -> Exception:
 def _chained(outer: BaseException, cause: BaseException) -> BaseException:
     outer.__cause__ = cause
     return outer
+
+
+def _provider_error_from(cause: BaseException, *, status: int | None) -> Exception:
+    error = ModelProviderError(
+        prefix="Provider API error",
+        kind="unknown",
+        status_code=status,
+        provider_code=None,
+        provider_message=None,
+        sdk_message=str(cause),
+        details=[],
+    )
+    error.__cause__ = cause
+    return error
+
+
+def _timeout_error() -> Exception:
+    return openai.APITimeoutError(request=REQUEST)
 
 
 def _tool_protocol_error(code: str) -> LLMToolProtocolError:
@@ -123,6 +142,34 @@ def _tool_protocol_error(code: str) -> LLMToolProtocolError:
     ],
 )
 def test_classify_run_failure_branches(
+    error: BaseException, expected: InterruptionReason | None
+) -> None:
+    assert classify_run_failure(error) is expected
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (
+            _provider_error_from(_rate_limit_error(), status=429),
+            InterruptionReason.LLM_UNAVAILABLE,
+        ),
+        (
+            _provider_error_from(_status_error(503), status=503),
+            InterruptionReason.LLM_UNAVAILABLE,
+        ),
+        (
+            _provider_error_from(_timeout_error(), status=None),
+            InterruptionReason.LLM_UNAVAILABLE,
+        ),
+        (_provider_error_from(_status_error(401), status=401), None),
+        (_provider_error_from(_status_error(403), status=403), None),
+        (_provider_error_from(_status_error(404), status=404), None),
+        (_provider_error_from(_status_error(400), status=400), None),
+    ],
+    ids=["429", "503", "timeout", "401", "403", "404", "400"],
+)
+def test_classify_run_failure_for_model_provider_errors(
     error: BaseException, expected: InterruptionReason | None
 ) -> None:
     assert classify_run_failure(error) is expected

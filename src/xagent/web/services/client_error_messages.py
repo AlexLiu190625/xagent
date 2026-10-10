@@ -1,12 +1,17 @@
 """Client-visible projections of server-side failures.
 
 Holds the fixed fallback strings used when a failure has nothing safe to
-say, the per-exception adapters that pass a curated message through, and
-the projector that lifts a connector-runtime failure's code onto a
-task_error frame.
+say, the per-exception adapters that pass a curated message through, the
+projector that lifts a connector-runtime failure's code onto a task_error
+frame, and the projector that turns a recorded model-provider failure into a
+bounded message for task-stream audiences. It also provides the credential
+masking used for the owner-facing ``tasks.error_message`` text.
 """
 
+import re
+import unicodedata
 from enum import StrEnum
+from typing import Any
 
 from ...core.tools.adapters.vibe.config import RequiredMCPUnavailableError
 from ...core.tools.adapters.vibe.connector_runtime import (
@@ -20,6 +25,7 @@ from ...core.tools.adapters.vibe.connector_runtime import (
     ERROR_SCHEDULED_SECRET_UNAVAILABLE,
     ConnectorRuntimeError,
 )
+from ...core.utils.security import redact_sensitive_text
 
 CLIENT_SAFE_VALIDATION_ERROR = "The message could not be processed. Please try again."
 
@@ -33,6 +39,38 @@ CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE = (
 CLIENT_SAFE_GUIDANCE_IN_PROGRESS = (
     "A previous guidance message is still being applied. Please wait for it to finish."
 )
+
+# Head of every model-provider failure sentence shown to task-stream audiences.
+MODEL_ERROR_CLIENT_HEAD = "Model provider call failed"
+# Fixed fallback for ``ClientErrorCode.MODEL_ERROR``; equals the projection of a
+# failure that carries no status, no provider code and no kind phrase.
+CLIENT_SAFE_MODEL_ERROR = f"{MODEL_ERROR_CLIENT_HEAD}."
+MODEL_ERROR_CLIENT_MESSAGE_MAX_CHARS = 200
+MODEL_ERROR_PROVIDER_CODE_MAX_CHARS = 64
+# Statuses whose provider message body may reach task-stream audiences. Every
+# other status carries no body: 400 keeps the generic task-failure sentence, 401
+# bodies echo the submitted credential, and a missing status says nothing about
+# who produced the text.
+MODEL_ERROR_BODY_STATUSES = frozenset({403, 404, 408, 409, 429}) | frozenset(
+    range(500, 600)
+)
+_PROVIDER_CODE_PATTERN = re.compile(
+    rf"^[A-Za-z0-9_.:-]{{1,{MODEL_ERROR_PROVIDER_CODE_MAX_CHARS}}}$"
+)
+# One short clause per failure kind, used when the body is withheld. ``unknown``
+# has no phrase: the tail is omitted.
+MODEL_ERROR_KIND_PHRASES: dict[str, str | None] = {
+    "timeout": "the request timed out",
+    "connection_failed": "the provider could not be reached",
+    "bad_request": "the provider rejected the request",
+    "authentication_failed": "the credential was rejected",
+    "access_denied": "access to the model was denied",
+    "not_found": "the model was not found",
+    "rate_limited": "the provider rate limit was reached",
+    "server_error": "the provider returned a server error",
+    "rejected": "the provider rejected the request",
+    "unknown": None,
+}
 
 
 class ClientErrorCode(StrEnum):
@@ -68,6 +106,7 @@ class ClientErrorCode(StrEnum):
     # command ended in failure while its task was already COMPLETED or
     # FAILED. That record never reaches a client.
     EXTERNAL_TURN_INTERRUPTED = "external_turn_interrupted"
+    MODEL_ERROR = "model_error"
 
 
 def client_error_message(code: ClientErrorCode) -> str:
@@ -129,6 +168,7 @@ def client_error_message(code: ClientErrorCode) -> str:
             "conversation before sending it again."
         ),
         ClientErrorCode.EXTERNAL_TURN_INTERRUPTED: "This response was interrupted.",
+        ClientErrorCode.MODEL_ERROR: CLIENT_SAFE_MODEL_ERROR,
     }[code]
 
 
@@ -212,3 +252,140 @@ CONNECTOR_RUNTIME_CLIENT_ERROR_CODES = frozenset(
         ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
     }
 )
+
+
+# Credential shapes masked in provider text. A token counts as starting
+# where no ASCII letter or digit precedes it, so ``my_sk-…`` is caught;
+# ``key`` and ``token`` are left out as prefixes on purpose: they would also
+# mask ordinary words such as ``token_limit_exceeded_for_model``.
+_SECRET_PREFIX_PATTERN = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(sk|pk|rk|gsk|hf|xai|nvapi)[-_][A-Za-z0-9_-]{8,}"
+)
+# Account identifiers, masked only for task-stream audiences: the owner text
+# keeps them because a ``proj-`` prefix also starts some model names.
+_ACCOUNT_ID_PREFIX_PATTERN = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(org|proj)[-_][A-Za-z0-9_-]{8,}"
+)
+_JWT_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])eyJ[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_.-]+)?"
+)
+_GOOGLE_API_KEY_PATTERN = re.compile(r"(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{20,}")
+_AWS_ACCESS_KEY_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])"
+)
+# A bare ``Bearer <token>``. The token must hold a digit and be at least 16
+# characters long, so ``Bearer authentication required`` stays as it is.
+_BARE_BEARER_PATTERN = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(bearer\s+)(?=[A-Za-z0-9._~+/-]*[0-9])[A-Za-z0-9._~+/-]{16,}=*"
+)
+# A quoted ``"api_key": "…"`` pair, which ``redact_sensitive_text`` does not
+# recognise (it handles ``identifier=value``).
+_QUOTED_CREDENTIAL_PATTERN = re.compile(
+    r"""(?i)(["'](?:api[_-]?key|apikey|access[_-]?token|auth[_-]?token|refresh[_-]?token|secret|secret[_-]?key|client[_-]?secret|password|token)["']\s*:\s*["'])[^"'\s]+(["'])"""
+)
+_STRIPPED_CHARACTER_CATEGORIES = frozenset({"Cc", "Cf"})
+
+
+def mask_provider_secrets(text: str) -> str:
+    """Mask credential-shaped tokens in provider-authored text.
+
+    ``redact_sensitive_text`` runs first so the header and assignment shapes
+    it knows keep their usual ``***1234`` form; the shape patterns above
+    then mask what it does not recognise. Account identifiers are not
+    touched here.
+    """
+
+    masked = redact_sensitive_text(text)
+    masked = _SECRET_PREFIX_PATTERN.sub(lambda match: f"{match.group(1)}-***", masked)
+    masked = _JWT_PATTERN.sub("***", masked)
+    masked = _GOOGLE_API_KEY_PATTERN.sub("***", masked)
+    masked = _AWS_ACCESS_KEY_PATTERN.sub("***", masked)
+    masked = _BARE_BEARER_PATTERN.sub(lambda match: f"{match.group(1)}***", masked)
+    return _QUOTED_CREDENTIAL_PATTERN.sub(
+        lambda match: f"{match.group(1)}***{match.group(2)}", masked
+    )
+
+
+def _clean_provider_text(text: str) -> str:
+    """Make one provider message safe and short enough for task-stream audiences.
+
+    Whitespace is collapsed before control and format characters are dropped, so
+    separate lines stay separate words. Account identifiers are masked next,
+    then ``mask_provider_secrets`` masks the credential shapes, and the result
+    is capped at ``MODEL_ERROR_CLIENT_MESSAGE_MAX_CHARS`` characters.
+    """
+
+    collapsed = " ".join(text.split())
+    visible = "".join(
+        ch
+        for ch in collapsed
+        if unicodedata.category(ch) not in _STRIPPED_CHARACTER_CATEGORIES
+    )
+    masked = _ACCOUNT_ID_PREFIX_PATTERN.sub(
+        lambda match: f"{match.group(1)}-***", visible
+    )
+    return mask_provider_secrets(masked)[:MODEL_ERROR_CLIENT_MESSAGE_MAX_CHARS]
+
+
+def model_error_client_projection(value: object) -> dict[str, Any] | None:
+    """Project a recorded model-provider failure for task-stream audiences.
+
+    ``value`` is the dict a ``ModelProviderError`` publishes (``kind``,
+    ``status_code``, ``provider_code``, ``message``). Every field is validated
+    by exact type; anything that fails validation is treated as missing.
+    Returns ``None`` when ``value`` is not a dict or the failure is an HTTP 400,
+    whose body never reaches these audiences: callers then show the generic
+    task-failure sentence. Otherwise returns ``error_code``, ``error_message``,
+    ``kind``, ``status_code`` and ``provider_code``. The provider ``message``
+    appears only for ``MODEL_ERROR_BODY_STATUSES``, cleaned and capped.
+    """
+
+    if type(value) is not dict:
+        return None
+    raw_kind = value.get("kind")
+    kind = (
+        raw_kind
+        if type(raw_kind) is str and raw_kind in MODEL_ERROR_KIND_PHRASES
+        else "unknown"
+    )
+    raw_status = value.get("status_code")
+    status_code = (
+        raw_status if type(raw_status) is int and 100 <= raw_status <= 599 else None
+    )
+    if status_code == 400:
+        return None
+    raw_code = value.get("provider_code")
+    provider_code = (
+        raw_code
+        if type(raw_code) is str and _PROVIDER_CODE_PATTERN.fullmatch(raw_code)
+        else None
+    )
+    message: str | None = None
+    raw_message = value.get("message")
+    if (
+        status_code in MODEL_ERROR_BODY_STATUSES
+        and type(raw_message) is str
+        and raw_message.strip()
+    ):
+        try:
+            message = _clean_provider_text(raw_message)
+        except Exception:
+            message = None
+
+    parts = [str(status_code) if status_code is not None else None, provider_code]
+    joined = " ".join(part for part in parts if part is not None)
+    paren = f" ({joined})" if joined else ""
+    phrase = MODEL_ERROR_KIND_PHRASES[kind]
+    if message:
+        text = f"{MODEL_ERROR_CLIENT_HEAD}{paren}: {message}"
+    elif phrase:
+        text = f"{MODEL_ERROR_CLIENT_HEAD}{paren}: {phrase}."
+    else:
+        text = f"{MODEL_ERROR_CLIENT_HEAD}{paren}."
+    return {
+        "error_code": ClientErrorCode.MODEL_ERROR.value,
+        "error_message": text,
+        "kind": kind,
+        "status_code": status_code,
+        "provider_code": provider_code,
+    }

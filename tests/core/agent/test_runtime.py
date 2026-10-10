@@ -43,7 +43,10 @@ from xagent.core.model.chat.basic.call_boundary import (
     ProviderCallError,
     guard_llm_calls,
 )
-from xagent.core.model.chat.exceptions import LLMRetryableError
+from xagent.core.model.chat.exceptions import (
+    LLMRetryableError,
+    ModelProviderError,
+)
 from xagent.core.model.chat.stream_progress import STREAM_ABORTED_KEY
 from xagent.core.model.chat.types import (
     CONTENT_SOURCE_KEY,
@@ -3343,6 +3346,57 @@ async def test_on_pattern_error_preserves_the_original_error_when_finish_trace_f
         pattern=_RecordingReActPattern(),
         error=original,
     )
+
+
+class _RecordingEventTracer:
+    def __init__(self) -> None:
+        self.events: list[dict[str, Any]] = []
+
+    async def trace_event(self, event_type: Any, **kwargs: Any) -> None:
+        self.events.append({"event_type": event_type, **kwargs})
+
+
+def _provider_failure() -> ModelProviderError:
+    return ModelProviderError(
+        prefix="Provider API error",
+        kind="access_denied",
+        status_code=403,
+        provider_code="provider_code_4204",
+        provider_message="Model is decommissioned",
+        sdk_message="Error code: 403 - Model is decommissioned",
+        details=["request_id=req-1"],
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        _provider_failure(),
+        RuntimeError("chat failed"),
+    ],
+    ids=["model_provider_error", "runtime_error"],
+)
+async def test_on_pattern_error_attaches_model_error_only_for_provider_failures(
+    error: Exception,
+) -> None:
+    tracer = _RecordingEventTracer()
+    runtime = PatternRuntime(tracer=tracer, execution_id="exec-model-error-event")
+
+    await runtime.on_pattern_error(
+        context=ExecutionContext(execution_id="exec-model-error-event"),
+        pattern=_RecordingReActPattern(),
+        error=error,
+    )
+
+    assert len(tracer.events) == 1
+    data = tracer.events[0]["data"]
+    assert data["error_type"] == "agent_pattern_error"
+    assert data["error_message"] == str(error)
+    if isinstance(error, ModelProviderError):
+        assert data["model_error"] == error.structured_fields()
+    else:
+        assert "model_error" not in data
 
 
 @pytest.mark.asyncio

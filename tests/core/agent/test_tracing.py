@@ -103,6 +103,52 @@ async def test_trace_callback_attaches_final_answer_stream_message_id() -> None:
     assert tracer.events[1]["data"]["result"]["stream_message_id"] == "final_answer_123"
 
 
+_PROVIDER_MODEL_ERROR = {
+    "kind": "access_denied",
+    "status_code": 403,
+    "provider_code": "provider_code_4204",
+    "message": "Model is decommissioned",
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("result_extra", "expect_key"),
+    [
+        ({"model_error": _PROVIDER_MODEL_ERROR}, True),
+        ({}, False),
+        ({"model_error": "access_denied"}, False),
+        ({"model_error": ["access_denied"]}, False),
+    ],
+    ids=["dict", "absent", "string", "list"],
+)
+async def test_trace_callback_failed_run_attaches_only_a_dict_model_error(
+    result_extra: dict[str, Any], expect_key: bool
+) -> None:
+    tracer = TraceRecorder()
+    callback = TraceEventCallback()
+    runner = SimpleNamespace(tracer=tracer)
+    context = ExecutionContext(execution_id="exec-trace-model-error")
+
+    await callback.on_run_end(
+        runner=runner,
+        context=context,
+        result={
+            "success": False,
+            "execution_id": "exec-trace-model-error",
+            "error": "All 1 patterns failed or returned unsuccessful results.",
+            **result_extra,
+        },
+    )
+
+    assert len(tracer.events) == 1
+    data = tracer.events[0]["data"]
+    if expect_key:
+        assert data["model_error"] == _PROVIDER_MODEL_ERROR
+    else:
+        assert "model_error" not in data
+
+
 @pytest.mark.asyncio
 async def test_trace_callback_ignores_failed_final_answer_stream_id() -> None:
     tracer = TraceRecorder()

@@ -1649,6 +1649,72 @@ def test_execution_adapter_uses_last_assistant_message_when_output_missing() -> 
     assert result["output"] == "answer from context"
 
 
+def _plain_react_adapter() -> AgentExecutionAdapter:
+    return AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="provider-failure",
+            pattern="react",
+            llm=FakeLLM([]),
+            skill_manager=NoSkillManager(),
+        )
+    )
+
+
+def test_execution_adapter_promotes_model_error_keys_and_keeps_output_backfill() -> (
+    None
+):
+    aggregate = "All 1 patterns failed or returned unsuccessful results."
+    model_error = {
+        "kind": "access_denied",
+        "status_code": 403,
+        "provider_code": "provider_code_4204",
+        "message": "Model is decommissioned",
+    }
+
+    result = _plain_react_adapter()._normalize_result(
+        result={
+            "success": False,
+            "error": aggregate,
+            "diagnostic_error": "Provider API error (403): denied",
+            "model_error": model_error,
+        },
+        execution_type="agent_react",
+        execution_id="provider-failure-exec",
+    )
+
+    assert result["diagnostic_error"] == "Provider API error (403): denied"
+    assert result["model_error"] == model_error
+    assert result["output"] == aggregate
+    assert result["error"] == aggregate
+
+
+@pytest.mark.parametrize(
+    ("diagnostic_error", "model_error"),
+    [
+        ("", "not a dict"),
+        ("   ", ["kind", "access_denied"]),
+        (None, None),
+        (403, 403),
+    ],
+)
+def test_execution_adapter_ignores_malformed_model_error_keys(
+    diagnostic_error: Any, model_error: Any
+) -> None:
+    result = _plain_react_adapter()._normalize_result(
+        result={
+            "success": False,
+            "error": "All 1 patterns failed or returned unsuccessful results.",
+            "diagnostic_error": diagnostic_error,
+            "model_error": model_error,
+        },
+        execution_type="agent_react",
+        execution_id="provider-failure-malformed",
+    )
+
+    assert "diagnostic_error" not in result
+    assert "model_error" not in result
+
+
 def test_execution_adapter_hides_internal_error_for_interrupted_result() -> None:
     adapter = AgentExecutionAdapter(
         AgentExecutionConfig(

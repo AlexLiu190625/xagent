@@ -6,7 +6,8 @@
 // `TaskErrorController`, so nothing happens. An app layer (e.g. xagent-cloud)
 // replaces that controller to present its own dialog — mirroring the backend
 // quota-hook seam, where core forwards a code and the app layer decides what
-// it means.
+// it means. Core also sets codes of its own, such as "model_error" for a
+// model-provider failure; the event fires for those too.
 //
 // The event fires only on the live terminal task_completed event, not on
 // history replay after a reload — a reloaded failed task shows its reason in

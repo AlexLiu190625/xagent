@@ -481,6 +481,15 @@ class AgentExecutionAdapter:
             if interruption_reason is not None:
                 normalized[INTERRUPTION_REASON_KEY] = interruption_reason
                 normalized["metadata"][INTERRUPTION_REASON_KEY] = interruption_reason
+        # The provider failure behind a failed run travels in its own keys;
+        # ``output`` above is still backfilled from ``error``. Only a
+        # well-formed value crosses this boundary.
+        diagnostic_error = result.get("diagnostic_error")
+        if type(diagnostic_error) is str and diagnostic_error.strip():
+            normalized["diagnostic_error"] = diagnostic_error
+        model_error = result.get("model_error")
+        if type(model_error) is dict:
+            normalized["model_error"] = model_error
         if status == "waiting_for_user":
             message = str(result.get("message") or output or "")
             interactions = result.get("interactions")
