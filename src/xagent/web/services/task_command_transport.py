@@ -282,16 +282,30 @@ def _canonical_payload(payload: dict[str, Any]) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
 
 
-def _normalize_command_id(command_id: str) -> str:
+# Command ids reserved for the auto-resume sweeper. Episode bookkeeping does
+# not count a RESUME with this prefix as a person acting (and the sweeper's
+# claim-time check will trust one as its own), so no ingress may stage one.
+# ``reserved=True`` is the sweeper's door into the namespace; it has no
+# production caller until the sweeper lands, and tests exercise it.
+AUTO_RESUME_COMMAND_PREFIX = "auto-resume:"
+
+
+def _normalize_command_id(command_id: str, *, reserved: bool = False) -> str:
     """Strip and validate a caller-supplied command_id.
 
     Shared by every normalization site in this module so the accepted format
-    -- 1-64 URL-safe characters -- cannot drift between them.
+    -- 1-64 URL-safe characters -- cannot drift between them. The
+    ``auto-resume:`` namespace is refused unless ``reserved`` says the caller
+    is the auto-resume sweeper.
     """
 
     normalized = command_id.strip()
     if COMMAND_ID_PATTERN.fullmatch(normalized) is None:
         raise ValueError("command_id must be 1-64 URL-safe characters")
+    if not reserved and normalized.startswith(AUTO_RESUME_COMMAND_PREFIX):
+        raise ValueError(
+            f"command_id prefix {AUTO_RESUME_COMMAND_PREFIX!r} is reserved"
+        )
     return normalized
 
 
@@ -427,8 +441,12 @@ def stage_task_command(
     reply_host_id: str | None = None,
     reply_origin: str | None = None,
     target_run_id: str | None = None,
+    reserved: bool = False,
 ) -> StagedTaskCommand:
     """Add an idempotent command row to the session without ending its transaction.
+
+    ``reserved`` admits the auto-resume sweeper's command id namespace;
+    every other caller leaves it False, so no ingress can stage one.
 
     Never calls ``db.commit()``, ``db.rollback()``, or the dispatcher notify --
     the caller owns the transaction boundary and decides what durability means
@@ -476,7 +494,7 @@ def stage_task_command(
        writer, including the dispatcher's claim, blocks for that whole span.
     """
 
-    normalized_id = _normalize_command_id(command_id)
+    normalized_id = _normalize_command_id(command_id, reserved=reserved)
     resolved_task_id = int(task_id)
 
     try:
