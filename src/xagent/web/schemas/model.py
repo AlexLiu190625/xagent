@@ -3,6 +3,8 @@ from typing import Any, List, Literal, Optional, Set
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from xagent.core.model.model import MODEL_ID_MAX_LENGTH, MODEL_NAME_MAX_LENGTH
+
 
 def _strip_whitespace(v: Any) -> Any:
     """Strip whitespace from a string field; pass non-strings through unchanged."""
@@ -116,10 +118,10 @@ def _validate_abilities_for_category(abilities: List[str], category: str) -> Lis
 class ModelCreate(BaseModel):
     """Model creation request schema"""
 
-    model_id: str
+    model_id: str = Field(max_length=MODEL_ID_MAX_LENGTH)
     category: str = "llm"
     model_provider: str
-    model_name: str
+    model_name: str = Field(max_length=MODEL_NAME_MAX_LENGTH)
     api_key: Optional[str] = None
     base_url: Optional[str] = None
     bedrock_region: Optional[str] = None
@@ -164,7 +166,7 @@ class ModelUpdate(BaseModel):
 
     category: Optional[str] = None
     model_provider: Optional[str] = None
-    model_name: Optional[str] = None
+    model_name: Optional[str] = Field(default=None, max_length=MODEL_NAME_MAX_LENGTH)
     api_key: Optional[str] = None
     base_url: Optional[str] = None
     bedrock_region: Optional[str] = None
@@ -212,7 +214,7 @@ class ModelResponse(BaseModel):
     model_id: str
     category: str
     model_provider: str
-    model_name: str
+    model_name: str = Field(max_length=MODEL_NAME_MAX_LENGTH)
     base_url: Optional[str]
     bedrock_region: Optional[str] = None
     bedrock_auth_mode: Optional[Literal["api_key", "credentials_chain"]] = None
@@ -262,7 +264,7 @@ class ModelConnectionTestRequest(BaseModel):
     """Request schema for testing an unsaved model connection"""
 
     model_provider: str
-    model_name: str
+    model_name: str = Field(max_length=MODEL_NAME_MAX_LENGTH)
     api_key: Optional[str] = None
     base_url: Optional[str] = None
     bedrock_region: Optional[str] = None
@@ -370,7 +372,7 @@ class ModelWithAccessInfo(BaseModel):
     model_id: str
     category: str
     model_provider: str
-    model_name: str
+    model_name: str = Field(max_length=MODEL_NAME_MAX_LENGTH)
     base_url: Optional[str]
     bedrock_region: Optional[str] = None
     bedrock_auth_mode: Optional[Literal["api_key", "credentials_chain"]] = None

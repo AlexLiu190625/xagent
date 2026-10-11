@@ -6,6 +6,7 @@ from sqlalchemy import JSON, Boolean, Column, DateTime, Float, Integer, String, 
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
+from xagent.core.model.model import MODEL_ID_MAX_LENGTH, MODEL_NAME_MAX_LENGTH
 from xagent.core.model.storage.db.db_models import create_model_table
 
 if TYPE_CHECKING:
@@ -15,10 +16,12 @@ if TYPE_CHECKING:
 
     class Model(Base):  # type: ignore[valid-type, misc]
         id = Column(Integer, primary_key=True, index=True)
-        model_id = Column(String(100), unique=True, index=True, nullable=False)
+        model_id = Column(
+            String(MODEL_ID_MAX_LENGTH), unique=True, index=True, nullable=False
+        )
         category = Column(String(20), nullable=False, default="llm")
         model_provider = Column(String(50), nullable=False)
-        model_name = Column(String(100), nullable=False)
+        model_name = Column(String(MODEL_NAME_MAX_LENGTH), nullable=False)
         # Type-checking facade for the decrypted property exposed by the
         # runtime model factory. The persisted ciphertext column is declared
         # as Text in create_model_table().

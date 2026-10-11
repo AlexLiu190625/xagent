@@ -8,6 +8,7 @@ from sqlalchemy import JSON, Boolean, Column, DateTime, Float, Integer, String, 
 from sqlalchemy.sql import func
 
 from .....config import DEV_FALLBACK_ENCRYPTION_KEY
+from ...model import MODEL_ID_MAX_LENGTH, MODEL_NAME_MAX_LENGTH
 
 
 def create_model_table(Base: Type[Any]) -> Type[Any]:
@@ -27,14 +28,16 @@ def create_model_table(Base: Type[Any]) -> Type[Any]:
         __tablename__ = "models"
 
         id = Column(Integer, primary_key=True, index=True)
-        model_id = Column(String(100), unique=True, index=True, nullable=False)
+        model_id = Column(
+            String(MODEL_ID_MAX_LENGTH), unique=True, index=True, nullable=False
+        )
         category = Column(
             String(20), nullable=False, default="llm"
         )  # llm, image, embedding, etc.
         model_provider = Column(
             String(50), nullable=False
         )  # openai, zhipu, dashscope, etc.
-        model_name = Column(String(100), nullable=False)  # gpt-4, glm-4, etc.
+        model_name = Column(String(MODEL_NAME_MAX_LENGTH), nullable=False)
         base_url = Column(String(500), nullable=True)
         temperature = Column(Float, nullable=True)
         max_tokens = Column(Integer, nullable=True)

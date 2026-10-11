@@ -294,6 +294,53 @@ def test_user_creation_rejects_auto_router_namespace(
     assert "auto-router-" in response.json()["detail"]
 
 
+@pytest.mark.parametrize("path", ["/api/models/", "/api/models/register"])
+def test_model_create_rejects_internal_id_exceeding_storage_limit(
+    test_db, regular_headers, sample_model_data, path
+):
+    payload = {**sample_model_data, "model_id": "m" * 101}
+
+    response = client.post(path, headers=regular_headers, json=payload)
+
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"][-1] == "model_id"
+
+
+def test_model_name_request_limits_match_storage_contract(
+    test_db, regular_headers, sample_model_data
+):
+    oversized_name = "m" * 2049
+
+    create_response = client.post(
+        "/api/models/",
+        headers=regular_headers,
+        json={**sample_model_data, "model_name": oversized_name},
+    )
+    assert create_response.status_code == 422
+
+    created = client.post(
+        "/api/models/", headers=regular_headers, json=sample_model_data
+    )
+    assert created.status_code == 200
+    update_response = client.put(
+        f"/api/models/{sample_model_data['model_id']}",
+        headers=regular_headers,
+        json={"model_name": oversized_name},
+    )
+    assert update_response.status_code == 422
+
+    connection_response = client.post(
+        "/api/models/test-connection",
+        headers=regular_headers,
+        json={
+            "model_provider": "openai",
+            "model_name": oversized_name,
+            "api_key": "test-api-key",
+        },
+    )
+    assert connection_response.status_code == 422
+
+
 def test_trusted_platform_store_persists_provenance_without_user_ownership(test_db):
     db = next(get_db())
     try:
@@ -1252,13 +1299,18 @@ class TestModelAPI:
     def test_bedrock_settings_survive_create_list_and_runtime_reload(
         self, test_db, regular_user, regular_headers
     ):
+        system_profile_arn = "arn:aws:bedrock:us-west-2::inference-profile/" + "a" * 64
+        application_profile_arn = (
+            "arn:aws:bedrock:us-west-2:123456789012:"
+            "application-inference-profile/" + "b" * 64
+        )
+        assert len(system_profile_arn) > 100
+        assert len(application_profile_arn) > 100
         payload = {
             "model_id": "bedrock-profile",
             "category": "llm",
             "model_provider": "bedrock",
-            "model_name": (
-                "arn:aws:bedrock:us-west-2:123456789012:inference-profile/example"
-            ),
+            "model_name": system_profile_arn,
             "api_key": "b" * 1000,
             "base_url": "https://bedrock-runtime.us-west-2.amazonaws.com",
             "bedrock_region": "us-west-2",
@@ -1268,8 +1320,17 @@ class TestModelAPI:
 
         created = client.post("/api/models/", json=payload, headers=regular_headers)
         assert created.status_code == 200
+        assert created.json()["model_name"] == system_profile_arn
         assert created.json()["bedrock_region"] == "us-west-2"
         assert created.json()["bedrock_auth_mode"] == "api_key"
+
+        updated = client.put(
+            "/api/models/bedrock-profile",
+            json={"model_name": application_profile_arn},
+            headers=regular_headers,
+        )
+        assert updated.status_code == 200
+        assert updated.json()["model_name"] == application_profile_arn
 
         listed = client.get("/api/models/", headers=regular_headers)
         assert listed.status_code == 200
@@ -1278,6 +1339,7 @@ class TestModelAPI:
         )
         assert saved["bedrock_region"] == "us-west-2"
         assert saved["bedrock_auth_mode"] == "api_key"
+        assert saved["model_name"] == application_profile_arn
 
         db = next(get_db())
         try:
@@ -1292,7 +1354,8 @@ class TestModelAPI:
         assert llm is not None
         assert llm._inner.region_name == "us-west-2"
         assert llm._inner.auth_mode == "api_key"
-        assert llm._inner.model_name == payload["model_name"]
+        assert config.model_name == application_profile_arn
+        assert llm._inner.model_name == application_profile_arn
 
     def test_bedrock_connection_test_uses_native_runtime(
         self, test_db, regular_user, regular_headers

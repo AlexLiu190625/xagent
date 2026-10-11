@@ -3,6 +3,9 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
+MODEL_ID_MAX_LENGTH = 100
+MODEL_NAME_MAX_LENGTH = 2048
+
 
 class VectorDBType(str, Enum):
     """Supported vector database backend types."""

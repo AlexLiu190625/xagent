@@ -134,14 +134,17 @@ def test_standalone_model_hub_round_trips_bedrock_settings(monkeypatch) -> None:
     base.metadata.create_all(engine)
     session = sessionmaker(bind=engine)()
     hub = SQLAlchemyModelHub(session, model)
+    inference_profile_arn = (
+        "arn:aws:bedrock:us-west-2:123456789012:application-inference-profile/"
+        + "a" * 64
+    )
+    assert len(inference_profile_arn) > 100
 
     hub.store(
         ChatModelConfig(
             id="bedrock-profile",
             model_provider="bedrock",
-            model_name=(
-                "arn:aws:bedrock:us-west-2:123456789012:inference-profile/example"
-            ),
+            model_name=inference_profile_arn,
             api_key="bedrock-token",
             base_url="https://bedrock-runtime.us-west-2.amazonaws.com",
             bedrock_region="us-west-2",
@@ -154,9 +157,7 @@ def test_standalone_model_hub_round_trips_bedrock_settings(monkeypatch) -> None:
     assert isinstance(loaded, ChatModelConfig)
     assert loaded.bedrock_region == listed.bedrock_region == "us-west-2"
     assert loaded.bedrock_auth_mode == listed.bedrock_auth_mode == "api_key"
-    assert loaded.model_name == (
-        "arn:aws:bedrock:us-west-2:123456789012:inference-profile/example"
-    )
+    assert loaded.model_name == inference_profile_arn
     session.close()
 
 
