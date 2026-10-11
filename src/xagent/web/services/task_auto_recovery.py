@@ -12,8 +12,10 @@ unsuccessful result) writes for an interruption is decided by
 rests PAUSED instead of FAILED, so its user can resume it. Lease-expiry
 recovery keeps its own verdict mapping.
 
-Phase 1 has no executor, so a recorded interruption is never ``scheduled``.
-Its state says only that nothing automatic will act on the run: ``manual``
+The executor (``task_auto_resume``) dispatches only ``scheduled`` rows, and
+recording does not schedule yet, so a recorded interruption is never
+``scheduled``. Its state says only that nothing automatic will act on the
+run: ``manual``
 (only the user can act -- resume a PAUSED task; a FAILED one is terminal and
 the row just records why), ``ineligible`` (a task kind automatic recovery will
 never touch) or ``disabled`` (the interruption would have paused the run but
@@ -312,6 +314,18 @@ def is_auto_resume_command_id(command_id: object) -> bool:
     return isinstance(command_id, str) and command_id.startswith(
         AUTO_RESUME_COMMAND_PREFIX
     )
+
+
+def auto_resume_schedulable(kind: str | None) -> bool:
+    """Whether an eligible task of ``kind`` may be resumed automatically now.
+
+    Channel tasks are recorded but not scheduled until a resumed channel run
+    can hold the channel and deliver its answer back (PR9): resuming one
+    today would refuse new channel messages as busy while the answer never
+    reached the channel.
+    """
+
+    return kind is not None and kind != "channel"
 
 
 def _user_command_since_dispatch(

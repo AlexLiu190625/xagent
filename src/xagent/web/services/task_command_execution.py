@@ -142,6 +142,7 @@ from .task_command_terminal_events import (
     terminal_event_draft_for_error,
 )
 from .task_command_transport import (
+    AUTO_RESUME_COMMAND_PREFIX,
     COMMAND_ID_PATTERN,
     COMMAND_PROCESSING,
     MAX_COMMAND_FAILURES,
@@ -609,6 +610,10 @@ class ResumeCommandOutcome(str, enum.Enum):
     ALREADY_IN_PROGRESS = "already_in_progress"
     DEFERRED = "deferred"
     REJECTED = "rejected"
+    # An automatic resume that no longer applies (the task moved on, or
+    # automatic resume was switched off). A success: the command completes
+    # without an error reply.
+    AUTO_SKIPPED = "auto_skipped"
 
 
 @dataclass(frozen=True)
@@ -3526,6 +3531,34 @@ async def resume_task(
             status=task_status,
         ).as_dict()
 
+        # An automatic resume re-checks, against the same snapshot every
+        # admission decision below uses, that it still applies. The
+        # RESUME_REQUESTED transition is fenced on this snapshot's version,
+        # so a row that moves after the check defers the command and the
+        # retry is checked again.
+        auto_resume = message_data.get("auto_resume")
+        if auto_resume is not None:
+            from .task_auto_resume import check_auto_resume_claim_sync
+
+            claim = await run_db_io_cancellation_safe(
+                lambda: check_auto_resume_claim_sync(
+                    task_id=task_id,
+                    command_id=message_data.get("_durable_command_id"),
+                    auto_resume=auto_resume,
+                    status=task_status,
+                    control_state=raw_control_state,
+                    run_id=task_fields.run_id,
+                    state_version=task_fields.state_version,
+                    attempt_count=message_data.get("_durable_attempt_count"),
+                )
+            )
+            if not claim.proceed:
+                return ResumeCommandResult(
+                    ResumeCommandOutcome.AUTO_SKIPPED,
+                    f"Automatic resume skipped ({claim.why})",
+                    reason_code=claim.why,
+                )
+
         # Compatibility seam into the interaction lifecycle service: both
         # resume paths below (the supports_live_control branch and the
         # bare resume_execution fallback) reach the durable RESUME
@@ -4342,6 +4375,9 @@ async def _execute_durable_task_command(
             "_durable_ack_sent": True,
             "_durable_attempt_count": command.attempt_count,
             "_durable_target_run_id": command.target_run_id,
+            # Lets resume_task tell the sweeper's own commands apart; client
+            # ingress strips every ``_durable_`` field, so it is never forged.
+            "_durable_command_id": command.command_id,
         }
     )
     if command.kind != TaskCommandKind.CANCEL:
@@ -4349,7 +4385,17 @@ async def _execute_durable_task_command(
             lambda: _load_command_actor(command.actor_user_id)
         )
         message_data.update({"user": user, "user_id": int(user.id)})
-    if command.kind != TaskCommandKind.MESSAGE and command.target_run_id is not None:
+    # The sweeper's own RESUME checks the run itself, in its claim guard, and
+    # closes its recovery row as ``stale`` when the run has rotated; rejecting
+    # it here would fail the command and leave that row ``dispatched``.
+    auto_resume = command.kind == TaskCommandKind.RESUME and (
+        command.command_id.startswith(AUTO_RESUME_COMMAND_PREFIX)
+    )
+    if (
+        command.kind != TaskCommandKind.MESSAGE
+        and command.target_run_id is not None
+        and not auto_resume
+    ):
         current_run_id = await run_db_io_cancellation_safe(
             lambda: _load_command_task_run_id(command.task_id)
         )
