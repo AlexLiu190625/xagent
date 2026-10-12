@@ -26,6 +26,7 @@ from ..core.config import (
     DEFAULT_INDEX_POLICY,
     DEFAULT_VECTOR_STORE_DELETE_BATCH_SIZE,
     DEFAULT_VECTOR_STORE_SCAN_LIMIT,
+    MAIN_POINTERS_NO_MATCH_FILTER,
     IndexPolicy,
 )
 from ..core.schemas import CollectionInfo, IndexResult
@@ -3598,6 +3599,55 @@ def _vis_collapse_embedding_table_counts(counts: Dict[str, int]) -> Dict[str, in
     return collapsed
 
 
+def _vis_main_pointers_filter(
+    *, conn: Any, filter_expr: str, user_id: Optional[int]
+) -> str:
+    """Limit a non-admin main_pointers delete to doc_ids the caller owns.
+
+    Ownership comes from ``documents`` (main_pointers.user_id is never written).
+    Raises when it cannot be resolved so no sibling table is deleted without it.
+    """
+    from ..core.exceptions import DatabaseOperationError
+    from ..LanceDB.schema_manager import _safe_close_table
+
+    if user_id is None:
+        return f"{filter_expr} AND {MAIN_POINTERS_NO_MATCH_FILTER}"
+    pointers = documents = None
+    try:
+        pointers = conn.open_table("main_pointers")
+        rows = query_to_list(
+            pointers.search().where(filter_expr).select(["doc_id"]).limit(-1)
+        )
+        candidates = sorted({str(row["doc_id"]) for row in rows if row.get("doc_id")})
+        owned: list = []
+        if candidates:
+            documents = conn.open_table("documents")
+            if "user_id" not in documents.schema.names:
+                owned = candidates
+            else:
+                user_expr = build_user_id_filter_for_table(documents, user_id)
+                size = DEFAULT_VECTOR_STORE_DELETE_BATCH_SIZE
+                for i in range(0, len(candidates), size):
+                    expr = (
+                        f"{filter_expr} AND "
+                        f"{_vis_doc_ids_filter(candidates[i : i + size])} AND {user_expr}"
+                    )
+                    found = query_to_list(
+                        documents.search().where(expr).select(["doc_id"]).limit(-1)
+                    )
+                    owned.extend(str(row["doc_id"]) for row in found)
+    except Exception as exc:
+        raise DatabaseOperationError(
+            "Failed to resolve document owners for main_pointers delete"
+        ) from exc
+    finally:
+        _safe_close_table(pointers)
+        _safe_close_table(documents)
+    if not owned:
+        return f"{filter_expr} AND {MAIN_POINTERS_NO_MATCH_FILTER}"
+    return f"{filter_expr} AND {_vis_doc_ids_filter(sorted(set(owned)))}"
+
+
 def _vis_build_collection_filter(
     *,
     conn: Any,
@@ -3614,6 +3664,12 @@ def _vis_build_collection_filter(
     from .lancedb_cleanup_filters import table_has_column as _table_has_column
 
     base: Dict[str, str] = {"collection": collection}
+    if table_name == "main_pointers" and not is_admin:
+        return _vis_main_pointers_filter(
+            conn=conn,
+            filter_expr=build_lancedb_filter_expression(base, skip_user_filter=True),
+            user_id=user_id,
+        )
     table = None
     try:
         table = conn.open_table(table_name)
@@ -3648,6 +3704,12 @@ def _vis_build_document_filter(
     from .lancedb_cleanup_filters import table_has_column as _table_has_column
 
     base: Dict[str, str] = {"collection": collection, "doc_id": doc_id}
+    if table_name == "main_pointers" and not is_admin:
+        return _vis_main_pointers_filter(
+            conn=conn,
+            filter_expr=build_lancedb_filter_expression(base, skip_user_filter=True),
+            user_id=user_id,
+        )
     table = None
     try:
         table = conn.open_table(table_name)
@@ -3696,6 +3758,10 @@ def _vis_build_documents_filter(
 
     if is_admin:
         return scoped_expr
+    if table_name == "main_pointers":
+        return _vis_main_pointers_filter(
+            conn=conn, filter_expr=scoped_expr, user_id=user_id
+        )
     if user_id is None:
         return f"{scoped_expr} AND ({UserPermissions.get_no_access_filter()})"
 

@@ -94,6 +94,9 @@ UNAUTHENTICATED_NO_ACCESS_FILTER: Final[str] = (
 )
 """A stable LanceDB filter expression that always matches no rows."""
 
+# main_pointers.user_id is never written, so the no-match filter is on doc_id.
+MAIN_POINTERS_NO_MATCH_FILTER: Final[str] = "(doc_id IS NULL AND doc_id IS NOT NULL)"
+
 ENABLE_AUTO_EMBEDDINGS_MIGRATION: Final[bool] = (
     os.getenv("ENABLE_AUTO_EMBEDDINGS_MIGRATION", "false").lower() == "true"
 )
