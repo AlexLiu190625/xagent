@@ -1334,9 +1334,6 @@ def test_main_pointer_store_list(mock_get_connection: Mock) -> None:
     mock_table = Mock()
     mock_conn.open_table.return_value = mock_table
 
-    # Mock count_rows > 0
-    mock_table.search.return_value.where.return_value.count_rows.return_value = 1
-
     # Mock result
     mock_row_data = {
         "collection": "test_collection",
@@ -1356,9 +1353,15 @@ def test_main_pointer_store_list(mock_get_connection: Mock) -> None:
 
     store = LanceDBMainPointerStore()
 
-    pointers = store.list_main_pointers("test_collection")
+    pointers = store.list_main_pointers("test_collection", doc_id="test_doc", limit=7)
     assert len(pointers) == 1
     assert pointers[0]["semantic_id"] == "parse-123"
+    mock_table.count_rows.assert_not_called()
+    where = mock_table.search.return_value.where
+    where.assert_called_once()
+    assert "test_collection" in where.call_args.args[0]
+    assert "test_doc" in where.call_args.args[0]
+    where.return_value.limit.assert_called_once_with(7)
 
 
 @patch(

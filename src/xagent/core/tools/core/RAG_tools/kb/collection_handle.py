@@ -1453,12 +1453,7 @@ class KBCollectionHandle(ABC):
     def get_main_pointer(
         self, doc_id: str, step_type: str, model_tag: str | None = None
     ) -> Optional[Dict[str, Any]]:
-        """Return the main pointer for a document stage, or ``None``.
-
-        Known LanceDB deviation (#2858): with ``model_tag=None`` it never
-        matches, since the ``IS NULL`` / ``= ''`` alternatives are passed as a tuple
-        and combined with AND. New engines should not treat that as the reference.
-        """
+        """Return the main pointer for a document stage, or ``None``."""
 
     @abstractmethod
     def set_main_pointer(
@@ -1476,22 +1471,13 @@ class KBCollectionHandle(ABC):
     def list_main_pointers(
         self, doc_id: str | None = None, limit: int = 100
     ) -> List[Dict[str, Any]]:
-        """List main pointers for this collection.
-
-        Known LanceDB deviation (#2858): on lancedb 0.33 it raises
-        ``MainPointerError`` (the empty query builder has no ``count_rows``).
-        """
+        """List main pointers for this collection."""
 
     @abstractmethod
     def delete_main_pointer(
         self, doc_id: str, step_type: str, model_tag: str | None = None
     ) -> bool:
-        """Delete the main pointer for a document stage; ``True`` if one existed.
-
-        Known LanceDB deviation (#2858): with ``model_tag=None`` it never
-        matches, for the same reason as :meth:`get_main_pointer`, so it deletes
-        nothing.
-        """
+        """Delete the main pointer for a document stage; ``True`` if one existed."""
 
     # --- Version candidates and promotion (#513) ---
 

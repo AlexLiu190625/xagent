@@ -12,14 +12,10 @@ which both engines serve without search. Milvus counts and searches are Bounded,
 a change shows after a moment (``_eventually``). Not covered here:
 
 - async search: LanceDB async search returns no rows today;
-- untagged main pointers and ``list_main_pointers``: on LanceDB the untagged
-  ``IS NULL`` / ``= ''`` alternatives are passed as a tuple and ANDed, so they
-  never match, and ``list_main_pointers`` raises ``MainPointerError``
-  (#2858);
 - main pointers under tenant deletes: ``main_pointers`` has no owner column, so
   a tenant-scoped document delete or document cascade on another owner's doc_id
   removes that owner's pointers (#2859). New engines should not take
-  LanceDB as the reference for either main-pointer item;
+  LanceDB as the reference;
 - version candidates, promotion and the candidate-cleanup snapshots: covered on
   LanceDB by ``test_collection_handle_version.py``;
 - count-based reads right after a parse, chunk or embeddings cascade: LanceDB
@@ -120,6 +116,7 @@ MILVUS_SKELETON = {
     "test_ingestion_status_round_trip_and_snapshot",
     "test_ingestion_status_async_round_trip",
     "test_main_pointer_round_trip_and_snapshot",
+    "test_untagged_main_pointer_and_list_main_pointers",
     "test_rename_collection_status_moves_only_the_callers_rows",
     "test_rename_collection_metadata_moves_only_the_callers_config",
     "test_delete_collection_config_follows_tenant_scope",
@@ -760,6 +757,36 @@ def test_main_pointer_round_trip_and_snapshot(open_handle: OpenHandle) -> None:
     assert handle.delete_main_pointer("doc-1", "embed", TAG) is True
     assert handle.delete_main_pointer("doc-1", "embed", TAG) is False
     assert technical_id() is None
+
+
+def test_untagged_main_pointer_and_list_main_pointers(open_handle: OpenHandle) -> None:
+    handle = open_handle(COLLECTION)
+
+    handle.set_main_pointer("doc-1", "parse", "v1", "hash-1")
+    handle.set_main_pointer("doc-1", "embed", "v1", "hash-e", TAG)
+    handle.set_main_pointer("doc-2", "parse", "v1", "hash-2")
+
+    pointer = handle.get_main_pointer("doc-1", "parse")
+    assert pointer is not None and pointer["technical_id"] == "hash-1"
+    handle.set_main_pointer("doc-1", "parse", "v2", "hash-3")
+    pointer = handle.get_main_pointer("doc-1", "parse")
+    assert pointer is not None and pointer["technical_id"] == "hash-3"
+    assert handle.get_main_pointer("doc-1", "embed") is None
+
+    listed = handle.list_main_pointers()
+    assert sorted((p["doc_id"], p["step_type"]) for p in listed) == [
+        ("doc-1", "embed"),
+        ("doc-1", "parse"),
+        ("doc-2", "parse"),
+    ]
+    only = handle.list_main_pointers("doc-1")
+    assert {p["doc_id"] for p in only} == {"doc-1"}
+    assert len(handle.list_main_pointers(limit=1)) == 1
+
+    assert handle.delete_main_pointer("doc-1", "embed") is False
+    assert handle.delete_main_pointer("doc-1", "parse") is True
+    assert handle.delete_main_pointer("doc-1", "parse") is False
+    assert handle.get_main_pointer("doc-1", "embed", TAG) is not None
 
 
 @pytest.fixture
