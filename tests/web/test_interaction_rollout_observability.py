@@ -60,7 +60,13 @@ def _reset_state(monkeypatch):
     clear_degradation(INTERACTION_ROLLOUT_UNKNOWN_TASK_SOURCE)
 
 
-def _set_policy(monkeypatch, *, mode="legacy", native_sources=frozenset()):
+def _set_policy(
+    monkeypatch,
+    *,
+    mode="legacy",
+    native_sources=frozenset(),
+    shared_task_execution=True,
+):
     monkeypatch.setattr(
         ir,
         "_policy",
@@ -68,6 +74,7 @@ def _set_policy(monkeypatch, *, mode="legacy", native_sources=frozenset()):
             mode=mode,
             native_sources=frozenset(native_sources),
             native_protocol_version=1,
+            shared_task_execution=shared_task_execution,
         ),
     )
 
