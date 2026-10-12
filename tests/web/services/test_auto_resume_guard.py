@@ -985,3 +985,81 @@ async def test_resume_task_skips_an_unanswered_question_without_an_error(
     assert result.reason_code == "interaction_pending"
     reply.assert_not_awaited()
     handler.manager.try_reserve_resume.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_crashed_run_is_resumed_without_its_user(factory, handler, monkeypatch):
+    """End to end from the crash: lease recovery records ``scheduled``, the
+    sweeper dispatches the resume once it is due, and the durable dispatcher
+    runs it through ``resume_task`` to RESUME_REQUESTED."""
+    from xagent.core.agent.checkpoint import CHECKPOINT_TYPE
+    from xagent.web.models.task import TraceEvent
+    from xagent.web.services import task_lease_recovery
+    from xagent.web.services.task_lease_service import TASK_RUN_ID_TRACE_FIELD
+
+    monkeypatch.setattr(
+        task_lease_recovery, "invalidate_task_cache_best_effort", lambda _id: None
+    )
+    monkeypatch.setattr(
+        task_auto_resume, "notify_task_command_dispatcher", lambda: None
+    )
+    with factory() as db:
+        user = User(username=f"crash-{uuid.uuid4().hex[:8]}", password_hash="x")
+        db.add(user)
+        db.flush()
+        task = Task(
+            user_id=user.id,
+            title="Crashed",
+            description="crashed run",
+            execution_mode="balanced",
+            status=TaskStatus.RUNNING,
+            control_state="running",
+            runner_id="dead-runner",
+            run_id=RUN,
+            state_version=PV - 1,
+            lease_expires_at=utc_now() - timedelta(seconds=5),
+        )
+        db.add(task)
+        db.flush()
+        db.add(
+            TraceEvent(
+                task_id=task.id,
+                event_id="checkpoint-crash",
+                event_type="system_update_general",
+                timestamp=utc_now(),
+                data={
+                    "checkpoint_type": CHECKPOINT_TYPE,
+                    "snapshot": {"type": "checkpoint"},
+                    TASK_RUN_ID_TRACE_FIELD: RUN,
+                },
+            )
+        )
+        task.last_checkpoint_event_id = "checkpoint-crash"
+        db.commit()
+        task_id = int(task.id)
+
+    batch = task_lease_recovery.recover_expired_task_leases_batch_isolated(
+        cutoff=utc_now(), batch_size=10, after=None
+    )
+    assert batch.recovered == 1
+    row = _row(factory, task_id)
+    assert (row.state, row.paused_state_version) == ("scheduled", PV)
+    # Not due yet: nothing is dispatched.
+    assert run_auto_resume_tick(now=utc_now()).dispatched == 0
+
+    due = row.next_attempt_at + timedelta(seconds=1)
+    assert run_auto_resume_tick(now=due).dispatched == 1
+    command = await _dispatch_auto_command(factory, task_id)
+
+    assert command.command_id == CID
+    assert command.status == "completed"
+    assert command.result["resume_outcome"] == "scheduled"
+    task = _task(factory, task_id)
+    assert (task.status, task.control_state, task.state_version) == (
+        TaskStatus.PAUSED,
+        "resume_requested",
+        PV + 1,
+    )
+    assert task.run_id == RUN
+    handler.background.assert_called_once()
+    assert _events(factory, task_id) == ["interrupted", "scheduled", "auto_resumed"]

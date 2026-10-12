@@ -333,6 +333,82 @@ def test_public_view_exposes_only_the_client_contract(state, detail, expected):
     )
 
 
+def _recorded(state: str, detail: str | None = None) -> Any:
+    from xagent.web.services.task_settlement_report import RecordedInterruption
+
+    return RecordedInterruption(
+        task_id=3,
+        run_id=RUN,
+        reason="lease_expired",
+        state=state,
+        state_detail=detail,
+        paused_state_version=PV,
+        next_attempt_at=(
+            datetime(2026, 10, 10, 8, 0, 12, tzinfo=timezone.utc)
+            if state == "scheduled"
+            else None
+        ),
+        attempt=1,
+    )
+
+
+@pytest.mark.parametrize(
+    ("state", "detail", "trigger_error", "notice"),
+    [
+        ("scheduled", None, None, ("scheduled", None)),
+        (
+            "exhausted",
+            None,
+            TASK_AUTO_RESUME_EXHAUSTED_TRIGGER_ERROR,
+            ("stopped", "limit_reached"),
+        ),
+        (
+            "expired",
+            None,
+            TASK_AUTO_RESUME_EXPIRED_TRIGGER_ERROR,
+            ("stopped", "expired"),
+        ),
+        (
+            "superseded",
+            None,
+            TASK_AUTO_RESUME_SUPERSEDED_TRIGGER_ERROR,
+            ("stopped", "superseded"),
+        ),
+        # Recorded manual outcomes keep the caller's message and stay silent:
+        # the pause the client already shows is all there is.
+        ("manual", "auto_resume_disabled", "default", None),
+        ("manual", "channel_hold_pending", "default", None),
+        ("manual", "supersede_check_failed", "default", None),
+        ("manual", None, "default", None),
+        ("ineligible", "ineligible:source_sdk", "default", None),
+    ],
+)
+def test_recorded_interruption_maps_to_trigger_error_and_notice(
+    state, detail, trigger_error, notice
+):
+    recorded = _recorded(state, detail)
+
+    assert (
+        task_auto_resume.trigger_error_for_recorded(recorded, default="default")
+        == trigger_error
+    )
+    built = task_auto_resume.recorded_notice(recorded)
+    if notice is None:
+        assert built is None
+        return
+    assert built is not None
+    assert (built.auto_resume["status"], built.auto_resume["stop_reason"]) == notice
+    assert (built.task_id, built.run_id, built.state_version) == (3, RUN, PV)
+    assert built.auto_resume["next_attempt_at"] == (
+        "2026-10-10T08:00:12+00:00" if state == "scheduled" else None
+    )
+
+
+def test_nothing_recorded_keeps_the_default_trigger_error():
+    assert task_auto_resume.trigger_error_for_recorded(None, default="x") == "x"
+    assert task_auto_resume.recorded_notice(None) is None
+
+
 # --------------------------------------------------------------------------
 # Dispatch
 # --------------------------------------------------------------------------
@@ -465,6 +541,11 @@ def test_each_fence_column_makes_the_row_stale(factory, notified, field, task_fi
         (TaskStatus.WAITING_FOR_USER, TriggerRunStatus.RUNNING.value),
         (TaskStatus.COMPLETED, TriggerRunStatus.COMPLETED.value),
         (TaskStatus.FAILED, TriggerRunStatus.FAILED.value),
+        # A user's resume that failed to start rolled the task back to
+        # paused on the same run, two versions on. The row goes stale and
+        # the run stays RUNNING until a later run settles it, as after any
+        # user pause (#2177); deleting the task fails it.
+        (TaskStatus.PAUSED, TriggerRunStatus.RUNNING.value),
     ],
 )
 def test_stale_never_fails_a_trigger_run_it_only_mirrors_an_ended_task(
@@ -473,7 +554,10 @@ def test_stale_never_fails_a_trigger_run_it_only_mirrors_an_ended_task(
     now = utc_now()
     with factory() as db:
         task_id, trigger_run_id = _trigger_task(db, now)
-        db.get(Task, task_id).status = status
+        task = db.get(Task, task_id)
+        task.status = status
+        if status is TaskStatus.PAUSED:
+            task.state_version = int(task.state_version) + 2
         db.commit()
 
     assert run_auto_resume_tick(now=now).stale == 1
