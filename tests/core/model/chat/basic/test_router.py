@@ -1215,3 +1215,43 @@ def test_build_service_rejects_unknown_backend_before_loading_anything(
         router._build_service("model.joblib", "models", "routers")
 
     assert touched == []
+
+
+def test_build_service_rebinds_real_routing_service_encoder(monkeypatch) -> None:
+    from xrouter_llm import (
+        EmbeddingEncoder,
+        XinferenceEmbeddingBackend,
+        build_embedding_backend,
+    )
+
+    from xagent.core.model.chat.basic import router
+
+    # Constructing the sentence-transformers backend does not load the model.
+    serialized_backend = build_embedding_backend("sentence-transformers")
+
+    class _Predictor:
+        def __init__(self) -> None:
+            self.prompt_encoder_ = EmbeddingEncoder(serialized_backend)
+
+        def predict(self, *args: Any, **kwargs: Any) -> list[Any]:
+            return []
+
+    predictor = _Predictor()
+    monkeypatch.setattr("joblib.load", lambda _path: predictor)
+    monkeypatch.setattr("xrouter_llm.load_benchmark_profiles", lambda _dir: {})
+    monkeypatch.setattr("xrouter_llm.serving.load_router_configs", lambda _dir: {})
+    monkeypatch.setattr("xrouter_llm.store.CallStore", lambda _path: "store")
+    monkeypatch.setenv("XROUTER_EMBEDDING_BACKEND", "xinference")
+    monkeypatch.setenv("XROUTER_EMBEDDING_MODEL", "dep_example")
+    monkeypatch.setenv("XINFERENCE_BASE_URL", "https://embeddings.example.test/v1")
+    monkeypatch.setenv("XINFERENCE_API_KEY", "secret")
+
+    service = router._build_service("model.joblib", "models", "routers")
+
+    assert service.predictor is predictor
+    backend = predictor.prompt_encoder_.backend
+    assert backend is not serialized_backend
+    assert isinstance(backend, XinferenceEmbeddingBackend)
+    assert backend.model_name == "dep_example"
+    assert backend.base_url == "https://embeddings.example.test/v1"
+    assert backend.api_key == "secret"
