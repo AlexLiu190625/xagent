@@ -1057,6 +1057,8 @@ class ToolFactory:
         reason: object = None,
         message: object = None,
         failure_code: object = None,
+        cause_type: object = None,
+        status_code: object = None,
     ) -> Tool:
         """Build the shared server-scoped unavailable MCP tool."""
         from ....agent.result import normalize_tool_failure_code
@@ -1071,6 +1073,10 @@ class ToolFactory:
             kwargs["reason"] = reason
         if isinstance(message, str):
             kwargs["message"] = message
+        if isinstance(cause_type, str):
+            kwargs["cause_type"] = cause_type
+        if type(status_code) is int:
+            kwargs["status_code"] = status_code
         return UnavailableMCPTool(**kwargs)
 
     @staticmethod
@@ -1122,6 +1128,8 @@ class ToolFactory:
                     server_id=server_id,
                     reason=failure.phase.value,
                     message=mcp_load_failure_message(failure.phase),
+                    cause_type=failure.cause_type,
+                    status_code=failure.status_code,
                 )
             )
         return tools

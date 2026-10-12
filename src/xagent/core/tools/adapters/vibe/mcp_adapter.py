@@ -232,12 +232,22 @@ def classify_non_idempotent_write(raw_annotations: object) -> bool:
 
 @dataclass(frozen=True)
 class MCPServerLoadFailure:
-    """Safe MCP load failure data that excludes raw exception details."""
+    """Safe MCP load failure data that excludes raw exception details.
+
+    ``error_type`` is the class name of the exception the load caught.
+    ``cause_type`` is the class name of the exception behind it --
+    ``error_type`` itself when that is not an exception group, otherwise the
+    first non-group member reached through ``.exceptions`` -- and
+    ``status_code`` the HTTP status that exception carries. Both are ``None``
+    when unknown.
+    """
 
     server_name: str
     phase: MCPFailurePhase
     error_type: str | None
     attempts: int = 1
+    cause_type: str | None = None
+    status_code: int | None = None
 
 
 @dataclass(frozen=True)
@@ -401,8 +411,9 @@ def _replace_staged_upload_paths(value: Any, replacements: Mapping[str, str]) ->
 
 # Hard ceiling on how many exception nodes either walk over a failed call
 # visits, so a wide or cyclic __cause__/__context__ graph cannot spin.
-# Two consumers read it: _bounded_exception_nodes (the 401 resolver's
-# challenge lookup) and _level_order_exception_nodes (failure logging).
+# Three consumers read it: _bounded_exception_nodes (the 401 resolver's
+# challenge lookup), _level_order_exception_nodes (failure logging) and
+# _load_failure_cause (load-failure cause).
 _EXCEPTION_WALK_NODE_LIMIT = 64
 # Caps each exception message logged when an MCP tool call fails, so a server
 # that echoes a large payload back in its error (or an SDK that dumps a full
@@ -875,6 +886,66 @@ def _level_order_exception_nodes(exc: BaseException) -> Iterator[BaseException]:
             pending.append(current.__cause__)
         if isinstance(current.__context__, BaseException):
             pending.append(current.__context__)
+
+
+def _load_failure_cause(exc: BaseException) -> BaseException | None:
+    """Return the exception behind an MCP load failure.
+
+    That is ``exc`` itself when it is not an exception group, otherwise the
+    first non-group member reached breadth-first through ``.exceptions`` only
+    (the ``mcp`` HTTP clients raise a transport ``httpx.HTTPStatusError`` as a
+    member of an anyio ``ExceptionGroup``). ``__cause__``/``__context__`` are
+    not followed: a group's context is whatever was being handled when it was
+    raised, not why it was raised. Visits at most
+    ``_EXCEPTION_WALK_NODE_LIMIT`` nodes; returns ``None`` if that runs out
+    before a non-group member is found.
+    """
+    pending: list[BaseException] = [exc]
+    index = 0
+    while index < len(pending) and index < _EXCEPTION_WALK_NODE_LIMIT:
+        current = pending[index]
+        index += 1
+        if not isinstance(current, BaseExceptionGroup):
+            return current
+        pending.extend(current.exceptions)
+    return None
+
+
+# The range an HTTP status line can carry. Anything else read from an
+# exception is not reported as a status.
+_HTTP_STATUS_RANGE = range(100, 600)
+
+
+def _exception_http_status(exc: BaseException) -> int | None:
+    """Return the HTTP status ``exc`` itself carries, or ``None``.
+
+    Reads ``exc.response.status_code`` for an ``httpx.HTTPStatusError`` and
+    otherwise a ``status_code`` attribute, falling back to ``status``. Only an
+    integer in 100..599 counts (``bool`` does not; an ``int`` subclass such
+    as ``http.HTTPStatus`` is converted to a plain ``int``), so the result is
+    always safe to put in a log line. A getter that raises counts as no
+    status and is logged by class name only. The exception's message, request
+    and response body are never read.
+    """
+    try:
+        value: object
+        if isinstance(exc, httpx.HTTPStatusError):
+            value = exc.response.status_code
+        else:
+            value = getattr(exc, "status_code", None)
+            if value is None:
+                value = getattr(exc, "status", None)
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        status = int(value)
+    except Exception as err:
+        logger.debug(
+            "Could not read an HTTP status from %s (%s)",
+            type(exc).__name__,
+            type(err).__name__,
+        )
+        return None
+    return status if status in _HTTP_STATUS_RANGE else None
 
 
 # A URL token ends only at whitespace or an angle bracket. A quote is NOT a
@@ -2332,7 +2403,8 @@ class MCPToolAdapter(AbstractBaseTool):
                 await self._discard_external_upload_args(staged_uploads)
 
         # The tool-loading handlers (_load_direct_mcp_tools,
-        # load_mcp_tools_as_agent_tools) log only the class name above DEBUG
+        # load_mcp_tools_as_agent_tools) log only class names (and, in
+        # _load_direct_mcp_tools, an integer HTTP status) above DEBUG
         # and keep the raw traceback (exc_info) for DEBUG, because a traceback
         # is unredacted and unbounded. These two handlers log at ERROR, but
         # only _truncated_error_message() output -- passed through
@@ -2733,6 +2805,8 @@ class UnavailableMCPTool(AbstractBaseTool):
     callers make, enforced where the unavailable config is built.
     ``unavailable_server`` is the raw configured name, shown to anyone who can
     see the trace, including anonymous share viewers (#1041).
+    ``cause_type`` and ``status_code`` are kept for the setup summary only and
+    are not part of the result.
     """
 
     read_only = True
@@ -2746,6 +2820,8 @@ class UnavailableMCPTool(AbstractBaseTool):
         failure_code: str | None = None,
         reason: str | None = None,
         message: str = _DEFAULT_UNAVAILABLE_MCP_MESSAGE,
+        cause_type: str | None = None,
+        status_code: int | None = None,
     ) -> None:
         from ....agent.result import normalize_tool_failure_code
         from .base import ToolCategory
@@ -2755,6 +2831,8 @@ class UnavailableMCPTool(AbstractBaseTool):
         self._server_id = server_id
         self._failure_code = normalize_tool_failure_code(failure_code)
         self._reason = reason
+        self._cause_type = cause_type
+        self._status_code = status_code
         self._message = message
         self._name = _format_unavailable_mcp_tool_name(server_name, server_id)
         self.source_server = normalize_mcp_server_name(server_name)
@@ -2773,6 +2851,16 @@ class UnavailableMCPTool(AbstractBaseTool):
     def unavailability_reason(self) -> str | None:
         """Public-safe reason code used by strict setup diagnostics."""
         return self._reason
+
+    @property
+    def unavailability_cause_type(self) -> str | None:
+        """Diagnostic for the setup summary; never part of the tool result."""
+        return self._cause_type
+
+    @property
+    def unavailability_status_code(self) -> int | None:
+        """Diagnostic for the setup summary; never part of the tool result."""
+        return self._status_code
 
     @property
     def description(self) -> str:
@@ -3190,6 +3278,8 @@ async def _load_direct_mcp_tools(
     concurrency_safe, concurrent_tools = _connection_concurrency_config(connection)
     failure_phase = MCPFailurePhase.SESSION_START
     error_type: str | None = None
+    cause_type: str | None = None
+    status_code: int | None = None
     # Outside the retry try-block: instrumenting is a dict copy, and a failure
     # here would be our bug, not a server fault to retry.
     session_connection = (
@@ -3213,23 +3303,38 @@ async def _load_direct_mcp_tools(
         except Exception as e:
             failure_phase = current_phase
             error_type = type(e).__name__
+            cause = _load_failure_cause(e)
+            cause_type = type(cause).__name__ if cause is not None else None
+            status_code = _exception_http_status(cause) if cause is not None else None
             if attempt < max_attempts - 1:
                 logger.warning(
-                    "Attempt %d failed to load tools from MCP server %s during %s (%s); retrying",
+                    "Attempt %d failed to load tools from MCP server %s during %s "
+                    "(%s; cause=%s status=%s); retrying",
                     attempt + 1,
                     server_name,
                     current_phase.value,
                     error_type,
+                    cause_type,
+                    status_code,
                 )
                 await asyncio.sleep(1)
             else:
-                # DEBUG, not WARNING: same secret-leak concern as the
-                # sandboxed-load handler below -- a session-start/initialize
-                # /list-tools failure can carry secrets from the connection
-                # (e.g. an oauth-authenticated request's URL or headers
-                # surfacing in the exception message). Opt-in: set
-                # XAGENT_LOG_LEVEL=DEBUG (or run with --debug) to capture it
-                # when reproducing a failure.
+                logger.warning(
+                    "Giving up loading tools from MCP server %s during %s after "
+                    "%d attempt(s) (%s; cause=%s status=%s)",
+                    server_name,
+                    current_phase.value,
+                    attempt + 1,
+                    error_type,
+                    cause_type,
+                    status_code,
+                )
+                # The traceback stays at DEBUG: an exception message or a
+                # traceback can carry secrets from the connection (e.g. an
+                # oauth-authenticated request's URL or headers), so the
+                # WARNING above carries only class names and an integer HTTP
+                # status. Opt-in: set XAGENT_LOG_LEVEL=DEBUG (or run with
+                # --debug) to capture the traceback when reproducing a failure.
                 logger.debug(
                     "Exhausted retries loading tools from MCP server %s during %s",
                     server_name,
@@ -3246,6 +3351,8 @@ async def _load_direct_mcp_tools(
                     phase=failure_phase,
                     error_type=error_type,
                     attempts=max_attempts,
+                    cause_type=cause_type,
+                    status_code=status_code,
                 ),
             ),
         )
