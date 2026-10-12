@@ -249,6 +249,7 @@ def test_a_moved_task_is_skipped_as_stale(factory, snapshot, fields):
     decision = _check(task_id, **snapshot)
 
     assert (decision.proceed, decision.why) == (False, "stale")
+    assert decision.notices == ()
     row = _row(factory, task_id)
     assert row.state == "stale"
     assert row.next_attempt_at is None
@@ -282,6 +283,8 @@ def test_switch_off_at_the_fence_stops_the_row_and_fails_the_trigger_run(
     decision = _check(task_id)
 
     assert (decision.proceed, decision.why) == (False, "auto_resume_disabled")
+    (notice,) = decision.notices
+    assert notice.auto_resume["stop_reason"] == "disabled"
     row = _row(factory, task_id)
     assert (row.state, row.state_detail) == ("manual", "auto_resume_disabled")
     assert _events(factory, task_id) == ["skipped_disabled"]
@@ -760,7 +763,11 @@ def test_a_claim_the_row_no_longer_names_is_skipped_and_the_row_left_alone(
         ),
     )
 
-    assert (decision.proceed, decision.why) == (False, "not_current")
+    assert (decision.proceed, decision.why, decision.notices) == (
+        False,
+        "not_current",
+        (),
+    )
     after = _row(factory, task_id)
     if before is None:
         assert after is None
@@ -779,10 +786,16 @@ def test_a_claim_the_row_no_longer_names_is_skipped_and_the_row_left_alone(
 
 
 @pytest.mark.asyncio
-async def test_resume_task_with_the_switch_off_never_replies(
+async def test_resume_task_with_the_switch_off_publishes_and_never_replies(
     factory, handler, monkeypatch
 ):
     monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_ENABLED", "false")
+    published: list[Any] = []
+
+    async def publish(notices):
+        published.extend(notices)
+
+    monkeypatch.setattr(task_auto_resume, "publish_recovery_notices", publish)
     with factory() as db:
         task_id, _ = _seed(db)
         db.commit()
@@ -792,6 +805,7 @@ async def test_resume_task_with_the_switch_off_never_replies(
     assert result.outcome is ResumeCommandOutcome.AUTO_SKIPPED
     assert result.reason_code == "auto_resume_disabled"
     reply.assert_not_awaited()
+    assert [n.auto_resume["stop_reason"] for n in published] == ["disabled"]
     assert _row(factory, task_id).state == "manual"
     assert _task(factory, task_id).state_version == PV
 
@@ -851,6 +865,9 @@ def test_retry_after_its_own_rolled_back_resume_is_scheduled_again(
     decision = _check(task_id, state_version=PV + 2, attempt_count=2)
 
     assert (decision.proceed, decision.why) == (False, "rolled_back")
+    (notice,) = decision.notices
+    assert notice.auto_resume["status"] == "scheduled"
+    assert notice.state_version == PV + 2
     row = _row(factory, task_id)
     assert row.state == "scheduled"
     assert row.paused_state_version == PV + 2
@@ -872,6 +889,7 @@ def test_rolled_back_retry_with_the_switch_off_stops(factory, monkeypatch):
     decision = _check(task_id, state_version=PV + 2, attempt_count=2)
 
     assert (decision.proceed, decision.why) == (False, "rolled_back")
+    assert [n.auto_resume["stop_reason"] for n in decision.notices] == ["disabled"]
     row = _row(factory, task_id)
     assert (row.state, row.state_detail) == ("manual", "auto_resume_disabled")
     assert row.paused_state_version == PV + 2
@@ -881,7 +899,7 @@ def test_rolled_back_retry_with_the_switch_off_stops(factory, monkeypatch):
         assert db.get(TriggerRun, trigger_run_id).status == "failed"
 
 
-def test_rolled_back_retry_at_its_limit_stops(factory):
+def test_rolled_back_retry_at_its_limit_stops_with_a_notice(factory):
     with factory() as db:
         task_id, trigger_run_id = _seed(db, trigger=True, state_version=PV + 2)
         db.get(TaskAutoRecovery, task_id).no_progress_resumes = 3
@@ -890,6 +908,7 @@ def test_rolled_back_retry_at_its_limit_stops(factory):
     decision = _check(task_id, state_version=PV + 2, attempt_count=2)
 
     assert decision.why == "rolled_back"
+    assert [n.auto_resume["stop_reason"] for n in decision.notices] == ["limit_reached"]
     assert _row(factory, task_id).state == "exhausted"
     with factory() as db:
         assert db.get(TriggerRun, trigger_run_id).status == "failed"

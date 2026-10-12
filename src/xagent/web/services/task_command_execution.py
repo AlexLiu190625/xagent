@@ -3538,7 +3538,10 @@ async def resume_task(
         # retry is checked again.
         auto_resume = message_data.get("auto_resume")
         if auto_resume is not None:
-            from .task_auto_resume import check_auto_resume_claim_sync
+            from .task_auto_resume import (
+                check_auto_resume_claim_sync,
+                publish_recovery_notices,
+            )
 
             claim = await run_db_io_cancellation_safe(
                 lambda: check_auto_resume_claim_sync(
@@ -3553,6 +3556,7 @@ async def resume_task(
                 )
             )
             if not claim.proceed:
+                await publish_recovery_notices(claim.notices)
                 return ResumeCommandResult(
                     ResumeCommandOutcome.AUTO_SKIPPED,
                     f"Automatic resume skipped ({claim.why})",
