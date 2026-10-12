@@ -214,8 +214,9 @@ class RouterLLM(BaseLLM):
         )
         if self._candidate_models == ():
             raise ValueError("A configured Auto model needs at least one candidate")
-        # The auto model's own OpenRouter credentials. Routing is in-process (not
-        # an HTTP call), but these are used by the fallback resolver below when no
+        # The auto model's own OpenRouter credentials. Routing itself never calls
+        # OpenRouter (only the prompt embedding may call a remote embedding
+        # service), but these are used by the fallback resolver below when no
         # downstream OpenRouter model is injected (e.g. test-connection paths), so
         # the chosen slug still runs against the user's configured key/base_url.
         self._api_key = api_key
@@ -515,8 +516,9 @@ class RouterLLM(BaseLLM):
         preferred_input_modalities: tuple[str, ...] = (),
         advisory_input_modalities: tuple[str, ...] = (),
     ) -> str:
-        # The decision loads/embeds in-process and is CPU-bound, so run it in a
-        # worker thread to avoid blocking the event loop.
+        # The decision either embeds in-process (CPU-bound) or calls a remote
+        # embedding endpoint (blocking I/O), so run it in a worker thread to avoid
+        # blocking the event loop.
         try:
             selected = await asyncio.to_thread(
                 self._route_sync,
