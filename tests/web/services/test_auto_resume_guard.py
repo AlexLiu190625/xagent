@@ -605,7 +605,9 @@ def _scheduled(factory: sessionmaker) -> int:
 
 
 @pytest.mark.asyncio
-async def test_dispatched_command_resumes_the_task(factory, handler, monkeypatch):
+async def test_dispatched_command_resumes_the_task_and_housekeeping_confirms(
+    factory, handler, monkeypatch
+):
     monkeypatch.setattr(
         task_auto_resume, "notify_task_command_dispatcher", lambda: None
     )
@@ -618,9 +620,11 @@ async def test_dispatched_command_resumes_the_task(factory, handler, monkeypatch
     assert command.status == "completed"
     assert command.result["resume_outcome"] == "scheduled"
     handler.background.assert_called_once()
-    assert _task(factory, task_id).control_state == "resume_requested"
-    # The row stays dispatched: confirming it is housekeeping's job.
-    assert _row(factory, task_id).state == "dispatched"
+    # The resumed run moved the fence: the next check confirms the dispatch.
+    report = run_auto_resume_tick(now=now + timedelta(seconds=61))
+    assert report.confirmed == 1
+    row = _row(factory, task_id)
+    assert (row.state, row.next_attempt_at) == ("dispatched", None)
 
 
 @pytest.mark.asyncio

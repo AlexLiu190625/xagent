@@ -1,4 +1,4 @@
-"""The auto-resume sweeper: dispatch, give-ups, budgets, loop.
+"""The auto-resume sweeper: dispatch, give-ups, budgets, housekeeping, loop.
 
 Nothing records ``scheduled`` rows yet, so every case seeds them directly.
 Runs on SQLite (scan + compare-and-swap) and, when
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -41,6 +42,7 @@ from xagent.web.services.task_auto_recovery import (
 )
 from xagent.web.services.task_auto_resume import (
     DISPATCH_CHECK_GRACE_SECONDS,
+    TASK_AUTO_RESUME_DISPATCH_FAILED_TRIGGER_ERROR,
     TASK_AUTO_RESUME_EXHAUSTED_TRIGGER_ERROR,
     TASK_AUTO_RESUME_EXPIRED_TRIGGER_ERROR,
     TASK_AUTO_RESUME_SUPERSEDED_TRIGGER_ERROR,
@@ -563,6 +565,17 @@ def test_max_per_tick_bounds_dispatches(factory, notified, monkeypatch):
     assert notified == [1]
 
 
+def _capture_counters(monkeypatch) -> list[str]:
+    names: list[str] = []
+    real_counter = task_auto_resume.increment_counter
+    monkeypatch.setattr(
+        task_auto_resume,
+        "increment_counter",
+        lambda name, **kw: (names.append(name), real_counter(name, **kw)),
+    )
+    return names
+
+
 def _inflight_running(db: Session, now: datetime) -> None:
     """A: an auto-resumed run still RUNNING (row confirmed, check cleared)."""
     _seed(
@@ -614,6 +627,58 @@ def test_max_inflight_counts_running_and_queued_resumes(
     assert report.budget == 3 - expected
     assert report.dispatched == 3 - expected
     assert sum(_row(factory, i).state == "dispatched" for i in ids) == 3 - expected
+
+
+@pytest.mark.parametrize(
+    ("later_command", "counted"),
+    [
+        (None, True),
+        # The sweeper's own later dispatch is still automatic.
+        ("auto-resume:5:2:run-a", True),
+        # A person resumed it by hand since: not an automatic resume any more.
+        ("resume-by-hand", False),
+        ("message-1", False),
+        # The reserved prefix is case-sensitive, as the transport checks it.
+        ("AUTO-RESUME:5:2:run-a", False),
+    ],
+)
+def test_inflight_running_excludes_runs_a_person_resumed(
+    factory, later_command, counted
+):
+    now = utc_now()
+    dispatch_id = auto_resume_command_id(PV, 1, "run-a")
+    with factory() as db:
+        task_id = _seed(
+            db,
+            now,
+            state="dispatched",
+            due_in=None,
+            status=TaskStatus.RUNNING,
+            control_state="running",
+            run_id="run-a",
+            state_version=PV + 4,
+            paused_state_version=PV,
+            last_command_id=dispatch_id,
+        )
+        user_id = db.get(Task, task_id).user_id
+        for command_id in (dispatch_id, later_command):
+            if command_id is None:
+                continue
+            db.add(
+                TaskExecutionCommand(
+                    task_id=task_id,
+                    actor_user_id=user_id,
+                    command_id=command_id,
+                    kind="message" if command_id.startswith("message") else "resume",
+                    payload={},
+                    status="completed",
+                )
+            )
+            db.flush()
+        db.commit()
+
+    with factory() as db:
+        assert task_auto_resume.count_inflight(db) == (1 if counted else 0)
 
 
 def test_give_ups_still_advance_when_no_dispatch_budget_is_left(
@@ -1094,6 +1159,249 @@ def test_switch_off_tick_does_nothing(factory, notified, monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# Housekeeping
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("command_status", ["failed", None])
+def test_housekeeping_marks_a_failed_or_lost_dispatch(
+    factory, notified, command_status
+):
+    now = utc_now()
+    with factory() as db:
+        task_id = _dispatched(db, now, command_status=command_status)
+        user = db.get(User, db.get(Task, task_id).user_id)
+        trigger_run_id, _later = _trigger(db, user, task_id)
+        db.commit()
+
+    report = run_auto_resume_tick(now=now)
+
+    row = _row(factory, task_id)
+    assert row.state == "dispatch_failed"
+    assert row.next_attempt_at is None
+    (event,) = _events(factory, task_id)
+    assert event.event == "dispatch_failed"
+    assert event.detail["at"] == "housekeeping"
+    assert event.detail["rejection_reason"] == (
+        "stale_run" if command_status == "failed" else None
+    )
+    run = _trigger_run(factory, trigger_run_id)
+    assert run.status == TriggerRunStatus.FAILED.value
+    assert run.error_message == TASK_AUTO_RESUME_DISPATCH_FAILED_TRIGGER_ERROR
+    assert report.gave_up == 1
+
+
+def test_housekeeping_reschedules_a_completed_resume_that_did_not_happen(
+    factory, notified, monkeypatch
+):
+    monkeypatch.setattr(task_auto_resume, "_AUTO_RESUME_RNG", random.Random(7))
+    now = utc_now()
+    with factory() as db:
+        task_id = _dispatched(db, now, command_status="completed")
+        db.commit()
+
+    report = run_auto_resume_tick(now=now)
+
+    row = _row(factory, task_id)
+    assert row.state == "scheduled"
+    # The dispatch happened; its counters stand.
+    assert (row.no_progress_resumes, row.total_resumes) == (1, 1)
+    # Second short backoff (20s) plus at most 10s of jitter.
+    assert now + timedelta(seconds=20) <= _aware(row.next_attempt_at)
+    assert _aware(row.next_attempt_at) <= now + timedelta(seconds=30)
+    (event,) = _events(factory, task_id)
+    assert (event.event, event.attempt) == ("scheduled", 2)
+    assert event.detail == {"at": "housekeeping", "after": "already_in_progress"}
+    assert report.rescheduled == 1
+
+
+def test_housekeeping_stops_a_completed_resume_at_its_limit(factory, notified):
+    now = utc_now()
+    with factory() as db:
+        task_id = _dispatched(
+            db, now, command_status="completed", no_progress=3, total=3
+        )
+        db.commit()
+
+    run_auto_resume_tick(now=now)
+
+    assert _row(factory, task_id).state == "exhausted"
+    (event,) = _events(factory, task_id)
+    assert event.event == "exhausted"
+    assert event.detail["after"] == "already_in_progress"
+
+
+def test_housekeeping_cas_misses_a_row_redispatched_since_it_was_read(
+    factory, notified, monkeypatch
+):
+    now = utc_now()
+    with factory() as db:
+        task_id = _dispatched(db, now, command_status="failed")
+        db.commit()
+    with factory() as seen:
+        stale_task = seen.get(Task, task_id)
+        stale_row = seen.get(TaskAutoRecovery, task_id)
+        seen.expunge_all()
+    redispatched = auto_resume_command_id(PV, 2, RUN)
+    with factory() as db:
+        db.get(TaskAutoRecovery, task_id).last_command_id = redispatched
+        db.commit()
+    monkeypatch.setattr(
+        task_auto_resume,
+        "_load_locked_no_commit",
+        lambda _db, _id: (stale_task, stale_row),
+    )
+
+    with factory() as db:
+        result = task_auto_resume._housekeep_candidate_no_commit(db, task_id, now=now)
+        db.rollback()
+
+    assert result.outcome is task_auto_resume._Outcome.RACED
+    row = _row(factory, task_id)
+    assert (row.state, row.last_command_id) == ("dispatched", redispatched)
+
+
+def test_housekeeping_reschedule_rechecks_the_fence(factory, notified, monkeypatch):
+    # Read at the fence with its command completed, the task was resumed by
+    # hand before the CAS: scheduling another resume would race the person.
+    now = utc_now()
+    with factory() as db:
+        task_id = _dispatched(db, now, command_status="completed")
+        db.commit()
+    with factory() as seen:
+        stale_task = seen.get(Task, task_id)
+        stale_row = seen.get(TaskAutoRecovery, task_id)
+        seen.expunge_all()
+    with factory() as db:
+        db.get(Task, task_id).state_version = PV + 1
+        db.commit()
+    monkeypatch.setattr(
+        task_auto_resume,
+        "_load_locked_no_commit",
+        lambda _db, _id: (stale_task, stale_row),
+    )
+
+    with factory() as db:
+        result = task_auto_resume._housekeep_candidate_no_commit(db, task_id, now=now)
+        db.rollback()
+
+    assert result.outcome is task_auto_resume._Outcome.RACED
+    assert _row(factory, task_id).state == "dispatched"
+    assert _events(factory, task_id) == []
+
+
+def test_housekeeping_rearm_rechecks_the_fence(factory, notified, monkeypatch):
+    # Read while still at the fence, the task resumed before the CAS: the
+    # rearm must miss, so the next check confirms instead.
+    now = utc_now()
+    with factory() as db:
+        task_id = _dispatched(db, now, command_status="pending")
+        db.commit()
+    with factory() as seen:
+        stale_task = seen.get(Task, task_id)
+        stale_row = seen.get(TaskAutoRecovery, task_id)
+        seen.expunge_all()
+    with factory() as db:
+        db.get(Task, task_id).state_version = PV + 1
+        db.commit()
+    monkeypatch.setattr(
+        task_auto_resume,
+        "_load_locked_no_commit",
+        lambda _db, _id: (stale_task, stale_row),
+    )
+
+    with factory() as db:
+        result = task_auto_resume._housekeep_candidate_no_commit(db, task_id, now=now)
+        db.rollback()
+
+    assert result.outcome is task_auto_resume._Outcome.RACED
+    assert _aware(_row(factory, task_id).next_attempt_at) == now - timedelta(seconds=1)
+
+
+@pytest.mark.parametrize("command_status", ["completed", "failed", "pending", None])
+def test_housekeeping_confirms_once_the_fence_moved(
+    factory, notified, monkeypatch, command_status
+):
+    now = utc_now()
+    with factory() as db:
+        task_id = _dispatched(db, now, command_status=command_status)
+        task = db.get(Task, task_id)
+        task.status = TaskStatus.RUNNING
+        task.control_state = "running"
+        task.state_version = PV + 2
+        db.commit()
+
+    counters = _capture_counters(monkeypatch)
+
+    report = run_auto_resume_tick(now=now)
+
+    assert report.confirmed == 1
+    assert "xagent.task.auto_resume.confirmed" in counters
+    row = _row(factory, task_id)
+    assert (row.state, row.next_attempt_at) == ("dispatched", None)
+    assert _events(factory, task_id) == []
+
+
+def test_housekeeping_fails_a_resume_whose_last_attempt_rolled_back(factory, notified):
+    """The resume wrote ``resume_requested``, failed to start and rolled the
+    task back to ``paused`` two versions on, on its command's last attempt:
+    the fence moved, but nothing resumed the task, so it is a failed
+    dispatch rather than a confirmed one."""
+    now = utc_now()
+    with factory() as db:
+        task_id = _dispatched(db, now, command_status="failed")
+        user = db.get(User, db.get(Task, task_id).user_id)
+        trigger_run_id, _later = _trigger(db, user, task_id)
+        db.get(Task, task_id).state_version = PV + 2
+        db.commit()
+
+    report = run_auto_resume_tick(now=now)
+
+    assert (report.confirmed, report.gave_up) == (0, 1)
+    row = _row(factory, task_id)
+    assert (row.state, row.next_attempt_at) == ("dispatch_failed", None)
+    (event,) = _events(factory, task_id)
+    assert event.event == "dispatch_failed"
+    run = _trigger_run(factory, trigger_run_id)
+    assert run.status == TriggerRunStatus.FAILED.value
+    assert run.error_message == TASK_AUTO_RESUME_DISPATCH_FAILED_TRIGGER_ERROR
+
+
+@pytest.mark.parametrize("command_status", ["pending", "processing"])
+def test_housekeeping_rechecks_a_queued_command_later(
+    factory, notified, monkeypatch, command_status
+):
+    now = utc_now()
+    with factory() as db:
+        task_id = _dispatched(db, now, command_status=command_status)
+        db.commit()
+
+    counters = _capture_counters(monkeypatch)
+
+    report = run_auto_resume_tick(now=now)
+
+    assert report.rearmed == 1
+    assert "xagent.task.auto_resume.rearmed" in counters
+    row = _row(factory, task_id)
+    assert row.state == "dispatched"
+    assert _aware(row.next_attempt_at) == now + timedelta(
+        seconds=DISPATCH_CHECK_GRACE_SECONDS
+    )
+    assert _events(factory, task_id) == []
+
+
+def test_housekeeping_ignores_dispatches_not_yet_due(factory, notified):
+    now = utc_now()
+    with factory() as db:
+        task_id = _dispatched(db, now, command_status=None, due_in=10)
+        db.commit()
+
+    run_auto_resume_tick(now=now)
+
+    assert _row(factory, task_id).state == "dispatched"
+
+
+# --------------------------------------------------------------------------
 # Loop
 # --------------------------------------------------------------------------
 
@@ -1376,10 +1684,15 @@ def test_notify_fires_even_when_the_tick_fails_after_a_dispatch(
     assert notified == [1]
 
 
-def test_scan_limit_bounds_each_tick(factory, notified, monkeypatch):
+def test_scan_and_housekeeping_limits_bound_each_tick(factory, notified, monkeypatch):
     monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_MAX_PER_TICK", "1")
     now = utc_now()
     with factory() as db:
+        # Housekeeping takes at most MAX_PER_TICK rows.
+        queued = [
+            _dispatched(db, now, command_status="pending", due_in=-10 + i)
+            for i in range(2)
+        ]
         # The scan takes at most 4 x MAX_PER_TICK rows, give-ups included.
         expired = [
             _seed(
@@ -1395,6 +1708,11 @@ def test_scan_limit_bounds_each_tick(factory, notified, monkeypatch):
 
     report = run_auto_resume_tick(now=now)
 
+    assert report.rearmed == 1
+    assert [_aware(_row(factory, t).next_attempt_at) > now for t in queued] == [
+        True,
+        False,
+    ]
     assert report.gave_up == 4
     assert [_row(factory, t).state for t in expired] == ["expired"] * 4 + ["scheduled"]
 
@@ -1403,13 +1721,14 @@ def test_scan_limit_bounds_each_tick(factory, notified, monkeypatch):
 def test_unconfirmed_dispatches_whose_command_ended_are_not_in_flight(
     factory, notified, monkeypatch, command_status
 ):
-    # Nothing confirms or closes a dispatched row yet; one whose command has
-    # ended must neither be revisited nor hold an in-flight slot forever.
+    # Until housekeeping closes it, a row whose command has ended must not
+    # hold an in-flight slot.
     monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_MAX_INFLIGHT", "1")
     now = utc_now()
     with factory() as db:
+        # Not due a check yet, so housekeeping leaves it alone this tick.
         ended = _dispatched(
-            db, now, command_status=command_status, due_in=-30, run_id="run-ended"
+            db, now, command_status=command_status, due_in=30, run_id="run-ended"
         )
         due = _seed(db, now)
         db.commit()
@@ -1420,23 +1739,18 @@ def test_unconfirmed_dispatches_whose_command_ended_are_not_in_flight(
     assert _row(factory, due).state == "dispatched"
     row = _row(factory, ended)
     assert row.state == "dispatched"
-    assert _aware(row.next_attempt_at) == now - timedelta(seconds=30)
+    assert _aware(row.next_attempt_at) == now + timedelta(seconds=30)
     assert _events(factory, ended) == []
 
 
-def test_dispatched_rows_alone_leave_the_tick_inert(factory, notified, monkeypatch):
+def test_due_dispatched_rows_alone_make_the_tick_run(factory, notified):
     now = utc_now()
     with factory() as db:
-        _dispatched(db, now, command_status="failed", due_in=-30)
+        task_id = _dispatched(db, now, command_status="pending")
         db.commit()
 
-    def unexpected(*_args, **_kwargs):
-        raise AssertionError("dispatched rows are not the tick's to check yet")
-
-    monkeypatch.setattr(task_auto_resume, "count_inflight", unexpected)
-    monkeypatch.setattr(task_auto_resume, "_candidates", unexpected)
-
-    assert run_auto_resume_tick(now=now) == task_auto_resume.AutoResumeTickReport()
+    assert run_auto_resume_tick(now=now).rearmed == 1
+    assert _aware(_row(factory, task_id).next_attempt_at) > now
 
 
 def test_failure_while_postponing_after_a_full_queue_fails_the_tick(
