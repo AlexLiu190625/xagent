@@ -830,3 +830,139 @@ def test_a_database_error_while_closing_a_skipped_claim_propagates(
     with pytest.raises(sa.exc.OperationalError):
         _check(task_id, state_version=PV + 1)
     assert _row(factory, task_id).state == "dispatched"
+
+
+# --------------------------------------------------------------------------
+# A resume this command started and then rolled back; an unanswered question
+# --------------------------------------------------------------------------
+
+
+def test_retry_after_its_own_rolled_back_resume_is_scheduled_again(
+    factory, monkeypatch
+):
+    monkeypatch.setattr(
+        task_auto_resume, "_AUTO_RESUME_RNG", __import__("random").Random(3)
+    )
+    with factory() as db:
+        task_id, trigger_run_id = _seed(db, trigger=True, state_version=PV + 2)
+        db.commit()
+    now = utc_now()
+
+    decision = _check(task_id, state_version=PV + 2, attempt_count=2)
+
+    assert (decision.proceed, decision.why) == (False, "rolled_back")
+    row = _row(factory, task_id)
+    assert row.state == "scheduled"
+    assert row.paused_state_version == PV + 2
+    assert row.next_attempt_at is not None
+    assert row.next_attempt_at.replace(tzinfo=None) >= now.replace(tzinfo=None)
+    assert _events(factory, task_id) == ["scheduled"]
+    with factory() as db:
+        assert db.get(TriggerRun, trigger_run_id).status == "running"
+
+
+def test_rolled_back_retry_with_the_switch_off_stops(factory, monkeypatch):
+    """The re-arm does not schedule while the switch is off, so turning it
+    back on never resumes the row retroactively."""
+    monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_ENABLED", "false")
+    with factory() as db:
+        task_id, trigger_run_id = _seed(db, trigger=True, state_version=PV + 2)
+        db.commit()
+
+    decision = _check(task_id, state_version=PV + 2, attempt_count=2)
+
+    assert (decision.proceed, decision.why) == (False, "rolled_back")
+    row = _row(factory, task_id)
+    assert (row.state, row.state_detail) == ("manual", "auto_resume_disabled")
+    assert row.paused_state_version == PV + 2
+    assert row.next_attempt_at is None
+    assert _events(factory, task_id) == ["skipped_disabled"]
+    with factory() as db:
+        assert db.get(TriggerRun, trigger_run_id).status == "failed"
+
+
+def test_rolled_back_retry_at_its_limit_stops(factory):
+    with factory() as db:
+        task_id, trigger_run_id = _seed(db, trigger=True, state_version=PV + 2)
+        db.get(TaskAutoRecovery, task_id).no_progress_resumes = 3
+        db.commit()
+
+    decision = _check(task_id, state_version=PV + 2, attempt_count=2)
+
+    assert decision.why == "rolled_back"
+    assert _row(factory, task_id).state == "exhausted"
+    with factory() as db:
+        assert db.get(TriggerRun, trigger_run_id).status == "failed"
+
+
+@pytest.mark.parametrize("case", ["first_attempt", "user_command", "three_versions"])
+def test_a_rollback_lookalike_stays_stale(factory, case):
+    with factory() as db:
+        task_id, _ = _seed(
+            db, state_version=PV + (3 if case == "three_versions" else 2)
+        )
+        task = db.get(Task, task_id)
+        for command_id, kind in [(CID, "resume")] + (
+            [("message-1", "message")] if case == "user_command" else []
+        ):
+            db.add(
+                TaskExecutionCommand(
+                    task_id=task_id,
+                    actor_user_id=task.user_id,
+                    command_id=command_id,
+                    kind=kind,
+                    payload={},
+                    status="pending",
+                )
+            )
+        db.commit()
+
+    decision = _check(
+        task_id,
+        state_version=PV + (3 if case == "three_versions" else 2),
+        attempt_count=1 if case == "first_attempt" else 2,
+    )
+
+    assert decision.why == "stale"
+    assert _row(factory, task_id).state == "stale"
+
+
+@pytest.mark.asyncio
+async def test_resume_task_reschedules_after_its_own_rollback(factory, handler):
+    with factory() as db:
+        task_id, _ = _seed(db)
+        db.commit()
+    handler.manager.register_reserved_resume.side_effect = RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await _resume(factory, task_id)
+
+    task = _task(factory, task_id)
+    assert (task.control_state, task.state_version) == ("paused", PV + 2)
+    handler.manager.register_reserved_resume.side_effect = None
+    retry, reply = await _resume(factory, task_id, attempt_count=2)
+
+    assert retry.outcome is ResumeCommandOutcome.AUTO_SKIPPED
+    assert retry.reason_code == "rolled_back"
+    reply.assert_not_awaited()
+    row = _row(factory, task_id)
+    assert (row.state, row.paused_state_version) == ("scheduled", PV + 2)
+
+
+@pytest.mark.asyncio
+async def test_resume_task_skips_an_unanswered_question_without_an_error(
+    factory, handler, monkeypatch
+):
+    from xagent.web.services.task_interaction_close import ActiveInteractionFound
+
+    with factory() as db:
+        task_id, _ = _seed(db)
+        db.commit()
+    handler.interaction.return_value = ActiveInteractionFound(interaction_id=9)
+
+    result, reply = await _resume(factory, task_id)
+
+    assert result.outcome is ResumeCommandOutcome.AUTO_SKIPPED
+    assert result.reason_code == "interaction_pending"
+    reply.assert_not_awaited()
+    handler.manager.try_reserve_resume.assert_not_called()
