@@ -272,8 +272,10 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     # one, brings the census to 55.
     # V2 resume also wraps its safe terminal constructor with committed control
     # identity; the scanner visits both the constructor and the wrapper.
-    assert result.error_payloads == 56, (
-        f"expected exactly 56 error payloads, matched {result.error_payloads}; "
+    # The external cancel's terminal broadcast sends one of two frames, one
+    # per wording, so only the "didn't go through" one asserts a code: 57.
+    assert result.error_payloads == 57, (
+        f"expected exactly 57 error payloads, matched {result.error_payloads}; "
         "review the changed sites and bump deliberately"
     )
     # Every allowlist entry must be earned by a live call site: a stale entry

@@ -46,16 +46,27 @@ RAISE_CALL_NAMES = {"_raise_runtime_error", "ConnectorRuntimeError"}
     ],
     ids=["neither"],
 )
-def test_terminal_error_event_shape_unchanged(kwargs: dict[str, Any]) -> None:
+def test_terminal_error_event_shape_unchanged(
+    kwargs: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
     """A caller that passes neither code argument gets the same six-key frame."""
 
-    event = create_terminal_task_error_event(1, "x", **kwargs)
+    with caplog.at_level(logging.ERROR):
+        event = create_terminal_task_error_event(1, "x", **kwargs)
 
     assert set(event.keys()) == BASE_FIELDS
+    # Passing no code is the normal case, not a dropped assertion.
+    assert "dropped=asserted_code" not in caplog.text
 
 
-def test_terminal_error_event_carries_a_valid_code() -> None:
-    event = create_terminal_task_error_event(1, "x", code="missing_runtime_context")
+def test_terminal_error_event_carries_a_valid_code(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.ERROR):
+        event = create_terminal_task_error_event(1, "x", code="missing_runtime_context")
+
+    # A projected code with no assertion is not a conflict.
+    assert "dropped=asserted_code" not in caplog.text
 
     assert set(event.keys()) == BASE_FIELDS | {"code"}
     assert event["code"] == "missing_runtime_context"
@@ -291,6 +302,7 @@ def test_an_asserted_code_is_written_onto_the_frame() -> None:
             None,
         ),
         ({"asserted_code": ClientErrorCode.TASK_EXECUTION_FAILED}, None),
+        ({"asserted_code": ClientErrorCode.EXTERNAL_STOP_NOT_APPLIED}, None),
         ({"asserted_code": ["not", "hashable"]}, None),
         (
             {
@@ -299,13 +311,22 @@ def test_an_asserted_code_is_written_onto_the_frame() -> None:
             },
             "missing_runtime_context",
         ),
+        (
+            {
+                "code": "bogus",
+                "asserted_code": ClientErrorCode.EXTERNAL_TURN_INTERRUPTED,
+            },
+            None,
+        ),
     ],
     ids=[
         "plain_string",
         "audit_enum_member",
         "unlisted_member",
+        "command_error_frame_member",
         "unhashable",
         "both_arguments",
+        "invalid_code_with_assertion",
     ],
 )
 def test_an_unusable_asserted_code_is_dropped_and_logged(

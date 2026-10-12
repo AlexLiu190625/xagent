@@ -108,6 +108,13 @@ class ClientErrorCode(StrEnum):
     # command ended in failure while its task was already COMPLETED or
     # FAILED. That record never reaches a client.
     EXTERNAL_TURN_INTERRUPTED = "external_turn_interrupted"
+    # An external stop request ended without the server confirming it took
+    # effect, and the server could not confirm the turn is over: it may still
+    # be running, or its row may be unreadable. Only the terminal command
+    # broadcast for an external-scope cancel puts it on a frame, as
+    # ``error_code`` on an ``agent_error``, by passing it to that frame's
+    # builder as ``asserted_code``.
+    EXTERNAL_STOP_NOT_APPLIED = "external_stop_not_applied"
     MODEL_ERROR = "model_error"
 
 
@@ -170,6 +177,9 @@ def client_error_message(code: ClientErrorCode) -> str:
             "conversation before sending it again."
         ),
         ClientErrorCode.EXTERNAL_TURN_INTERRUPTED: "This response was interrupted.",
+        ClientErrorCode.EXTERNAL_STOP_NOT_APPLIED: (
+            "Stopping this response didn't go through — please try again."
+        ),
         ClientErrorCode.MODEL_ERROR: CLIENT_SAFE_MODEL_ERROR,
     }[code]
 

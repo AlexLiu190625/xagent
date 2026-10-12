@@ -62,6 +62,7 @@ from .task_execution import (
     _mark_task_pause_accepted,
     _task_error_payload,
     client_safe_error_message,
+    create_external_command_error_event,
     create_stream_event,
 )
 from .task_interaction_close import (
@@ -110,6 +111,7 @@ from .external_task_cancel import (
     EXTERNAL_COMMAND_SCOPE,
     cancel_external_task_unserialized,
     external_cancel_exhausted_message,
+    external_cancel_target_ended,
 )
 from .external_task_input import (
     execute_external_task_input_command,
@@ -4698,10 +4700,10 @@ async def _broadcast_terminal_command_error(
     # wording has to be true about the turn, which takes reading the task.
     # And ``command_kind``/``command_id`` are operator handles: an anonymous
     # visitor cannot act on them and should not be shown the durable command
-    # identity of a task they do not own. Three payload literals rather than
-    # one built and trimmed: the client-safe guard only inspects dict
-    # literals passed straight to the sink, and a payload assembled in a
-    # variable would drop this site out of its view entirely.
+    # identity of a task they do not own. Each payload reaches the sink as a
+    # literal or as a listed frame builder's return value, never assembled
+    # and then trimmed: the client-safe guard cannot follow a payload mutated
+    # after it is built.
     if is_external_cancel_command(kind=command.kind.value, scope=scope):
         task_status = await _load_terminal_command_task_status(command.task_id)
         if task_status is TaskStatus.COMPLETED:
@@ -4711,18 +4713,29 @@ async def _broadcast_terminal_command_error(
             # persisted terminal-event draft keeps its audit classification;
             # nothing renders it to a client.
             return
+        stop_message = client_safe_task_command_failure(
+            command.kind,
+            error,
+            scope=scope,
+            task_status=task_status,
+        )
+        # The code rides only on the "didn't go through" sentence, picked by
+        # the same predicate, so a client that cannot read the sentence still
+        # learns the server could not confirm the stop took effect. The audit
+        # draft's message code is a separate vocabulary and is never copied
+        # onto this frame.
+        if external_cancel_target_ended(task_status):
+            await publish_task_event(
+                create_external_command_error_event(command.task_id, stop_message),
+                command.task_id,
+            )
+            return
         await publish_task_event(
-            {
-                "type": "agent_error",
-                "message": client_safe_task_command_failure(
-                    command.kind,
-                    error,
-                    scope=scope,
-                    task_status=task_status,
-                ),
-                "task_id": command.task_id,
-                "timestamp": datetime.now(timezone.utc).timestamp(),
-            },
+            create_external_command_error_event(
+                command.task_id,
+                stop_message,
+                asserted_code=ClientErrorCode.EXTERNAL_STOP_NOT_APPLIED,
+            ),
             command.task_id,
         )
         return
@@ -4736,16 +4749,14 @@ async def _broadcast_terminal_command_error(
         # and this branch runs inside exception handlers where an unguarded
         # database read would escape the disposition that is being reported.
         await publish_task_event(
-            {
-                "type": "agent_error",
-                "message": client_safe_task_command_failure(
+            create_external_command_error_event(
+                command.task_id,
+                client_safe_task_command_failure(
                     command.kind,
                     error,
                     scope=scope,
                 ),
-                "task_id": command.task_id,
-                "timestamp": datetime.now(timezone.utc).timestamp(),
-            },
+            ),
             command.task_id,
         )
         return

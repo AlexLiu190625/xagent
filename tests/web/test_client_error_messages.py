@@ -13,7 +13,14 @@ from xagent.web.services.client_error_messages import (
     client_error_message,
     required_mcp_unavailable_client_message,
 )
-from xagent.web.services.external_task_cancel import EXTERNAL_TURN_INTERRUPTED_MESSAGE
+from xagent.web.services.external_task_cancel import (
+    EXTERNAL_CANCEL_NOT_APPLIED_MESSAGE,
+    EXTERNAL_TURN_INTERRUPTED_MESSAGE,
+)
+from xagent.web.services.task_execution import (
+    _CALLER_ASSERTED_COMMAND_ERROR_CODES,
+    _CALLER_ASSERTED_TERMINAL_CODES,
+)
 
 
 def test_client_error_codes_have_fixed_safe_fallbacks() -> None:
@@ -38,6 +45,10 @@ def test_client_error_codes_have_fixed_safe_fallbacks() -> None:
     assert (
         client_error_message(ClientErrorCode.EXTERNAL_TURN_INTERRUPTED)
         == EXTERNAL_TURN_INTERRUPTED_MESSAGE
+    )
+    assert (
+        client_error_message(ClientErrorCode.EXTERNAL_STOP_NOT_APPLIED)
+        == EXTERNAL_CANCEL_NOT_APPLIED_MESSAGE
     )
     assert {code.value: client_error_message(code) for code in ClientErrorCode} == {
         "message_processing_failed": "The message could not be processed. Please try again.",
@@ -97,6 +108,9 @@ def test_client_error_codes_have_fixed_safe_fallbacks() -> None:
             "conversation before sending it again."
         ),
         "external_turn_interrupted": "This response was interrupted.",
+        "external_stop_not_applied": (
+            "Stopping this response didn't go through — please try again."
+        ),
         "model_error": "Model provider call failed.",
     }
 
@@ -128,8 +142,14 @@ _FRONTEND_TABLE = (
 )
 
 
-def test_the_interruption_code_is_in_the_frontend_error_table() -> None:
-    """The cancel core's code is only useful if the client table lists it.
+@pytest.mark.parametrize(
+    "code",
+    sorted(_CALLER_ASSERTED_TERMINAL_CODES | _CALLER_ASSERTED_COMMAND_ERROR_CODES),
+)
+def test_every_caller_asserted_code_is_in_the_frontend_error_table(
+    code: ClientErrorCode,
+) -> None:
+    """A caller-asserted code is only useful if the client table lists it.
 
     A client that does not render server prose shows a generic fallback for
     any code ``CLIENT_ERROR_CODES`` does not list, so renaming either side
@@ -141,4 +161,4 @@ def test_the_interruption_code_is_in_the_frontend_error_table() -> None:
     table = source.split("export const CLIENT_ERROR_CODES = [", 1)
     assert len(table) == 2, "could not parse: CLIENT_ERROR_CODES moved"
     listed = set(re.findall(r'^\s*"(\w+)",', table[1].split("] as const", 1)[0], re.M))
-    assert ClientErrorCode.EXTERNAL_TURN_INTERRUPTED.value in listed
+    assert code.value in listed

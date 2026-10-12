@@ -88,11 +88,12 @@ EXTERNAL_TURN_INTERRUPTED_MESSAGE = "This response was interrupted."
 # which is what keeps the two causes apart for whoever reads the row later.
 EXTERNAL_CANCEL_ERROR_MESSAGE = "Stopped by the visitor."
 
-# Broadcast, never stored. An exhausted cancel command whose target is
-# still alive has to say so, and the sentence has to be actionable: the
-# visitor can press stop again. Writing it to ``task.error_message`` would
-# put a text the replay judgement does not recognise on a live row, so this
-# constant has exactly one consumer - the terminal command broadcast.
+# Broadcast, never stored. An exhausted cancel command whose target the
+# server cannot show to be over has to say so: the stop may not have taken
+# effect, and the turn may still be producing. Writing it to
+# ``task.error_message`` would put a text the replay judgement does not
+# recognise on a live row, so this constant has exactly one consumer - the
+# terminal command broadcast.
 EXTERNAL_CANCEL_NOT_APPLIED_MESSAGE = (
     "Stopping this response didn't go through — please try again."
 )
@@ -105,18 +106,20 @@ EXTERNAL_CANCEL_NOT_APPLIED_MESSAGE = (
 #   stop press can reach — the target's run/version moved between the
 #   producer's read and the dispatch — and nothing else answers that press.
 #   Its producers are this module's own checks above plus three sites in
-#   ``websocket.py``'s dispatcher: the common pre-dispatch target-run-id
-#   comparison (ahead of either execution core), the CANCEL payload's
-#   state-version validation, and the ``StaleTaskRunError`` wrap around the
-#   cancel cores. Every one of them rides this same gate — it matches on
+#   ``task_command_execution.py``'s dispatcher: the common pre-dispatch
+#   target-run-id comparison (ahead of either execution core), the CANCEL
+#   payload's state-version validation, and the ``StaleTaskRunError`` wrap
+#   around the cancel cores. Every one of them rides this same gate — it matches on
 #   the reason, not the raise site. The broadcast wording is read
 #   from the task's current status (``external_cancel_exhausted_message``),
 #   so it stays true for a live successor ("didn't go through — please try
 #   again") and for a target that settled on its own ("This response was
-#   interrupted."). A target that is ``COMPLETED`` is the one exception: the
-#   broadcast site suppresses the live frame there, because the task's own
-#   completion frame already answered the visitor and "interrupted" would
-#   be false for a run that finished.
+#   interrupted."), and a frame saying the stop did not go through also
+#   carries the ``external_stop_not_applied`` client error code, picked by
+#   ``external_cancel_target_ended``. A target that is ``COMPLETED`` is the
+#   one exception: the broadcast site suppresses the live frame there,
+#   because the task's own completion frame already answered the visitor
+#   and "interrupted" would be false for a run that finished.
 # - ``task_not_found`` stays silent. The status read has no row to consult,
 #   and the fallback wording would invite retrying a stop against a task
 #   that no longer exists.
@@ -125,6 +128,19 @@ EXTERNAL_CANCEL_NOT_APPLIED_MESSAGE = (
 #   classifies external cancels by that same scope, so no membership here
 #   could ever make it broadcast.
 EXTERNAL_CANCEL_BROADCAST_REJECTION_REASONS = frozenset({"stale_run"})
+
+
+def external_cancel_target_ended(task_status: TaskStatus | None) -> bool:
+    """Whether a cancel command's terminal broadcast may say the turn is over.
+
+    Only ``COMPLETED`` and ``FAILED`` prove it. Every other status - and
+    ``None``, a row that is gone or could not be read - leaves the turn
+    unconfirmed, so the broadcast says the stop did not go through and
+    carries ``ClientErrorCode.EXTERNAL_STOP_NOT_APPLIED``. The sentence and
+    the code are both picked by this predicate.
+    """
+
+    return task_status in _TERMINAL_STATUSES
 
 
 def external_cancel_exhausted_message(task_status: TaskStatus | None) -> str:
@@ -142,7 +158,7 @@ def external_cancel_exhausted_message(task_status: TaskStatus | None) -> str:
     turn is the safe one there too.
     """
 
-    if task_status in _TERMINAL_STATUSES:
+    if external_cancel_target_ended(task_status):
         return EXTERNAL_TURN_INTERRUPTED_MESSAGE
     return EXTERNAL_CANCEL_NOT_APPLIED_MESSAGE
 

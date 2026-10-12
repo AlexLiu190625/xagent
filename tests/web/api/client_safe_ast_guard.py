@@ -91,6 +91,13 @@ DICT_ERROR_PAYLOAD_BUILDERS = {
     "_task_error_payload": "error",
     "_terminal_task_error_payload": "agent_error",
     "create_terminal_task_error_event": "task_error",
+    "create_external_command_error_event": "agent_error",
+}
+
+# Builders a sink may take as its whole payload, message second.
+DIRECT_FRAME_BUILDERS = {
+    "create_terminal_task_error_event",
+    "create_external_command_error_event",
 }
 
 # The only functions allowed to mint client-visible text from an exception.
@@ -381,7 +388,7 @@ def _error_payload_messages(
     messages: list[ast.expr] = []
     if isinstance(argument, ast.Call) and isinstance(argument.func, ast.Name):
         helper = argument.func.id
-        if helper == "create_terminal_task_error_event":
+        if helper in DIRECT_FRAME_BUILDERS:
             helper_is_trusted = helper in module_helpers and not _has_local_binding(
                 argument, helper, parents
             )

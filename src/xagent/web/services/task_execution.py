@@ -266,6 +266,45 @@ def _task_error_payload(
     return payload
 
 
+def _admit_asserted_code(
+    task_id: int,
+    asserted_code: object,
+    listed: frozenset[ClientErrorCode],
+    *,
+    component: str,
+    conflicts: bool = False,
+) -> ClientErrorCode | None:
+    """Return the caller-asserted code a frame builder may write, or ``None``.
+
+    The one rule for every builder that takes ``asserted_code``: the value
+    must be a ``ClientErrorCode`` member in that builder's own listed set,
+    and must not conflict with anything else the caller passed. An equal
+    plain string or a same-valued member of another enum fails the first
+    test. Anything else is dropped and logged with its stack, never raised:
+    a bad optional argument costs that argument and nothing else.
+    """
+
+    if asserted_code is None:
+        return None
+    # The type check comes first: an unhashable value would raise inside the
+    # membership test.
+    if (
+        conflicts
+        or not isinstance(asserted_code, ClientErrorCode)
+        or asserted_code not in listed
+    ):
+        logger.error(
+            "task_id=%s component=%s dropped=asserted_code value=%r; "
+            "the frame is still sent without it",
+            task_id,
+            component,
+            asserted_code,
+            stack_info=True,
+        )
+        return None
+    return asserted_code
+
+
 # Codes a caller states from an outcome it proved itself, as opposed to
 # ``code``, which is projected from an exception. Add a member in the change
 # that adds the call site asserting it; the runtime set is derived from this.
@@ -309,19 +348,13 @@ def create_terminal_task_error_event(
     # The exclusivity check reads ``code`` as passed, before its own gate
     # below can clear it: an assertion never rides along with a projected
     # failure, valid or not.
-    if asserted_code is not None and (
-        not isinstance(asserted_code, ClientErrorCode)
-        or asserted_code not in _CALLER_ASSERTED_TERMINAL_CODES
-        or code is not None
-    ):
-        logger.error(
-            "task_id=%s component=terminal-error-frame dropped=asserted_code "
-            "value=%r; the frame is still sent without it",
-            task_id,
-            asserted_code,
-            stack_info=True,
-        )
-        asserted_code = None
+    admitted_code = _admit_asserted_code(
+        task_id,
+        asserted_code,
+        _CALLER_ASSERTED_TERMINAL_CODES,
+        component="terminal-error-frame",
+        conflicts=code is not None,
+    )
 
     # Python annotations are not enforced at run time, so the mypy gate on the
     # signature above is not the whole door: a caller that routes through Any
@@ -364,8 +397,56 @@ def create_terminal_task_error_event(
     }
     if code is not None:
         event["code"] = code
-    elif asserted_code is not None:
-        event["code"] = asserted_code.value
+    elif admitted_code is not None:
+        event["code"] = admitted_code.value
+    return event
+
+
+# Codes a caller states on the ``agent_error`` frame that reports an
+# external-scope command's terminal outcome to the task's anonymous audience.
+# Same rule as ``CallerAssertedTerminalCode``: add a member in the change that
+# adds the call site asserting it; the runtime set is derived from this. The
+# two sets are disjoint: a code names one outcome on one kind of frame.
+CallerAssertedCommandErrorCode = Literal[ClientErrorCode.EXTERNAL_STOP_NOT_APPLIED]
+_CALLER_ASSERTED_COMMAND_ERROR_CODES: frozenset[ClientErrorCode] = frozenset(
+    get_args(CallerAssertedCommandErrorCode)
+)
+
+
+def create_external_command_error_event(
+    task_id: int,
+    message: str,
+    *,
+    asserted_code: CallerAssertedCommandErrorCode | None = None,
+) -> dict[str, Any]:
+    """Shape the ``agent_error`` an external-scope command's terminal outcome sends.
+
+    When an external-scope command's terminal failure is reported to the
+    task's audience, this is the frame. Not every one is reported: a cancel
+    rejected as ``task_not_found``, and a cancel whose target already
+    completed, end silently. The audience is anonymous, so the frame carries
+    the sentence, the task id and the time, and never the durable command
+    identity or the exception text.
+    ``asserted_code`` is the one way a code reaches it, written as
+    ``error_code`` - the field clients already read on ``agent_error`` - so a
+    client that does not render server prose still names the outcome. It is
+    admitted only from ``CallerAssertedCommandErrorCode``.
+    """
+
+    admitted_code = _admit_asserted_code(
+        task_id,
+        asserted_code,
+        _CALLER_ASSERTED_COMMAND_ERROR_CODES,
+        component="external-command-error-frame",
+    )
+    event: dict[str, Any] = {
+        "type": "agent_error",
+        "message": message,
+        "task_id": task_id,
+        "timestamp": datetime.now(timezone.utc).timestamp(),
+    }
+    if admitted_code is not None:
+        event["error_code"] = admitted_code.value
     return event
 
 

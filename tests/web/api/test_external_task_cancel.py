@@ -1018,7 +1018,14 @@ async def test_terminal_command_error_text_external(
     assert "command_id" not in payloads[0]
     assert str(raised.value) not in repr(payloads)
     assert command.command_id not in repr(payloads)
-    assert set(payloads[0]) == {"type", "message", "task_id", "timestamp"}
+    assert payloads[0]["error_code"] == "external_stop_not_applied"
+    assert set(payloads[0]) == {
+        "type",
+        "message",
+        "task_id",
+        "timestamp",
+        "error_code",
+    }
 
 
 def _exhausted_cancel_command(*, task_id: int, agent_id: int) -> ClaimedTaskCommand:
@@ -1038,24 +1045,28 @@ def _exhausted_cancel_command(*, task_id: int, agent_id: int) -> ClaimedTaskComm
     )
 
 
+_NOT_APPLIED = (EXTERNAL_CANCEL_NOT_APPLIED_MESSAGE, "external_stop_not_applied")
+# What the broadcast says for each status it answers, decided member by
+# member; COMPLETED is silent (tested below).
+_BROADCAST_BY_STATUS = {
+    TaskStatus.PENDING: _NOT_APPLIED,
+    TaskStatus.RUNNING: _NOT_APPLIED,
+    TaskStatus.PAUSED: _NOT_APPLIED,
+    TaskStatus.WAITING_FOR_USER: _NOT_APPLIED,
+    TaskStatus.FAILED: (EXTERNAL_TURN_INTERRUPTED_MESSAGE, None),
+}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("task_status", "expected_message"),
-    [
-        (TaskStatus.RUNNING, EXTERNAL_CANCEL_NOT_APPLIED_MESSAGE),
-        (TaskStatus.FAILED, EXTERNAL_TURN_INTERRUPTED_MESSAGE),
-        (TaskStatus.PAUSED, EXTERNAL_CANCEL_NOT_APPLIED_MESSAGE),
-    ],
-    ids=[
-        "still_running",
-        "already_failed",
-        "paused_is_still_alive",
-    ],
+    ("task_status", "expected"),
+    list(_BROADCAST_BY_STATUS.items()),
+    ids=[status.value for status in _BROADCAST_BY_STATUS],
 )
 async def test_terminal_command_error_text_follows_the_task_state(
     monkeypatch: pytest.MonkeyPatch,
     task_status: TaskStatus,
-    expected_message: str,
+    expected: tuple[str, str | None],
 ) -> None:
     """The exhausted-cancel wording asserts only what the task's state proves.
 
@@ -1081,7 +1092,10 @@ async def test_terminal_command_error_text_follows_the_task_state(
     )
 
     payloads = _broadcast_payloads(manager)
-    assert payloads[0]["message"] == expected_message
+    # The code rides on the "didn't go through" sentence and on nothing else.
+    assert (payloads[0]["message"], payloads[0].get("error_code")) == expected
+    # A new status must be classified here before this test can pass.
+    assert set(_BROADCAST_BY_STATUS) | {TaskStatus.COMPLETED} == set(TaskStatus)
 
 
 @pytest.mark.asyncio
@@ -1138,13 +1152,20 @@ def _external_cancel_command(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("task_kwargs", "target_state_version", "expected_message", "expected_code"),
+    (
+        "task_kwargs",
+        "target_state_version",
+        "expected_message",
+        "expected_code",
+        "expected_error_code",
+    ),
     [
         (
             {"state_version": 9},
             4,
             EXTERNAL_CANCEL_NOT_APPLIED_MESSAGE,
             TerminalTaskEventMessageCode.EXTERNAL_CANCEL_NOT_APPLIED,
+            "external_stop_not_applied",
         ),
         (
             {
@@ -1156,18 +1177,21 @@ def _external_cancel_command(
             4,
             EXTERNAL_TURN_INTERRUPTED_MESSAGE,
             TerminalTaskEventMessageCode.EXTERNAL_TURN_INTERRUPTED,
+            None,
         ),
         (
             {},
             None,
             EXTERNAL_CANCEL_NOT_APPLIED_MESSAGE,
             TerminalTaskEventMessageCode.EXTERNAL_CANCEL_NOT_APPLIED,
+            "external_stop_not_applied",
         ),
         (
             {"run_id": "run-successor"},
             4,
             EXTERNAL_CANCEL_NOT_APPLIED_MESSAGE,
             TerminalTaskEventMessageCode.EXTERNAL_CANCEL_NOT_APPLIED,
+            "external_stop_not_applied",
         ),
     ],
     ids=[
@@ -1183,6 +1207,7 @@ async def test_rejected_external_cancel_stale_run_broadcasts(
     target_state_version: int | None,
     expected_message: str,
     expected_code: TerminalTaskEventMessageCode,
+    expected_error_code: str | None,
 ) -> None:
     """A stale external cancel tells the visitor, through the real dispatch.
 
@@ -1221,7 +1246,10 @@ async def test_rejected_external_cancel_stale_run_broadcasts(
     payloads = _broadcast_payloads(manager)
     assert [payload["type"] for payload in payloads] == ["agent_error"]
     assert payloads[0]["message"] == expected_message
-    assert set(payloads[0]) == {"type", "message", "task_id", "timestamp"}
+    assert payloads[0].get("error_code") == expected_error_code
+    assert set(payloads[0]) == {"type", "message", "task_id", "timestamp"} | (
+        {"error_code"} if expected_error_code else set()
+    )
     assert raised.value.args[0] not in repr(payloads)
     draft = terminal_event_draft_for_error(raised.value)
     assert draft is not None
