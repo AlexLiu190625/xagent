@@ -117,9 +117,12 @@ async def test_error_after_prepare_settles_preclaimed_task_instead_of_orphaning_
     assert finalized == [TaskStatus.FAILED]
     assert managed.closed is True
     assert sent_messages == [
-        CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
-        if auto_unavailable
-        else "Sorry, an error occurred while processing your request."
+        (
+            CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+            if auto_unavailable
+            else "Sorry, an error occurred while processing your request."
+        )
+        + " (Task ID: 45)"
     ]
 
 
@@ -266,6 +269,7 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
         "expected_message_type",
         "expected_content",
         "expected_error",
+        "expected_chat_text",
     ),
     [
         (
@@ -274,6 +278,7 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
             "assistant_response",
             "completed reply",
             None,
+            "completed reply",
         ),
         (
             {
@@ -288,6 +293,7 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
             "question",
             "Please confirm",
             None,
+            "Please confirm\n\n• Continue?\n  Options: Yes, No",
         ),
         (
             {
@@ -300,6 +306,9 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
             "assistant_response",
             "Task execution failed.",
             "provider token=secret",
+            # The direct path appends the task id to the chat text only; the
+            # persisted transcript above stays exactly "Task execution failed.".
+            "Task execution failed. (Task ID: 45)",
         ),
     ],
 )
@@ -311,6 +320,7 @@ async def test_successful_channel_turn_persists_user_before_exact_assistant_sett
     expected_message_type: str,
     expected_content: str,
     expected_error: str | None,
+    expected_chat_text: str,
 ) -> None:
     bot = object.__new__(FeishuBotInstance)
     bot._initialize_batch_control()
@@ -396,8 +406,10 @@ async def test_successful_channel_turn_persists_user_before_exact_assistant_sett
     async def send_text(_chat_id: str, _text: str) -> str:
         return "loading-message-id"
 
-    async def update_text(*_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
-        return None
+    chat_texts: list[str] = []
+
+    async def update_text(*args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+        chat_texts.append(args[2])
 
     monkeypatch.setattr(
         "xagent.web.channels.feishu.bot.prepare_channel_task",
@@ -441,6 +453,7 @@ async def test_successful_channel_turn_persists_user_before_exact_assistant_sett
     await bot._process_messages_batch("open-id", [message])
 
     assert events == ["user-message", "execute", "assistant-settlement"]
+    assert chat_texts == [expected_chat_text]
     assert connector_turn_ids == execution_turn_ids == persisted_turn_ids
     assert len(connector_turn_ids) == 1
     assert connector_turn_ids[0]

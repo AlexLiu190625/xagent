@@ -1207,6 +1207,133 @@ def test_slack_only_handles_mentions_in_shared_channels() -> None:
 
 
 @pytest.mark.asyncio
+async def test_slack_direct_failed_result_appends_task_id_to_chat_text_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The direct path shows the task id in chat but keeps the transcript clean."""
+    bot = make_bot()
+    bot.active_tasks["T1:D1:U1:direct"] = 45
+    bot._save_active_tasks = lambda: None  # type: ignore[method-assign]
+    lease = TaskLease(task_id=45, runner_id="runner-a", run_id="run-a")
+    finalized: list[dict[str, Any]] = []
+    final_messages: list[dict[str, Any]] = []
+
+    class FakeManagedLease:
+        heartbeat_task = None
+
+        def __init__(self) -> None:
+            self.lease = lease
+
+        async def finalize_result(self, **kwargs: Any) -> bool:
+            finalized.append(kwargs)
+            return True
+
+        async def close(self) -> bool:
+            return True
+
+    managed = FakeManagedLease()
+
+    async def prepare(**_kwargs: Any) -> Any:
+        return SimpleNamespace(
+            user_id=5,
+            task_id=45,
+            is_new_task=False,
+            managed_lease=managed,
+        )
+
+    class FakeTracer:
+        def __init__(self) -> None:
+            self.handlers: list[Any] = []
+
+        def add_handler(self, handler: Any) -> None:
+            self.handlers.append(handler)
+
+    agent_service = SimpleNamespace(
+        workspace=None,
+        tracer=FakeTracer(),
+        set_conversation_history=lambda _messages,
+        *,
+        watermark=None,
+        event_watermark=None: None,
+        set_execution_context_messages=lambda _messages: None,
+        set_recovered_skill_context=lambda _context: None,
+    )
+    execution_result = {
+        "success": False,
+        "status": "error",
+        "output": "provider token=secret",
+        "error": "provider token=secret",
+    }
+
+    class FakeAgentManager:
+        async def get_agent_for_task(self, *_args: Any, **_kwargs: Any) -> Any:
+            return agent_service
+
+        async def execute_task(self, **_kwargs: Any) -> dict[str, Any]:
+            return execution_result
+
+    async def persist(**_kwargs: Any) -> None:
+        return None
+
+    async def send_text(
+        _channel_id: str,
+        _text: str,
+        *,
+        thread_ts: str | None,
+    ) -> str:
+        return "loading-ts"
+
+    async def send_final_text(**kwargs: Any) -> None:
+        final_messages.append(kwargs)
+
+    monkeypatch.setattr(
+        "xagent.web.channels.slack.bot.prepare_channel_task",
+        prepare,
+    )
+    monkeypatch.setattr(
+        "xagent.web.channels.slack.bot.load_task_setup_snapshot_sync",
+        lambda *_args: SimpleNamespace(
+            runtime_user=None,
+            conversation_history=(),
+            conversation_watermark=None,
+            conversation_event_watermark=None,
+            execution_recovery=TaskExecutionRecoverySnapshot(),
+            task=SimpleNamespace(source="internal"),
+        ),
+    )
+    monkeypatch.setattr(
+        "xagent.web.channels.slack.bot.get_agent_manager",
+        lambda: FakeAgentManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.web.channels.slack.bot.persist_channel_user_message",
+        persist,
+    )
+    bot._send_text = send_text  # type: ignore[method-assign]
+    bot._send_final_text = send_final_text  # type: ignore[method-assign]
+
+    await bot._process_event(
+        "T1:D1:U1:direct",
+        {},
+        {
+            "type": "message",
+            "channel_type": "im",
+            "channel": "D1",
+            "user": "U1",
+            "ts": "1.0",
+            "text": "hello",
+        },
+    )
+
+    assert [message["text"] for message in final_messages] == [
+        "Task execution failed. (Task ID: 45)"
+    ]
+    assert len(finalized) == 1
+    assert finalized[0]["status"] == TaskStatus.FAILED
+    assert finalized[0]["assistant_content"] == "Task execution failed."
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("auto_unavailable", [False, True])
 @pytest.mark.parametrize("is_new_task", [False, True])
 async def test_slack_turn_reuses_channel_runtime_and_reports_auto_failure(
@@ -1353,7 +1480,9 @@ async def test_slack_turn_reuses_channel_runtime_and_reports_auto_failure(
     assert bot.active_tasks == {"T1:D1:U1:direct": 45}
     if auto_unavailable:
         assert finalized == [(TaskStatus.FAILED, "")]
-        assert final_messages == [{"text": CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE}]
+        assert final_messages == [
+            {"text": f"{CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE} (Task ID: 45)"}
+        ]
         assert managed.closed is True
         return
     assert persisted[0]["content"] == "hello"

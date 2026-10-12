@@ -164,6 +164,35 @@ def test_project_empty_failure_has_no_diagnostic_and_uses_safe_display() -> None
     assert projection.interactions == []
 
 
+def test_project_failure_appends_task_id_to_visible_text_only() -> None:
+    projection = project_execution_result_for_channel(
+        {"success": False, "status": "error", "error": "boom"}, task_id=45
+    )
+
+    assert projection.task_status == TaskStatus.FAILED
+    assert projection.visible_text == "Task execution failed. (Task ID: 45)"
+    assert projection.transcript_content == "Task execution failed."
+    assert projection.diagnostic_error == "boom"
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"success": True, "status": "completed", "output": "done"},
+        {"success": True, "status": "interrupted", "output": "partial"},
+        {"success": False, "status": "waiting_for_user", "output": "Need input."},
+    ],
+)
+def test_project_non_failure_ignores_task_id(result: dict) -> None:
+    assert project_execution_result_for_channel(
+        result, task_id=45
+    ) == project_execution_result_for_channel(result)
+    assert (
+        "Task ID"
+        not in project_execution_result_for_channel(result, task_id=45).visible_text
+    )
+
+
 @pytest.mark.parametrize(
     "result, expected",
     [

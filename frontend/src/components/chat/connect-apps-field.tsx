@@ -15,6 +15,8 @@ import type { Interaction } from "@/contexts/app-context-chat";
 import { capitalize } from "@/lib/tool-category-labels";
 import { findMatchingMcpApp } from "@/lib/mcp-lookup";
 import { ApiKeyConnectDialog, CONNECT_TIMEOUT_MS, handleIconLoadError } from "./api-key-connect-dialog";
+import { useOAuthAccountStep } from "@/components/mcp/oauth-account-dialog";
+import type { OAuthAccountInput } from "@/lib/oauth-account";
 
 // The 11 builtin-OAuth providers (see src/xagent/web/builtin_mcp_registry.py's
 // get_builtin_oauth_provider_rows) - brand names, left untranslated in both
@@ -206,6 +208,7 @@ export function ConnectAppsField({
   // withdraw, unlike the bare-OAuth-popup or keyless paths that merely open a
   // redundant popup or hit an idempotent backend.
   const connectingKeysRef = useRef<Set<string>>(new Set());
+  const { requestAccount, accountDialog } = useOAuthAccountStep();
 
   useEffect(() => {
     isMountedRef.current = true;
@@ -271,8 +274,32 @@ export function ConnectAppsField({
     }
   };
 
-  const handleConnectOAuth = (group: OAuthProviderGroup) =>
-    withConnectingKey(providerConnectingKey(group.provider), async () => {
+  // A provider hosted on the customer's own account needs the account label
+  // before any login, the bare batch login included, so the field is taken
+  // from whichever app in the group carries it.
+  const requestGroupAccount = (group: OAuthProviderGroup, input: OAuthAccountInput, retry = false) => {
+    const unconnectedApps = group.apps.filter((app) => !app.is_connected);
+    if (unconnectedApps.length === 0) return;
+    const onlyApp = unconnectedApps.length === 1 ? unconnectedApps[0] : undefined;
+    requestAccount(
+      {
+        key: providerConnectingKey(group.provider),
+        name: onlyApp ? onlyApp.name : PROVIDER_DISPLAY_NAMES[group.provider] || capitalize(group.provider),
+        icon: onlyApp?.icon,
+        input,
+        onSubmit: (account) => void handleConnectOAuth(group, account),
+      },
+      { retry }
+    );
+  };
+
+  const handleConnectOAuth = (group: OAuthProviderGroup, account?: string) => {
+    const accountInput = group.apps.find((app) => app.oauth_account_input)?.oauth_account_input;
+    if (accountInput && account === undefined) {
+      requestGroupAccount(group, accountInput);
+      return;
+    }
+    return withConnectingKey(providerConnectingKey(group.provider), async () => {
       const unconnectedApps = group.apps.filter((app) => !app.is_connected);
       if (unconnectedApps.length === 0) return;
       // More than one app still needs connecting: run the bare, app_id-less
@@ -307,9 +334,18 @@ export function ConnectAppsField({
       // instead of an unhandled promise rejection with connectingKeys stuck
       // showing "Connecting...".
       try {
-        const result = await openBuiltinOAuthPopup({ provider: group.provider, appId, token });
+        const result = await openBuiltinOAuthPopup({
+          provider: group.provider,
+          appId,
+          token,
+          account,
+        });
         if (!isMountedRef.current) return;
-        if (!result.success) {
+        if (!result.success && accountInput && !result.popupBlocked) {
+          // The server's own error page, if any, was shown in the popup; the
+          // reopened step's retry hint stands in for the failure toast.
+          requestGroupAccount(group, accountInput, true);
+        } else if (!result.success) {
           toast.error(
             t(
               result.popupBlocked
@@ -327,6 +363,7 @@ export function ConnectAppsField({
         }
       }
     });
+  };
 
   const handleConnectMcpOAuth = (app: McpApp) =>
     withConnectingKey(appConnectingKey(app.id), async () => {
@@ -525,6 +562,7 @@ export function ConnectAppsField({
         }}
         onConnected={refresh}
       />
+      {accountDialog}
     </div>
   );
 }

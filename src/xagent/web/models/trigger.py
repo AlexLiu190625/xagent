@@ -27,6 +27,10 @@ class TriggerType(str, enum.Enum):
     GMAIL = "gmail"
 
 
+# Idempotency-key prefix of a manual test fire; the only marker on the run row.
+TEST_TRIGGER_RUN_KEY_PREFIX = "trigger-run:test:"
+
+
 class TriggerRunStatus(str, enum.Enum):
     PENDING = "pending"
     RUNNING = "running"

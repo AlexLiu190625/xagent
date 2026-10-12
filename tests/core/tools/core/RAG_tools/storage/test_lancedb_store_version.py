@@ -250,6 +250,66 @@ class TestCleanupCascadeByScope:
         assert "chunks" in result
         assert "parses" in result
 
+    @pytest.mark.parametrize(
+        ("scope", "expected"),
+        [
+            ("parse", {"embeddings": 2, "chunks": 2}),
+            ("chunk", {"embeddings": 2}),
+        ],
+    )
+    def test_no_hashes_targets_untagged_main_pointer_rows_only(
+        self, isolated_store, scope, expected
+    ):
+        """With neither hash, the untagged main pointer picks the rows to delete."""
+        from xagent.core.tools.core.RAG_tools.storage.factory import (
+            get_main_pointer_store,
+        )
+
+        store = isolated_store
+        coll, doc = "cc_ptr", "cc_ptr_doc"
+        store.upsert_parses(
+            [_make_parse_row(coll, doc, "main_hash"), _make_parse_row(coll, doc, "x")]
+        )
+        store.upsert_chunks(
+            [
+                _make_chunk_row(coll, doc, "main_hash", "m1"),
+                _make_chunk_row(coll, doc, "main_hash", "m2"),
+                _make_chunk_row(coll, doc, "x", "x1"),
+            ]
+        )
+        store.upsert_embeddings(
+            "m1",
+            [
+                {
+                    "collection": coll,
+                    "doc_id": doc,
+                    "chunk_id": c,
+                    "parse_hash": h,
+                    "model": "m1",
+                    "vector": [0.1, 0.2],
+                    "vector_dimension": 2,
+                    "text": c,
+                    "chunk_hash": "ch_" + c,
+                    "created_at": datetime.now(timezone.utc),
+                    "metadata": "{}",
+                    "user_id": None,
+                }
+                for h, c in [("main_hash", "m1"), ("main_hash", "m2"), ("x", "x1")]
+            ],
+        )
+
+        def preview():
+            return store.cleanup_cascade_by_scope(
+                coll, doc, scope, preview_only=True, confirm=False
+            )
+
+        assert preview() == {"embeddings": 0}
+
+        get_main_pointer_store().set_main_pointer(
+            coll, doc, scope, f"{scope}_v1", "main_hash"
+        )
+        assert preview() == expected
+
     def test_document_scope_returns_6_keys(self, isolated_store):
         """cleanup_cascade_by_scope scope=document returns 6-key dict."""
         store = isolated_store

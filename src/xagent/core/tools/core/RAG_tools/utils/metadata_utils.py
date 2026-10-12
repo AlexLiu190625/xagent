@@ -36,6 +36,23 @@ def serialize_metadata(metadata: Optional[Dict[str, Any]]) -> Optional[str]:
     return json.dumps(metadata, ensure_ascii=False, sort_keys=True)
 
 
+CONTENT_HASH_KEY = "content_hash"  # file content a chunk was made from
+
+
+def content_hash_or_empty(value: Any) -> str:
+    """A file hash; a missing value or pandas NaN reads as none."""
+    return value if isinstance(value, str) else ""
+
+
+def recorded_content_hash(parse_record: Any) -> str:
+    """The file hash a parse row was made from; none for an old or unreadable row."""
+    try:
+        value = json.loads(parse_record.params_json or "{}").get(CONTENT_HASH_KEY)
+    except (AttributeError, TypeError, ValueError):
+        return ""
+    return content_hash_or_empty(value)
+
+
 def deserialize_metadata(metadata_json: Optional[str]) -> Optional[Dict[str, Any]]:
     """Deserialize metadata JSON string from database to dictionary.
 

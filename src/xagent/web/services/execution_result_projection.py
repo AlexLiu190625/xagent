@@ -12,6 +12,7 @@ from .client_error_messages import (
     CLIENT_SAFE_TASK_FAILURE,
     mask_provider_secrets,
     model_error_client_projection,
+    with_task_reference,
 )
 
 EMPTY_CHANNEL_OUTPUT_FALLBACK = "Task completed, but no output was generated."
@@ -133,8 +134,16 @@ class ChannelExecutionProjection:
 
 def project_execution_result_for_channel(
     result: dict[str, Any],
+    *,
+    task_id: int | None = None,
 ) -> ChannelExecutionProjection:
-    """Project an execution result into the state chat channels should consume."""
+    """Project an execution result into the state chat channels should consume.
+
+    When ``task_id`` is given, the visible failure text ends with a reportable
+    task reference; the transcript content never carries it. The default
+    ``None`` keeps the visible failure text exactly ``CLIENT_SAFE_TASK_FAILURE``
+    for callers that compare against it.
+    """
     status = str(result.get("status") or "")
     chat_response = result.get("chat_response")
     chat_message = ""
@@ -163,8 +172,8 @@ def project_execution_result_for_channel(
         transcript_content = ""
         interactions = []
     elif task_status == TaskStatus.FAILED:
-        base_text = CLIENT_SAFE_TASK_FAILURE
-        transcript_content = base_text
+        transcript_content = CLIENT_SAFE_TASK_FAILURE
+        base_text = with_task_reference(CLIENT_SAFE_TASK_FAILURE, task_id)
         interactions = []
     elif not base_text.strip() and not interactions:
         base_text = EMPTY_CHANNEL_OUTPUT_FALLBACK

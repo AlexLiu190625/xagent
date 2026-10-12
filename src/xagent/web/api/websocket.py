@@ -71,6 +71,7 @@ from ..models.user import User
 from ..services import task_command_execution as command_execution_service
 from ..services import task_start as task_start_service
 from ..services.assistant_history_safety import (
+    TASK_FAILURE_MESSAGE_TYPE,
     assistant_history_has_safe_ancillary_payload,
     client_safe_assistant_history_content,
 )
@@ -124,7 +125,10 @@ from ..services.public_trace_events import (
     normalize_public_trace_event,
     public_task_trace_filter,
 )
-from ..services.task_auto_recovery import current_auto_recovery_view
+from ..services.task_auto_recovery import (
+    current_auto_recovery_view,
+    is_auto_resume_command_id,
+)
 from ..services.task_command_execution import _read_task_error_payload_offloop
 from ..services.task_command_transport import (
     COMMAND_FAILED,
@@ -1726,6 +1730,20 @@ async def _enqueue_websocket_task_command(
             "Reserved field 'scope' is not accepted from clients",
             error_code=ClientErrorCode.INVALID_MESSAGE,
         )
+    # ``auto_resume`` and the ``auto-resume:`` id namespace belong to the
+    # auto-resume sweeper: a RESUME carrying both passes for the sweeper's
+    # own, so a client may name neither. The transport refuses the prefix
+    # too; this check answers the sender with a precise error code.
+    if "auto_resume" in payload:
+        raise ClientVisibleValidationError(
+            "Reserved field 'auto_resume' is not accepted from clients",
+            error_code=ClientErrorCode.INVALID_MESSAGE,
+        )
+    if is_auto_resume_command_id(resolved_command_id.strip()):
+        raise ClientVisibleValidationError(
+            "Command ids starting with 'auto-resume:' are reserved",
+            error_code=ClientErrorCode.INVALID_MESSAGE,
+        )
     if kind == TaskCommandKind.MESSAGE:
         # The durable command identity is also the delivery/turn identity.
         # This remains stable across retries even when an API client omitted
@@ -2592,6 +2610,12 @@ def _load_historical_stream_snapshot_sync(
                     }
                     if isinstance(interactions, list):
                         data["metadata"] = {"interactions": interactions}
+                    # Only the failure provenance is exposed: the client marks
+                    # the replayed bubble failed (and shows the task id). Other
+                    # types stay hidden, e.g. ``question`` would re-arm the
+                    # expects-response path that ``expect_response`` disables.
+                    if chat_message.message_type == TASK_FAILURE_MESSAGE_TYPE:
+                        data["message_type"] = TASK_FAILURE_MESSAGE_TYPE
                     event_type = "agent_message"
                 else:
                     continue

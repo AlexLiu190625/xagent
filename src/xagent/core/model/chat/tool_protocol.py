@@ -21,6 +21,7 @@ def tool_protocol_error_response(
     violation: ToolProtocolViolation,
     *,
     raw: Any = None,
+    finish_reason: Any = None,
 ) -> dict[str, Any]:
     # ``tool_calls`` is always ``[]`` here, never the violating call: callers
     # that only persist reasoning-replay state for tool-call turns (e.g.
@@ -34,6 +35,11 @@ def tool_protocol_error_response(
     }
     if raw is not None:
         response["raw"] = raw
+    # The streamed envelope carries the stop reason (runtime stamps it), so a
+    # non-streamed one must too: it is how a call cut off at the output limit
+    # is told apart from a model that wrote bad JSON.
+    if isinstance(finish_reason, str) and finish_reason:
+        response["finish_reason"] = finish_reason
     return response
 
 

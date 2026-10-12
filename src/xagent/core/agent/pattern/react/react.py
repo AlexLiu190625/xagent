@@ -158,6 +158,13 @@ from .duplicate_write_guard import (
     build_suppression_envelope,
     tool_requires_duplicate_write_guard,
 )
+from .truncation import (
+    TRUNCATED_TOOL_ARGUMENTS,
+    TRUNCATED_TOOL_ARGUMENTS_ERROR,
+    is_truncated_tool_call,
+    response_finish_reason,
+    truncated_tool_arguments_instruction,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -251,6 +258,8 @@ class ToolCallRecord:
     # ``turn_id`` so the original call keeps its execution identity while the
     # duplicate-write guard can protect the one resumed turn that follows it.
     settlement_turn_id: str | None = None
+    # Durable obligation to emit both settlement lifecycle trace events.
+    settlement_trace_pending: bool = False
     # The ReAct step that issued the call. Persisted so a rebuilt runtime can
     # resume the exact gate identity instead of inventing a new execution slot.
     step_id: str | None = None
@@ -271,6 +280,7 @@ class ToolCallRecord:
             "settlement_status": self.settlement_status,
             "turn_id": self.turn_id,
             "settlement_turn_id": self.settlement_turn_id,
+            "settlement_trace_pending": self.settlement_trace_pending,
             "step_id": self.step_id,
             "issued_at": self.issued_at,
         }
@@ -299,6 +309,7 @@ class ToolCallRecord:
                 if data.get("settlement_turn_id") is not None
                 else None
             ),
+            settlement_trace_pending=bool(data.get("settlement_trace_pending", False)),
             step_id=str(data["step_id"]) if data.get("step_id") else None,
             issued_at=(
                 float(data["issued_at"]) if data.get("issued_at") is not None else None
@@ -332,8 +343,12 @@ _INTERACTION_TRIM_CHARS = (
 )  # 30 code points
 
 
-def _normalize_interaction_text(value: str) -> str:
+def normalize_interaction_text(value: str) -> str:
     """Strip every code point either Python or JavaScript treats as trimmable.
+
+    Public because modules outside this one judge interaction text against
+    the same table; ``_normalize_interaction_text`` below is the same
+    function under its earlier private name, kept for existing callers.
 
     One pass over one union table, deliberately -- not ``value.strip()``
     followed by a second pass over the JavaScript-only characters.
@@ -355,6 +370,9 @@ def _normalize_interaction_text(value: str) -> str:
     "optimize" this back into two passes.
     """
     return value.strip(_INTERACTION_TRIM_CHARS)
+
+
+_normalize_interaction_text = normalize_interaction_text
 
 
 def _is_non_blank_str(value: Any) -> bool:
@@ -829,6 +847,7 @@ class ReActPattern(AgentPattern):
                 context=context,
                 runtime=runtime,
             )
+            await self._replay_unemitted_settlement_traces(runtime=runtime)
             result = await self._run_tool_calling_loop(
                 context=context,
                 tools=context_tools,
@@ -1231,6 +1250,7 @@ class ReActPattern(AgentPattern):
                         empty_final_answer=(
                             self._empty_final_answer_call(normalized) is not None
                         ),
+                        response=response,
                     )
                 if answer_streamer is not None:
                     await answer_streamer.fail(INVALID_TOOL_PROTOCOL_RETRYING_REASON)
@@ -1269,7 +1289,12 @@ class ReActPattern(AgentPattern):
                     # Handing this one the full tool set would run ordinary
                     # work there, so stop as the loop does at its bound.
                     break
-                empty_final_answer = self._empty_final_answer_call(normalized)
+                truncated = is_truncated_tool_call(response)
+                # A cut-off final_answer has its arguments dropped, so it looks
+                # empty; the truncation is the cause the retry has to address.
+                empty_final_answer = (
+                    None if truncated else self._empty_final_answer_call(normalized)
+                )
                 if empty_final_answer is not None:
                     logger.warning(
                         "ReAct final_answer carried no answer text; discarding the "
@@ -1277,12 +1302,23 @@ class ReActPattern(AgentPattern):
                         iteration,
                         sorted(self._tool_call_args_dict(empty_final_answer), key=str),
                     )
+                protocol_error = get_tool_protocol_error(response)
                 if recover_full_tool_set:
                     recovery_reason: str | None = "unavailable_tool_call"
+                elif truncated and not settlement_fence:
+                    # A fenced turn keeps its own instruction: it must not be
+                    # steered back toward work tools.
+                    recovery_reason = TRUNCATED_TOOL_ARGUMENTS
                 elif empty_final_answer is not None:
                     recovery_reason = "empty_final_answer"
                 elif settlement_fence:
                     recovery_reason = "settlement_final_answer_required"
+                elif (
+                    protocol_error is not None
+                    and protocol_error.get("code") == "malformed_tool_arguments"
+                ):
+                    # The same repair the raised form of this error gets.
+                    recovery_reason = "malformed_tool_arguments"
                 else:
                     recovery_reason = None
                 try:
@@ -1330,6 +1366,7 @@ class ReActPattern(AgentPattern):
                         empty_final_answer=(
                             self._empty_final_answer_call(normalized) is not None
                         ),
+                        response=response,
                     )
             original_tool_calls = normalized.get("tool_calls") or []
             kept_tool_calls, stripped_final_answers = (
@@ -1556,8 +1593,16 @@ class ReActPattern(AgentPattern):
         answer_streamer: ReActFinalAnswerStreamer | None,
         stream_failure_message: str,
         empty_final_answer: bool = False,
+        response: Any = None,
     ) -> dict[str, Any]:
         """Abandon the run after the one repair attempt failed.
+
+        ``response`` is the rejected last response. Its protocol code and stop
+        reason go on the result, so a call cut off at the output limit fails
+        as ``truncated_tool_arguments`` rather than as a generic violation.
+        A cut-off response also overrides the caller's ``empty_final_answer``:
+        a cut-off ``final_answer`` only looks empty because its arguments were
+        dropped, and the run did not end for lack of an answer.
 
         ``empty_final_answer`` distinguishes "the model never produced an answer"
         from the status's other producers (provider protocol errors, mixed
@@ -1567,12 +1612,27 @@ class ReActPattern(AgentPattern):
         produced an answer" - see ``agent_tool._classify_delegated_failure``.
         """
 
+        truncated = is_truncated_tool_call(response)
+        if truncated:
+            # A cut-off final_answer only looks empty: its arguments were dropped.
+            empty_final_answer = False
+        protocol_error = get_tool_protocol_error(response)
+        protocol_code: str | None
+        if truncated:
+            protocol_code = TRUNCATED_TOOL_ARGUMENTS
+        elif protocol_error is not None:
+            protocol_code = protocol_error.get("code")
+        else:
+            protocol_code = None
+        finish_reason = response_finish_reason(response)
         logger.warning(
             "ReAct failing the run after an invalid tool protocol: %s "
-            "(iteration=%s empty_final_answer=%s)",
+            "(iteration=%s empty_final_answer=%s code=%s finish_reason=%s)",
             stream_failure_message,
             iteration,
             empty_final_answer,
+            protocol_code,
+            finish_reason,
         )
         if answer_streamer is not None:
             await answer_streamer.fail(stream_failure_message)
@@ -1585,21 +1645,31 @@ class ReActPattern(AgentPattern):
             pattern=self,
             metadata={"iteration": iteration},
         )
-        error = (
-            "The model called final_answer without an answer twice, so the run "
-            "produced no response."
-            if empty_final_answer
-            else "The model returned an invalid tool protocol response "
-            "after one repair attempt."
-        )
+        if truncated:
+            error = TRUNCATED_TOOL_ARGUMENTS_ERROR
+        elif empty_final_answer:
+            error = (
+                "The model called final_answer without an answer twice, so the "
+                "run produced no response."
+            )
+        else:
+            error = (
+                "The model returned an invalid tool protocol response "
+                "after one repair attempt."
+            )
+        metadata: dict[str, Any] = {
+            "iterations": iteration + 1,
+            "status": "invalid_tool_protocol",
+            "empty_final_answer": empty_final_answer,
+        }
+        if protocol_code:
+            metadata["protocol_code"] = protocol_code
+        if finish_reason:
+            metadata["finish_reason"] = finish_reason
         return PatternResult(
             success=False,
             error=error,
-            metadata={
-                "iterations": iteration + 1,
-                "status": "invalid_tool_protocol",
-                "empty_final_answer": empty_final_answer,
-            },
+            metadata=metadata,
         ).to_dict()
 
     async def _close_streamed_answer(
@@ -1935,6 +2005,11 @@ class ReActPattern(AgentPattern):
                 "complete user-facing response in its answer field."
             )
             retry_phase = "malformed_tool_arguments_recovery"
+        elif recovery_reason == TRUNCATED_TOOL_ARGUMENTS:
+            retry_instruction = truncated_tool_arguments_instruction(
+                self._schema_tool_names(tools), force_final_answer=force_final_answer
+            )
+            retry_phase = "truncated_tool_arguments_recovery"
         elif recovery_reason == "empty_final_answer":
             # On a forced turn ``tools`` above holds no work tool, so offering
             # one would instruct the model to do something the schema forbids
@@ -2064,6 +2139,10 @@ class ReActPattern(AgentPattern):
         without it only final_answer is allowed.
         """
         if get_tool_protocol_error(normalized.get("raw")) is not None:
+            return True
+        if is_truncated_tool_call(normalized.get("raw")):
+            # Unvalidated providers pass cut-off arguments through; running
+            # the call would hand the tool a fragment of what was asked.
             return True
         allowed_names = allowed_tool_names or frozenset({"final_answer"})
         tool_calls = normalized.get("tool_calls") or []
@@ -2919,6 +2998,7 @@ class ReActPattern(AgentPattern):
             # turn, ReAct step) instead of inventing a new one.
             resume_call = {
                 "id": str(pending.get("tool_call_id") or ""),
+                "invocation_id": record.invocation_id,
                 "name": tool_name,
                 "turn_id": record.turn_id,
                 "step_id": record.step_id,
@@ -2948,14 +3028,16 @@ class ReActPattern(AgentPattern):
                         "external outcome is unknown and automatic retry is disabled."
                     )
                 )
-            settled = isinstance(resumed, ToolInteractionSettlement)
+            settlement = (
+                resumed if isinstance(resumed, ToolInteractionSettlement) else None
+            )
 
             popped = False
             try:
-                if settled:
+                if settlement is not None:
                     self._project_tool_interaction_settlement(
                         record=record,
-                        settlement=resumed,
+                        settlement=settlement,
                         context=context,
                         runtime=runtime,
                     )
@@ -2975,7 +3057,9 @@ class ReActPattern(AgentPattern):
                         "tool_call_id": pending.get("tool_call_id", ""),
                         "invocation_id": record.invocation_id,
                         "interaction_id": pending.get("interaction_id", ""),
-                        "settlement_status": resumed.status if settled else None,
+                        "settlement_status": (
+                            settlement.status if settlement is not None else None
+                        ),
                     },
                 )
             except BaseException:
@@ -2988,10 +3072,19 @@ class ReActPattern(AgentPattern):
                 if popped:
                     self.pending_tool_interaction_responses.insert(0, pending)
                 raise
-            if settled:
+            if settlement is not None:
+                settled_record = (
+                    self._find_tool_record(
+                        tool_call_id=record.tool_call_id,
+                        invocation_id=record.invocation_id,
+                    )
+                    or record
+                )
                 await self._trace_tool_interaction_settlement(
-                    record=record,
-                    settlement=resumed,
+                    record=settled_record,
+                    status=settlement.status,
+                    result=settled_record.result,
+                    error=settled_record.error,
                     runtime=runtime,
                 )
 
@@ -3026,7 +3119,10 @@ class ReActPattern(AgentPattern):
 
         tool_name = str(pending.get("tool_name") or "")
         tool_call_id = str(pending.get("tool_call_id") or "")
-        candidate = self._record_for_tool_call_id(tool_call_id)
+        candidate = self._find_tool_record(
+            tool_call_id=tool_call_id,
+            invocation_id=self._normalized_invocation_id(pending.get("invocation_id")),
+        )
         # Only a record for this exact call AND this exact tool is ours.
         record = (
             candidate
@@ -3115,9 +3211,18 @@ class ReActPattern(AgentPattern):
             if popped:
                 self.pending_tool_interaction_responses.insert(0, pending)
             raise
+        settled_record = (
+            self._find_tool_record(
+                tool_call_id=record.tool_call_id,
+                invocation_id=record.invocation_id,
+            )
+            or record
+        )
         await self._trace_tool_interaction_settlement(
-            record=record,
-            settlement=settlement,
+            record=settled_record,
+            status=settlement.status,
+            result=settled_record.result,
+            error=settled_record.error,
             runtime=runtime,
         )
 
@@ -3158,41 +3263,31 @@ class ReActPattern(AgentPattern):
         self,
         *,
         record: ToolCallRecord,
-        settlement: ToolInteractionSettlement,
+        status: str,
+        result: Any,
+        error: str | None,
         runtime: PatternRuntime,
     ) -> None:
-        """Emit a paired lifecycle after the settlement is durably checkpointed.
-
-        The pause already emitted a full start/end pair for this tool_call_id
-        (the end carrying ``waiting_for_user``), so the frontend renderer needs
-        a fresh *running* action before it can close the call — an unpaired end
-        event would be mis-attributed to an unrelated card. The events are
-        written straight to the tracer rather than through
-        ``runtime.on_tool_start``: that method unconditionally calls
-        ``add_tool_call_usage(1)``, which would durably bill the user a second
-        tool call for a resume that executes no tool. The payload otherwise
-        mirrors what ``PatternRuntime.on_tool_start`` / ``on_tool_end`` /
-        ``on_tool_error`` write, and the ``settlement_delivery`` marker lets
-        consumers tell a settlement pair from an execution pair.
-        """
+        """Emit the durable settlement lifecycle without billing another call."""
 
         tracer = getattr(runtime, "tracer", None)
         trace_event = getattr(tracer, "trace_event", None)
         if not callable(trace_event):
             return
-        result = settlement.projected_result()
-        succeeded = settlement.status == "succeeded"
+        succeeded = status == "succeeded"
         base: dict[str, Any] = {
             "tool_name": record.tool_name,
             "tool_call_id": record.tool_call_id,
             "settlement_delivery": True,
-            "settlement_status": settlement.status,
+            "settlement_status": status,
         }
         if record.invocation_id:
             base["invocation_id"] = record.invocation_id
-        turn_id = getattr(runtime, "active_turn_id", None)
+        turn_id = record.settlement_turn_id or getattr(runtime, "active_turn_id", None)
         if turn_id:
             base["turn_id"] = str(turn_id)
+        if record.issued_at is not None:
+            base["original_started_at"] = record.issued_at
         start_data = {**base, "tool_params": copy.deepcopy(record.args)}
         if succeeded:
             end_type = TraceEventType(
@@ -3206,8 +3301,7 @@ class ReActPattern(AgentPattern):
             }
         else:
             error_message = str(
-                settlement.error
-                or (result.get("error") if isinstance(result, dict) else result)
+                error or (result.get("error") if isinstance(result, dict) else result)
             )
             end_type = TraceEventType(
                 TraceScope.ACTION, TraceAction.ERROR, TraceCategory.TOOL
@@ -3220,18 +3314,50 @@ class ReActPattern(AgentPattern):
                 "result": result,
                 "success": False,
             }
-        await self._emit_settlement_trace_event(
+        settlement_step_id = record.step_id or getattr(
+            runtime, "active_react_step_id", None
+        )
+        started = await self._emit_settlement_trace_event(
             trace_event,
             TraceEventType(TraceScope.ACTION, TraceAction.START, TraceCategory.TOOL),
             runtime=runtime,
+            step_id=settlement_step_id,
             data=start_data,
         )
-        await self._emit_settlement_trace_event(
+        ended = await self._emit_settlement_trace_event(
             trace_event,
             end_type,
             runtime=runtime,
+            step_id=settlement_step_id,
             data=end_data,
         )
+        if started and ended:
+            self._clear_settlement_trace_pending(record)
+
+    def _clear_settlement_trace_pending(self, settled_record: ToolCallRecord) -> None:
+        record = self._find_tool_record(
+            tool_call_id=settled_record.tool_call_id,
+            invocation_id=settled_record.invocation_id,
+        )
+        if record is None or not record.settlement_trace_pending:
+            return
+        self.tool_ledger[self._ledger_key(record)] = replace(
+            record, settlement_trace_pending=False
+        )
+
+    async def _replay_unemitted_settlement_traces(
+        self, *, runtime: PatternRuntime
+    ) -> None:
+        for record in list(self.tool_ledger.values()):
+            if not (record.settlement_status and record.settlement_trace_pending):
+                continue
+            await self._trace_tool_interaction_settlement(
+                record=record,
+                status=record.settlement_status,
+                result=record.result,
+                error=record.error,
+                runtime=runtime,
+            )
 
     @staticmethod
     async def _emit_settlement_trace_event(
@@ -3239,28 +3365,26 @@ class ReActPattern(AgentPattern):
         event_type: TraceEventType,
         *,
         runtime: PatternRuntime,
+        step_id: str | None,
         data: dict[str, Any],
-    ) -> None:
-        """Persist settlement facts strictly and deliver observers best-effort."""
+    ) -> bool:
+        """Require persistence and report whether the trace event landed."""
 
         execution_id = getattr(runtime, "execution_id", None)
-        step_id = getattr(runtime, "active_react_step_id", None)
         try:
             emitted = trace_event(
                 event_type,
                 task_id=str(execution_id or ""),
                 step_id=str(step_id or execution_id or "root"),
                 data=data,
+                require_persisted=True,
             )
             if inspect.isawaitable(emitted):
                 await emitted
-        except ExecutionEventPersistenceError:
-            raise
         except Exception:
-            # UI trace events are best-effort, exactly as in
-            # PatternRuntime._emit_trace_event; a tracer fault must not undo a
-            # settlement that is already durable.
             logger.debug("settlement trace event failed", exc_info=True)
+            return False
+        return True
 
     def _validate_tool_interaction_settlement_target(
         self,
@@ -3271,7 +3395,11 @@ class ReActPattern(AgentPattern):
         """Validate every durable identity before a resume callback can run."""
 
         tool_call_id = str(pending.get("tool_call_id") or "")
-        record = self._record_for_tool_call_id(tool_call_id)
+        invocation_id = self._normalized_invocation_id(pending.get("invocation_id"))
+        record = self._find_tool_record(
+            tool_call_id=tool_call_id,
+            invocation_id=invocation_id,
+        )
         if record is None:
             raise RuntimeError(
                 "Cannot settle resumed tool interaction without its original "
@@ -3297,6 +3425,11 @@ class ReActPattern(AgentPattern):
             for message in messages
             if getattr(message, "role", None) == "tool"
             and getattr(message, "tool_call_id", None) == tool_call_id
+            and (
+                not invocation_id
+                or getattr(message, "metadata", {}).get("invocation_id")
+                == invocation_id
+            )
         ]
         if len(matches) != 1:
             raise RuntimeError(
@@ -3359,6 +3492,7 @@ class ReActPattern(AgentPattern):
                 result=result,
                 settlement_status=settlement.status,
                 settlement_turn_id=settlement_turn_id,
+                settlement_trace_pending=True,
             )
         else:
             error = str(
@@ -3372,6 +3506,7 @@ class ReActPattern(AgentPattern):
                 error=error,
                 settlement_status=settlement.status,
                 settlement_turn_id=settlement_turn_id,
+                settlement_trace_pending=True,
             )
         # A rejection or an unknown dispatch anywhere in the delivery batch is
         # an authorization boundary for the whole resumed turn. Maintainers
@@ -3446,6 +3581,11 @@ class ReActPattern(AgentPattern):
             for index, message in enumerate(messages)
             if getattr(message, "role", None) == "tool"
             and getattr(message, "tool_call_id", None) == tool_call_id
+            and (
+                not invocation_id
+                or getattr(message, "metadata", {}).get("invocation_id")
+                == invocation_id
+            )
         ]
         if len(matching_indexes) != 1:
             raise RuntimeError(
@@ -6091,6 +6231,7 @@ class ReActPattern(AgentPattern):
         error: str | None = None,
         settlement_status: str | None = None,
         settlement_turn_id: str | None = None,
+        settlement_trace_pending: bool = False,
         index_tool_call_id: bool = True,
     ) -> None:
         tool_call_id = str(
@@ -6125,6 +6266,7 @@ class ReActPattern(AgentPattern):
             settlement_turn_id=(
                 str(settlement_turn_id) if settlement_turn_id else None
             ),
+            settlement_trace_pending=settlement_trace_pending,
             step_id=(str(tool_call["step_id"]) if tool_call.get("step_id") else None),
             issued_at=issued_at,
         )

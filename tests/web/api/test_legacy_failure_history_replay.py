@@ -328,6 +328,46 @@ async def test_unsafe_legacy_assistant_ancillary_payload_is_not_replayed(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message_type", "expected_message_type"),
+    [
+        ("task_failure", "task_failure"),
+        # Fail-closed legacy rows may be legitimate answers, so they are not
+        # marked failed on the client.
+        ("chat_response", None),
+        ("assistant_response", None),
+        # A replayed question must not re-arm the expects-response path.
+        ("question", None),
+    ],
+)
+async def test_legacy_history_exposes_only_task_failure_provenance(
+    _test_db,
+    monkeypatch: pytest.MonkeyPatch,
+    message_type: str,
+    expected_message_type: str | None,
+) -> None:
+    task_id, user_id = _failed_task_with_message(
+        content="Assistant history row.",
+        message_type=message_type,
+    )
+
+    events = await _replay_history(
+        monkeypatch,
+        task_id=task_id,
+        user_id=user_id,
+    )
+
+    agent_messages = [
+        event.get("data", {})
+        for event in events
+        if event.get("event_type") == "agent_message"
+        and event.get("data", {}).get("source") == "chat_history"
+    ]
+    assert len(agent_messages) == 1
+    assert agent_messages[0].get("message_type") == expected_message_type
+
+
+@pytest.mark.asyncio
 async def test_failure_trace_and_chat_are_both_redacted_on_history_replay(
     _test_db,
     monkeypatch: pytest.MonkeyPatch,

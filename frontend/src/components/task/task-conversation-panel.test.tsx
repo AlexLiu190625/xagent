@@ -122,6 +122,7 @@ vi.mock("@/components/chat/ChatMessage", () => ({
     taskRuntimeExtensionMetadata,
     interactionRequestId,
     interactions,
+    failureTaskId,
   }: {
     content?: string | null
     interactionsActive?: boolean
@@ -138,6 +139,7 @@ vi.mock("@/components/chat/ChatMessage", () => ({
     }
     interactionRequestId?: string
     interactions?: unknown[]
+    failureTaskId?: number | null
   }) => (
     <div
       data-testid="chat-message"
@@ -151,6 +153,7 @@ vi.mock("@/components/chat/ChatMessage", () => ({
       data-runtime-extension-metadata={JSON.stringify(taskRuntimeExtensionMetadata || {})}
       data-request-id={interactionRequestId || ""}
       data-interactions={JSON.stringify(interactions || [])}
+      data-failure-task-id={failureTaskId ?? ""}
     >
       {content}
       {onOpenExecutionPlan && traceEvents?.some((event) => {
@@ -972,6 +975,113 @@ describe("TaskConversationPanel", () => {
     render(<TaskConversationPanel mode="page" showProcessView={false} />)
     const hiddenTraceMessages = screen.getAllByTestId("chat-message")
     expect(hiddenTraceMessages[1]).toHaveAttribute("data-task-status", "failed")
+  })
+
+  it("passes the task id only to failed assistant messages", () => {
+    appState.messages = [
+      { id: "msg-user", role: "user", content: "Run analysis", timestamp: "1000" },
+      {
+        id: "msg-failed",
+        role: "assistant",
+        content: "Failure reason",
+        timestamp: "2000",
+        status: "failed",
+        isResult: true,
+      },
+      { id: "msg-user-2", role: "user", content: "Try again", timestamp: "3000" },
+      {
+        id: "msg-done",
+        role: "assistant",
+        content: "Answer",
+        timestamp: "4000",
+        status: "completed",
+        isResult: true,
+      },
+    ] as any
+    appState.traceEvents = []
+    appState.currentTask = { id: "42", title: "Task", status: "completed" } as any
+
+    render(<TaskConversationPanel mode="page" />)
+
+    const renderedMessages = screen.getAllByTestId("chat-message")
+    expect(renderedMessages).toHaveLength(4)
+    expect(renderedMessages.map((message) => message.getAttribute("data-failure-task-id")))
+      .toEqual(["", "42", "", ""])
+  })
+
+  it("passes the task id to a failed trace process group", () => {
+    appState.messages = [
+      { id: "msg-user", role: "user", content: "Run analysis", timestamp: "1000" },
+    ] as any
+    appState.traceEvents = [
+      { event_id: "start", event_type: "task_start", timestamp: 1500, data: {} },
+      { event_id: "fail", event_type: "task_failed", timestamp: 1600, data: { error: "boom" } },
+    ] as any
+    appState.currentTask = { id: "42", title: "Task", status: "failed" } as any
+
+    render(<TaskConversationPanel mode="page" showProcessView={false} />)
+
+    const renderedMessages = screen.getAllByTestId("chat-message")
+    expect(renderedMessages.at(-1)).toHaveAttribute("data-failure-task-id", "42")
+    expect(renderedMessages[0]).toHaveAttribute("data-failure-task-id", "")
+  })
+
+  it("labels a failed embedded turn once when trace group and result row both fail", () => {
+    appState.messages = [
+      { id: "msg-user", role: "user", content: "Run analysis", timestamp: "1000" },
+      {
+        id: "msg-failed",
+        role: "assistant",
+        content: "Task execution failed.",
+        timestamp: "1700",
+        status: "failed",
+        isResult: true,
+      },
+    ] as any
+    appState.traceEvents = [
+      { event_id: "start", event_type: "task_start", timestamp: 1500, data: {} },
+      { event_id: "fail", event_type: "task_failed", timestamp: 1600, data: { error: "boom" } },
+    ] as any
+    appState.currentTask = { id: "42", title: "Task", status: "failed" } as any
+
+    render(<TaskConversationPanel mode="page" showProcessView={false} />)
+
+    const labels = screen
+      .getAllByTestId("chat-message")
+      .map((message) => message.getAttribute("data-failure-task-id"))
+    expect(labels.filter((label) => label === "42")).toHaveLength(1)
+    const failedRow = screen
+      .getAllByTestId("chat-message")
+      .find((message) => message.textContent?.includes("Task execution failed."))
+    expect(failedRow).toHaveAttribute("data-failure-task-id", "42")
+  })
+
+  it("passes the task id to the virtual failure placeholder of the current task", () => {
+    appState.messages = [
+      { id: "msg-user", role: "user", content: "Run analysis", timestamp: "1000" },
+    ] as any
+    appState.traceEvents = []
+    appState.currentTask = { id: "42", title: "Task", status: "failed" } as any
+
+    render(<TaskConversationPanel mode="page" />)
+
+    const renderedMessages = screen.getAllByTestId("chat-message")
+    expect(renderedMessages).toHaveLength(2)
+    expect(renderedMessages[1]).toHaveAttribute("data-failure-task-id", "42")
+  })
+
+  it("does not label the virtual placeholder with a mismatched task id", () => {
+    appState.messages = [
+      { id: "msg-user", role: "user", content: "Run analysis", timestamp: "1000" },
+    ] as any
+    appState.traceEvents = []
+    appState.currentTask = { id: "7", title: "Previous task", status: "failed" } as any
+
+    render(<TaskConversationPanel mode="page" />)
+
+    const renderedMessages = screen.getAllByTestId("chat-message")
+    expect(renderedMessages).toHaveLength(2)
+    expect(renderedMessages[1]).toHaveAttribute("data-failure-task-id", "")
   })
 
   it("applies current task status only to the latest trace process group", () => {

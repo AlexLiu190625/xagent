@@ -844,3 +844,21 @@ async def test_control_settles_remaining_replays(ingress, boundary, control):
                     )
                 )
             )
+
+
+@pytest.mark.asyncio
+async def test_failed_shared_result_carries_delivery_task_id(ingress):
+    make, _sessions, _observe = ingress
+    bot = make()
+    delivery = channel_delivery.ChannelDelivery(
+        1,
+        77,
+        1,
+        {"chat_id": "chat", "loading_message_id": "loading"},
+        "claim",
+        "sender",
+    )
+    await bot._deliver_shared_result(
+        delivery, {"success": False, "status": "error", "error": "boom"}
+    )
+    assert bot._update_text.await_args.args[2] == "Task execution failed. (Task ID: 77)"

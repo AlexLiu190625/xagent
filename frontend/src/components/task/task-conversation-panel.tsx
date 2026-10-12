@@ -465,6 +465,39 @@ export function TaskConversationPanel({
     managerTraceEvents,
   ])
 
+  // One task-id reference per failed turn. With the trace hidden, a failed
+  // turn can render both its failed process group and its failed result row,
+  // so the result row takes the reference and the process group only gets it
+  // when it is the turn's sole failure mark.
+  const { failureReferenceItemIds, lastTurnHasFailureReference } = useMemo(() => {
+    const ids = new Set<string>()
+    let turn: CombinedItem[] = []
+    let lastTurnHasReference = false
+    const closeTurn = () => {
+      const failed = turn.filter(
+        (item) =>
+          item.role === "assistant" &&
+          (item.status === "failed" || item.processStatus === "failed")
+      )
+      const resultRows = failed.filter((item) => !Array.isArray(item.traceEvents))
+      const chosen = resultRows.at(-1) ?? failed.at(-1)
+      if (chosen) {
+        ids.add(chosen.id)
+      }
+      lastTurnHasReference = Boolean(chosen)
+      turn = []
+    }
+    timelineItems.forEach((item) => {
+      if (item.role === "user") {
+        closeTurn()
+        return
+      }
+      turn.push(item)
+    })
+    closeTurn()
+    return { failureReferenceItemIds: ids, lastTurnHasFailureReference: lastTurnHasReference }
+  }, [timelineItems])
+
   const currentTurnTraceEvents = useMemo(() => {
     if (managerTraceEvents.length === 0) {
       return []
@@ -831,6 +864,9 @@ export function TaskConversationPanel({
                         } : undefined}
                         onOpenExecutionPlan={showDagPreview ? openDagPreview : undefined}
                         onAgentExecutionClick={onAgentExecutionClick}
+                        failureTaskId={
+                          failureReferenceItemIds.has(item.id) ? state.taskId : undefined
+                        }
                       />
                     )
                   })}
@@ -849,6 +885,13 @@ export function TaskConversationPanel({
                       interactionsActive={state.currentTask?.status === "waiting_for_user"}
                       onOpenExecutionPlan={showDagPreview ? openDagPreview : undefined}
                       onAgentExecutionClick={onAgentExecutionClick}
+                      failureTaskId={
+                        !lastTurnHasFailureReference &&
+                        state.currentTask?.id === String(state.taskId) &&
+                        state.currentTask.status === "failed"
+                          ? state.taskId
+                          : undefined
+                      }
                     />
                   )}
                 </>

@@ -39,8 +39,12 @@ export function openBuiltinOAuthPopup(options: {
    * this is an opt-in per call, not a default. */
   appId?: string;
   token: string | null | undefined;
+  /** The account label for a provider declaring `oauth_account_input`
+   * (lib/oauth-account.ts). Omit for every other provider: the backend
+   * rejects the parameter there. */
+  account?: string;
 }): Promise<OpenBuiltinOAuthPopupResult> {
-  const { provider, appId, token } = options;
+  const { provider, appId, token, account } = options;
   // The backend echoes this same value back as the postMessage's `provider`
   // field (auth.py: `provider: app_id or provider`) - matching against it
   // below is what lets a concurrent second connect's success message not
@@ -51,7 +55,8 @@ export function openBuiltinOAuthPopup(options: {
     const left = window.screenX + (window.outerWidth - POPUP_WIDTH) / 2;
     const top = window.screenY + (window.outerHeight - POPUP_HEIGHT) / 2;
     const appIdParam = appId ? `&app_id=${encodeURIComponent(appId)}` : "";
-    const authUrl = `${getApiUrl()}/api/auth/${encodeURIComponent(provider)}/login?token=${encodeURIComponent(token || "")}${appIdParam}&redirect=${encodeURIComponent(window.location.href)}`;
+    const accountParam = account !== undefined ? `&account=${encodeURIComponent(account)}` : "";
+    const authUrl = `${getApiUrl()}/api/auth/${encodeURIComponent(provider)}/login?token=${encodeURIComponent(token || "")}${appIdParam}${accountParam}&redirect=${encodeURIComponent(window.location.href)}`;
     const popup = window.open(
       authUrl,
       `${provider}OAuth`,

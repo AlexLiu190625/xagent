@@ -354,7 +354,8 @@ async def test_new_conversation_suppresses_remaining_shared_reply_chunks(bot):
 
     bot._update_text.side_effect = update
     delivery = SimpleNamespace(
-        destination={"chat_id": "chat", "loading_message_id": "loading"}
+        task_id=45,
+        destination={"chat_id": "chat", "loading_message_id": "loading"},
     )
     with pytest.raises(module.ChannelDeliveryDiscarded):
         await bot._deliver_shared_result(

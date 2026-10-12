@@ -45,6 +45,7 @@ from ..base import AgentPattern, PatternResult, RequiredToolCallError
 from ..final_answer_stream import FinalAnswerStreamSession, ToolCallStringFieldStreamer
 from ..partial_delivery import request_partial_delivery
 from ..react import ReActPattern, ReActReasoningMode
+from .failure_handoff import log_step_failure, step_results_handoff
 from .plan_generator import (
     CallablePlanGenerator,
     ExecutionPlan,
@@ -1163,6 +1164,12 @@ class DAGPattern(AgentPattern):
             metadata = _model_failure_metadata(exc)
             if metadata is not None:
                 self._step_model_failures[step.id] = metadata
+            log_step_failure(
+                task_id=root_context.execution_id,
+                step_id=step.id,
+                code=getattr(exc, "code", None) or type(exc).__name__,
+                exc_info=exc,
+            )
             self._retain_failed_step_evidence(step.id, child_context, react_pattern)
             self._clear_active_step(step.id)
             await runtime.on_dag_step_end(
@@ -1229,6 +1236,12 @@ class DAGPattern(AgentPattern):
         if not result.get("success"):
             step.status = "failed"
             step.error = result.get("error", f"Step {step.id} failed.")
+            log_step_failure(
+                task_id=root_context.execution_id,
+                step_id=step.id,
+                code=result.get("protocol_code") or result.get("status"),
+                finish_reason=result.get("finish_reason"),
+            )
             self._retain_failed_step_evidence(step.id, child_context, react_pattern)
             await runtime.on_dag_step_end(
                 context=root_context,
@@ -1591,6 +1604,18 @@ class DAGPattern(AgentPattern):
             )
         except ExecutionInterrupted:
             return failure
+        deterministic_handoff = False
+        # The delivery call gave nothing usable (it can be cut off at its own
+        # output cap); completed results must still reach the user. A step that
+        # failed on a model-provider error never gets this handoff, so its
+        # failure result keeps carrying the provider error to the client.
+        if args is None and "model_error" not in failure:
+            args = step_results_handoff(
+                self.plan.steps if self.plan is not None else [],
+                self.step_results,
+                failure.get("failed_step_id"),
+            )
+            deterministic_handoff = args is not None
         if args is None or await runtime.should_interrupt():
             await runtime.checkpoint(
                 "dag_failed",
@@ -1627,6 +1652,7 @@ class DAGPattern(AgentPattern):
             metadata={
                 "completion_outcome": outcome,
                 "termination_reason": "step_failed",
+                **({"handoff": "step_results"} if deterministic_handoff else {}),
             },
         )
         return result

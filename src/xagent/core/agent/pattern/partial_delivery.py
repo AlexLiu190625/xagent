@@ -46,13 +46,11 @@ async def request_partial_delivery(
                 messages=messages,
                 tools=[schema],
                 tool_choice={"type": "function", "function": {"name": "final_answer"}},
+                # Kept small on purpose: the call must finish inside ``timeout``.
                 max_tokens=2048,
             )
-        args = (
-            parse_response(response)
-            if get_tool_protocol_error(response) is None
-            else None
-        )
+        protocol_error = get_tool_protocol_error(response)
+        args = parse_response(response) if protocol_error is None else None
         if args is not None and not Draft202012Validator(
             schema["function"]["parameters"]
         ).is_valid(args):
@@ -60,7 +58,15 @@ async def request_partial_delivery(
         await runtime.on_llm_end(
             context=context,
             response=response,
-            metadata={**metadata, "success": args is not None},
+            metadata={
+                **metadata,
+                "success": args is not None,
+                **(
+                    {"protocol_code": protocol_error.get("code")}
+                    if protocol_error is not None
+                    else {}
+                ),
+            },
         )
         return args
     except ExecutionInterrupted:

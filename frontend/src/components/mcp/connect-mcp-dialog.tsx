@@ -82,6 +82,7 @@ export type { AppIntegration } from "./types"
 import type { AppIntegration } from "./types"
 
 import { OfficialMcpSettingsDialog } from "./official-mcp-settings-dialog"
+import { useOAuthAccountStep } from "./oauth-account-dialog"
 import { CustomApiForm, MCPServerFormData } from "./custom-api-form"
 import { CustomMcpForm } from "./custom-mcp-form"
 import {
@@ -111,6 +112,7 @@ export function ConnectMcpDialog({
   const { t } = useI18n()
   const { token, inTeam } = useAuth()
   const { apps: officialApps } = useMcpApps()
+  const { requestAccount, accountDialog } = useOAuthAccountStep()
   const [searchQuery, setSearchQuery] = useState("")
   const [debouncedSearch, setDebouncedSearch] = useState("")
   // Per-app-id in-flight set, not a single shared slot: every connect
@@ -1014,7 +1016,23 @@ export function ConnectMcpDialog({
     mcpOauthPollTimersRef.current.add(checkPopup)
   }
 
-  const handleConnectApp = (app: AppIntegration, autoSelect: boolean = false) => {
+  // A provider hosted on the customer's own account needs the account label
+  // before the popup; the label comes back into handleConnectApp below.
+  const requestAppAccount = (app: AppIntegration, autoSelect: boolean, retry = false) => {
+    if (!app.oauth_account_input) return
+    requestAccount(
+      {
+        key: app.id,
+        name: app.name,
+        icon: app.icon,
+        input: app.oauth_account_input,
+        onSubmit: (account) => handleConnectApp(app, autoSelect, account),
+      },
+      { retry },
+    )
+  }
+
+  const handleConnectApp = (app: AppIntegration, autoSelect: boolean = false, account?: string) => {
     if (app.auth_type !== "builtin_oauth") {
       // Key-based catalog app: collect the key; keyless app: connect directly;
       // remote-MCP OAuth app (catalog or user-added custom server): start the
@@ -1039,6 +1057,11 @@ export function ConnectMcpDialog({
       return;
     }
 
+    if (app.oauth_account_input && account === undefined) {
+      requestAppAccount(app, autoSelect)
+      return
+    }
+
     // #1330: same same-tick window as the mcp_oauth handler above. There is no
     // provider-side registration here (the client is static), but two calls
     // would open two provider popups and register two postMessage listeners,
@@ -1050,7 +1073,8 @@ export function ConnectMcpDialog({
     const left = window.screenX + (window.outerWidth - width) / 2;
     const top = window.screenY + (window.outerHeight - height) / 2;
 
-    const authUrl = `${getApiUrl()}/api/auth/${provider}/login?token=${token || ''}&app_id=${app.id}&redirect=${encodeURIComponent(window.location.href)}`;
+    const accountParam = account !== undefined ? `&account=${encodeURIComponent(account)}` : ''
+    const authUrl = `${getApiUrl()}/api/auth/${provider}/login?token=${token || ''}&app_id=${app.id}${accountParam}&redirect=${encodeURIComponent(window.location.href)}`;
     const popup = window.open(
       authUrl,
       `${provider} OAuth`,
@@ -1103,6 +1127,9 @@ export function ConnectMcpDialog({
       window.removeEventListener('message', handleMessage);
       mcpOauthMessageListenersRef.current.delete(handleMessage)
       clearAppLoading(app.id);
+      // Closed without connecting: the server's own error page, if any, was
+      // shown in the popup, so offer the account step again.
+      if (account !== undefined && popup?.closed) requestAppAccount(app, autoSelect, true)
     }, 500);
     mcpOauthPollTimersRef.current.add(checkPopup)
   }
@@ -1867,6 +1894,7 @@ export function ConnectMcpDialog({
         </div>
       </DialogContent>
     </Dialog>
+    {accountDialog}
     </>
   )
 }

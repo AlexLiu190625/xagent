@@ -27,6 +27,7 @@ from ..models.agent import Agent, AgentOrigin, is_workforce_generated_manager_ag
 from ..models.background_job import BackgroundJob, BackgroundJobType
 from ..models.task import Task, TaskStatus
 from ..models.trigger import (
+    TEST_TRIGGER_RUN_KEY_PREFIX,
     AgentTrigger,
     TriggerProvisioningStatus,
     TriggerRun,
@@ -1392,7 +1393,7 @@ def _trigger_run_idempotency_key(
     test: bool,
 ) -> str:
     if test:
-        return f"trigger-run:test:{trigger.id}:{secrets.token_urlsafe(16)}"
+        return f"{TEST_TRIGGER_RUN_KEY_PREFIX}{trigger.id}:{secrets.token_urlsafe(16)}"
     event_identity = _event_source_id(event_payload, source_event_id)
     return f"trigger-run:{trigger.id}:{event_identity}"
 

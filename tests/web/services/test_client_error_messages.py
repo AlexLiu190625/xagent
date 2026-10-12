@@ -24,6 +24,7 @@ from xagent.web.services.client_error_messages import (
     connector_runtime_client_code,
     connector_runtime_client_message,
     model_error_client_projection,
+    with_task_reference,
 )
 
 # --------------------------------------------------------------------------
@@ -96,6 +97,24 @@ def test_client_code_is_fail_closed_for_an_incidental_exception(
     """The specific name is not the gate; the isinstance check is."""
 
     assert connector_runtime_client_code(error) is None
+
+
+# --------------------------------------------------------------------------
+# with_task_reference
+# --------------------------------------------------------------------------
+
+
+def test_with_task_reference_appends_positive_integer_id() -> None:
+    assert with_task_reference("x", 7) == "x (Task ID: 7)"
+    assert (
+        with_task_reference(CLIENT_SAFE_TASK_FAILURE, 123)
+        == "Task execution failed. (Task ID: 123)"
+    )
+
+
+@pytest.mark.parametrize("task_id", [None, 0, -1, True, "7", 7.0])
+def test_with_task_reference_ignores_missing_or_invalid_id(task_id: object) -> None:
+    assert with_task_reference("x", task_id) == "x"  # type: ignore[arg-type]
 
 
 # --------------------------------------------------------------------------

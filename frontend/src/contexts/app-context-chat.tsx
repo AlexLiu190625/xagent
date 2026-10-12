@@ -3700,7 +3700,10 @@ export function AppProvider({
                 content: messageContent,
                 rawContent: messageContent,
                 timestamp: message.timestamp,
-                status: canonicalMessageId ? (eventData.message_type === "task_failure" ? "failed" : "completed")
+                // Legacy chat_history replay rows carry no canonical id, so
+                // the failure provenance must win over the id-based status.
+                status: eventData.message_type === "task_failure" ? "failed"
+                  : canonicalMessageId ? "completed"
                   : eventData.status === "completed" ? "completed" : "running",
                 isResult: true,
                 streamMessageId,

@@ -26,6 +26,7 @@ from ..core.config import (
     DEFAULT_INDEX_POLICY,
     DEFAULT_VECTOR_STORE_DELETE_BATCH_SIZE,
     DEFAULT_VECTOR_STORE_SCAN_LIMIT,
+    MAIN_POINTERS_NO_MATCH_FILTER,
     IndexPolicy,
 )
 from ..core.schemas import CollectionInfo, IndexResult
@@ -311,40 +312,6 @@ class LanceDBMetadataStore(MetadataStore):
             table.merge_insert(
                 ["name"]
             ).when_matched_update_all().when_not_matched_insert_all().execute([data])
-        finally:
-            _safe_close_table(table)
-
-    async def save_collections(self, collections: Sequence[CollectionInfo]) -> None:
-        if not collections:
-            return
-        await asyncio.to_thread(self._save_collections_sync, collections)
-
-    def _save_collections_sync(self, collections: Sequence[CollectionInfo]) -> None:
-        """Blocking body of :meth:`save_collections`; must not run on the loop."""
-        from ..LanceDB.schema_manager import _safe_close_table
-
-        conn = self.get_raw_connection()
-        self._ensure_collection_metadata_table_sync(conn)
-
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-        rows_by_name = OrderedDict()
-        for collection in collections:
-            if not collection.name:
-                continue
-            data = collection.to_storage()
-            data["updated_at"] = data.get("updated_at") or now
-            rows_by_name[collection.name] = data
-
-        if not rows_by_name:
-            return
-
-        table = conn.open_table("collection_metadata")
-        try:
-            table.merge_insert(
-                ["name"]
-            ).when_matched_update_all().when_not_matched_insert_all().execute(
-                list(rows_by_name.values())
-            )
         finally:
             _safe_close_table(table)
 
@@ -3234,13 +3201,18 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         else:
             raise CascadeCleanupError(f"Unsupported scope: {scope}")
 
-        result = _vis_execute_or_plan_by_predicates(
-            conn,
-            predicates,
-            preview_only=preview_only,
-            confirm=confirm,
-            model_tag=model_tag,
-        )
+        try:
+            result = _vis_execute_or_plan_by_predicates(
+                conn,
+                predicates,
+                preview_only=preview_only,
+                confirm=confirm,
+                model_tag=model_tag,
+            )
+        finally:
+            # Earlier tables may already be deleted when a later one raises.
+            if confirm and not preview_only:
+                self.invalidate_table_cache()
         if scope in {"parse", "chunk", "embeddings"}:
             return _vis_collapse_embedding_table_counts(result)
         return result
@@ -3334,15 +3306,18 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 )
             predicates[table_name] = [filter_expr]
 
-        result = _vis_execute_or_plan_by_predicates(
-            conn,
-            predicates,
-            preview_only=preview_only,
-            confirm=confirm,
-            model_tag=None,
-        )
-        if confirm:
-            self.invalidate_table_cache()
+        try:
+            result = _vis_execute_or_plan_by_predicates(
+                conn,
+                predicates,
+                preview_only=preview_only,
+                confirm=confirm,
+                model_tag=None,
+            )
+        finally:
+            # Earlier tables may already be deleted when a later one raises.
+            if confirm:
+                self.invalidate_table_cache()
         return result
 
 
@@ -3598,6 +3573,55 @@ def _vis_collapse_embedding_table_counts(counts: Dict[str, int]) -> Dict[str, in
     return collapsed
 
 
+def _vis_main_pointers_filter(
+    *, conn: Any, filter_expr: str, user_id: Optional[int]
+) -> str:
+    """Limit a non-admin main_pointers delete to doc_ids the caller owns.
+
+    Ownership comes from ``documents`` (main_pointers.user_id is never written).
+    Raises when it cannot be resolved so no sibling table is deleted without it.
+    """
+    from ..core.exceptions import DatabaseOperationError
+    from ..LanceDB.schema_manager import _safe_close_table
+
+    if user_id is None:
+        return f"{filter_expr} AND {MAIN_POINTERS_NO_MATCH_FILTER}"
+    pointers = documents = None
+    try:
+        pointers = conn.open_table("main_pointers")
+        rows = query_to_list(
+            pointers.search().where(filter_expr).select(["doc_id"]).limit(-1)
+        )
+        candidates = sorted({str(row["doc_id"]) for row in rows if row.get("doc_id")})
+        owned: list = []
+        if candidates:
+            documents = conn.open_table("documents")
+            if "user_id" not in documents.schema.names:
+                owned = candidates
+            else:
+                user_expr = build_user_id_filter_for_table(documents, user_id)
+                size = DEFAULT_VECTOR_STORE_DELETE_BATCH_SIZE
+                for i in range(0, len(candidates), size):
+                    expr = (
+                        f"{filter_expr} AND "
+                        f"{_vis_doc_ids_filter(candidates[i : i + size])} AND {user_expr}"
+                    )
+                    found = query_to_list(
+                        documents.search().where(expr).select(["doc_id"]).limit(-1)
+                    )
+                    owned.extend(str(row["doc_id"]) for row in found)
+    except Exception as exc:
+        raise DatabaseOperationError(
+            "Failed to resolve document owners for main_pointers delete"
+        ) from exc
+    finally:
+        _safe_close_table(pointers)
+        _safe_close_table(documents)
+    if not owned:
+        return f"{filter_expr} AND {MAIN_POINTERS_NO_MATCH_FILTER}"
+    return f"{filter_expr} AND {_vis_doc_ids_filter(sorted(set(owned)))}"
+
+
 def _vis_build_collection_filter(
     *,
     conn: Any,
@@ -3614,6 +3638,12 @@ def _vis_build_collection_filter(
     from .lancedb_cleanup_filters import table_has_column as _table_has_column
 
     base: Dict[str, str] = {"collection": collection}
+    if table_name == "main_pointers" and not is_admin:
+        return _vis_main_pointers_filter(
+            conn=conn,
+            filter_expr=build_lancedb_filter_expression(base, skip_user_filter=True),
+            user_id=user_id,
+        )
     table = None
     try:
         table = conn.open_table(table_name)
@@ -3648,6 +3678,12 @@ def _vis_build_document_filter(
     from .lancedb_cleanup_filters import table_has_column as _table_has_column
 
     base: Dict[str, str] = {"collection": collection, "doc_id": doc_id}
+    if table_name == "main_pointers" and not is_admin:
+        return _vis_main_pointers_filter(
+            conn=conn,
+            filter_expr=build_lancedb_filter_expression(base, skip_user_filter=True),
+            user_id=user_id,
+        )
     table = None
     try:
         table = conn.open_table(table_name)
@@ -3696,6 +3732,10 @@ def _vis_build_documents_filter(
 
     if is_admin:
         return scoped_expr
+    if table_name == "main_pointers":
+        return _vis_main_pointers_filter(
+            conn=conn, filter_expr=scoped_expr, user_id=user_id
+        )
     if user_id is None:
         return f"{scoped_expr} AND ({UserPermissions.get_no_access_filter()})"
 
@@ -4764,10 +4804,10 @@ class LanceDBMainPointerStore(MainPointerStore):
                     field="model_tag", operator=FilterOperator.EQ, value=""
                 )
                 # Combine as: (base) AND (model_tag IS NULL OR model_tag == '')
-                model_tag_filter: FilterExpression = (
+                model_tag_filter: FilterExpression = [
                     model_tag_null_cond,
                     model_tag_empty_cond,
-                )  # OR tuple
+                ]  # OR list
                 filter_expr: FilterExpression = (
                     *base_conditions,
                     model_tag_filter,
@@ -4844,11 +4884,9 @@ class LanceDBMainPointerStore(MainPointerStore):
             if doc_id is not None:
                 filters_dict["doc_id"] = doc_id
 
-            filter_expr = build_lancedb_filter_expression(filters_dict)
-
-            # First check if any pointers exist using efficient count_rows
-            if table.search().where(filter_expr).count_rows() == 0:
-                return []
+            filter_expr = build_lancedb_filter_expression(
+                filters_dict, skip_user_filter=True
+            )
 
             result = table.search().where(filter_expr).limit(limit).to_arrow()
 
@@ -4920,10 +4958,10 @@ class LanceDBMainPointerStore(MainPointerStore):
                     field="model_tag", operator=FilterOperator.EQ, value=""
                 )
                 # Combine as: (base) AND (model_tag IS NULL OR model_tag == '')
-                model_tag_filter: FilterExpression = (
+                model_tag_filter: FilterExpression = [
                     model_tag_null_cond,
                     model_tag_empty_cond,
-                )  # OR tuple
+                ]  # OR list
                 filter_expr: FilterExpression = (
                     *base_conditions,
                     model_tag_filter,

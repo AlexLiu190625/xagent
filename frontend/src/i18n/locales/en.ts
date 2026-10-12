@@ -86,6 +86,7 @@ const en = {
     errors: {
       unknown: "Unknown error",
       taskFailed: "Something went wrong. Please try again.",
+      taskIdReference: "Task ID: {id}",
     },
   },
   voiceInput: {
@@ -1212,6 +1213,13 @@ Build when you need.`,
           authorizationRequiresDelegated: "Authorization bindings require delegated authorization."
         }
       },
+      // Account identifier step before a builtin OAuth popup, for providers
+      // hosted on the customer's own account (oauth-account-dialog.tsx).
+      accountStep: {
+        continue: "Continue",
+        invalid: "Enter only your account name: letters, digits, and hyphens (not at the start or end), up to 63 characters.",
+        retryHint: "Not connected yet. If the sign-in window showed an error, check the account name and try again.",
+      },
       dialog: {
         addTitle: "Add MCP Server",
         editTitle: "Edit MCP Server",
@@ -2120,6 +2128,13 @@ Build when you need.`,
       apiKeyPlaceholderEdit: "Leave blank to keep unchanged",
       baseUrl: "Base URL",
       baseUrlPlaceholder: "https://api.openai.com/v1",
+      bedrockEndpointPlaceholder: "https://bedrock-runtime.us-east-1.amazonaws.com",
+      region: "AWS Region",
+      authMode: "Authentication Mode",
+      bedrockApiKey: "Amazon Bedrock API key",
+      awsCredentialsChain: "AWS credential chain",
+      awsCredentialsChainAdminOnly: "AWS credential chain (administrators only)",
+      awsCredentialsChainAdminRequired: "Only an administrator can save or test this credential-chain configuration. Switch to API key authentication to update it.",
       abilities: "Abilities",
       description: "Description",
       selectModel: "Select Model Name",
@@ -2149,6 +2164,9 @@ Build when you need.`,
       rerank: "Rerank",
     },
     providers: {
+      bedrock: {
+        description: "Amazon Bedrock models through the native Converse API.",
+      },
       openai: {
         description: "Access GPT-4o, GPT-4 Turbo, and DALL-E 3 models. Industry standard for reasoning and creativity.",
       },

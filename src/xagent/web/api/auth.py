@@ -379,6 +379,22 @@ def _resolve_oauth_secret(
     return os.environ.get(_oauth_env_name(provider, env_suffix), "")
 
 
+def _resolve_oauth_client_per_field(provider: str, db_provider: Any) -> tuple[str, str]:
+    """Resolve the OAuth client id and secret of a provider row, field by field.
+
+    Each field is read from ``db_provider`` and falls back to its own
+    ``<PROVIDER>_CLIENT_ID`` or ``<PROVIDER>_CLIENT_SECRET`` environment
+    variable when the row leaves it blank (see ``_resolve_oauth_secret``). An
+    empty string means that field is not configured. The connector runtime
+    refreshes stored credentials with this client, so other code that
+    refreshes the same credentials resolves it here too.
+    """
+    return (
+        _resolve_oauth_secret(provider, db_provider.client_id, "CLIENT_ID"),
+        _resolve_oauth_secret(provider, db_provider.client_secret, "CLIENT_SECRET"),
+    )
+
+
 def _resolve_oauth_redirect_uri(provider: str, db_provider: Any) -> str:
     if getattr(db_provider, "redirect_uri", None):
         return str(db_provider.redirect_uri)
@@ -4159,6 +4175,8 @@ def generic_oauth_callback(
         }
         if code_verifier:
             data["code_verifier"] = code_verifier
+        if account_host is not None:
+            data.update(account_host.token_params)
         if is_deputy:
             # Deputy's docs list `scope` as a required body param on the
             # code-exchange request itself, not just the authorize redirect
@@ -4759,6 +4777,10 @@ def generic_oauth_callback(
                     ),
                     status_code=400,
                 )
+            envelope = account_host.userinfo_envelope if account_host else None
+            if envelope is not None:
+                nested_info = info_data.get(envelope)
+                info_data = nested_info if isinstance(nested_info, dict) else {}
             provider_user_id = info_data.get(db_provider.user_id_path or "id")
             email = info_data.get(db_provider.email_path or "email")
 

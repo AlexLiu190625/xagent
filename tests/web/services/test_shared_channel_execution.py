@@ -241,6 +241,11 @@ async def test_worker_handoff_and_channel_result_commit_atomically(
         async with asyncio.timeout(10):
             while shared._read_channel_result(command.id, selected.run_id) is None:
                 await asyncio.sleep(0.01)
+            # The channel result commits before the run finishes; let it
+            # finish rather than have shutdown cancel its remaining steps.
+            await asyncio.gather(
+                *task_execution.background_task_manager.running_tasks.values()
+            )
     finally:
         await task_coordinator_runtime.close_task_coordinators()
         await task_execution.background_task_manager.shutdown()

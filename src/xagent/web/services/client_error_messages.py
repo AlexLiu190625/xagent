@@ -32,6 +32,8 @@ CLIENT_SAFE_VALIDATION_ERROR = "The message could not be processed. Please try a
 # Task audiences did not necessarily initiate the failing operation, so a
 # task-level failure uses neutral wording instead of the validation fallback.
 CLIENT_SAFE_TASK_FAILURE = "Task execution failed."
+
+
 CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE = (
     "Your Auto model configuration has no usable candidate models. "
     "Review your Auto model settings."
@@ -170,6 +172,13 @@ def client_error_message(code: ClientErrorCode) -> str:
         ClientErrorCode.EXTERNAL_TURN_INTERRUPTED: "This response was interrupted.",
         ClientErrorCode.MODEL_ERROR: CLIENT_SAFE_MODEL_ERROR,
     }[code]
+
+
+def with_task_reference(message: str, task_id: int | None) -> str:
+    """Append the reportable task id to a client-visible failure line."""
+    if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0:
+        return message
+    return f"{message} (Task ID: {task_id})"
 
 
 def required_mcp_unavailable_client_message(

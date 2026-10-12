@@ -49,7 +49,10 @@ from ...services.channel_runtime import (
     register_channel_uploaded_files,
     update_channel_task_fields,
 )
-from ...services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+from ...services.client_error_messages import (
+    CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE,
+    with_task_reference,
+)
 from ...services.db_runtime import (
     await_task_settlement,
     cancel_and_drain_async_task,
@@ -983,7 +986,7 @@ class FeishuBotInstance(BatchChannelControl[str]):
                 if fs_handler is not None:
                     local_service.tracer.remove_handler(fs_handler)
 
-            projection = project_execution_result_for_channel(result)
+            projection = project_execution_result_for_channel(result, task_id=task_id)
             if managed_lease is not None and not await managed_lease.finalize_result(
                 status=projection.task_status,
                 assistant_content=projection.transcript_content,
@@ -1054,9 +1057,12 @@ class FeishuBotInstance(BatchChannelControl[str]):
                 return
             await self._send_text(
                 chat_id,
-                CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
-                if isinstance(e, AutoModelUnavailableError)
-                else "Sorry, an error occurred while processing your request.",
+                with_task_reference(
+                    CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+                    if isinstance(e, AutoModelUnavailableError)
+                    else "Sorry, an error occurred while processing your request.",
+                    claimed_task_id,
+                ),
             )
         finally:
             if fs_handler is not None:
@@ -1098,7 +1104,9 @@ class FeishuBotInstance(BatchChannelControl[str]):
 
         if not is_current():
             raise ChannelDeliveryDiscarded
-        projection = project_execution_result_for_channel(result)
+        projection = project_execution_result_for_channel(
+            result, task_id=delivery.task_id
+        )
         chat_id = delivery.destination["chat_id"]
         loading_id = delivery.destination["loading_message_id"]
         chunks = [

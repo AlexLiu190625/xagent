@@ -13,13 +13,23 @@ from sqlalchemy.pool import QueuePool
 from xagent.web.services import trace_database, trace_handlers
 from xagent.web.services.trace_database import TraceDatabaseRuntime
 
+# A blocked worker that gives up returns its permit and lets queued work in,
+# which on a stalled CI runner looks exactly like an admission bug. Tests set
+# ``release`` in ``finally``, so workers wait far beyond any realistic stall;
+# the bound (below pytest-timeout) only stops a missed release from keeping the
+# default executor, and with it the pytest process, alive after a failure.
+WORKER_RELEASE_BOUND = 240
+# Loop-side waits, where expiry fails the test instead of changing what it
+# measures.
+HANG_TIMEOUT = 30
+
 
 async def wait_until(predicate):
     async def wait():
         while not predicate():
             await asyncio.sleep(0)
 
-    await asyncio.wait_for(wait(), 3)
+    await asyncio.wait_for(wait(), HANG_TIMEOUT)
 
 
 @pytest.mark.asyncio
@@ -27,26 +37,37 @@ async def test_admission_precedes_thread_submission_and_keeps_context(monkeypatc
     runtime = TraceDatabaseRuntime(None, use_async=False, limit=2)
     release = threading.Event()
     started = []
+    active_lock = threading.Lock()
+    active = peak = 0
     context = ContextVar("test_trace_context", default="missing")
     token = context.set("lease-context")
 
     def write():
+        nonlocal active, peak
+        with active_lock:
+            active += 1
+            peak = max(peak, active)
         started.append(context.get())
-        assert release.wait(3)
+        try:
+            release.wait(WORKER_RELEASE_BOUND)
+        finally:
+            with active_lock:
+                active -= 1
 
     tasks = [asyncio.create_task(runtime.run(write, lambda db: None)) for _ in range(6)]
     try:
-        await wait_until(lambda: len(started) == 2)
+        await wait_until(lambda: len(started) >= 2)
         await asyncio.sleep(0.01)
         assert len(started) == 2
         # API work on the default pool still has a worker available.
-        assert await asyncio.wait_for(asyncio.to_thread(lambda: 42), 1) == 42
+        assert await asyncio.wait_for(asyncio.to_thread(lambda: 42), HANG_TIMEOUT) == 42
     finally:
         release.set()
         await asyncio.gather(*tasks)
         context.reset(token)
         await runtime.close()
     assert started == ["lease-context"] * 6
+    assert peak == 2
 
 
 @pytest.mark.asyncio
@@ -64,7 +85,7 @@ async def test_handler_cancellation_drains_before_releasing_admission(
 
     def write(event):
         started.append(event.id)
-        assert release.wait(3)
+        release.wait(WORKER_RELEASE_BOUND)
 
     monkeypatch.setattr(handler, "_sync_save_to_database", write)
     events = [
@@ -99,13 +120,14 @@ async def test_close_drains_accepted_writes_and_rejects_new_work():
 
     def write():
         started.set()
-        assert release.wait(3)
+        release.wait(WORKER_RELEASE_BOUND)
 
     work = asyncio.create_task(runtime.run(write, lambda db: None))
-    await wait_until(started.is_set)
-    close = asyncio.create_task(runtime.close())
-    await wait_until(lambda: runtime._closing)
+    close = None
     try:
+        await wait_until(started.is_set)
+        close = asyncio.create_task(runtime.close())
+        await wait_until(lambda: runtime._closing)
         with pytest.raises(RuntimeError, match="closing"):
             await runtime.run(lambda: None, lambda db: None)
         close.cancel()
@@ -114,8 +136,9 @@ async def test_close_drains_accepted_writes_and_rejects_new_work():
     finally:
         release.set()
         await work
-        with pytest.raises(asyncio.CancelledError):
-            await close
+        if close is not None:
+            with pytest.raises(asyncio.CancelledError):
+                await close
         await runtime.close()
 
 
@@ -156,7 +179,7 @@ async def test_preparation_is_bounded_drained_and_precedes_connection(
     def prepare(trace):
         prepared.append(context.get())
         started.set()
-        assert release.wait(3)
+        release.wait(WORKER_RELEASE_BOUND)
         return lambda db: None
 
     monkeypatch.setattr(handler, "_prepare_async_trace_transaction", prepare)
@@ -177,7 +200,7 @@ async def test_preparation_is_bounded_drained_and_precedes_connection(
         assert prepared == ["lease"]
         assert not checkouts
         assert not callers[0].done() and not closing.done()
-        assert await asyncio.wait_for(asyncio.to_thread(lambda: 42), 1) == 42
+        assert await asyncio.wait_for(asyncio.to_thread(lambda: 42), HANG_TIMEOUT) == 42
     finally:
         release.set()
         outcomes = await asyncio.gather(*callers, return_exceptions=True)

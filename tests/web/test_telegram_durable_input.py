@@ -881,3 +881,30 @@ async def test_explicit_new_still_discards_replayed_old_reply(ingress):
     with sessions() as db:
         assert db.query(TaskChannelDelivery).one().status == "discarded"
     types.Message.edit_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_failed_shared_result_carries_delivery_task_id():
+    from tests.web.test_telegram_message_queue import make_bot
+
+    bot = make_bot()
+    bot.bot = AsyncMock(return_value=message(identity=99, chat=-100, topic=20))
+    delivery = channel_delivery.ChannelDelivery(
+        1,
+        77,
+        1,
+        {
+            "chat_id": -100,
+            "message_thread_id": 20,
+            "message_id": 1,
+            "loading_message_id": None,
+            "telegram_user_id": 123,
+        },
+        "claim",
+        "123",
+    )
+    await bot._deliver_shared_result(
+        delivery, {"success": False, "status": "error", "error": "boom"}
+    )
+    texts = [getattr(call.args[0], "text", None) for call in bot.bot.await_args_list]
+    assert "Task execution failed. (Task ID: 77)" in texts

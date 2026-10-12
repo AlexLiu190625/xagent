@@ -53,7 +53,10 @@ def normalize_deepseek_response(
     if violation is None:
         return response
     raw = response.get("raw") if isinstance(response, dict) else None
-    return tool_protocol_error_response(violation, raw=raw)
+    finish_reason = (
+        response.get("finish_reason") if isinstance(response, dict) else None
+    )
+    return tool_protocol_error_response(violation, raw=raw, finish_reason=finish_reason)
 
 
 async def adapt_deepseek_stream(

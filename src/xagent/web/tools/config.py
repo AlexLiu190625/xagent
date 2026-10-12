@@ -88,10 +88,7 @@ from ..services.tool_credentials import (
     resolve_tool_credential,
     unresolved_tool_policy_allowlist,
 )
-from ..services.user_oauth import (
-    get_scoped_user_oauth_account,
-    scoped_user_oauth_query,
-)
+from ..services.user_oauth import is_ordinary_gmail, scoped_user_oauth_query
 
 logger = logging.getLogger(__name__)
 
@@ -768,6 +765,16 @@ _PROVIDER_DEAD_REFRESH_TOKEN_ERROR_CODES: dict[str, frozenset[str]] = {
     # See meta_invalid_token_error_code -- normalizes Meta's own
     # OAuthException codes to this string.
     "meta": frozenset({"invalid_grant"}),
+    # Zendesk refresh tokens are single-use and expire (90 days at most);
+    # Zendesk's refresh-token docs attribute a failed refresh with an expired
+    # or invalid token to an invalid grant. Trusting it assumes a wrong client secret answers
+    # invalid_client instead -- otherwise an admin credential change would
+    # tombstone every connection -- which the live-account verification for
+    # #2930 must confirm. A personal-flow request that merely lost a race
+    # against a concurrent rotation is kept from tombstoning the newer grant
+    # in _finish_legacy_oauth_access_token_resolution; the actor flow holds
+    # its row lock across the refresh instead.
+    "zendesk": frozenset({"invalid_grant"}),
 }
 
 
@@ -892,7 +899,10 @@ async def refresh_oauth_token_if_needed(
 
     logger.info(f"Token expired for {provider_name}, attempting to refresh...")
     try:
-        from ..api.auth import _resolve_oauth_redirect_uri, _resolve_oauth_secret
+        from ..api.auth import (
+            _resolve_oauth_client_per_field,
+            _resolve_oauth_redirect_uri,
+        )
         from ..models.oauth_provider import OAuthProvider
         from ..oauth_provider_quirks import requires_json_accept_header
 
@@ -910,11 +920,8 @@ async def refresh_oauth_token_if_needed(
         # blank credentials (e.g. a migration that ran before the app's env
         # was fully populated) connects fine via the env fallback but then
         # fails every refresh, since this used to read only the DB row.
-        client_id = _resolve_oauth_secret(
-            provider_name, provider_config.client_id, "CLIENT_ID"
-        )
-        client_secret = _resolve_oauth_secret(
-            provider_name, provider_config.client_secret, "CLIENT_SECRET"
+        client_id, client_secret = _resolve_oauth_client_per_field(
+            provider_name, provider_config
         )
 
         if not client_id or not client_secret:
@@ -1021,6 +1028,7 @@ async def refresh_oauth_token_if_needed(
                 resolve_oauth_account_endpoints, account_host, stored_account
             )
             refresh_token_url = account_endpoints.token_url
+            data.update(account_host.token_params)
             # A redirect would skip the account host's private-network check.
             post_kwargs["follow_redirects"] = False
         if normalized_provider == "deputy":
@@ -3918,6 +3926,8 @@ class WebToolConfig(BaseToolConfig):
         user_id: int,
         resource_owner_key: str | None,
     ) -> _LegacyOAuthTokenResolution:
+        from ...web.models.user_oauth import UserOAuth
+
         if not oauth_account:
             return _LegacyOAuthTokenResolution(access_token=None)
         if not oauth_account.access_token:
@@ -3932,6 +3942,8 @@ class WebToolConfig(BaseToolConfig):
             oauth_account.expires_at,
         )
         account_id = int(oauth_account.id)
+        attempted_refresh_token = oauth_account.refresh_token
+        ordinary_gmail = is_ordinary_gmail(oauth_account)
         permanently_invalid = False
         try:
             is_valid = await refresh_oauth_token_if_needed(
@@ -3971,12 +3983,46 @@ class WebToolConfig(BaseToolConfig):
                 # failed flush. Actor flows retain their credential lock so a
                 # concurrent winner cannot be deleted after refresh.
                 oauth_db.rollback()
-                oauth_account = get_scoped_user_oauth_account(
-                    oauth_db,
-                    user_id=user_id,
-                    account_id=account_id,
-                    resource_owner_key=None,
-                )
+                # Unlike the actor flow, nothing serialized the refresh, so
+                # lock the row for the check-then-clear below (the same
+                # per-dialect lock the actor flow takes). Ordinary Gmail's
+                # check below is not atomic with its clear on either dialect:
+                # its tombstone enters the mailbox transition lock, which
+                # commits this session first on PostgreSQL (releasing the
+                # row lock), and on SQLite is an in-process lock that every
+                # other Gmail writer takes before writing, so this session
+                # must not hold the database write lock while waiting for
+                # it. Gmail does not rotate refresh tokens.
+                reread_query = scoped_user_oauth_query(
+                    oauth_db, user_id=user_id, resource_owner_key=None
+                ).filter(UserOAuth.id == account_id)
+                if oauth_db.get_bind().dialect.name != "sqlite":
+                    reread_query = reread_query.with_for_update()
+                elif not ordinary_gmail:
+                    oauth_db.execute(
+                        text("UPDATE user_oauth SET id = id WHERE id = :id"),
+                        {"id": account_id},
+                    )
+                oauth_account = reread_query.populate_existing().first()
+                if (
+                    oauth_account is not None
+                    and oauth_account.refresh_token != attempted_refresh_token
+                ):
+                    # A concurrent refresh or reconnect replaced the grant
+                    # after this refresh was sent. A provider that rotates
+                    # refresh tokens (e.g. Zendesk) rejects the superseded
+                    # one, which says nothing about the stored grant.
+                    logger.warning(
+                        "OAUTH CONFIG: Token for '%s' was replaced while it was "
+                        "being refreshed; keeping the newer credentials.",
+                        provider_name,
+                    )
+                    oauth_db.rollback()
+                    return _LegacyOAuthTokenResolution(
+                        access_token=None,
+                        refresh_failed=True,
+                        credential_present=True,
+                    )
             if oauth_account is not None:
                 # Keep the account identity as a reconnect tombstone. Deleting
                 # the row makes a permanently invalid connection

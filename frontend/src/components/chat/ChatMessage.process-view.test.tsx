@@ -4,7 +4,8 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({
-    t: (key: string) => key,
+    t: (key: string, vars?: Record<string, unknown>) =>
+      vars && "id" in vars ? `${key}(${vars.id})` : key,
     tDynamic: (_key: string, fallback: string) => fallback,
   }),
 }))
@@ -363,5 +364,129 @@ describe("ChatMessage failures", () => {
     )
 
     expect(screen.getByText("common.errors.unknown")).toBeTruthy()
+  })
+})
+
+describe("ChatMessage failure task reference", () => {
+  const REFERENCE = "common.errors.taskIdReference(42)"
+
+  it("shows the task id under a failed markdown answer on internal pages", () => {
+    render(
+      <ChatMessage
+        role="assistant"
+        content="Partial answer"
+        traceEvents={[]}
+        showProcessView={true}
+        failureTaskId={42}
+      />
+    )
+
+    expect(screen.getByText("Partial answer")).toBeTruthy()
+    expect(screen.getByTestId("task-failure-reference").textContent).toBe(REFERENCE)
+  })
+
+  it("shows the task id under the generic failure line when the trace is hidden", () => {
+    render(
+      <ChatMessage
+        role="assistant"
+        content={RAW_ERROR}
+        traceEvents={[]}
+        showProcessView={false}
+        processStatus="failed"
+        failureTaskId={42}
+      />
+    )
+
+    expect(screen.getByText("common.errors.taskFailed")).toBeTruthy()
+    expect(screen.getByTestId("task-failure-reference").textContent).toBe(REFERENCE)
+    expect(screen.queryByText(RAW_ERROR)).toBeNull()
+  })
+
+  it("shows the task id on a content-less virtual failure placeholder", () => {
+    render(
+      <ChatMessage
+        role="assistant"
+        content={null}
+        traceEvents={FAILED_TRACE_EVENTS}
+        showProcessView={true}
+        isVirtual
+        processStatus="failed"
+        taskStatus="failed"
+        failureTaskId={42}
+      />
+    )
+
+    expect(screen.getByText(RAW_ERROR)).toBeTruthy()
+    expect(screen.getByTestId("task-failure-reference").textContent).toBe(REFERENCE)
+  })
+
+  it.each([
+    ["no task id", undefined],
+    ["a null task id", null],
+    ["a non-positive task id", 0],
+  ])("shows nothing with %s", (_label, failureTaskId) => {
+    render(
+      <ChatMessage
+        role="assistant"
+        content={RAW_ERROR}
+        traceEvents={[]}
+        showProcessView={false}
+        processStatus="failed"
+        failureTaskId={failureTaskId}
+      />
+    )
+
+    expect(screen.queryByTestId("task-failure-reference")).toBeNull()
+  })
+
+  it("never shows the task id on a user message", () => {
+    render(
+      <ChatMessage
+        role="user"
+        content="My question"
+        failureTaskId={42}
+      />
+    )
+
+    expect(screen.queryByTestId("task-failure-reference")).toBeNull()
+  })
+
+  it("does not add the task id to a hidden process-only turn", () => {
+    render(
+      <ChatMessage
+        role="assistant"
+        content={null}
+        traceEvents={FAILED_TRACE_EVENTS}
+        showProcessView={true}
+        showEmptyStatus={false}
+        processStatus="failed"
+        failureTaskId={42}
+      />
+    )
+
+    expect(screen.getByTestId("trace-renderer")).toBeTruthy()
+    expect(screen.queryByTestId("task-failure-reference")).toBeNull()
+  })
+
+  it("copies the task id along with the displayed failure text", () => {
+    const writeText = vi.fn()
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    })
+
+    render(
+      <ChatMessage
+        role="assistant"
+        content={RAW_ERROR}
+        traceEvents={[]}
+        showProcessView={false}
+        processStatus="failed"
+        failureTaskId={42}
+      />
+    )
+
+    fireEvent.click(screen.getByTitle("common.copy"))
+    expect(writeText).toHaveBeenCalledWith(`common.errors.taskFailed\n${REFERENCE}`)
   })
 })

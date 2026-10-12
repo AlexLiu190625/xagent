@@ -1495,7 +1495,7 @@ async def test_empty_output_edits_the_loading_message_with_a_placeholder(
     # The execution produced no visible text and no attachments.
     monkeypatch.setattr(
         "xagent.web.channels.telegram.bot.project_execution_result_for_channel",
-        lambda _result: SimpleNamespace(
+        lambda _result, **_kwargs: SimpleNamespace(
             visible_text="",
             task_status=TaskStatus.COMPLETED,
             transcript_content="",
@@ -1676,6 +1676,143 @@ async def test_successful_telegram_turn_hands_finalize_the_execution_result(
     assert connector_turn_ids == execution_turn_ids == persisted_turn_ids
     assert len(connector_turn_ids) == 1
     assert connector_turn_ids[0]
+
+
+@pytest.mark.asyncio
+async def test_telegram_direct_failed_result_appends_task_id_to_chat_text_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The direct path shows the task id in chat but keeps the transcript clean."""
+
+    bot = make_bot()
+    bot.channel_id = 1
+    bot.channel_name = "Telegram failed result"
+    bot.active_tasks = {123: 48}
+    bot._active_tasks_unsaved = False
+    bot.bot = object()
+    bot._save_active_tasks = lambda: True
+    bot._consume_user_stop_request = lambda _user_id: False
+    bot._clear_user_stop_request = lambda _user_id: None
+
+    lease = TaskLease(task_id=48, runner_id="runner-a", run_id="run-a")
+    finalized: list[dict] = []
+
+    class FakeManagedLease:
+        heartbeat_task = None
+
+        def __init__(self) -> None:
+            self.lease = lease
+
+        async def close(self) -> bool:
+            return True
+
+        async def finalize_result(self, **kwargs) -> bool:  # type: ignore[no-untyped-def]
+            finalized.append(kwargs)
+            return True
+
+    execution_result = {
+        "success": False,
+        "status": "error",
+        "output": "provider token=secret",
+        "error": "provider token=secret",
+    }
+
+    class FakeTracer:
+        def add_handler(self, _handler: object) -> None:
+            return None
+
+        def remove_handler(self, _handler: object) -> None:
+            return None
+
+    agent_service = SimpleNamespace(
+        tracer=FakeTracer(),
+        set_conversation_history=lambda _messages,
+        *,
+        watermark=None,
+        event_watermark=None: None,
+        set_execution_context_messages=lambda _messages: None,
+        set_recovered_skill_context=lambda _context: None,
+    )
+
+    class FakeAgentManager:
+        async def get_agent_for_task(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return agent_service
+
+        async def execute_task(self, **_kwargs):  # type: ignore[no-untyped-def]
+            return execution_result
+
+    async def extract_text(_message):  # type: ignore[no-untyped-def]
+        return "hello", []
+
+    async def await_execution(_user_id, execution, *, reason):  # type: ignore[no-untyped-def]
+        return await execution
+
+    async def fake_prepare(**_kwargs):  # type: ignore[no-untyped-def]
+        return SimpleNamespace(
+            user_id=5,
+            task_id=48,
+            is_new_task=False,
+            managed_lease=FakeManagedLease(),
+            requested_agent_missing=False,
+        )
+
+    async def persist_message(**_kwargs) -> None:  # type: ignore[no-untyped-def]
+        return None
+
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.prepare_channel_task", fake_prepare
+    )
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.load_task_setup_snapshot_sync",
+        lambda *_args: SimpleNamespace(
+            runtime_user=None,
+            conversation_history=(),
+            conversation_watermark=None,
+            conversation_event_watermark=None,
+            execution_recovery=TaskExecutionRecoverySnapshot(),
+            task=SimpleNamespace(source="internal"),
+        ),
+    )
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.get_agent_manager",
+        lambda: FakeAgentManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.persist_channel_user_message",
+        persist_message,
+    )
+    bot._extract_message_content = extract_text
+    bot._await_execution_with_stop_monitor = await_execution
+
+    edits: list[str] = []
+
+    class LoadingMessage:
+        message_id = 77
+
+        async def edit_text(self, text: str, **_kwargs) -> None:
+            edits.append(text)
+
+        async def delete(self) -> None:
+            return None
+
+    class Message:
+        from_user = SimpleNamespace(id=123)
+        chat = SimpleNamespace(id=456)
+
+        def __init__(self) -> None:
+            self.answers: list[str] = []
+
+        async def answer(self, text: str, **_kwargs) -> LoadingMessage:
+            self.answers.append(text)
+            return LoadingMessage()
+
+    message = Message()
+    await bot._process_user_messages_batch(123, [message])  # type: ignore[arg-type]
+
+    assert edits == ["Task execution failed. (Task ID: 48)"]
+    assert len(finalized) == 1
+    assert finalized[0]["status"] == TaskStatus.FAILED
+    assert finalized[0]["assistant_content"] == "Task execution failed."
 
 
 @pytest.mark.asyncio

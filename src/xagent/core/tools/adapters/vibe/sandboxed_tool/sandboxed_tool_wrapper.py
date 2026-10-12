@@ -626,8 +626,9 @@ class SandboxedToolWrapper(AbstractBaseTool):
         if not rebuilt_by_path:
             return result
 
-        # Both sandboxed executors keep artifacts 1:1 with file_refs, so the
-        # rebuild below is lossless for them and only for them.
+        # The sandboxed Python, JS and command executors keep artifacts 1:1
+        # with file_refs, so the rebuild below is lossless for them and only
+        # for them.
         merged = [
             rebuilt_by_path.get(key or "", ref) for key, ref in zip(keys, original_refs)
         ]

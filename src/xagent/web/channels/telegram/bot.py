@@ -74,6 +74,7 @@ from ...services.channel_runtime import (
     register_channel_uploaded_files,
     update_channel_task_fields,
 )
+from ...services.client_error_messages import with_task_reference
 from ...services.db_runtime import (
     await_task_settlement,
     cancel_and_drain_async_task,
@@ -2484,7 +2485,7 @@ class TelegramBotInstance(BatchChannelControl[int]):
                 if agent_service is not None:
                     agent_service.tracer.remove_handler(tg_handler)
 
-            projection = project_execution_result_for_channel(result)
+            projection = project_execution_result_for_channel(result, task_id=task_id)
             if managed_lease is not None and not await managed_lease.finalize_result(
                 status=projection.task_status,
                 assistant_content=projection.transcript_content,
@@ -2576,12 +2577,18 @@ class TelegramBotInstance(BatchChannelControl[int]):
                     return
             if isinstance(e, TelegramVoiceTranscriptionError):
                 await last_message.answer(
-                    "I couldn't transcribe that voice message. Please try again "
-                    "or send the request as text."
+                    with_task_reference(
+                        "I couldn't transcribe that voice message. Please try "
+                        "again or send the request as text.",
+                        claimed_task_id,
+                    )
                 )
             else:
                 await last_message.answer(
-                    "Sorry, an error occurred while processing your request."
+                    with_task_reference(
+                        "Sorry, an error occurred while processing your request.",
+                        claimed_task_id,
+                    )
                 )
         finally:
             if tg_handler is not None:
@@ -2794,7 +2801,9 @@ class TelegramBotInstance(BatchChannelControl[int]):
             delivery, is_current=current
         )
         await self._deliver_telegram_result(
-            project_execution_result_for_channel(result).visible_text,
+            project_execution_result_for_channel(
+                result, task_id=delivery.task_id
+            ).visible_text,
             task_id=delivery.task_id,
             owner_user_id=delivery.user_id,
             last_message=message,

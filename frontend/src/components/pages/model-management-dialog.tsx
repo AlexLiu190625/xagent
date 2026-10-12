@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useMemo } from "react"
+import React, { useState, useMemo } from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -48,10 +48,73 @@ import { ScrollArea } from "@/components/ui/scroll-area"
 import { toast } from "@/components/ui/sonner"
 import { Model, ModelCreate, ProviderConfig, generateModelId, getModelDetailUrl } from "./models"
 import { isContextWindowUnset } from "./model-display-capabilities"
+import {
+  bedrockDefaults,
+  bedrockAuthModesForUser,
+  BedrockAuthMode,
+  buildModelRequestPayload,
+  hasInvalidModelProviderSettings,
+  isBedrockCredentialChainBlocked,
+  modelToFormData,
+  shouldFetchProviderModelCatalog,
+} from "@/lib/model-provider-settings"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { Stepper } from "@/components/ui/stepper"
 
 const SPEECH_ABILITY_VALUES = new Set(["asr", "tts"])
+
+type BedrockSettingsFieldsProps = {
+  region: string
+  authMode: BedrockAuthMode
+  authModeOptions: { value: string; label: string }[]
+  credentialChainBlocked: boolean
+  layout: "stacked" | "grid"
+  onRegionChange: (region: string) => void
+  onAuthModeChange: (authMode: BedrockAuthMode) => void
+}
+
+function BedrockSettingsFields({
+  region,
+  authMode,
+  authModeOptions,
+  credentialChainBlocked,
+  layout,
+  onRegionChange,
+  onAuthModeChange,
+}: BedrockSettingsFieldsProps) {
+  const { t } = useI18n()
+
+  return (
+    <div className={layout === "grid" ? "grid grid-cols-1 md:grid-cols-2 gap-4" : "space-y-4"}>
+      <div className="space-y-2">
+        <Label className={layout === "stacked" ? "text-base" : undefined} htmlFor={`${layout}-bedrock-region`}>
+          {t('models.form.region')}
+        </Label>
+        <Input
+          id={`${layout}-bedrock-region`}
+          placeholder="us-east-1"
+          value={region}
+          onChange={(event) => onRegionChange(event.target.value)}
+        />
+      </div>
+      <div className="space-y-2">
+        <Label className={layout === "stacked" ? "text-base" : undefined}>
+          {t('models.form.authMode')}
+        </Label>
+        <Select
+          value={authMode}
+          onValueChange={(value) => onAuthModeChange(value as BedrockAuthMode)}
+          options={authModeOptions}
+        />
+        {credentialChainBlocked && (
+          <p className="text-sm text-amber-700">
+            {t('models.form.awsCredentialsChainAdminRequired')}
+          </p>
+        )}
+      </div>
+    </div>
+  )
+}
 
 function getProviderModelAbilities(model?: ProviderModel): string[] {
   const abilities = model?.abilities?.length
@@ -146,6 +209,16 @@ export function ModelManagementDialog({
   const [isDeletingModel, setIsDeletingModel] = useState(false)
   const [hasInitializedDefaults, setHasInitializedDefaults] = useState(false)
   const [selectedDefaultConfigTypes, setSelectedDefaultConfigTypes] = useState<string[]>([])
+
+  const bedrockAuthModeOptions = (currentMode?: "api_key" | "credentials_chain") =>
+    bedrockAuthModesForUser(user?.is_admin === true, currentMode).map(mode => ({
+      value: mode,
+      label: mode === "api_key"
+        ? t('models.form.bedrockApiKey')
+        : user?.is_admin
+          ? t('models.form.awsCredentialsChain')
+          : t('models.form.awsCredentialsChainAdminOnly'),
+    }))
 
   const getCategoryForActiveTab = (providerId?: string): string => {
     if (activeTab !== 'audio') return activeTab
@@ -249,8 +322,6 @@ export function ModelManagementDialog({
     setModelCatalogUnavailable(false)
   }
 
-  const providerAllowsEmptyApiKey = (providerId: string) => providerId === 'xinference'
-
   const getDefaultBaseUrlForProvider = (providerId: string, category: string) => {
     const provider = providers.find(p => p.id === providerId)
     if (!provider) return ""
@@ -269,20 +340,7 @@ export function ModelManagementDialog({
   const getInitialFormData = (): ModelCreate => {
     if (initialEditingModel) {
       const currentDefaults = getModelDefaultTypes(initialEditingModel.id)
-      return {
-        model_id: initialEditingModel.model_id,
-        category: initialEditingModel.category,
-        model_provider: initialEditingModel.model_provider,
-        model_name: initialEditingModel.model_name,
-        api_key: "",
-        base_url: initialEditingModel.base_url || "",
-        temperature: initialEditingModel.temperature,
-        context_window: initialEditingModel.context_window,
-        dimension: initialEditingModel.dimension,
-        abilities: initialEditingModel.abilities || [],
-        default_config_types: currentDefaults,
-        share_with_users: initialEditingModel.is_shared
-      }
+      return modelToFormData(initialEditingModel, currentDefaults)
     }
 
     // Determine default provider based on activeTab if no initialProviderId is given
@@ -308,6 +366,7 @@ export function ModelManagementDialog({
       model_name: "",
       api_key: "",
       base_url: getDefaultBaseUrlForProvider(defaultProvider, initialCategory),
+      ...bedrockDefaults(defaultProvider),
       temperature: initialCategory === 'llm' ? undefined : undefined,
       dimension: initialCategory === 'embedding' ? undefined : undefined,
       abilities: getDefaultAbilitiesForProvider(initialCategory, defaultProvider),
@@ -316,6 +375,18 @@ export function ModelManagementDialog({
   }
 
   const [formData, setFormData] = useState<ModelCreate>(getInitialFormData())
+
+  const bedrockCredentialChainBlocked = isBedrockCredentialChainBlocked(
+    formData.model_provider,
+    formData.bedrock_auth_mode,
+    user?.is_admin === true,
+  )
+  const showApiKey = formData.model_provider !== "bedrock"
+    || formData.bedrock_auth_mode !== "credentials_chain"
+  const providerSettingsInvalid = hasInvalidModelProviderSettings(formData, {
+    isEditing: Boolean(editingModel),
+    initialBedrockAuthMode: editingModel?.bedrock_auth_mode,
+  })
 
   const abilityOptions = useMemo(() => [
     { value: "chat", label: t('models.abilities.chat') },
@@ -420,20 +491,7 @@ export function ModelManagementDialog({
     setDefaultTargetModel(null)
     setEditingModel(model)
     const currentDefaults = getModelDefaultTypes(model.id)
-    setFormData({
-      model_id: model.model_id,
-      category: model.category,
-      model_provider: model.model_provider,
-      model_name: model.model_name,
-      api_key: "",
-      base_url: model.base_url || "",
-      temperature: model.temperature,
-      context_window: model.context_window,
-      dimension: model.dimension,
-      abilities: model.abilities || [],
-      default_config_types: currentDefaults,
-      share_with_users: model.is_shared
-    })
+    setFormData(modelToFormData(model, currentDefaults))
     setViewMode('form')
   }
 
@@ -457,6 +515,7 @@ export function ModelManagementDialog({
       model_name: "",
       api_key: "",
       base_url: providerConfig?.defaultBaseUrl || "",
+      ...bedrockDefaults(managingProviderId),
       temperature: category === 'llm' ? undefined : undefined,
       dimension: category === 'embedding' ? undefined : undefined,
       abilities: getDefaultAbilitiesForProvider(category, managingProviderId),
@@ -501,21 +560,24 @@ export function ModelManagementDialog({
     setTestConnectionStatus('testing')
     setTestConnectionError(null)
     try {
+      const payload = buildModelRequestPayload({
+        model_provider: formData.model_provider,
+        model_name: targetModel,
+        api_key: formData.api_key,
+        base_url: formData.base_url,
+        bedrock_region: formData.bedrock_region,
+        bedrock_auth_mode: formData.bedrock_auth_mode,
+        category: formData.category,
+        temperature: formData.temperature,
+        dimension: formData.dimension,
+        abilities: formData.abilities
+      })
       const response = await apiRequest(`${getApiUrl()}/api/models/test-connection`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
         },
-        body: JSON.stringify({
-          model_provider: formData.model_provider,
-          model_name: targetModel,
-          api_key: formData.api_key,
-          base_url: formData.base_url,
-          category: formData.category,
-          temperature: formData.temperature,
-          dimension: formData.dimension,
-          abilities: formData.abilities
-        })
+        body: JSON.stringify(payload)
       })
 
       const data = await response.json()
@@ -532,6 +594,10 @@ export function ModelManagementDialog({
   }
 
   const fetchModelsForCategory = async (category: string) => {
+    if (!shouldFetchProviderModelCatalog(formData.model_provider)) {
+      setFetchedModels([])
+      return
+    }
     try {
       setIsFetchingModels(true)
       const catalog = await getProviderModels(formData.model_provider, {
@@ -645,7 +711,7 @@ export function ModelManagementDialog({
     try {
       setLoading(true)
 
-      const payload = { ...data }
+      const payload = buildModelRequestPayload(data)
 
       if (!editingModel && !payload.model_id && payload.model_name && payload.model_provider) {
         payload.model_id = generateModelId(payload.model_name, payload.model_provider, user?.id)
@@ -942,6 +1008,7 @@ export function ModelManagementDialog({
                                     model_name: "",
                                     base_url: getDefaultBaseUrlForProvider(provider.id, prev.category),
                                     api_key: prev.model_provider === provider.id ? prev.api_key : "",
+                                    ...bedrockDefaults(provider.id, prev),
                                     abilities: getDefaultAbilitiesForProvider(prev.category, provider.id),
                                   }))
                                 }}
@@ -987,7 +1054,23 @@ export function ModelManagementDialog({
                         </div>
                       )}
 
-                      <div className="space-y-2">
+                      {formData.model_provider === "bedrock" && (
+                        <BedrockSettingsFields
+                          region={formData.bedrock_region || ""}
+                          authMode={formData.bedrock_auth_mode || "api_key"}
+                          authModeOptions={bedrockAuthModeOptions(formData.bedrock_auth_mode)}
+                          credentialChainBlocked={bedrockCredentialChainBlocked}
+                          layout="stacked"
+                          onRegionChange={(bedrock_region) => setFormData({ ...formData, bedrock_region })}
+                          onAuthModeChange={(bedrock_auth_mode) => setFormData({
+                            ...formData,
+                            bedrock_auth_mode,
+                            api_key: bedrock_auth_mode === "credentials_chain" ? "" : formData.api_key,
+                          })}
+                        />
+                      )}
+
+                      {showApiKey && <div className="space-y-2">
                         <Label className="text-base">{t('models.dialog.connect.apiKeyTitle', { provider: selectedProvider?.name || '' })}</Label>
                         <Input
                           type="password"
@@ -999,7 +1082,7 @@ export function ModelManagementDialog({
                           <div className="w-4 h-4 rounded-full border border-current flex items-center justify-center text-[10px]">i</div>
                           {t('models.dialog.connect.apiKeyHint')}
                         </div>
-                      </div>
+                      </div>}
 
                       {baseUrlRequired ? (
                         <div className="space-y-2">
@@ -1022,10 +1105,16 @@ export function ModelManagementDialog({
                               {t('models.dialog.connect.advancedSettings')}
                             </summary>
                             <div className="mt-4 space-y-2 pl-5">
-                              <Label className="text-base font-medium">{t('models.form.baseUrl')}</Label>
+                              <Label className="text-base font-medium">
+                                {t('models.form.baseUrl')}
+                                {formData.model_provider === "bedrock" ? ` ${t('common.optional')}` : ""}
+                              </Label>
                               <Input
                                 value={formData.base_url || ""}
                                 onChange={(e) => setFormData({ ...formData, base_url: e.target.value })}
+                                placeholder={formData.model_provider === "bedrock"
+                                  ? t('models.form.bedrockEndpointPlaceholder')
+                                  : undefined}
                               />
                             </div>
                           </details>
@@ -1048,7 +1137,8 @@ export function ModelManagementDialog({
                             }
                           }}
                           disabled={
-                            (!providerAllowsEmptyApiKey(formData.model_provider) && !formData.api_key)
+                            providerSettingsInvalid
+                            || bedrockCredentialChainBlocked
                             || (baseUrlRequired ? !formData.base_url?.trim() : false)
                             || testConnectionStatus === 'testing'
                           }
@@ -1067,9 +1157,11 @@ export function ModelManagementDialog({
                       <div className="space-y-2">
                         <div className="flex justify-between items-center">
                           <Label className="text-base font-medium">{t('models.form.name')}</Label>
-                          <Button variant="ghost" size="sm" className="h-8 text-primary" onClick={handleFetchModels} disabled={isFetchingModels}>
-                            <RefreshCw className={`w-3 h-3 mr-1 ${isFetchingModels ? 'animate-spin' : ''}`} /> {t('common.refresh')}
-                          </Button>
+                          {shouldFetchProviderModelCatalog(formData.model_provider) && (
+                            <Button variant="ghost" size="sm" className="h-8 text-primary" onClick={handleFetchModels} disabled={isFetchingModels}>
+                              <RefreshCw className={`w-3 h-3 mr-1 ${isFetchingModels ? 'animate-spin' : ''}`} /> {t('common.refresh')}
+                            </Button>
+                          )}
                         </div>
                         <Select
                           value={formData.model_name}
@@ -1545,6 +1637,7 @@ export function ModelManagementDialog({
                         model_name: "",
                         base_url: getDefaultBaseUrlForProvider(value, prev.category),
                         api_key: prev.model_provider === value ? prev.api_key : "",
+                        ...bedrockDefaults(value, prev),
                         abilities: getDefaultAbilitiesForProvider(prev.category, value),
                       }))
                     }}
@@ -1560,7 +1653,23 @@ export function ModelManagementDialog({
                 </div>
               </div>
 
-              <div>
+              {formData.model_provider === "bedrock" && (
+                <BedrockSettingsFields
+                  region={formData.bedrock_region || ""}
+                  authMode={formData.bedrock_auth_mode || "api_key"}
+                  authModeOptions={bedrockAuthModeOptions(formData.bedrock_auth_mode)}
+                  credentialChainBlocked={bedrockCredentialChainBlocked}
+                  layout="grid"
+                  onRegionChange={(bedrock_region) => setFormData({ ...formData, bedrock_region })}
+                  onAuthModeChange={(bedrock_auth_mode) => setFormData({
+                    ...formData,
+                    bedrock_auth_mode,
+                    api_key: bedrock_auth_mode === "credentials_chain" ? "" : formData.api_key,
+                  })}
+                />
+              )}
+
+              {showApiKey && <div>
                 <Label htmlFor="api_key">{t('models.form.apiKey')}</Label>
                 <Input
                   id="api_key"
@@ -1569,15 +1678,20 @@ export function ModelManagementDialog({
                   onChange={(e) => setFormData({ ...formData, api_key: e.target.value })}
                   placeholder={t('models.form.apiKeyPlaceholder')}
                 />
-              </div>
+              </div>}
 
               <div>
-                <Label htmlFor="base_url">{t('models.form.baseUrl')}</Label>
+                <Label htmlFor="base_url">
+                  {t('models.form.baseUrl')}
+                  {formData.model_provider === "bedrock" ? ` ${t('common.optional')}` : ""}
+                </Label>
                 <Input
                   id="base_url"
                   value={formData.base_url}
                   onChange={(e) => setFormData({ ...formData, base_url: e.target.value })}
-                  placeholder={t('models.form.baseUrlPlaceholder')}
+                  placeholder={formData.model_provider === "bedrock"
+                    ? t('models.form.bedrockEndpointPlaceholder')
+                    : t('models.form.baseUrlPlaceholder')}
                 />
               </div>
 
@@ -1614,7 +1728,7 @@ export function ModelManagementDialog({
               <div>
                 <div className="flex justify-between items-center mb-2">
                   <Label htmlFor="model_name">{t('models.form.name')}</Label>
-                  {!editingModel && (
+                  {!editingModel && shouldFetchProviderModelCatalog(formData.model_provider) && (
                     <div className="flex items-center gap-2">
                       <Button
                         variant="ghost"
@@ -1738,7 +1852,10 @@ export function ModelManagementDialog({
               <Button variant="outline" onClick={closeDialog}>
                 {t('models.dialog.cancel')}
               </Button>
-              <Button onClick={() => submitModelData(formData)}>
+              <Button
+                onClick={() => submitModelData(formData)}
+                disabled={providerSettingsInvalid || bedrockCredentialChainBlocked}
+              >
                 {editingModel ? t('models.form.update') : t('models.form.create')}
               </Button>
             </div>

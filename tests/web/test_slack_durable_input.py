@@ -513,3 +513,26 @@ async def test_slack_cancellation_waits_for_staging_before_compensation(
         release.set()
         await asyncio.gather(worker, return_exceptions=True)
         get_unscoped_file_storage.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_failed_shared_result_carries_delivery_task_id(slack_ingress):
+    from xagent.web.services import channel_delivery
+
+    make_bot, _sessions = slack_ingress
+    bot = make_bot()
+    delivery = channel_delivery.ChannelDelivery(
+        1,
+        77,
+        1,
+        {"chat_id": "chat", "thread_ts": "1.0", "loading_ts": "loading-ts"},
+        "claim",
+        "sender",
+    )
+    await bot._deliver_shared_result(
+        delivery, {"success": False, "status": "error", "error": "boom"}
+    )
+    assert (
+        bot._send_final_text.await_args.kwargs["text"]
+        == "Task execution failed. (Task ID: 77)"
+    )

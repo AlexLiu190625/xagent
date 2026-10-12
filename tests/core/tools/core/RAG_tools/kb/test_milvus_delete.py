@@ -13,6 +13,7 @@ import os
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from functools import cache
 from pathlib import Path
 from typing import Any
@@ -168,13 +169,21 @@ def _chunks(
     from datetime import datetime, timezone
 
     now = datetime.now(timezone.utc)
+    document = handle.load_document(doc_id, is_admin=True)
+    made_from = {"content_hash": document.content_hash} if document else {}
     handle.write_chunks(
         doc_id,
         parse_hash,
         "cfg",
         {},
         [
-            {"chunk_id": c, "index": i, "text": f"kiwi {c}", "created_at": now}
+            {
+                "chunk_id": c,
+                "index": i,
+                "text": f"kiwi {c}",
+                "created_at": now,
+                "metadata": made_from,
+            }
             for i, c in enumerate(ids)
         ],
         user_id=user_id,
@@ -1092,3 +1101,150 @@ def test_a_restore_loads_a_collection_that_is_not_loaded(
         assert handle.restore_document_rows(snapshot, user_id=1, is_admin=False) == []
 
     assert set(_rows(client, model)) == {"a", "b", "k", "s"}
+
+
+# --- retire of replaced content --------------------------------------------
+
+
+def _replace_content(
+    handle: KBCollectionHandle,
+    model: str,
+    tmp_path: Path,
+    ids: list[str],
+    *,
+    embed: bool = True,
+) -> None:
+    """Re-register "doc" with new content and write+embed its chunks as NEXT_PARSE."""
+    from xagent.core.tools.core.RAG_tools.core.schemas import ParsedParagraph
+
+    source = tmp_path / "doc.txt"
+    source.write_text("lime", encoding="utf-8")
+    handle.register_document(
+        RegisterDocumentRequest(
+            collection=COLLECTION, source_path=str(source), doc_id="doc", user_id=1
+        )
+    )
+    content = handle.load_document("doc", is_admin=True).content_hash
+    handle.write_parse(
+        "doc",
+        NEXT_PARSE,
+        "default",
+        {"content_hash": content},
+        [ParsedParagraph(text="lime", metadata={})],
+        user_id=1,
+    )
+    _chunks(handle, "doc", ids, parse_hash=NEXT_PARSE)
+    if embed:
+        _embed(handle, model, "doc", parse_hash=NEXT_PARSE)
+
+
+def _old_chunks(handle: KBCollectionHandle) -> set[str]:
+    return {
+        c["chunk_id"]
+        for c in handle.read_existing_chunks("doc", PARSE, "cfg", user_id=1)
+    }
+
+
+def test_a_commit_that_fails_after_the_gate_keeps_the_old_ledger_chunks(
+    client: Any, model: str, tmp_path: Path
+) -> None:
+    handle = _open()
+    _ingest(handle, model, "doc", ["a", "b"], tmp_path)
+    _replace_content(handle, model, tmp_path, ["x"])
+    gates: list[int] = []
+
+    def supersede_at_the_delete() -> None:
+        gates.append(1)
+        if len(gates) == 2:
+            raise RuntimeError("superseded")
+
+    with pytest.raises(RuntimeError, match="superseded"):
+        handle.commit_embeddings(
+            "doc", NEXT_PARSE, model, commit_gate=supersede_at_the_delete, user_id=1
+        )
+
+    assert _old_chunks(handle) == {"a", "b"}
+
+    handle.commit_embeddings("doc", NEXT_PARSE, model, user_id=1)
+
+    assert _old_chunks(handle) == set()
+    assert _visible(client, model) == {"x"}
+
+
+def test_a_commit_retires_the_vectors_of_other_models_too(
+    client: Any, model: str, other_model: str, tmp_path: Path
+) -> None:
+    handle = _open()
+    _ingest(handle, model, "doc", ["a", "b"], tmp_path)
+    _embed(handle, other_model, "doc", visible=True)
+    assert set(_rows(client, other_model)) == {"a", "b"}
+    _replace_content(handle, model, tmp_path, ["x"])
+
+    handle.commit_embeddings("doc", NEXT_PARSE, model, user_id=1)
+
+    assert _rows(client, other_model) == {}
+
+
+def test_a_read_skips_chunks_of_other_content_in_the_parsed_hash(
+    model: str, tmp_path: Path
+) -> None:
+    handle = _open()
+    _ingest(handle, model, "doc", ["a"], tmp_path)
+    _replace_content(handle, model, tmp_path, ["x"], embed=False)
+    handle.write_chunks(
+        "doc",
+        NEXT_PARSE,
+        "cfg-stale",
+        {},
+        [
+            {
+                "chunk_id": "stale",
+                "index": 0,
+                "text": "kiwi",
+                "created_at": datetime.now(timezone.utc),
+                "metadata": {"content_hash": "C0"},
+            }
+        ],
+        user_id=1,
+    )
+
+    read = handle.read_chunks_needing_embedding("doc", NEXT_PARSE, model, user_id=1)
+
+    assert [c.chunk_id for c in read.chunks] == ["x"]
+
+
+def test_a_commit_failing_in_another_models_collection_is_retried_whole(
+    client: Any,
+    model: str,
+    other_model: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handle = _open()
+    _ingest(handle, model, "doc", ["a", "b"], tmp_path)
+    _embed(handle, other_model, "doc", visible=True)
+    _replace_content(handle, model, tmp_path, ["x"])
+    real = collection_handle.MilvusCollectionHandle._delete_ids
+    calls: list[int] = []
+
+    def fail_once(self: Any, *args: Any) -> None:
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("delete failed")
+        real(self, *args)
+
+    monkeypatch.setattr(
+        collection_handle.MilvusCollectionHandle, "_delete_ids", fail_once
+    )
+
+    with pytest.raises(RuntimeError, match="delete failed"):
+        handle.commit_embeddings("doc", NEXT_PARSE, model, user_id=1)
+
+    assert _old_chunks(handle) == {"a", "b"}
+    assert set(_rows(client, other_model)) == {"a", "b"}
+
+    handle.commit_embeddings("doc", NEXT_PARSE, model, user_id=1)
+
+    assert _old_chunks(handle) == set()
+    assert _rows(client, other_model) == {}
+    assert _visible(client, model) == {"x"}

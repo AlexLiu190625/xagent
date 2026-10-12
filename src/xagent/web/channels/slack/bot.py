@@ -56,7 +56,10 @@ from ...services.channel_runtime import (
     register_channel_uploaded_files,
     update_channel_task_fields,
 )
-from ...services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+from ...services.client_error_messages import (
+    CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE,
+    with_task_reference,
+)
 from ...services.db_runtime import (
     await_task_settlement,
     cancel_and_drain_async_task,
@@ -659,7 +662,7 @@ class SlackBotInstance:
                 ):
                     local_service.tracer.handlers.remove(trace_handler)
 
-            projection = project_execution_result_for_channel(result)
+            projection = project_execution_result_for_channel(result, task_id=task_id)
             if managed_lease is not None and not await managed_lease.finalize_result(
                 status=projection.task_status,
                 assistant_content=projection.transcript_content,
@@ -733,6 +736,7 @@ class SlackBotInstance:
                 )
             else:
                 error_text = "Sorry, an error occurred while processing your request."
+            error_text = with_task_reference(error_text, claimed_task_id)
             if loading_ts:
                 await self._update_text(slack_channel_id, loading_ts, error_text)
             else:
@@ -990,7 +994,9 @@ class SlackBotInstance:
     async def _deliver_shared_result(
         self, delivery: ChannelDelivery, result: dict[str, Any]
     ) -> None:
-        projection = project_execution_result_for_channel(result)
+        projection = project_execution_result_for_channel(
+            result, task_id=delivery.task_id
+        )
         destination = delivery.destination
         output, output_files = strip_slack_file_refs(projection.visible_text)
         await self._send_final_text(

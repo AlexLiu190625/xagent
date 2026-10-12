@@ -509,3 +509,80 @@ class TestParseDocumentFallback:
             # Verify None values are preserved
             assert result.get("title") is None
             assert result.get("language") is None
+
+
+@pytest.mark.parametrize(
+    ("params_json", "expected"),
+    [
+        (None, ""),
+        ("", ""),
+        ("{}", ""),
+        ('{"content_hash": ""}', ""),
+        ('{"content_hash": 7}', ""),
+        ("not json", ""),
+        ('{"content_hash": "same"}', "same"),
+    ],
+)
+def test_recorded_content_hash_reads_only_a_string(
+    params_json: str | None, expected: str
+) -> None:
+    from types import SimpleNamespace
+
+    from xagent.core.tools.core.RAG_tools.utils.metadata_utils import (
+        recorded_content_hash,
+    )
+
+    assert recorded_content_hash(SimpleNamespace(params_json=params_json)) == expected
+    assert recorded_content_hash(None) == ""
+
+
+def test_changed_content_is_parsed_again_and_the_parse_records_its_hash(
+    temp_lancedb_dir: str, test_collection: str, test_doc_id: str, tmp_path: Path
+) -> None:
+    import json
+
+    from xagent.core.tools.core.RAG_tools.storage.factory import (
+        get_vector_index_store,
+    )
+
+    source = tmp_path / "notes.txt"
+
+    def register_and_parse(text: str) -> dict:
+        source.write_text(text, encoding="utf-8")
+        register_document(
+            collection=test_collection,
+            source_path=str(source),
+            doc_id=test_doc_id,
+            user_id=1,
+        )
+        return parse_document(
+            collection=test_collection,
+            doc_id=test_doc_id,
+            parse_method=ParseMethod.DEEPDOC,
+            user_id=1,
+            is_admin=True,
+        )
+
+    def recorded() -> str:
+        rows = [
+            row
+            for batch in get_vector_index_store().iter_batches(
+                table_name="parses",
+                filters={"collection": test_collection, "doc_id": test_doc_id},
+                is_admin=True,
+            )
+            for row in batch.to_pylist()
+        ]
+        assert len(rows) == 1
+        return str(json.loads(rows[0]["params_json"])["content_hash"])
+
+    first = register_and_parse("alpha zebra lantern")
+    first_hash = recorded()
+    assert first["written"] is True
+    assert register_and_parse("alpha zebra lantern")["written"] is False
+
+    changed = register_and_parse("gamma quokka prism")
+
+    assert changed["written"] is True
+    assert "quokka" in changed["paragraphs"][0]["text"]
+    assert recorded() != first_hash

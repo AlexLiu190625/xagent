@@ -332,7 +332,7 @@ def _telegram_voice_error_bot(
         (
             "missing_download",
             "I couldn't transcribe that voice message. Please try again or send "
-            "the request as text.",
+            "the request as text. (Task ID: 1)",
         ),
     ],
 )

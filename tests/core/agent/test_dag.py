@@ -3470,10 +3470,13 @@ async def test_dag_pattern_catches_dynamically_scheduled_step_failure() -> None:
         timeout=1,
     )
 
-    assert result["success"] is False
-    assert result["status"] == "failed"
-    assert result["failure_reason"] == "step_failed"
+    # The fake model gives no usable handoff, so the completed step's result
+    # is handed over as it stands (#2850) instead of a bare failure.
+    assert result["success"] is True
+    assert result["completion_outcome"] == "partial"
+    assert result["termination_reason"] == "step_failed"
     assert result["failed_step_id"] == "render_zh"
+    assert "Create Chinese HTML done" in result["output"]
     assert "Create English HTML" in llm.cancelled_tasks
 
 

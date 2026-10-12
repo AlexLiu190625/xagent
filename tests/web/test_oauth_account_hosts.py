@@ -156,6 +156,26 @@ def test_account_host_with_no_resolved_addresses_is_rejected(
         resolve_oauth_account_endpoints(fake_provider, "acme")
 
 
+@pytest.mark.parametrize(
+    "key",
+    [
+        "grant_type",
+        "code",
+        "redirect_uri",
+        "code_verifier",
+        "refresh_token",
+        "client_id",
+        "client_secret",
+        "scope",
+    ],
+)
+def test_token_params_cannot_override_standard_token_request_fields(key):
+    # The code exchange and refresh merge token_params at different points,
+    # so letting it name a standard field would make them disagree.
+    with pytest.raises(ValueError, match=key):
+        dataclasses.replace(FAKE_HOST, token_params={key: "x"})
+
+
 def test_lookup_is_case_insensitive_and_unknown_providers_have_no_host(fake_provider):
     assert get_oauth_account_host("AcmeDesk") is fake_provider
     assert get_oauth_account_host("github") is None

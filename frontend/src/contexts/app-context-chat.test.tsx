@@ -1341,6 +1341,46 @@ describe("AppProvider websocket message routing", () => {
   })
 
   it.each([
+    ["task_failure", "failed"],
+    [undefined, "running"],
+  ])("marks a legacy chat_history row failed only for task_failure provenance (%s)", async (messageType, expectedStatus) => {
+    render(
+      <AppProvider token="token">
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:00Z",
+        data: {
+          event_id: "chat_message_7",
+          event_type: "agent_message",
+          data: {
+            message: "Task execution failed.",
+            content: "Task execution failed.",
+            role: "assistant",
+            source: "chat_history",
+            display: "chat",
+            expect_response: false,
+            visible: true,
+            ...(messageType ? { message_type: messageType } : {}),
+          },
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(JSON.parse(screen.getByTestId("message-statuses").textContent || "[]"))
+        .toEqual([expectedStatus])
+    })
+  })
+
+  it.each([
     "Round 1: please confirm",
     "Round 1: please confirm\n\nPlease answer the following questions:\n- Proceed?",
   ])("does not re-print the question when replay is followed by the waiting re-assert (%#)", async (transcriptText) => {

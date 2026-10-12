@@ -102,6 +102,10 @@ export interface ChatMessageProps {
     detail: string;
   }>;
   taskRuntimeExtensionMetadata?: TaskRuntimeMessageMetadataExtensionProps;
+  // Set by the caller on a failed assistant turn so the user can quote the
+  // task to an admin. Rendered beside the content rather than inside it: the
+  // stored failure text is replaced on reload and replayed as LLM context.
+  failureTaskId?: number | null;
 }
 
 function GeneratingIndicator({ latestTitle, taskStatus }: { latestTitle?: string, taskStatus?: string }) {
@@ -325,6 +329,7 @@ export function ChatMessage({
   onSendInteraction,
   contextBadges,
   taskRuntimeExtensionMetadata,
+  failureTaskId,
 }: ChatMessageProps) {
   const { t, tDynamic } = useI18n();
   const { filesDisabled, openFilePreview } = useApp();
@@ -488,9 +493,17 @@ export function ChatMessage({
     ? serializeFilesDisabledPresentation(copyableContent)
     : copyableContent;
 
+  const failureReference =
+    !isUser && typeof failureTaskId === "number" && failureTaskId > 0
+      ? t("common.errors.taskIdReference", { id: failureTaskId })
+      : "";
+  const clipboardContent = displayCopyableContent && failureReference
+    ? `${displayCopyableContent}\n${failureReference}`
+    : displayCopyableContent;
+
   const handleCopy = () => {
-    if (displayCopyableContent) {
-      navigator.clipboard.writeText(displayCopyableContent);
+    if (clipboardContent) {
+      navigator.clipboard.writeText(clipboardContent);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     }
@@ -569,6 +582,14 @@ export function ChatMessage({
                 !isUser && resolvedProcessStatus !== "interrupted" && (showEmptyStatus || (!showProcessView && isStoppedWithoutAnswer)) && (
                   <GeneratingIndicator latestTitle={statusTitle} taskStatus={resolvedProcessStatus} />
                 )
+              )}
+              {failureReference && (
+                <div
+                  className="mt-1 text-xs text-muted-foreground select-all"
+                  data-testid="task-failure-reference"
+                >
+                  {failureReference}
+                </div>
               )}
               {isUser && contextBadges && contextBadges.length > 0 && (
                 <div className="mt-2 flex flex-wrap gap-1.5">
