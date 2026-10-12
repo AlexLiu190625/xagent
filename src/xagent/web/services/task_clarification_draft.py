@@ -100,7 +100,7 @@ from datetime import datetime, timedelta
 from typing import Any, Literal, Mapping
 
 from ...core.agent.clarification import ClarificationDraft
-from ...core.agent.pattern.react.react import _normalize_interaction_text
+from ...core.agent.pattern.react.react import normalize_interaction_text
 from ...core.tools.adapters.vibe.mcp_approval_gate import (
     is_gate_issued_interaction_id,
 )
@@ -311,14 +311,22 @@ def build_clarification_payload(draft: ClarificationDraft) -> dict[str, Any]:
     characters a truncated tail happened to contain -- the same input must
     always truncate to the same length.
 
-    Between those two steps, ``message`` and each interaction's ``field``
-    go through ``_normalize_interaction_text`` (``react.py``), the same
-    trim function the write-side rules (``validate_v1_write_payload``)
-    judge them with, so a control character removed next to an edge space
-    cannot leave that space behind for the write side to refuse. Option
+    After control-character filtering, each interaction's ``field`` goes
+    through ``normalize_interaction_text`` (``react.py``), the trim function
+    the write-side rules (``validate_v1_write_payload``) compare a field
+    against, so a control character removed next to an edge space cannot
+    leave that space behind for the write side to refuse. That covers each
+    field on its own, not uniqueness across fields: two fields that differ
+    only by a control character, such as ``"\x07a"`` and ``"a"``, both come
+    out as ``"a"``, and the write side refuses the pair as
+    ``field_duplicate``. ``message`` is
+    not trimmed: the write side only refuses a message that is blank under
+    that same function, and leading indentation or newlines (a code block,
+    for instance) are part of what the user should see. The blank judgment
+    itself is made by :func:`resolve_publishable_clarification`. Option
     ``label`` / ``value``, ``message_type`` and ``requests`` are not
-    normalized: trimming option text would change option values that are
-    valid today.
+    normalized either: trimming option text would change option values that
+    are valid today.
 
     Every step here degrades rather than raises: a control character is
     dropped silently (it was never visible to begin with), an over-length
@@ -374,11 +382,6 @@ def build_clarification_payload(draft: ClarificationDraft) -> dict[str, Any]:
             },
         )
 
-    # After the warning above, which counts control characters only: a
-    # message made only of trim characters such as U+FEFF is not "empty
-    # after removing control characters" and must not be logged as such.
-    cleaned_question = _normalize_interaction_text(cleaned_question)
-
     message_truncated = False
     question = cleaned_question
     if len(cleaned_question.encode("utf-8")) > _QUESTION_MAX_BYTES:
@@ -398,7 +401,7 @@ def build_clarification_payload(draft: ClarificationDraft) -> dict[str, Any]:
     for item in interactions_cleaned:
         field_value = item.get("field")
         if isinstance(field_value, str):
-            item["field"] = _normalize_interaction_text(field_value)
+            item["field"] = normalize_interaction_text(field_value)
     interactions_dropped = False
     interactions_payload: list[Any] = interactions_cleaned
     if _serialized_byte_length(interactions_cleaned) > _INTERACTIONS_MAX_BYTES:
@@ -521,7 +524,11 @@ def resolve_publishable_clarification(
        ``interaction_id`` the MCP approval gate issued is
        ``NotApplicable("host_approval_prompt")``. Any item, not all: a
        multi-tool draft is published as a single row, so publishing it would
-       hand that approval to the structured-answer path. Only
+       hand that approval to the structured-answer path. The other tools'
+       questions in such a mixed draft are therefore not published as a
+       structured interaction either; they stay on the legacy transcript
+       like every other ``NotApplicable`` outcome, and an info-level log
+       records that the mix happened. Only
        ``tool_waiting`` drafts are checked -- ``ask_user_question`` and
        ``send_message`` items carry a model-produced tool call id, which is
        never excluded even if it happens to look like a gate id. This runs
@@ -541,7 +548,8 @@ def resolve_publishable_clarification(
        native publication without discarding the round.
     8. The payload built from the draft fits the character domain and size
         limits in :func:`build_clarification_payload`; if it does not
-        (empty after filtering, or reduced to only whitespace, or still
+        (empty after filtering, or reduced to only characters
+        ``normalize_interaction_text`` trims, or still
         oversized after truncation), that also degrades rather than fails.
         This check runs last because it is the only one that requires
         building the payload first.
@@ -626,10 +634,26 @@ def resolve_publishable_clarification(
     if not task_row_matches_lease_attempt(task, lease):
         return FailClosed("attempt_mismatch")
 
-    if draft.source == "tool_waiting" and any(
-        is_gate_issued_interaction_id(item.interaction_id) for item in draft.requests
-    ):
-        return NotApplicable("host_approval_prompt")
+    if draft.source == "tool_waiting":
+        gated_count = sum(
+            1
+            for item in draft.requests
+            if is_gate_issued_interaction_id(item.interaction_id)
+        )
+        if gated_count:
+            if gated_count < len(draft.requests):
+                logger.info(
+                    "an approval prompt shares its waiting turn with another "
+                    "tool's question; neither is published as a structured "
+                    "interaction",
+                    extra={
+                        "task_id": task.id,
+                        "run_id": lease.run_id,
+                        "gated_request_count": gated_count,
+                        "request_count": len(draft.requests),
+                    },
+                )
+            return NotApplicable("host_approval_prompt")
 
     if anchor is None:
         return NotApplicable("no_anchor")
@@ -649,7 +673,10 @@ def resolve_publishable_clarification(
 
     payload = build_clarification_payload(draft)
 
-    if not payload["message"].strip():
+    # Judged with the write side's own trim function, not ``str.strip()``:
+    # the payload keeps the message's edge whitespace, and ``str.strip()``
+    # keeps a U+FEFF that the write side would refuse as ``message_blank``.
+    if not normalize_interaction_text(payload["message"]):
         return NotApplicable("empty_question")
 
     if _serialized_byte_length(payload) > _TOTAL_PAYLOAD_MAX_BYTES:

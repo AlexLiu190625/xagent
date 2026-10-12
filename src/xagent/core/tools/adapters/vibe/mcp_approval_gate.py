@@ -500,8 +500,10 @@ def _gated_interaction_source(interaction_id: str) -> tuple[str, str] | None:
 
 
 def is_gate_issued_interaction_id(interaction_id: str) -> bool:
-    """Return True when this gate issued ``interaction_id``.
+    """Return True when ``interaction_id`` has the shape of a gate-issued id.
 
+    This is a shape check only: there is no MAC and no registry of issued
+    ids behind it, so any string built in the gate's format is accepted.
     The prefix and length parsing lives only in
     :func:`_gated_interaction_source`; code outside this module that needs
     to recognise a gate-issued id must call this function instead of
