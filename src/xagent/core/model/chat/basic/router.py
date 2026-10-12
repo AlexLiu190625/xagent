@@ -1,14 +1,17 @@
 """Router LLM: a virtual model that delegates to xrouter-llm for selection.
 
-On every call it asks the xrouter-llm decision library (imported in-process, no
-external service) to pick ONE routing profile for the prompt, then dispatches
-the actual completion through the concrete saved model bound to that profile.
+On every call it asks the xrouter-llm decision library (imported in-process;
+only the prompt embedding may go to a remote service, see
+XROUTER_EMBEDDING_BACKEND below) to pick ONE routing profile for the prompt,
+then dispatches the actual completion through the concrete saved model bound to
+that profile.
 The legacy OpenRouter ``auto`` model remains supported and resolves every
 profile through its own OpenRouter credential pair.
 
 xrouter-llm ships a trained router, the model-profile registry, and the named
-router configs as package data, so the decision runs entirely in-process. The
-registry returns canonical ids (e.g. `anthropic/claude-opus-4.8`,
+router configs as package data, so the decision runs in-process except for the
+prompt embedding when a remote backend is selected. The registry returns
+canonical ids (e.g. `anthropic/claude-opus-4.8`,
 `openai/gpt-5.5`) which configured Auto maps to concrete model records.
 
 Every decision (prompt, candidate models with their predicted completion and
