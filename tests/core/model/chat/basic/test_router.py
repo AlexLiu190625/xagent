@@ -1181,3 +1181,37 @@ def test_build_service_rejects_unknown_embedding_backend(monkeypatch) -> None:
         router._build_service("model.joblib", "models", "routers")
 
     assert constructed == []
+
+
+def test_build_service_rejects_unknown_backend_before_loading_anything(
+    monkeypatch,
+) -> None:
+    from xagent.core.model.chat.basic import router
+
+    touched: list[str] = []
+
+    class _Predictor:
+        def predict(self, *args: Any, **kwargs: Any) -> list[Any]:
+            return []
+
+    def _recording(name: str, value: Any) -> Any:
+        def _call(*_args: Any) -> Any:
+            touched.append(name)
+            return value
+
+        return _call
+
+    monkeypatch.setattr("joblib.load", _recording("joblib.load", _Predictor()))
+    monkeypatch.setattr(
+        "xrouter_llm.load_benchmark_profiles", _recording("profiles", "profiles")
+    )
+    monkeypatch.setattr(
+        "xrouter_llm.serving.load_router_configs", _recording("configs", {})
+    )
+    monkeypatch.setattr("xrouter_llm.store.CallStore", _recording("store", "store"))
+    monkeypatch.setenv("XROUTER_EMBEDDING_BACKEND", "Xinference")
+
+    with pytest.raises(ValueError, match="Unknown embedding backend"):
+        router._build_service("model.joblib", "models", "routers")
+
+    assert touched == []

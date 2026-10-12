@@ -90,9 +90,12 @@ def _store_path() -> str:
         return "xrouter_calls.db"
 
 
-# A RoutingService loads a trained predictor plus a multilingual embedding model,
-# which is expensive, so build it once per (model, registry, configs) tuple and
-# share it across all RouterLLM instances.
+# A RoutingService holds a trained predictor whose prompt encoder runs a
+# multilingual embedding model (in process unless XROUTER_EMBEDDING_BACKEND
+# selects a remote backend), which is expensive, so build it once per
+# (model, registry, configs) tuple and share it across all RouterLLM instances.
+# The XROUTER_EMBEDDING_* / XINFERENCE_* variables are not part of that key:
+# they take effect when a process first builds the service.
 _SERVICE_LOCK = threading.Lock()
 _SERVICE_CACHE: dict[tuple[str, str, str], Any] = {}
 
@@ -103,11 +106,20 @@ def _build_service(model_path: str, models_dir: str, routers_dir: str) -> Any:
         from xrouter_llm import embedding_backend_from_env, load_benchmark_profiles
         from xrouter_llm.serving import RoutingService, load_router_configs
         from xrouter_llm.store import CallStore
-    except ImportError as exc:  # pragma: no cover - dependency missing
+    except ImportError as exc:  # pragma: no cover - dependency missing or too old
         raise RuntimeError(
-            "The 'router' (auto) provider needs the xrouter-llm package. "
-            "Install it with `pip install 'xagent[router]'` (or `pip install xrouter-llm`)."
+            "The 'router' (auto) provider needs xrouter-llm>=0.3.6; it is not "
+            "installed or the installed version is too old. Install it with "
+            "`pip install 'xagent[router]'` (or `pip install 'xrouter-llm>=0.3.6'`)."
         ) from exc
+
+    # Resolve the backend selected by XROUTER_EMBEDDING_BACKEND (see the module
+    # docstring) before loading anything. An unknown name raises ValueError here,
+    # and _get_service caches only successful builds, so a misconfigured process
+    # retries on every Auto call; failing first keeps each retry from reloading
+    # the artifact and rerunning the call-history migrations. None keeps the
+    # in-process backend serialized in the artifact.
+    embedding_backend = embedding_backend_from_env()
 
     predictor = joblib.load(model_path)
     if not hasattr(predictor, "predict"):
@@ -119,11 +131,6 @@ def _build_service(model_path: str, models_dir: str, routers_dir: str) -> Any:
     except Exception as exc:  # noqa: BLE001 - history must not break routing
         logger.warning("xrouter call history disabled (%s)", exc)
         store = _NullStore()
-    # XROUTER_EMBEDDING_BACKEND=xinference points the predictor's prompt encoder at a
-    # remote embedding endpoint (XINFERENCE_BASE_URL / XINFERENCE_API_KEY), so this
-    # process never loads the serialized sentence-transformers model. Unset keeps
-    # the in-process backend the artifact was trained with.
-    embedding_backend = embedding_backend_from_env()
     if embedding_backend is not None:
         logger.info("xrouter embedding backend: %s", embedding_backend.name)
     return RoutingService(
