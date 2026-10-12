@@ -521,7 +521,7 @@ def resolve_publishable_clarification(
        alone.
     5. The draft is not the host's MCP approval prompt: a ``tool_waiting``
        draft where *any* item in ``draft.requests`` carries an
-       ``interaction_id`` the MCP approval gate issued is
+       ``interaction_id`` in the MCP approval gate's id format is
        ``NotApplicable("host_approval_prompt")``. Any item, not all: a
        multi-tool draft is published as a single row, so publishing it would
        hand that approval to the structured-answer path. The other tools'
@@ -535,7 +535,7 @@ def resolve_publishable_clarification(
        after guards 2 through 4, because a fence failure must still discard
        the round, and before the anchor check, so an approval wait is
        neither reported as ``no_anchor`` nor shaped into a payload.
-       Recognising a gate-issued id belongs to the gate module
+       Recognising the gate's id format belongs to the gate module
        (``is_gate_issued_interaction_id``); this function does not parse
        the id itself. No degradation signal is registered.
     6. ``anchor is not None`` -- no resume anchor means this run's most
