@@ -1806,8 +1806,9 @@ def test_cm1_seven_cell_exit_matrix(
     # Python versions and capture setups) appears on both sides and cancels
     # out of the diff; a hand-constructed bare LogRecord does not have that
     # property. The attempt-mismatch cell logs its own message (see
-    # test_cm6_attempt_mismatch_logs_its_own_message) with the same `extra`
-    # keys, so that one cell selects its record by that message's prefix.
+    # test_cm6_attempt_mismatch_logs_its_own_message) with one more `extra`
+    # key, the task row's attempt, so that one cell selects its record by
+    # that message's prefix and expects that key on top of the six.
     if case == "attempt-mismatch":
         degraded_records = [
             r
@@ -1827,7 +1828,10 @@ def test_cm1_seven_cell_exit_matrix(
     )
     baseline = next(r for r in caplog.records if r.message == "caplog baseline probe")
     extra_keys = set(vars(record)) - set(vars(baseline))
-    assert extra_keys == _DEGRADATION_LOG_EXTRA_KEYS
+    expected_extra_keys = set(_DEGRADATION_LOG_EXTRA_KEYS)
+    if case == "attempt-mismatch":
+        expected_extra_keys.add("task_row_attempt_id")
+    assert extra_keys == expected_extra_keys
     assert record.task_id == task_id
     assert record.degradation_signal == expect_signal
 
@@ -2156,21 +2160,34 @@ def test_cm5_in_block_write_is_discarded_with_the_degraded_row(
     db.close()
 
 
+@pytest.mark.parametrize(
+    ("lease_attempt_id", "rendered_lease_attempt"),
+    [
+        pytest.param("attempt-stale", "'attempt-stale'", id="stale-attempt"),
+        pytest.param(None, "None", id="no-attempt"),
+    ],
+)
 def test_cm6_attempt_mismatch_logs_its_own_message(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    lease_attempt_id: str | None,
+    rendered_lease_attempt: str,
 ) -> None:
     """A swallowed attempt mismatch is logged with its own message naming
     the task, the lease's attempt and the task row's attempt, instead of
-    the message the other swallowed exceptions share. The expected message
-    is written out here as a literal on purpose, so a change to the
-    production format string is caught rather than mirrored."""
+    the message the other swallowed exceptions share. A lease that carries
+    no attempt at all raises the same exception and renders its attempt as
+    ``None``. The expected message is written out here as a literal on
+    purpose, so a change to the production format string is caught rather
+    than mirrored."""
 
     engine = _engine(tmp_path)
     session_factory = _session_factory(engine)
     task_id, anchor_id = _seed(session_factory)
     db = session_factory()
     anchor = _anchor(anchor_id)
-    lease = _force_attempt_mismatch(db, task_id)
+    _force_attempt_mismatch(db, task_id)
+    lease = _lease(task_id, attempt_id=lease_attempt_id)
     db.commit()
     task = db.get(Task, task_id)
     caplog.set_level(
@@ -2197,12 +2214,11 @@ def test_cm6_attempt_mismatch_logs_its_own_message(
     message = errors[0].getMessage()
     assert message == (
         "interaction handoff degraded: InteractionAttemptMismatch for task "
-        f"{task_id} (lease attempt 'attempt-stale', "
+        f"{task_id} (lease attempt {rendered_lease_attempt}, "
         "task row attempt 'attempt-current')"
     )
-    assert str(task_id) in message
-    assert "attempt-stale" in message
-    assert "attempt-current" in message
+    assert errors[0].lease_attempt_id == lease_attempt_id
+    assert errors[0].task_row_attempt_id == "attempt-current"
     assert ops_signals.INTERACTION_HANDOFF_DEGRADED in ops_signals.active_degradations()
     assert db.query(TaskInteractionRequest).count() == 0
     db.close()

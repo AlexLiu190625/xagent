@@ -306,13 +306,14 @@ class InteractionAttemptMismatch(InteractionHandoffError):
     Raised by ``InteractionHandoff.stage()``, at the start of the call,
     before any staging SQL is issued -- not by ``interaction_handoff``'s
     ``__enter__`` (see ``stage()``'s own docstring for why this
-    precondition has to live there). Raised when
-    ``lease.attempt_id is not None`` and it disagrees with
-    ``task.lease_attempt_id``. See ``TaskLease.attempt_id``'s docstring
-    (``task_lease_service.py``) for the ``is not None`` gate: a permanent
-    ``None`` lease (the ambient snapshot ``_task_lease_snapshot`` builds)
-    must read as "cannot prove attempt identity", never as "matches" or "does
-    not match".
+    precondition has to live there). Raised whenever
+    ``task_row_matches_lease_attempt`` (``task_lease_service.py``) is false:
+    when ``lease.attempt_id`` disagrees with ``task.lease_attempt_id``, and
+    also when ``lease.attempt_id`` is ``None``. See ``TaskLease.attempt_id``'s
+    docstring (``task_lease_service.py``) for why a ``None`` attempt is
+    refused: a permanent ``None`` lease (the ambient snapshot
+    ``_task_lease_snapshot`` builds) must read as "cannot prove attempt
+    identity", never as "matches", so it cannot stage either.
     """
 
 
@@ -1677,48 +1678,34 @@ def interaction_handoff(
                 f"task {_safe(task, 'id')} run {_safe(lease, 'run_id')}: "
                 f"{type(exc).__name__}: {exc}",
             )
+            log_extra: dict[str, Any] = {
+                "task_id": _safe(task, "id"),
+                "lease_run_id": _safe(lease, "run_id"),
+                "lease_attempt_id": _safe(lease, "attempt_id"),
+                "anchor_run_partition": _safe(anchor, "resume_run_partition"),
+                "exception_type": type(exc).__name__,
+                "degradation_signal": signal,
+            }
+            log_message = "interaction handoff degraded"
+            log_args: tuple[Any, ...] = ()
             if isinstance(exc, InteractionAttemptMismatch):
-                # Once wired, the three execution finalizers are not
-                # expected to reach this branch.
-                # _finalize_task_execution_result_isolated and
-                # _finalize_resumed_task pass the task object they locked
-                # with task_lease_attempt_predicate.
-                # finalize_managed_task_lease_result re-reads the row after
-                # release_task_lease_no_commit, which keeps lease_attempt_id
-                # only when a coordinator owns the execution, so it must
-                # publish only in that case. Kept for callers whose row lock
-                # does not filter on the lease's attempt. The message names
-                # the exception and the two values and does not infer a
-                # cause: a lease that carries no attempt at all raises here
-                # too. Same structured fields as the shared message below;
-                # only the message differs.
-                logger.error(
+                # An attempt mismatch gets its own message naming both
+                # attempt values, and the task row's attempt as one more
+                # structured field. The message states the two values and
+                # does not infer a cause: a lease that carries no attempt
+                # at all raises here too.
+                task_row_attempt_id = _safe(task, "lease_attempt_id")
+                log_extra["task_row_attempt_id"] = task_row_attempt_id
+                log_message = (
                     "interaction handoff degraded: InteractionAttemptMismatch "
-                    "for task %s (lease attempt %r, task row attempt %r)",
+                    "for task %s (lease attempt %r, task row attempt %r)"
+                )
+                log_args = (
                     _safe(task, "id"),
                     _safe(lease, "attempt_id"),
-                    _safe(task, "lease_attempt_id"),
-                    extra={
-                        "task_id": _safe(task, "id"),
-                        "lease_run_id": _safe(lease, "run_id"),
-                        "lease_attempt_id": _safe(lease, "attempt_id"),
-                        "anchor_run_partition": _safe(anchor, "resume_run_partition"),
-                        "exception_type": type(exc).__name__,
-                        "degradation_signal": signal,
-                    },
+                    task_row_attempt_id,
                 )
-            else:
-                logger.error(
-                    "interaction handoff degraded",
-                    extra={
-                        "task_id": _safe(task, "id"),
-                        "lease_run_id": _safe(lease, "run_id"),
-                        "lease_attempt_id": _safe(lease, "attempt_id"),
-                        "anchor_run_partition": _safe(anchor, "resume_run_partition"),
-                        "exception_type": type(exc).__name__,
-                        "degradation_signal": signal,
-                    },
-                )
+            logger.error(log_message, *log_args, extra=log_extra)
         finally:
             # Registration and logging run first, in the try; the rollback
             # lives in finally so it still runs even if logger.error itself
