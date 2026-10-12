@@ -1,3 +1,5 @@
+import type { OAuthAccountInput } from "@/lib/oauth-account"
+
 // Shared shape for a connector catalog entry / connected MCP app. Kept in one
 // place so the connector dialog and the settings dialog can't drift apart.
 export interface AppIntegration {
@@ -22,6 +24,10 @@ export interface AppIntegration {
   // backend (mcp_apps.classify_app_auth). Read this instead of re-deriving
   // from provider/required_env so the dialogs can't drift from the backend.
   auth_type?: "builtin_oauth" | "api_key" | "keyless" | "mcp_oauth" | "unconnectable"
+  // Builtin OAuth apps whose provider authorizes on the customer's own
+  // account host: the connect flow asks for this account label before the
+  // popup (oauth-account-dialog.tsx). Absent for every other app.
+  oauth_account_input?: OAuthAccountInput
   launch_config?: {
     command?: string
     args?: string[]

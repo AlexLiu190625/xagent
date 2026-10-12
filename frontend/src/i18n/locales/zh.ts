@@ -1213,6 +1213,13 @@ const zh = {
           authorizationRequiresDelegated: "Authorization 绑定需要开启委托授权。"
         }
       },
+      // Account identifier step before a builtin OAuth popup, for providers
+      // hosted on the customer's own account (oauth-account-dialog.tsx).
+      accountStep: {
+        continue: "继续",
+        invalid: "请只输入账号名：仅可包含字母、数字和连字符（连字符不能在开头或结尾），最长 63 个字符。",
+        retryHint: "尚未连接。如果登录窗口显示了错误，请检查账号名后重试。",
+      },
       dialog: {
         addTitle: "添加 MCP 服务器",
         editTitle: "编辑 MCP 服务器",

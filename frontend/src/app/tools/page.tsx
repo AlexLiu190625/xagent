@@ -184,7 +184,7 @@ function ToolsPageContent() {
 
   const { t, tDynamic } = useI18n()
   const { user, inTeam } = useAuth()
-  const { getAppIcon } = useMcpApps()
+  const { getAppIcon, apps: catalogApps } = useMcpApps()
   const isAdmin = Boolean(user?.is_admin)
 
   // F8: strip all three mcp_oauth redirect params in both effects below, not
@@ -586,6 +586,7 @@ function ToolsPageContent() {
 
       // Use app_id from backend if available, fallback to basic logic
       const appId = server.app_id || server.name.toLowerCase().replace(/\s+/g, '-')
+      const accountInput = catalogApps.find((app) => app.id === appId)?.oauth_account_input
 
       // We need to fetch the icon or use a generic one
       let icon = getAppIcon(server.name) || "";
@@ -620,6 +621,9 @@ function ToolsPageContent() {
         // above); set auth_type explicitly so the settings dialog's isKeyBased
         // check stays correct if this path is ever reused for other transports.
         auth_type: "builtin_oauth",
+        // Server rows don't carry the account input; the catalog entry does,
+        // and Configure re-runs the login that needs it.
+        oauth_account_input: accountInput,
       })
       setIsOfficialAppDialogOpen(true)
     } else if (server.transport === "custom_api") {
