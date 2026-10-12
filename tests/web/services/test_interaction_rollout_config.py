@@ -168,26 +168,61 @@ _NATIVE_WITHOUT_SHARED_EXECUTION_WARNING = (
 
 
 @pytest.mark.parametrize(
-    ("mode", "shared_env", "expected_shared", "expected_warnings"),
+    ("mode", "topology_env", "expected_shared", "expected_warnings"),
     [
         pytest.param(
             "native",
-            "false",
+            {config.SHARED_TASK_EXECUTION_ENABLED: "false"},
             False,
             [_NATIVE_WITHOUT_SHARED_EXECUTION_WARNING],
             id="native_not_shared",
         ),
-        pytest.param("native", "true", True, [], id="native_shared"),
-        pytest.param("legacy", "false", False, [], id="legacy_not_shared"),
+        pytest.param(
+            "native",
+            {config.SHARED_TASK_EXECUTION_ENABLED: "true"},
+            True,
+            [],
+            id="native_shared",
+        ),
+        pytest.param(
+            "legacy",
+            {config.SHARED_TASK_EXECUTION_ENABLED: "false"},
+            False,
+            [],
+            id="legacy_not_shared",
+        ),
+        # Explicit flag unset: the topology is derived from the process
+        # role and worker count, the way split web/worker deployments run.
+        pytest.param(
+            "native",
+            {config.TASK_EXECUTION_ROLE: "web"},
+            True,
+            [],
+            id="native_derived_shared_from_web_role",
+        ),
+        pytest.param(
+            "native",
+            {},
+            False,
+            [_NATIVE_WITHOUT_SHARED_EXECUTION_WARNING],
+            id="native_derived_not_shared_when_unconfigured",
+        ),
     ],
 )
 def test_tc15_topology_is_frozen_at_startup_and_only_native_without_shared_execution_warns(
-    monkeypatch, caplog, mode, shared_env, expected_shared, expected_warnings
+    monkeypatch, caplog, mode, topology_env, expected_shared, expected_warnings
 ):
     monkeypatch.setenv(config.INTERACTION_PROTOCOL_MODE, mode)
     if mode == "native":
         monkeypatch.setenv(config.INTERACTION_NATIVE_SOURCES, "sdk")
-    monkeypatch.setenv(config.SHARED_TASK_EXECUTION_ENABLED, shared_env)
+    for name in (
+        config.SHARED_TASK_EXECUTION_ENABLED,
+        config.TASK_EXECUTION_ROLE,
+        config.WORKER_COUNT,
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in topology_env.items():
+        monkeypatch.setenv(name, value)
 
     with caplog.at_level(logging.INFO, logger=_ROLLOUT_LOGGER):
         policy = ir.validate_interaction_rollout_at_startup()
@@ -210,6 +245,14 @@ def test_tc15_topology_is_frozen_at_startup_and_only_native_without_shared_execu
     assert policy_lines[0].rpartition(" shared_task_execution=")[2] == str(
         expected_shared
     )
+
+    # Flip the topology after startup: the live resolver follows the
+    # environment, the policy the gate reads does not.
+    monkeypatch.setenv(
+        config.SHARED_TASK_EXECUTION_ENABLED, "false" if expected_shared else "true"
+    )
+    assert config.get_shared_task_execution_enabled() is not expected_shared
+    assert ir.get_interaction_rollout_policy().shared_task_execution is expected_shared
 
 
 def test_tc10a_origin_vocabulary_equals_check_constraint_in_list():

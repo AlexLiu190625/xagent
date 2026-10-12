@@ -533,7 +533,13 @@ def evaluate_native_publication(
        shared task execution is a deployment fact that startup already
        reported with a WARNING, not a fault. It runs before the unknown-
        source check so that such a process set to native mode never
-       registers the unknown-source degradation.
+       registers the unknown-source degradation. Why the step exists: it
+       is a rollout-scope choice, not a precondition of any other step in
+       this gate. Task coordinators are only created under shared task
+       execution, and ``task_command_transport`` only claims START and
+       RESUME_INPUT commands there, so native publication is rolled out on
+       that one topology while every other process keeps asking questions
+       as chat messages. Relaxing this step is a policy decision.
     3. The schema-existence check is the only step that issues a query, so
        it runs last among the blocking checks -- after every check capable
        of rejecting for free has had its turn.

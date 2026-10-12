@@ -13,7 +13,6 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 import xagent.config as config
 import xagent.web.services.interaction_rollout as ir
 import xagent.web.services.managed_task_lease as managed_task_lease
-import xagent.web.services.task_coordinator_runtime as task_coordinator_runtime
 from tests.web.services.coordinator_command_shared import owning_coordinator
 from xagent.web.models.agent import Agent
 from xagent.web.models.chat_message import TaskChatMessage
@@ -839,8 +838,6 @@ def test_finalize_without_execution_result_creates_no_interaction_row_in_native_
     assert lease is not None
 
     with owning_coordinator(lease):
-        coordinator = task_coordinator_runtime.current_task_coordinator(int(task.id))
-        assert coordinator is not None and coordinator.owns_execution(lease)
         assert (
             finalize_managed_task_lease_result(
                 db_session,
@@ -851,4 +848,8 @@ def test_finalize_without_execution_result_creates_no_interaction_row_in_native_
             is True
         )
 
+    # Released under its owning coordinator, the task row keeps its runner
+    # for that coordinator to give up; without one it would be cleared here.
+    db_session.refresh(task)
+    assert task.runner_id == lease.runner_id
     assert db_session.query(TaskInteractionRequest).count() == 0
