@@ -1595,6 +1595,29 @@ async def stop_runtime_performance_monitor(app_instance: FastAPI) -> None:
     await asyncio.to_thread(shutdown_runtime_performance_telemetry)
 
 
+def start_app_process_diagnostics(app_instance: FastAPI) -> None:
+    """Start this process's diagnostics line once per app lifespan; never raises."""
+
+    from .services.process_diagnostics import start_process_diagnostics
+
+    existing = getattr(app_instance.state, "process_diagnostics_task", None)
+    if (
+        existing is not None
+        and not existing.done()
+        and existing.get_loop() is asyncio.get_running_loop()
+    ):
+        return
+    app_instance.state.process_diagnostics_task = start_process_diagnostics()
+
+
+async def stop_app_process_diagnostics(app_instance: FastAPI) -> None:
+    from .services.process_diagnostics import stop_process_diagnostics
+
+    task = getattr(app_instance.state, "process_diagnostics_task", None)
+    app_instance.state.process_diagnostics_task = None
+    await stop_process_diagnostics(task)
+
+
 async def _initialize_database_and_admit_runtime(app_instance: FastAPI) -> None:
     """Prepare the database, admit the host, then open runtime work ingress."""
     with _startup_phase("database init"):
@@ -2203,6 +2226,7 @@ async def startup_event() -> None:
     if auto_migrate:
         start_temp_file_cleanup_task(app)
     start_runtime_performance_monitor(app)
+    start_app_process_diagnostics(app)
 
 
 @app.on_event("shutdown")
@@ -2336,6 +2360,7 @@ async def shutdown_event() -> None:
     # Export task-finalization metrics and post-drain gauges before stopping
     # telemetry. Exporter shutdown must not delay cancellation of live tasks.
     await stop_runtime_performance_monitor(app)
+    await stop_app_process_diagnostics(app)
 
     from .services.task_runtime import shutdown_task_runtime_hook_executor
 
