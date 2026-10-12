@@ -255,8 +255,14 @@ container control.
 
 Docker sibling mode also resolves sandbox bind mounts on the Docker host. The
 overlay defaults `XAGENT_SANDBOX_HOST_PROJECT_ROOT` to the current project root
-and binds `${XAGENT_HOST_STORAGE_ROOT:-/root/.xagent}` to `/root/.xagent`. It
-also passes `XAGENT_SANDBOX_HOST_STORAGE_ROOT` into the backend so sandbox
+and binds `${XAGENT_HOST_STORAGE_ROOT:-/root/.xagent}` to `/root/.xagent` in
+`backend`, `worker`, `scheduler` and `nginx` (read-only), so they all see the
+same uploads and data. The host directory stays authoritative for a
+deployment that ran this overlay before: the backend always wrote its uploads,
+LanceDB ledger and `.kb-engine` there. See "Upgrading an existing
+sandbox.docker deployment" below.
+
+The overlay also passes `XAGENT_SANDBOX_HOST_STORAGE_ROOT` into the backend so sandbox
 workspace mounts under `/root/.xagent` are translated back to the host storage
 path before they reach the host Docker daemon. When set,
 `XAGENT_SANDBOX_HOST_STORAGE_ROOT` must be an absolute Docker-host path;
@@ -338,6 +344,43 @@ the same host workspace, so concurrent execution creates two live writers.
 Rollback also requires a maintenance window. Drain and stop the namespaced
 backends and their v2 containers before starting pre-namespace code; the old
 backend cannot see v2 containers and otherwise double-provisions sandboxes.
+
+#### Upgrading an existing sandbox.docker deployment
+
+The `xagent_data` volume holds what the worker wrote (staged and published
+uploads, and LanceDB rows and a `.kb-engine` from its own ingests such as web
+ingests). Do not copy the volume's `data` over the host directory, because
+LanceDB cannot be merged by copying files. Set `COMPOSE_PROJECT_NAME` and
+`XAGENT_HOST_STORAGE_ROOT` (an absolute path) in your shell first, then
+confirm the volume name; a mistyped name makes `docker run -v` create an empty
+volume, so the listing below would be silently empty:
+
+```bash
+docker volume ls | grep xagent_data
+```
+
+List the volume:
+
+```bash
+docker run --rm -v "${COMPOSE_PROJECT_NAME}_xagent_data":/v:ro alpine find /v -type f
+```
+
+If `uploads` holds files the host lacks, copy only those, never overwriting a
+host file (`cp -n` in Alpine's BusyBox skips a whole directory that already
+exists, so use a loop):
+
+```bash
+docker run --rm \
+  -v "${COMPOSE_PROJECT_NAME}_xagent_data":/v:ro \
+  -v "${XAGENT_HOST_STORAGE_ROOT:-/root/.xagent}":/h alpine sh -c '
+  cd /v/uploads && find . -type f | while IFS= read -r f; do
+    [ -e "/h/uploads/$f" ] || { mkdir -p "/h/uploads/$(dirname "$f")"; cp -p "$f" "/h/uploads/$f"; }
+  done'
+```
+
+Documents that only the worker ingested must be ingested again. Review the
+listing for any other paths the worker may have written before removing the
+volume.
 
 ### Milvus Knowledge-Base Engine
 
