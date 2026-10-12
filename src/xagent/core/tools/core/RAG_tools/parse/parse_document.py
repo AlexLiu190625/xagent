@@ -29,6 +29,11 @@ from ..core.schemas import (
 )
 from ..storage.factory import get_vector_index_store
 from ..utils.hash_utils import compute_parse_hash, get_parse_params_whitelist
+from ..utils.metadata_utils import (
+    CONTENT_HASH_KEY,
+    content_hash_or_empty,
+    recorded_content_hash,
+)
 
 if TYPE_CHECKING:
     from ..kb import KBLegacyStepCompatibilityFacade
@@ -162,7 +167,14 @@ async def _parse_document_internal(
     parse_hash = compute_parse_hash(str(parse_method), params)
     logger.info("Computed parse hash: %s", parse_hash)
 
-    if handle.parse_exists(doc_id, parse_hash, user_id=user_id, is_admin=is_admin):
+    content_hash = content_hash_or_empty(document.get("content_hash"))
+    stored = handle.read_latest_parse_record(
+        doc_id, parse_hash=parse_hash, user_id=user_id, is_admin=is_admin
+    )
+    # parse_hash ignores file content: a parse made from other content is stale.
+    if stored is not None and (
+        not content_hash or recorded_content_hash(stored) == content_hash
+    ):
         existing_paragraphs = handle.read_parse_paragraphs(
             doc_id, parse_hash, user_id=user_id, is_admin=is_admin
         )
@@ -281,7 +293,7 @@ async def _parse_document_internal(
         doc_id,
         parse_hash,
         str(parse_method),
-        params,
+        {**params, CONTENT_HASH_KEY: content_hash} if content_hash else params,
         enriched_paragraphs,
         user_id=user_id,
     )

@@ -192,6 +192,134 @@ class TestChunkDocument:
             test_collection, test_doc_id, parse_hash
         )
 
+    def test_chunks_carry_the_content_the_parse_recorded_not_the_documents_row(
+        self, temp_lancedb_dir, test_collection, test_doc_id, tmp_path
+    ):
+        """A newer registration landing between parse and chunk must not relabel them."""
+        import json
+
+        from xagent.core.tools.core.RAG_tools.storage.factory import (
+            get_vector_index_store,
+        )
+        from xagent.core.tools.core.RAG_tools.utils.metadata_utils import (
+            deserialize_metadata,
+        )
+
+        source = tmp_path / "notes.txt"
+        source.write_text("alpha zebra lantern", encoding="utf-8")
+        register_document(
+            collection=test_collection,
+            source_path=str(source),
+            doc_id=test_doc_id,
+            user_id=1,
+        )
+        parse_result = parse_document(
+            collection=test_collection,
+            doc_id=test_doc_id,
+            parse_method="default",
+            user_id=1,
+            is_admin=True,
+        )
+        store = get_vector_index_store()
+
+        def rows(table: str) -> list[dict]:
+            return [
+                row
+                for batch in store.iter_batches(
+                    table_name=table,
+                    filters={"collection": test_collection, "doc_id": test_doc_id},
+                    is_admin=True,
+                )
+                for row in batch.to_pylist()
+            ]
+
+        parsed_from = json.loads(rows("parses")[0]["params_json"])["content_hash"]
+        source.write_text("gamma quokka prism", encoding="utf-8")
+        register_document(
+            collection=test_collection,
+            source_path=str(source),
+            doc_id=test_doc_id,
+            user_id=1,
+        )
+        assert rows("documents")[0]["content_hash"] != parsed_from
+
+        chunk_document(
+            collection=test_collection,
+            doc_id=test_doc_id,
+            parse_hash=parse_result["parse_hash"],
+            chunk_strategy=ChunkStrategy.RECURSIVE,
+            chunk_size=100,
+            chunk_overlap=0,
+            user_id=1,
+        )
+
+        chunks = rows("chunks")
+        assert chunks
+        for row in chunks:
+            assert deserialize_metadata(row["metadata"])["content_hash"] == parsed_from
+        first_config = {row["config_hash"] for row in chunks}
+
+        parse_document(
+            collection=test_collection,
+            doc_id=test_doc_id,
+            parse_method="default",
+            user_id=1,
+            is_admin=True,
+        )
+        chunk_document(
+            collection=test_collection,
+            doc_id=test_doc_id,
+            parse_hash=parse_result["parse_hash"],
+            chunk_strategy=ChunkStrategy.RECURSIVE,
+            chunk_size=100,
+            chunk_overlap=0,
+            user_id=1,
+        )
+
+        configs = {row["config_hash"] for row in rows("chunks")}
+        assert len(configs) == 2 and first_config < configs
+
+    def test_chunk_text_comes_from_the_same_parse_row_as_the_content_hash(
+        self, temp_lancedb_dir, test_collection, test_doc_id, monkeypatch
+    ):
+        """One read of the parse row: a second read could see a newer parse."""
+        from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
+            LanceDBCollectionHandle,
+        )
+
+        register_document(
+            collection=test_collection,
+            source_path="tests/resources/test_files/test.txt",
+            doc_id=test_doc_id,
+            user_id=1,
+        )
+        parse_result = parse_document(
+            collection=test_collection,
+            doc_id=test_doc_id,
+            parse_method="default",
+            user_id=1,
+            is_admin=True,
+        )
+
+        def second_read(*args, **kwargs):
+            raise AssertionError("paragraphs must come from the parse record")
+
+        monkeypatch.setattr(
+            LanceDBCollectionHandle, "read_parse_paragraph_dicts", second_read
+        )
+
+        result = chunk_document(
+            collection=test_collection,
+            doc_id=test_doc_id,
+            parse_hash=parse_result["parse_hash"],
+            chunk_strategy=ChunkStrategy.RECURSIVE,
+            chunk_size=100,
+            chunk_overlap=0,
+            user_id=1,
+        )
+
+        assert result["chunk_count"] > 0
+
     def test_chunk_idempotency(self, temp_lancedb_dir, test_collection, test_doc_id):
         """Test that chunking is idempotent."""
         # Step 1: Register and parse document

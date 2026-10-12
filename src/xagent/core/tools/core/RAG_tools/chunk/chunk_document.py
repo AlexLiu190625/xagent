@@ -4,6 +4,7 @@ This module provides the main chunk_document function that orchestrates
 document chunking using various chunking strategies.
 """
 
+import json
 import logging
 import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -22,6 +23,7 @@ from ..core.exceptions import (
 )
 from ..core.schemas import ChunkStrategy
 from ..utils.hash_utils import compute_chunk_hash
+from ..utils.metadata_utils import CONTENT_HASH_KEY, recorded_content_hash
 from .chunk_strategies import (
     _create_chunk_record,
     apply_fixed_size_strategy,
@@ -196,9 +198,17 @@ def _chunk_document_impl(
     # Validate chunk parameters
     _validate_chunk_params(chunk_strategy, params)
 
-    # Compute configuration-level hash for this chunking run
+    # The parse row's hash, not the mutable documents row: a newer registration
+    # must not relabel chunks made from the text this parse holds.
+    parse_record = handle.read_latest_parse_record(
+        doc_id, parse_hash=parse_hash, user_id=user_id, is_admin=is_admin
+    )
+    content_hash = recorded_content_hash(parse_record)
+    made_from = {CONTENT_HASH_KEY: content_hash} if content_hash else {}
+
+    # The file hash takes the text slot: new content must not reuse old chunks.
     try:
-        config_hash = compute_chunk_hash("", params)
+        config_hash = compute_chunk_hash(content_hash, params)
     except Exception as e:
         raise DocumentValidationError(f"Failed to compute config_hash: {e}") from e
 
@@ -225,9 +235,14 @@ def _chunk_document_impl(
             "created": False,
         }
 
-    # Load parsed content from database
-    paragraphs = handle.read_parse_paragraph_dicts(
-        doc_id, parse_hash, user_id=user_id, is_admin=is_admin
+    # The same row as the content hash: a parse rewritten since must not mix them.
+    paragraphs = (
+        [
+            {"text": item.get("text", ""), "metadata": item.get("metadata", {})}
+            for item in json.loads(parse_record.parsed_content or "[]")
+        ]
+        if parse_record
+        else []
     )
     if not paragraphs:
         raise DocumentNotFoundError(
@@ -279,7 +294,7 @@ def _chunk_document_impl(
                 "anchor": chunk.get("anchor"),
                 "json_path": chunk.get("json_path"),
                 "created_at": chunk.get("created_at", pd.Timestamp.now(tz="UTC")),
-                "metadata": chunk.get("metadata"),
+                "metadata": {**(chunk.get("metadata") or {}), **made_from},
             }
         )
 

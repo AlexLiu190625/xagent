@@ -10,6 +10,7 @@ fixture in ``tests/conftest.py``.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 import numpy as np
@@ -228,12 +229,55 @@ class TestHandleReadChunksNeedingEmbedding:
         assert result.pending_count == 1
         assert to_model_tag("other_model") == "other_model"
 
+    @staticmethod
+    def _parse(content_hash) -> None:
+        get_vector_index_store().upsert_parses(
+            [
+                {
+                    "collection": "coll",
+                    "doc_id": "d1",
+                    "parse_hash": "h1",
+                    "parser": "local:default@v1.0.0",
+                    "created_at": datetime.now(timezone.utc),
+                    "params_json": json.dumps(
+                        {"content_hash": content_hash} if content_hash else {}
+                    ),
+                    "parsed_content": "[]",
+                    "user_id": None,
+                }
+            ]
+        )
+
+    def test_only_chunks_made_from_the_parsed_content_are_pending(self) -> None:
+        handle = make_handle("coll")
+        self._parse("C2")
+        _seed_chunk("coll", "d1", "h1", "mine", metadata={"content_hash": "C2"})
+        _seed_chunk("coll", "d1", "h1", "other", metadata={"content_hash": "C1"})
+        _seed_chunk("coll", "d1", "h1", "legacy")
+        result = handle.read_chunks_needing_embedding(
+            "d1", "h1", "test_model", is_admin=True
+        )
+        assert [c.chunk_id for c in result.chunks] == ["mine"]
+
+    def test_every_chunk_is_pending_when_the_parse_records_no_content(self) -> None:
+        handle = make_handle("coll")
+        self._parse(None)
+        _seed_chunk("coll", "d1", "h1", "a", metadata={"content_hash": "C1"})
+        _seed_chunk("coll", "d1", "h1", "b")
+        result = handle.read_chunks_needing_embedding(
+            "d1", "h1", "test_model", is_admin=True
+        )
+        assert sorted(c.chunk_id for c in result.chunks) == ["a", "b"]
+
     def test_nan_page_number_normalized_to_none(self) -> None:
         # A missing page number can surface as a pandas/LanceDB NaN sentinel; it
         # must normalize to None, not be coerced to page 1.
         from unittest.mock import MagicMock
 
         handle, store = _mock_store_handle("coll")
+        object.__setattr__(
+            handle, "read_latest_parse_record", MagicMock(return_value=None)
+        )
         store.count_rows_or_zero.side_effect = [1, 0]  # 1 chunk, 0 embeddings
         batch = MagicMock()
         batch.to_pylist.return_value = [
@@ -659,13 +703,17 @@ class TestHandleWriteEmbeddingsMechanics:
             )
 
 
-def test_commit_embeddings_does_nothing_on_lancedb():
+def test_commit_embeddings_runs_the_gate_and_writes_nothing_on_lancedb():
     handle = make_handle()
+    gates: list[int] = []
 
-    def gate() -> None:
-        raise AssertionError("the commit gate must not run on LanceDB")
-
-    assert handle.commit_embeddings("d", "p", "m", commit_gate=gate, user_id=1) is None
+    assert (
+        handle.commit_embeddings(
+            "d", "p", "m", commit_gate=lambda: gates.append(1), user_id=1
+        )
+        is None
+    )
+    assert gates == [1]
 
 
 def test_discarding_uncommitted_embeddings_does_nothing_on_lancedb():
