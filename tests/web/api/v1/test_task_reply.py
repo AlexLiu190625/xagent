@@ -278,14 +278,14 @@ def test_reply_happy_path_resumes_the_same_run(mock_start_task):
 
 
 def test_reply_turn_id_is_never_reused_across_retries(mock_start_task):
-    """Documents a known structural boundary, not a behavior this endpoint
-    is expected to provide: every call mints ``turn_id`` from a fresh
-    ``uuid4()``, so even a client retry that resubmits the identical reply
-    body can never land on the same turn id twice. That means this call
-    site can never trigger AgentRunner.inject_user_message's turn_id
-    short-circuit and can never observe a POSTED_REPLAY outcome -- there is
-    no replay-skip guard to add here, and none should be, because the
-    condition it would guard against is unreachable through this path."""
+    """Run inline, every call mints ``turn_id`` from a fresh ``uuid4()``, so
+    even a client retry that resubmits the identical reply body never lands
+    on the same turn id twice, and this path never sees a POSTED_REPLAY from
+    AgentRunner.inject_user_message's turn_id short-circuit. Under shared
+    task execution the turn id is the RESUME_INPUT command id instead, and
+    that command is completed before the injection starts. The close in
+    _update_reply_input_sync is still guarded on POSTED_FRESH, as defense in
+    depth."""
     agent_id, full_key = _create_agent_with_key()
     task_id = _create_waiting_task(full_key, agent_id, run_id="run-original")
     _insert_question_message(task_id)
@@ -784,7 +784,10 @@ def test_update_reply_input_rolls_back_the_interaction_close_with_the_fence() ->
         task_id=task_id, runner_id="a-different-runner", run_id="run-reply-atomicity"
     )
     updated = task_resume._update_reply_input_sync(
-        stale_lease, "attempted text", row_id
+        stale_lease,
+        "attempted text",
+        row_id,
+        UserMessageInjectionOutcome.POSTED_FRESH,
     )
 
     assert updated is False

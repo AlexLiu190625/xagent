@@ -3798,7 +3798,7 @@ async def execute_resume_background(
             # if it ever stops carrying the id forward and starts deriving
             # its own. See task_interaction_close's module docstring for
             # the rule, the other sites, and why the v1 reply resume-input
-            # path needs no guard at all.
+            # path's guard is defense in depth.
             if posted is UserMessageInjectionOutcome.POSTED_FRESH:
                 try:
                     await run_db_io_cancellation_safe(
