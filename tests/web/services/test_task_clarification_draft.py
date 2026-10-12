@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 from pydantic import ValidationError
@@ -39,6 +39,7 @@ from xagent.core.agent.clarification import (
     ClarificationRequestItem,
     draft_from_waiting_request,
 )
+from xagent.core.tools.adapters.vibe.mcp_approval_gate import _gated_interaction_id
 from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task
@@ -50,6 +51,7 @@ from xagent.web.services.chat_history_service import (
 )
 from xagent.web.services.task_clarification_draft import (
     CLARIFICATION_REQUEST_TTL,
+    ClarificationResolution,
     FailClosed,
     NotApplicable,
     Publishable,
@@ -60,6 +62,7 @@ from xagent.web.services.task_clarification_draft import (
 )
 from xagent.web.services.task_command_transport import COMMAND_ID_PATTERN
 from xagent.web.services.task_interaction_service import (
+    InteractionWritePayloadRejected,
     materialize_compatibility_view,
     parse_v1_request_payload,
     validate_v1_write_payload,
@@ -385,6 +388,152 @@ def test_cross_run_anchor_mismatch_still_resolves_as_publishable() -> None:
         anchor=_anchor(resume_run_partition="a-different-run"),
         now=_now(),
     )
+    assert isinstance(resolution, Publishable)
+
+
+# ---------------------------------------------------------------------------
+# The host's MCP approval prompt is never published
+# ---------------------------------------------------------------------------
+
+
+_MIXED_APPROVAL_LOG = (
+    "an approval prompt shares its waiting turn with another tool's question; "
+    "neither is published as a structured interaction"
+)
+
+
+def _resolve_with_passing_fence_and_anchor(
+    draft: ClarificationDraft,
+) -> ClarificationResolution:
+    result = {"status": "waiting_for_user", "clarification_draft": draft}
+    return resolve_publishable_clarification(
+        result, task=_task(), lease=_lease(), anchor=_anchor(), now=_now()
+    )
+
+
+def _gated_tool_waiting_draft() -> ClarificationDraft:
+    gated = _gated_interaction_id("slack", "host-1")
+    return _draft(
+        source="tool_waiting",
+        message_type="question",
+        requests=(ClarificationRequestItem("mcp_tool", "call-1", gated),),
+    )
+
+
+def test_tool_waiting_draft_issued_by_the_approval_gate_is_not_published(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(
+        logging.INFO, logger="xagent.web.services.task_clarification_draft"
+    )
+
+    resolution = _resolve_with_passing_fence_and_anchor(_gated_tool_waiting_draft())
+
+    assert resolution == NotApplicable("host_approval_prompt")
+    assert ops_signals.active_degradations() == {}
+    assert not [r for r in caplog.records if r.getMessage() == _MIXED_APPROVAL_LOG]
+
+
+def test_approval_exclusion_runs_after_the_attempt_fence() -> None:
+    """A fence failure still discards the round for an approval prompt: the
+    attempt check runs before the approval exclusion, so a gated draft under
+    a superseded attempt is ``attempt_mismatch``, not
+    ``host_approval_prompt``."""
+
+    result = {
+        "status": "waiting_for_user",
+        "clarification_draft": _gated_tool_waiting_draft(),
+    }
+
+    resolution = resolve_publishable_clarification(
+        result,
+        task=_task(lease_attempt_id="attempt-current"),
+        lease=_lease(attempt_id="attempt-stale"),
+        anchor=_anchor(),
+        now=_now(),
+    )
+
+    assert resolution == FailClosed("attempt_mismatch")
+
+
+def test_approval_exclusion_runs_before_the_anchor_check() -> None:
+    """An approval prompt with no resume anchor is reported as an approval
+    prompt, not as ``no_anchor``."""
+
+    result = {
+        "status": "waiting_for_user",
+        "clarification_draft": _gated_tool_waiting_draft(),
+    }
+
+    resolution = resolve_publishable_clarification(
+        result, task=_task(), lease=_lease(), anchor=None, now=_now()
+    )
+
+    assert resolution == NotApplicable("host_approval_prompt")
+
+
+def test_multi_tool_draft_with_any_gate_issued_item_is_not_published(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One gate-issued item among several is enough: the whole draft is
+    published as one row, so publishing it would hand the approval to the
+    structured-answer path. The other tool's question is therefore not
+    published either, and an info-level log records the mix."""
+
+    caplog.set_level(
+        logging.INFO, logger="xagent.web.services.task_clarification_draft"
+    )
+    gated = _gated_interaction_id("slack", "host-1")
+    draft = _draft(
+        source="tool_waiting",
+        message_type="question",
+        requests=(
+            ClarificationRequestItem("mcp_tool", "call-1", gated),
+            ClarificationRequestItem("other_tool", "call-2", "call-2"),
+        ),
+    )
+
+    resolution = _resolve_with_passing_fence_and_anchor(draft)
+
+    assert resolution == NotApplicable("host_approval_prompt")
+    mixed = [r for r in caplog.records if r.getMessage() == _MIXED_APPROVAL_LOG]
+    assert len(mixed) == 1, mixed
+    assert mixed[0].levelno == logging.INFO
+    assert mixed[0].gated_request_count == 1
+    assert mixed[0].request_count == 2
+
+
+def test_tool_waiting_draft_with_no_gate_issued_item_is_publishable() -> None:
+    draft = _draft(
+        source="tool_waiting",
+        message_type="question",
+        requests=(
+            ClarificationRequestItem("mcp_tool", "call-1", "call-1"),
+            ClarificationRequestItem("other_tool", "call-2", "call-2"),
+        ),
+    )
+
+    resolution = _resolve_with_passing_fence_and_anchor(draft)
+
+    assert isinstance(resolution, Publishable)
+
+
+def test_ask_user_question_draft_with_a_gate_shaped_call_id_is_publishable() -> None:
+    """The id here is a complete id the gate itself can parse, not merely a
+    string that starts with the gate prefix, so this pins that the exclusion
+    applies only to ``tool_waiting`` drafts -- not that a malformed id fails
+    to parse. An ``ask_user_question`` item's id is the model's tool call
+    id, and is never treated as an approval prompt."""
+
+    gated = _gated_interaction_id("slack", "host-1")
+    draft = _draft(
+        source="ask_user_question",
+        message_type="question",
+        requests=(ClarificationRequestItem("ask_user_question", gated, gated),),
+    )
+
+    resolution = _resolve_with_passing_fence_and_anchor(draft)
+
     assert isinstance(resolution, Publishable)
 
 
@@ -1070,6 +1219,173 @@ def test_interaction_leaf_control_characters_are_stripped_through_full_payload_a
     draft = _draft(interactions=dirty_interactions)
     payload = build_clarification_payload(draft)
     assert payload["interactions"] == [{"prompt": "pickone", "id": "opt-1"}]
+
+
+def _message_draft(raw: str) -> ClarificationDraft:
+    return _draft(
+        source="ask_user_question",
+        message=raw,
+        interactions=({"type": "text_input", "field": "f", "label": "L"},),
+    )
+
+
+def _field_draft(raw: str) -> ClarificationDraft:
+    return _draft(
+        source="ask_user_question",
+        message="Which one?",
+        interactions=({"type": "text_input", "field": raw, "label": "L"},),
+    )
+
+
+def _produced_message(payload: dict[str, Any]) -> Any:
+    return payload["message"]
+
+
+def _produced_field(payload: dict[str, Any]) -> Any:
+    return payload["interactions"][0]["field"]
+
+
+# The producer must emit every ``field`` already in the form the write-side
+# rules compare it against. A control character next to an edge space is the
+# case that used to slip through: the control-character filter drops the
+# control character and leaves the space behind, which the write-side trim
+# table then refuses. ``message`` is only filtered, never trimmed: the write
+# side only refuses a blank message, so its edge whitespace is kept. The inner
+# cases pin that whitespace between two visible characters survives on both
+# leaves.
+@pytest.mark.parametrize(
+    ("build", "extract", "raw", "expected"),
+    [
+        pytest.param(
+            _message_draft, _produced_message, "\x07 ab", " ab", id="message-leading"
+        ),
+        pytest.param(
+            _message_draft, _produced_message, "ab \x07", "ab ", id="message-trailing"
+        ),
+        pytest.param(
+            _message_draft,
+            _produced_message,
+            "a \x07 b",
+            "a  b",
+            id="message-inner-negative-control",
+        ),
+        pytest.param(
+            _field_draft, _produced_field, "\x07 ab", "ab", id="field-leading"
+        ),
+        pytest.param(
+            _field_draft, _produced_field, "ab \x07", "ab", id="field-trailing"
+        ),
+        pytest.param(
+            _field_draft,
+            _produced_field,
+            "a \x07 b",
+            "a  b",
+            id="field-inner-negative-control",
+        ),
+    ],
+)
+def test_producer_side_normalizes_field_edges_and_keeps_message_edges(
+    build: Callable[[str], ClarificationDraft],
+    extract: Callable[[dict[str, Any]], Any],
+    raw: str,
+    expected: str,
+) -> None:
+    payload = build_clarification_payload(build(raw))
+
+    assert extract(payload) == expected
+    validate_v1_write_payload(parse_v1_request_payload(payload))
+
+
+def test_message_leading_indentation_and_newlines_are_kept() -> None:
+    """A message that opens with a newline and an indented code line keeps
+    both: trimming them would change what the user sees and make the
+    structured message differ from the legacy transcript."""
+
+    raw = "\n    print('hi')\n"
+
+    resolution = _resolve_with_passing_fence_and_anchor(_message_draft(raw))
+
+    assert isinstance(resolution, Publishable)
+    assert resolution.request_payload["message"] == raw
+
+
+def test_bom_only_question_is_not_applicable_after_normalization(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Only a message made entirely of trim-table characters that include
+    U+FEFF used to reach the write side as ``message_blank``: Python's
+    ``str.strip()`` does not remove U+FEFF, so the resolver's own blank
+    check let it through as publishable. The resolver now judges blankness
+    with the write side's trim function, so such a message lands on the
+    existing ``empty_question`` outcome instead. U+FEFF is not a control
+    character, so the "empty after removing control characters" warning
+    must not fire."""
+
+    caplog.set_level(
+        logging.WARNING, logger="xagent.web.services.task_clarification_draft"
+    )
+    result = {
+        "status": "waiting_for_user",
+        "clarification_draft": _draft(message="\ufeff"),
+    }
+    resolution = resolve_publishable_clarification(
+        result, task=_task(), lease=_lease(), anchor=_anchor(), now=_now()
+    )
+    assert resolution == NotApplicable("empty_question")
+    assert not [
+        record
+        for record in caplog.records
+        if record.message
+        == "clarification question was empty after removing control characters"
+    ]
+
+
+def test_option_label_and_value_made_only_of_control_characters_are_refused() -> None:
+    """Option ``label`` / ``value`` are deliberately not normalized, so an
+    option that is blank after control-character filtering is still refused
+    by the write side, exactly as before."""
+
+    draft = _draft(
+        source="ask_user_question",
+        interactions=(
+            {
+                "type": "select_one",
+                "field": "seat",
+                "label": "Seat",
+                "options": [{"label": "\x07\x07", "value": "\x01"}],
+            },
+        ),
+    )
+
+    payload = build_clarification_payload(draft)
+
+    assert payload["interactions"][0]["options"][0] == {"label": "", "value": ""}
+    with pytest.raises(InteractionWritePayloadRejected) as exc:
+        validate_v1_write_payload(parse_v1_request_payload(payload))
+    assert exc.value.refusal.rule == "option_blank"
+
+
+def test_option_edge_whitespace_is_left_untouched() -> None:
+    """Edge whitespace on an option ``label`` / ``value`` is valid today and
+    is shown to the user as written; the producer must not trim it."""
+
+    draft = _draft(
+        source="ask_user_question",
+        interactions=(
+            {
+                "type": "select_one",
+                "field": "seat",
+                "label": "Seat",
+                "options": [{"label": "  靠窗  ", "value": "  靠窗  "}],
+            },
+        ),
+    )
+
+    payload = build_clarification_payload(draft)
+
+    option = payload["interactions"][0]["options"][0]
+    assert option["label"] == "  靠窗  "
+    assert option["value"] == "  靠窗  "
 
 
 def test_payload_still_too_large_after_truncation_is_not_applicable(

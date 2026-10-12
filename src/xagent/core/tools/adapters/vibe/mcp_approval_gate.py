@@ -499,6 +499,22 @@ def _gated_interaction_source(interaction_id: str) -> tuple[str, str] | None:
     return payload[:length], payload[length:]
 
 
+def is_gate_issued_interaction_id(interaction_id: str) -> bool:
+    """Return True when ``interaction_id`` has the shape of a gate-issued id.
+
+    This is a shape check only: there is no MAC and no registry of issued
+    ids behind it, so any string built in the gate's format is accepted.
+    The prefix and length parsing lives only in
+    :func:`_gated_interaction_source`; code outside this module that needs
+    to recognise a gate-issued id must call this function instead of
+    parsing the id itself. Never raises for a ``str`` input: it only
+    delegates to :func:`_gated_interaction_source`, which never raises for
+    one.
+    """
+
+    return _gated_interaction_source(interaction_id) is not None
+
+
 @contextmanager
 def bind_tool_call_execution_context(
     context: ToolCallExecutionContext,

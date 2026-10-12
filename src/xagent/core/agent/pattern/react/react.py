@@ -339,8 +339,12 @@ _INTERACTION_TRIM_CHARS = (
 )  # 30 code points
 
 
-def _normalize_interaction_text(value: str) -> str:
+def normalize_interaction_text(value: str) -> str:
     """Strip every code point either Python or JavaScript treats as trimmable.
+
+    Public because modules outside this one judge interaction text against
+    the same table; ``_normalize_interaction_text`` below is the same
+    function under its earlier private name, kept for existing callers.
 
     One pass over one union table, deliberately -- not ``value.strip()``
     followed by a second pass over the JavaScript-only characters.
@@ -362,6 +366,9 @@ def _normalize_interaction_text(value: str) -> str:
     "optimize" this back into two passes.
     """
     return value.strip(_INTERACTION_TRIM_CHARS)
+
+
+_normalize_interaction_text = normalize_interaction_text
 
 
 def _is_non_blank_str(value: Any) -> bool:
