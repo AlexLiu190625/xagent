@@ -618,8 +618,9 @@ def test_every_close_call_sits_directly_under_a_fresh_injection_guard() -> None:
     implementation, not a call site.
 
     Each site's behavior is tested beside it; this only pins the shape, so
-    a fifth close call, or a guard that is removed, inverted, compared with
-    ``==`` or moved outward, turns this red."""
+    a fifth close called directly by name, or a guard that is removed,
+    inverted, compared with ``==`` or moved outward, turns this red. A close
+    passed as a value (for example through ``partial``) is not seen."""
     root = Path(next(iter(xagent.__path__)))
     sites: list[tuple[str, str]] = []
     unguarded: set[tuple[str, str]] = set()
