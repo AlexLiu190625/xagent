@@ -52,6 +52,14 @@ argument, must also wire in some close-family function -- otherwise a
 legacy resume answers a question without ever retiring the marker that
 names it. That guard is a static, module-level check, not a proof that
 the close call runs on every code path.
+
+A fourth guard covers when a close call may run at all: every production
+call to close_legacy_resume_interaction or
+close_legacy_resume_interaction_sync outside task_interaction_close.py
+sits directly in the body of an ``if ... is
+UserMessageInjectionOutcome.POSTED_FRESH:`` branch, so a replayed
+injection does not reach any of them. It is a static check of source
+shape; what each site's guard buys is tested beside that site.
 """
 
 from __future__ import annotations
@@ -523,3 +531,106 @@ def test_every_post_user_message_caller_wires_the_close_family() -> None:
         "the module to APPROVED_UNWIRED_POST_USER_MESSAGE_CALLERS with a "
         "documented reason"
     )
+
+
+INJECTION_OUTCOME_ENUM_NAME = "UserMessageInjectionOutcome"
+FRESH_INJECTION_MEMBER = "POSTED_FRESH"
+CLOSE_CALL_NAMES = frozenset(
+    {"close_legacy_resume_interaction", "close_legacy_resume_interaction_sync"}
+)
+# Every production close call, as (module stem, enclosing function). Each
+# is the one injection site of that function, and each must sit directly
+# under an `is POSTED_FRESH` branch.
+EXPECTED_CLOSE_CALL_SITES = (
+    ("task_command_execution", "handle_task_message"),
+    ("task_execution", "execute_resume_background"),
+    ("task_resume", "_update_a2a_resume_input_sync"),
+    ("task_resume", "_update_reply_input_sync"),
+)
+# Close calls allowed to run without that guard. Empty by construction: a
+# replayed injection must not retire a question at any site.
+APPROVED_UNGUARDED_CLOSE_CALL_SITES: frozenset[tuple[str, str]] = frozenset()
+
+
+def _is_fresh_injection_test(test: ast.expr) -> bool:
+    if not (
+        isinstance(test, ast.Compare)
+        and len(test.ops) == 1
+        and isinstance(test.ops[0], ast.Is)
+        and len(test.comparators) == 1
+    ):
+        return False
+    member = test.comparators[0]
+    return (
+        isinstance(member, ast.Attribute)
+        and member.attr == FRESH_INJECTION_MEMBER
+        and isinstance(member.value, ast.Name)
+        and member.value.id == INJECTION_OUTCOME_ENUM_NAME
+    )
+
+
+def _close_calls_and_guards(tree: ast.AST) -> list[tuple[str, bool]]:
+    """For each close call in ``tree``: the name of the function it is in,
+    and whether its nearest enclosing condition (an ``if``, a conditional
+    expression or a ``while``, looked for up to that function) is an
+    ``if ... is UserMessageInjectionOutcome.POSTED_FRESH:`` whose body holds
+    the call."""
+    parents = {
+        child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)
+    }
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = (
+            func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+        )
+        if name not in CLOSE_CALL_NAMES:
+            continue
+        guarded: bool | None = None
+        function_name = "<module>"
+        child: ast.AST = node
+        while child in parents:
+            parent = parents[child]
+            if guarded is None and isinstance(parent, (ast.If, ast.IfExp, ast.While)):
+                guarded = (
+                    isinstance(parent, ast.If)
+                    and child in parent.body
+                    and _is_fresh_injection_test(parent.test)
+                )
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                function_name = parent.name
+                break
+            child = parent
+        found.append((function_name, guarded is True))
+    return found
+
+
+def test_every_close_call_sits_directly_under_a_fresh_injection_guard() -> None:
+    """Each production call that retires an interaction row runs only when
+    its own injection wrote a fresh turn: the nearest condition around it is
+    ``if <outcome> is UserMessageInjectionOutcome.POSTED_FRESH:``, with the
+    call in that branch's body. Nested inside another condition is fine as
+    long as the guard is the innermost one. Scans every source file under
+    the installed xagent package, except task_interaction_close.py, whose
+    lock-reading wrapper delegating to the unlocked function is the
+    implementation, not a call site.
+
+    Each site's behavior is tested beside it; this only pins the shape, so
+    a fifth close call, or a guard that is removed, inverted, compared with
+    ``==`` or moved outward, turns this red."""
+    root = Path(next(iter(xagent.__path__)))
+    sites: list[tuple[str, str]] = []
+    unguarded: set[tuple[str, str]] = set()
+    for path in root.rglob("*.py"):
+        if path.stem == CLOSE_MODULE_NAME:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for function_name, guarded in _close_calls_and_guards(tree):
+            site = (path.stem, function_name)
+            sites.append(site)
+            if not guarded:
+                unguarded.add(site)
+    assert sorted(sites) == sorted(EXPECTED_CLOSE_CALL_SITES)
+    assert unguarded == set(APPROVED_UNGUARDED_CLOSE_CALL_SITES)
