@@ -22,6 +22,23 @@ Env overrides (all optional; default to the bundled package data):
   XAGENT_XROUTER_DB             routing-decision SQLite history path
   XAGENT_XROUTER_EXCLUDED_MODELS comma-separated candidate model slugs to omit
   XAGENT_ROUTER_FALLBACK_MODEL  slug to use if routing fails
+
+Embedding backend for the predictor's prompt encoder (all optional; the last
+three are read only when XROUTER_EMBEDDING_BACKEND is set):
+  XROUTER_EMBEDDING_BACKEND     unset keeps the in-process backend serialized in
+                                the artifact; "xinference" sends prompt
+                                embeddings to a remote OpenAI-compatible
+                                endpoint; "sentence-transformers" loads the
+                                model in process. Case-sensitive; any other
+                                value fails the service build with ValueError
+  XROUTER_EMBEDDING_MODEL       embedding model name (default
+                                Qwen/Qwen3-Embedding-0.6B); must be the model
+                                the artifact was trained with
+  XINFERENCE_BASE_URL           endpoint base URL ending in /v1, "/embeddings"
+                                is appended (default http://127.0.0.1:9997/v1)
+  XINFERENCE_API_KEY            bearer key for that endpoint; the same variable
+                                is read by the Xinference rerank client and as
+                                the DeepDoc Xinference fallback key
 """
 
 from __future__ import annotations
