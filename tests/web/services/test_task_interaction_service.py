@@ -5871,9 +5871,10 @@ def test_i_a_5b_system_path_reads_tasks_only_for_the_storage_version(
     _db: Session, _system_call_ctx: dict[str, Any]
 ) -> None:
     """Behavioral half of the static check above: across one successful
-    system-principal create() call, the only SELECT that reads ``tasks`` is
-    the execution-event storage-version check issued after the row is
-    staged. The static check only finds ``.query(...)`` calls; a reload of
+    system-principal create() call, the only statement that reads ``tasks``
+    is the execution-event storage-version check issued after the row is
+    staged. A read is any statement naming ``tasks`` after ``FROM`` or
+    ``JOIN``, so a join or a ``WITH``-prefixed read counts too. The static check only finds ``.query(...)`` calls; a reload of
     the caller's task object (``db.refresh``, an expired attribute, a
     ``db.get``) issues the same kind of read without one, and only the
     statement stream shows it."""
@@ -5903,15 +5904,12 @@ def test_i_a_5b_system_path_reads_tasks_only_for_the_storage_version(
         sa.event.remove(engine, "before_cursor_execute", _before_cursor_execute)
 
     assert isinstance(outcome, svc.CreateCreated)
-    task_selects = [
-        s
-        for s in statements
-        if re.match(r"\s*SELECT\b", s, re.IGNORECASE)
-        and re.search(r"\bFROM\s+tasks\b", s, re.IGNORECASE)
+    task_reads = [
+        s for s in statements if re.search(r"\b(FROM|JOIN)\s+tasks\b", s, re.IGNORECASE)
     ]
-    assert len(task_selects) == 1, task_selects
-    assert "tasks.conversation_storage_version" in task_selects[0]
-    assert re.search(r"WHERE\s+tasks\.id\s*=", task_selects[0])
+    assert len(task_reads) == 1, task_reads
+    assert "tasks.conversation_storage_version" in task_reads[0]
+    assert re.search(r"WHERE\s+tasks\.id\s*=", task_reads[0])
 
 
 def test_i_a_6_task_handed_to_handoff_is_the_caller_supplied_object(

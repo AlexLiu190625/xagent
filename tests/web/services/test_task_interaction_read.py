@@ -674,7 +674,7 @@ def test_adapter_still_returns_the_question_after_the_real_relabel(
         _db, task_id=int(task.id)
     )
     _db.commit()
-    assert relabelled >= 1
+    assert relabelled == 1
 
     question, interactions = read_surface.get_pending_interaction_question(_db, task)
 
