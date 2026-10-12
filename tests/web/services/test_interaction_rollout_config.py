@@ -159,6 +159,59 @@ def test_tc14_trigger_in_allowlist_warns_but_does_not_raise(monkeypatch, caplog)
     assert any("no interactive responder" in r.message for r in caplog.records)
 
 
+_ROLLOUT_LOGGER = "xagent.web.services.interaction_rollout"
+_NATIVE_WITHOUT_SHARED_EXECUTION_WARNING = (
+    f"{config.INTERACTION_PROTOCOL_MODE}=native but this process is not running "
+    f"shared task execution (see {config.SHARED_TASK_EXECUTION_ENABLED}), so "
+    "native publication will never happen in this process."
+)
+
+
+@pytest.mark.parametrize(
+    ("mode", "shared_env", "expected_shared", "expected_warnings"),
+    [
+        pytest.param(
+            "native",
+            "false",
+            False,
+            [_NATIVE_WITHOUT_SHARED_EXECUTION_WARNING],
+            id="native_not_shared",
+        ),
+        pytest.param("native", "true", True, [], id="native_shared"),
+        pytest.param("legacy", "false", False, [], id="legacy_not_shared"),
+    ],
+)
+def test_tc15_topology_is_frozen_at_startup_and_only_native_without_shared_execution_warns(
+    monkeypatch, caplog, mode, shared_env, expected_shared, expected_warnings
+):
+    monkeypatch.setenv(config.INTERACTION_PROTOCOL_MODE, mode)
+    if mode == "native":
+        monkeypatch.setenv(config.INTERACTION_NATIVE_SOURCES, "sdk")
+    monkeypatch.setenv(config.SHARED_TASK_EXECUTION_ENABLED, shared_env)
+
+    with caplog.at_level(logging.INFO, logger=_ROLLOUT_LOGGER):
+        policy = ir.validate_interaction_rollout_at_startup()
+
+    assert policy.mode == mode
+    assert policy.shared_task_execution is expected_shared
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == _ROLLOUT_LOGGER and record.levelno == logging.WARNING
+    ] == expected_warnings
+    policy_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == _ROLLOUT_LOGGER
+        and record.levelno == logging.INFO
+        and record.getMessage().startswith("Interaction rollout policy configured:")
+    ]
+    assert len(policy_lines) == 1
+    assert policy_lines[0].rpartition(" shared_task_execution=")[2] == str(
+        expected_shared
+    )
+
+
 def test_tc10a_origin_vocabulary_equals_check_constraint_in_list():
     check = next(
         c
