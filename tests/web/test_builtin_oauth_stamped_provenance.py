@@ -49,6 +49,8 @@ STAMPED_BUILTIN_OAUTH_APPS = {
     "sharepoint": "microsoft",
     "whatsapp": "meta",
 }
+# Stamped too, but hidden until verified, so the actor paths refuse them.
+HIDDEN_STAMPED_BUILTIN_OAUTH_APPS = {"zendesk"}
 
 
 @pytest.fixture
@@ -165,7 +167,9 @@ def test_catalog_callback_auth_is_canonical_for_every_builtin_oauth_app(
         if "builtin_provenance" in server.auth:
             stamped.add(app.app_id)
 
-    assert stamped == set(STAMPED_BUILTIN_OAUTH_APPS)
+    assert (
+        stamped == set(STAMPED_BUILTIN_OAUTH_APPS) | HIDDEN_STAMPED_BUILTIN_OAUTH_APPS
+    )
 
 
 @pytest.mark.parametrize("marker_persisted", [False, True])

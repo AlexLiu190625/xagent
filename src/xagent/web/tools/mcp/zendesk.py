@@ -61,7 +61,7 @@ _session = requests.Session()
 # the textbook TLS-intercepting corporate proxy with an internal CA,
 # which would otherwise fail closed with an opaque SSLError. .netrc
 # auto-auth stays disabled since this connector always sends its own
-# Basic Auth.
+# Bearer token.
 _session.trust_env = False
 _ca_bundle = environ.get("REQUESTS_CA_BUNDLE") or environ.get("CURL_CA_BUNDLE")
 if _ca_bundle:
@@ -108,29 +108,26 @@ def _error(message: str) -> str:
     return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
 
 
-def _auth() -> tuple[str, str]:
-    """Zendesk's Basic-Auth-with-API-token scheme: the username is the
-    agent's email address suffixed with the literal "/token", and the
-    password is the API token itself (generated self-serve, Admin Center ->
-    Apps and integrations -> APIs -> Zendesk API -> Add API token -- no
-    review). Zendesk's own docs mark this auth method "(deprecated)" in
-    favor of OAuth, but state it remains fully supported with no
-    announced removal date; OAuth access tokens for a private (non-
-    marketplace) client would need the same review-free bar but add a
-    full authorization-code exchange this module doesn't otherwise need.
+def _access_token() -> str:
+    """The OAuth access token the platform injects for this connection.
+
+    Zendesk OAuth grants are per account: the token is only valid on the
+    subdomain it was issued for, which the platform injects alongside it as
+    ZENDESK_SUBDOMAIN from the same stored grant.
     """
-    # Stripped like ZENDESK_SUBDOMAIN below: a value that's only whitespace
-    # (e.g. a trailing newline from pasting the credential into a
-    # connect-flow form) is not a usable credential and should be treated
-    # as missing here rather than sent to Zendesk as a malformed Basic Auth
-    # username/password, matching mixpanel.py's identical stripping.
-    email = environ.get("ZENDESK_EMAIL", "").strip()
-    api_token = environ.get("ZENDESK_API_TOKEN", "").strip()
-    if not email:
-        raise ValueError("ZENDESK_EMAIL environment variable is missing")
-    if not api_token:
-        raise ValueError("ZENDESK_API_TOKEN environment variable is missing")
-    return (f"{email}/token", api_token)
+    # Stripped like ZENDESK_SUBDOMAIN below: a whitespace-only value is not
+    # a usable credential and is treated as missing.
+    token = environ.get("ZENDESK_ACCESS_TOKEN", "").strip()
+    if not token:
+        raise ValueError(
+            "ZENDESK_ACCESS_TOKEN environment variable is missing; reconnect "
+            "Zendesk to authorize this connector"
+        )
+    return token
+
+
+def _headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {_access_token()}"}
 
 
 def _base_url() -> str:
@@ -163,7 +160,7 @@ def _ensure_configured() -> None:
     that returns before ever reaching _request(), which normally does this
     validation as a side effect of building the request."""
     _base_url()
-    _auth()
+    _access_token()
 
 
 def _clamp_limit(limit: int) -> int:
@@ -384,7 +381,7 @@ def _extract_field_reasons(details: Any) -> str | None:
     return truncate_error_text("; ".join(reasons))
 
 
-def _extract_error_detail(response: requests.Response) -> str | None:
+def _extract_error_detail(body: str) -> str | None:
     """Pull the human-readable message out of a Zendesk error body.
 
     Zendesk's error shape is inconsistent across endpoints: a plain string
@@ -394,7 +391,7 @@ def _extract_error_detail(response: requests.Response) -> str | None:
     nor field-level details are present.
     """
     try:
-        payload = response.json()
+        payload = json.loads(body)
     except ValueError:
         return None
     if not isinstance(payload, dict):
@@ -447,13 +444,13 @@ def _request(
             response = _session.request(
                 method=method,
                 url=url,
-                auth=_auth(),
+                headers=_headers(),
                 params=params,
                 json=json_data,
                 timeout=DEFAULT_TIMEOUT_SECONDS,
                 proxies=proxies,
-                # A redirect response is never followed with Basic Auth
-                # credentials still attached: Zendesk's documented API
+                # A redirect response is never followed with the Bearer
+                # token still attached: Zendesk's documented API
                 # doesn't redirect, so a 3xx here is either a
                 # misconfiguration or a host trying to relay the
                 # credentials elsewhere.
@@ -490,12 +487,27 @@ def _request(
         # (documented with an email-address example). Status + Zendesk's
         # own (redacted) error detail is everything the caller can act on.
         message = f"Zendesk returned HTTP {response.status_code}"
-        detail = _extract_error_detail(response)
+        # A provider error body could echo the credential back. It is removed
+        # from the raw body once, before any parsing or truncation could cut
+        # it into a prefix that no longer matches.
+        body = response.text.replace(_access_token(), "[redacted]")
+        detail = _extract_error_detail(body)
         if detail is None:
-            detail = truncate_error_text(response.text.strip())
+            detail = truncate_error_text(body.strip())
         if detail:
+            detail = _scrub_query_strings(redact_sensitive_text(detail))
+            message = f"{message} - {detail}"
+        # Neither heals on retry, so say what does.
+        if response.status_code == 401:
             message = (
-                f"{message} - {_scrub_query_strings(redact_sensitive_text(detail))}"
+                f"{message}. The Zendesk authorization expired or was revoked; "
+                "reconnect Zendesk and try again."
+            )
+        elif response.status_code == 403:
+            message = (
+                f"{message}. The connected Zendesk user's role or the scopes "
+                "granted to this connection do not allow this request; "
+                "reconnecting Zendesk requests the scopes again."
             )
         raise RuntimeError(message) from exc
 

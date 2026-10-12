@@ -251,6 +251,34 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             "default_scopes": [],
         },
         {
+            "provider_name": "zendesk",
+            "name": "Zendesk",
+            # Left blank so ZENDESK_CLIENT_ID/ZENDESK_CLIENT_SECRET/
+            # ZENDESK_REDIRECT_URI are read at request time (a non-blank
+            # column would take precedence): moving from a local OAuth client
+            # to the approved global one is then an env change, not a
+            # database edit. An admin can still set them in provider settings.
+            "client_id": "",
+            "client_secret": "",
+            # Every Zendesk endpoint lives on the customer's own
+            # {subdomain}.zendesk.com host, so the authorize, token, and
+            # userinfo URLs come from the code-owned OAUTH_ACCOUNT_HOSTS entry
+            # (oauth_account_hosts.py), and these static columns are never
+            # used for a request. Left empty rather than holding a URL
+            # template, which an admin edit could point at any host.
+            "auth_url": "",
+            "token_url": "",
+            "redirect_uri": "",
+            "userinfo_url": "",
+            # Read from inside the {"user": {...}} envelope of
+            # /api/v2/users/me.json (see the account-host entry).
+            "user_id_path": "id",
+            "email_path": "email",
+            # "read" is enough for the identity lookup; the connector's own
+            # write scope comes from its catalog row.
+            "default_scopes": ["read"],
+        },
+        {
             "provider_name": "salesforce",
             "name": "Salesforce",
             "client_id": os.environ.get("SALESFORCE_CLIENT_ID", ""),
@@ -1485,12 +1513,15 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         {
             "app_id": "zendesk",
             "name": "Zendesk",
-            "description": "Connect to Zendesk with an API token to search and manage tickets, reply to customers or add internal notes, and look up users and organizations.",
+            "description": "Connect to Zendesk to search and manage tickets, reply to customers or add internal notes, and look up users and organizations.",
             "icon": "https://www.google.com/s2/favicons?domain=zendesk.com&sz=128",
-            "transport": "stdio",
-            "provider_name": None,
+            "transport": "oauth",
+            "provider_name": "zendesk",
             "category": "Support",
-            "oauth_scopes": None,
+            # "read" covers every read tool, including /search.json, which
+            # has no resource-scoped variant; "tickets:write" covers create,
+            # update, delete, reply, and internal notes.
+            "oauth_scopes": ["read", "tickets:write"],
             # Hidden until manually verified against a live account, same
             # precedent as the intercom row above: it ships customer-facing
             # *write* tools (reply/internal note/create/update/delete)
@@ -1500,30 +1531,25 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # no redeploy needed (is_visible_in_connector is not
             # builtin-protected).
             "is_visible_in_connector": False,
-            # Key-based (non-oauth), like posthog/stripe/mixpanel: Zendesk
-            # API tokens are self-serve (Admin Center -> Apps and
-            # integrations -> APIs -> Zendesk API -> Add API token), no
-            # review. Zendesk's own docs mark this auth method
-            # "(deprecated)" in favor of OAuth, but it remains fully
-            # supported with no announced removal date -- a private
-            # (non-marketplace) OAuth client would clear the same no-review
-            # bar but adds a full authorization-code exchange this
-            # connector doesn't otherwise need. ZENDESK_SUBDOMAIN is just
-            # the account's subdomain label (e.g. "acme"), validated in
-            # zendesk.py to be a single DNS label before it's interpolated
-            # into the hardcoded "*.zendesk.com" host -- no arbitrary host
-            # is ever accepted. The resolved address is additionally
-            # validated in zendesk.py's _base_url(), the same
-            # resolve-and-reject DNS-rebinding guard posthog.py's
-            # _base_url() applies to its own hardcoded hostnames.
+            # Per-account OAuth (#2930): Zendesk stopped issuing API tokens
+            # to new accounts. The subdomain the user entered before consent
+            # is stored on the grant as instance_url (see
+            # oauth_account_hosts.py) and injected next to the token, so the
+            # connector always calls the account the token was issued for.
+            # zendesk.py still validates it as a single DNS label and checks
+            # every resolved address before use.
             "launch_config": {
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.zendesk"],
-                "required_env": [
-                    "ZENDESK_SUBDOMAIN",
-                    "ZENDESK_EMAIL",
-                    "ZENDESK_API_TOKEN",
-                ],
+                "env_mapping": {
+                    "ZENDESK_ACCESS_TOKEN": "access_token",
+                    "ZENDESK_SUBDOMAIN": "instance_url",
+                },
+                "builtin_provenance": {
+                    "registry": "xagent",
+                    "app_id": "zendesk",
+                    "version": 1,
+                },
             },
         },
         {

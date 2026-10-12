@@ -4175,6 +4175,8 @@ def generic_oauth_callback(
         }
         if code_verifier:
             data["code_verifier"] = code_verifier
+        if account_host is not None:
+            data.update(account_host.token_params)
         if is_deputy:
             # Deputy's docs list `scope` as a required body param on the
             # code-exchange request itself, not just the authorize redirect
@@ -4775,6 +4777,10 @@ def generic_oauth_callback(
                     ),
                     status_code=400,
                 )
+            envelope = account_host.userinfo_envelope if account_host else None
+            if envelope is not None:
+                nested_info = info_data.get(envelope)
+                info_data = nested_info if isinstance(nested_info, dict) else {}
             provider_user_id = info_data.get(db_provider.user_id_path or "id")
             email = info_data.get(db_provider.email_path or "email")
 

@@ -58,30 +58,38 @@ class MockResponse:
 @pytest.fixture(autouse=True)
 def _credentials(monkeypatch):
     monkeypatch.setenv("ZENDESK_SUBDOMAIN", "acme")
-    monkeypatch.setenv("ZENDESK_EMAIL", "agent@acme.com")
-    monkeypatch.setenv("ZENDESK_API_TOKEN", "test-token")
+    monkeypatch.setenv("ZENDESK_ACCESS_TOKEN", "test-token")
     # _base_url() resolves DNS to catch a hostname that rebinds to a private
     # address; tests must not depend on real network/DNS, so every test gets
     # a fake resolver returning an unambiguously public IP by default.
     monkeypatch.setattr(zendesk.socket, "getaddrinfo", _fake_getaddrinfo("1.1.1.1"))
 
 
-def test_auth_requires_email(monkeypatch):
-    monkeypatch.delenv("ZENDESK_EMAIL")
+def test_headers_require_access_token(monkeypatch):
+    monkeypatch.delenv("ZENDESK_ACCESS_TOKEN")
 
-    with pytest.raises(ValueError, match="ZENDESK_EMAIL"):
-        zendesk._auth()
-
-
-def test_auth_requires_api_token(monkeypatch):
-    monkeypatch.delenv("ZENDESK_API_TOKEN")
-
-    with pytest.raises(ValueError, match="ZENDESK_API_TOKEN"):
-        zendesk._auth()
+    with pytest.raises(ValueError, match="ZENDESK_ACCESS_TOKEN"):
+        zendesk._headers()
 
 
-def test_auth_returns_email_token_username_and_token_password():
-    assert zendesk._auth() == ("agent@acme.com/token", "test-token")
+def test_headers_treat_a_whitespace_only_access_token_as_missing(monkeypatch):
+    monkeypatch.setenv("ZENDESK_ACCESS_TOKEN", " \n")
+
+    with pytest.raises(ValueError, match="ZENDESK_ACCESS_TOKEN"):
+        zendesk._headers()
+
+
+def test_headers_send_the_access_token_as_a_bearer_credential():
+    assert zendesk._headers() == {"Authorization": "Bearer test-token"}
+
+
+def test_legacy_api_token_credentials_are_ignored(monkeypatch):
+    monkeypatch.delenv("ZENDESK_ACCESS_TOKEN")
+    monkeypatch.setenv("ZENDESK_EMAIL", "agent@acme.com")
+    monkeypatch.setenv("ZENDESK_API_TOKEN", "legacy-token")
+
+    with pytest.raises(ValueError, match="ZENDESK_ACCESS_TOKEN"):
+        zendesk._headers()
 
 
 def test_base_url_requires_subdomain(monkeypatch):
@@ -277,13 +285,13 @@ def test_extract_error_detail_prefers_description():
         json_data={"error": "RecordNotFound", "description": "Not found"}
     )
 
-    assert zendesk._extract_error_detail(response) == "Not found"
+    assert zendesk._extract_error_detail(response.text) == "Not found"
 
 
 def test_extract_error_detail_falls_back_to_string_error():
     response = MockResponse(json_data={"error": "Couldn't authenticate you"})
 
-    assert zendesk._extract_error_detail(response) == "Couldn't authenticate you"
+    assert zendesk._extract_error_detail(response.text) == "Couldn't authenticate you"
 
 
 def test_extract_error_detail_handles_nested_error_object():
@@ -291,19 +299,19 @@ def test_extract_error_detail_handles_nested_error_object():
         json_data={"error": {"title": "Unauthorized", "message": "Bad credentials"}}
     )
 
-    assert zendesk._extract_error_detail(response) == "Bad credentials"
+    assert zendesk._extract_error_detail(response.text) == "Bad credentials"
 
 
 def test_extract_error_detail_falls_back_to_title_when_message_absent():
     response = MockResponse(json_data={"error": {"title": "Unauthorized"}})
 
-    assert zendesk._extract_error_detail(response) == "Unauthorized"
+    assert zendesk._extract_error_detail(response.text) == "Unauthorized"
 
 
 def test_extract_error_detail_returns_none_for_non_json_body():
     response = MockResponse(status_code=500, text="not json", json_raises=True)
 
-    assert zendesk._extract_error_detail(response) is None
+    assert zendesk._extract_error_detail(response.text) is None
 
 
 def test_extract_error_detail_appends_record_invalid_field_reasons():
@@ -318,7 +326,7 @@ def test_extract_error_detail_appends_record_invalid_field_reasons():
     )
 
     assert (
-        zendesk._extract_error_detail(response)
+        zendesk._extract_error_detail(response.text)
         == "Record validation errors: Status: closed is not valid"
     )
 
@@ -338,7 +346,8 @@ def test_extract_error_detail_falls_back_to_field_reasons_without_description():
     )
 
     assert (
-        zendesk._extract_error_detail(response) == "Email: a@example.com already in use"
+        zendesk._extract_error_detail(response.text)
+        == "Email: a@example.com already in use"
     )
 
 
@@ -475,10 +484,10 @@ def test_request_uses_configured_host_and_auth(monkeypatch):
         mock_request.call_args.kwargs["url"]
         == "https://acme.zendesk.com/api/v2/tickets.json"
     )
-    assert mock_request.call_args.kwargs["auth"] == (
-        "agent@acme.com/token",
-        "test-token",
-    )
+    assert mock_request.call_args.kwargs["headers"] == {
+        "Authorization": "Bearer test-token"
+    }
+    assert "auth" not in mock_request.call_args.kwargs
     assert mock_request.call_args.kwargs["allow_redirects"] is False
 
 
@@ -659,11 +668,10 @@ def test_request_raises_with_structured_error_detail(monkeypatch):
 
 
 @pytest.mark.parametrize("status_code", [401, 403])
-def test_request_raises_a_clear_error_on_auth_failure(monkeypatch, status_code):
-    # An expired/invalid API token (401) or one lacking the needed
-    # permission (403) is a distinct, common failure mode from a not-found
-    # or validation error -- must surface as a clear, structured message
-    # like every other HTTPError case, not just an untested code path.
+def test_request_auth_failure_tells_the_user_to_reconnect(monkeypatch, status_code):
+    # An expired/revoked OAuth token (401) or a grant lacking the needed
+    # scope (403) can only be fixed by reconnecting Zendesk, so the error
+    # says so rather than leaving the agent to retry.
     monkeypatch.setattr(
         zendesk._session,
         "request",
@@ -675,8 +683,91 @@ def test_request_raises_a_clear_error_on_auth_failure(monkeypatch, status_code):
         ),
     )
 
-    with pytest.raises(RuntimeError, match="Couldn't authenticate you"):
+    with pytest.raises(RuntimeError) as excinfo:
         zendesk._request("GET", "/tickets/999.json")
+
+    message = str(excinfo.value)
+    assert f"HTTP {status_code}" in message
+    assert "Couldn't authenticate you" in message
+    assert "reconnect" in message.lower()
+
+
+def test_request_error_never_echoes_the_access_token(monkeypatch):
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=401,
+                json_data={"error": "invalid_token", "description": "test-token"},
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        zendesk._request("GET", "/tickets/999.json")
+
+    assert "test-token" not in str(excinfo.value)
+
+
+def test_request_error_redacts_a_token_echoed_past_the_truncation_point(monkeypatch):
+    token = "t" * 40
+    monkeypatch.setenv("ZENDESK_ACCESS_TOKEN", token)
+    body = "x" * 10_000 + token
+    monkeypatch.setattr(zendesk, "truncate_error_text", lambda text: text[:10_020])
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(return_value=MockResponse(status_code=401, text=body)),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        zendesk._request("GET", "/tickets/999.json")
+
+    assert "t" * 20 not in str(excinfo.value)
+
+
+def test_request_error_redacts_a_token_cut_by_the_details_truncation(monkeypatch):
+    # The field-level reasons are truncated while being extracted, so a token
+    # echoed across that cut must be removed from the raw body beforehand.
+    token = "k" * 40
+    monkeypatch.setenv("ZENDESK_ACCESS_TOKEN", token)
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=422,
+                json_data={
+                    "error": "RecordInvalid",
+                    "description": "Record validation errors",
+                    "details": {"base": [{"description": "y" * 980 + token}]},
+                },
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        zendesk._request("POST", "/tickets.json")
+
+    message = str(excinfo.value)
+    assert "Record validation errors" in message
+    assert "k" * 20 not in message
+
+
+def test_request_error_is_not_a_reconnect_hint_for_other_statuses(monkeypatch):
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(status_code=404, json_data={"error": "Not found"})
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        zendesk._request("GET", "/tickets/999.json")
+
+    assert "reconnect" not in str(excinfo.value).lower()
 
 
 def test_request_raises_clear_error_for_non_json_2xx_body(monkeypatch):
@@ -920,16 +1011,16 @@ def test_search_returns_empty_past_result_window_without_calling_zendesk(monkeyp
 
 def test_search_past_result_window_still_surfaces_missing_credentials(monkeypatch):
     # The past-window guard returns before ever calling _request(), which
-    # is normally what validates ZENDESK_SUBDOMAIN/EMAIL/API_TOKEN -- a
+    # is normally what validates ZENDESK_SUBDOMAIN/ACCESS_TOKEN -- a
     # misconfigured environment must not be masked as a clean "no results"
     # just because the caller happened to page past the window.
-    monkeypatch.delenv("ZENDESK_API_TOKEN")
+    monkeypatch.delenv("ZENDESK_ACCESS_TOKEN")
     page = zendesk._MAX_SEARCH_RESULT_WINDOW // 100 + 1
 
     result = json.loads(zendesk.zendesk_search("type:ticket", limit=100, page=page))
 
     assert result["status"] == "error"
-    assert "ZENDESK_API_TOKEN" in result["message"]
+    assert "ZENDESK_ACCESS_TOKEN" in result["message"]
 
 
 def test_list_tickets_sends_page_size_and_cursor(monkeypatch):
@@ -2012,7 +2103,7 @@ def test_search_users_does_not_trip_the_unified_search_window(monkeypatch):
 def test_search_users_past_result_window_still_surfaces_missing_credentials(
     monkeypatch,
 ):
-    monkeypatch.delenv("ZENDESK_API_TOKEN")
+    monkeypatch.delenv("ZENDESK_ACCESS_TOKEN")
     page = zendesk._MAX_USER_SEARCH_RESULT_WINDOW // 100 + 1
 
     result = json.loads(
@@ -2020,7 +2111,7 @@ def test_search_users_past_result_window_still_surfaces_missing_credentials(
     )
 
     assert result["status"] == "error"
-    assert "ZENDESK_API_TOKEN" in result["message"]
+    assert "ZENDESK_ACCESS_TOKEN" in result["message"]
 
 
 def test_search_users_sends_query_and_page_params(monkeypatch):
@@ -2306,22 +2397,79 @@ async def test_id_params_accept_a_bare_int_through_tool_schema(
     assert result["status"] == "success"
 
 
-def test_zendesk_app_registry_requires_subdomain_email_and_token():
+_ALL_TOOL_CALLS = [
+    ("zendesk_search", {"query": "status:open"}),
+    ("zendesk_list_tickets", {}),
+    ("zendesk_get_ticket", {"ticket_id": 1}),
+    ("zendesk_create_ticket", {"subject": "s", "comment": "c"}),
+    ("zendesk_update_ticket", {"ticket_id": 1, "status": "open"}),
+    ("zendesk_delete_ticket", {"ticket_id": 1}),
+    ("zendesk_list_ticket_comments", {"ticket_id": 1}),
+    ("zendesk_reply_to_ticket", {"ticket_id": 1, "body": "hi"}),
+    ("zendesk_add_internal_note", {"ticket_id": 1, "body": "hi"}),
+    ("zendesk_list_users", {}),
+    ("zendesk_get_user", {"user_id": 1}),
+    ("zendesk_search_users", {"query": "alice"}),
+    ("zendesk_list_organizations", {}),
+    ("zendesk_get_organization", {"organization_id": 1}),
+]
+
+
+async def test_tool_call_table_covers_every_registered_tool():
+    registered = {tool.name for tool in await zendesk.mcp.list_tools()}
+
+    assert registered == {name for name, _arguments in _ALL_TOOL_CALLS}
+
+
+@pytest.mark.parametrize("tool_name, arguments", _ALL_TOOL_CALLS)
+async def test_every_tool_sends_the_access_token_as_bearer(
+    monkeypatch, tool_name, arguments
+):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "ticket": {"id": 1},
+                "tickets": [],
+                "results": [],
+                "comments": [],
+                "users": [],
+                "user": {"id": 1},
+                "organizations": [],
+                "organization": {"id": 1},
+                "audit": {"events": []},
+                "meta": {"has_more": False},
+            }
+        )
+    )
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    _content, structured = await zendesk.mcp.call_tool(tool_name, arguments)
+
+    assert json.loads(structured["result"])["status"] == "success"
+    assert mock_request.call_count >= 1
+    for call in mock_request.call_args_list:
+        assert call.kwargs["headers"] == {"Authorization": "Bearer test-token"}
+        assert "auth" not in call.kwargs
+
+
+def test_zendesk_app_registry_uses_account_oauth():
     from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
 
     zendesk_app = next(
         row for row in get_builtin_public_mcp_app_rows() if row["app_id"] == "zendesk"
     )
-    assert zendesk_app["provider_name"] is None
+    assert zendesk_app["provider_name"] == "zendesk"
     assert zendesk_app["category"] == "Support"
-    assert zendesk_app["transport"] == "stdio"
-    assert zendesk_app["launch_config"]["required_env"] == [
-        "ZENDESK_SUBDOMAIN",
-        "ZENDESK_EMAIL",
-        "ZENDESK_API_TOKEN",
-    ]
-    # The release gate this connector's unverified write tools ship behind
-    # -- only the migration test asserted this before, and the registry
-    # row (what a running server actually seeds/reads from) is the more
-    # direct thing to pin.
+    assert zendesk_app["transport"] == "oauth"
+    assert zendesk_app["launch_config"]["env_mapping"] == {
+        "ZENDESK_ACCESS_TOKEN": "access_token",
+        "ZENDESK_SUBDOMAIN": "instance_url",
+    }
+    assert "required_env" not in zendesk_app["launch_config"]
+    assert zendesk_app["launch_config"]["builtin_provenance"] == {
+        "registry": "xagent",
+        "app_id": "zendesk",
+        "version": 1,
+    }
+    # The release gate this connector's unverified write tools ship behind.
     assert zendesk_app["is_visible_in_connector"] is False

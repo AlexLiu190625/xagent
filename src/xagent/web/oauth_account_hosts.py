@@ -24,10 +24,26 @@ registry can only ever produce ``https://<label>.<host_suffix>``.
 
 import re
 import socket
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 
 from ..core.utils.security import PrivateNetworkHostError, reject_private_network_host
 from .oauth_provider_quirks import matches_provider_family
+
+# Fields the code exchange and refresh set themselves. token_params is merged
+# into those requests at different points, so it must not name any of them.
+_RESERVED_TOKEN_PARAMS = frozenset(
+    {
+        "grant_type",
+        "code",
+        "redirect_uri",
+        "code_verifier",
+        "refresh_token",
+        "client_id",
+        "client_secret",
+        "scope",
+    }
+)
 
 # One DNS label: letters, digits and inner hyphens, at most 63 characters.
 # Matched with fullmatch, so a trailing newline cannot slip past "$".
@@ -47,6 +63,19 @@ class OAuthAccountHost:
     input_label: str
     input_placeholder: str
     input_help: str
+    # Key the userinfo response nests the identity under (e.g. Zendesk's
+    # {"user": {"id": ..., "email": ...}}); None reads top-level keys.
+    userinfo_envelope: str | None = None
+    # Extra form fields sent on both the code exchange and every refresh.
+    token_params: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        reserved = sorted(_RESERVED_TOKEN_PARAMS.intersection(self.token_params))
+        if reserved:
+            raise ValueError(
+                f"token_params must not set standard token request fields: "
+                f"{', '.join(reserved)}"
+            )
 
     def input_metadata(self) -> dict[str, str]:
         """What the connect UI shows when asking for the account label."""
@@ -72,10 +101,31 @@ class OAuthAccountError(ValueError):
     """The account identifier is missing, malformed, or not allowed."""
 
 
-# provider_name (lowercase) -> host spec. Empty until a provider registers
-# itself in its own change (Zendesk: #2930, Shopify: #2810). "-"-anchored
-# variant rows (e.g. "zendesk-sandbox") share the base provider's account host.
-OAUTH_ACCOUNT_HOSTS: dict[str, OAuthAccountHost] = {}
+# provider_name (lowercase) -> host spec. "-"-anchored variant rows (e.g.
+# "zendesk-sandbox") share the base provider's account host.
+OAUTH_ACCOUNT_HOSTS: dict[str, OAuthAccountHost] = {
+    "zendesk": OAuthAccountHost(
+        host_suffix="zendesk.com",
+        authorize_path="/oauth/authorizations/new",
+        token_path="/oauth/tokens",
+        userinfo_path="/api/v2/users/me.json",
+        input_label="Zendesk subdomain",
+        input_placeholder="your-company",
+        input_help="The part before .zendesk.com in your Zendesk URL.",
+        userinfo_envelope="user",
+        # Zendesk rotates the refresh token on every refresh and applies its
+        # defaults (for clients created since 2026-04-30, a 30-minute access
+        # token; a 30-day refresh token) to any request that omits these,
+        # including each refresh. Request the
+        # documented maximums on every token request: two days per access
+        # token keeps rotations rare, and 90 days lets an idle user's
+        # connection survive a quarter without reconnecting.
+        token_params={
+            "expires_in": "172800",
+            "refresh_token_expires_in": "7776000",
+        },
+    ),
+}
 
 
 def get_oauth_account_host(provider: str | None) -> OAuthAccountHost | None:

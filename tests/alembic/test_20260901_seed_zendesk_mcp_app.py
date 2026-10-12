@@ -190,16 +190,36 @@ def test_upgrade_forces_hidden_on_a_preexisting_colliding_row(tmp_path):
         assert row[2] == "Operator Zendesk"  # other fields left alone
 
 
-def test_seed_row_matches_registry():
-    """The migration snapshot and the runtime registry must define the same
-    zendesk row (the migration is a frozen copy; this catches drift)."""
-    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
+def test_seed_row_is_the_shape_the_oauth_switch_migrates_from():
+    """The seed is a frozen snapshot; the registry has since moved to OAuth
+    (#2930). The switch migration must recognize exactly what this seeded,
+    or it would refuse to upgrade a database this migration populated."""
+    migration = _load_migration_module()
+    switch_file = (
+        Path(__file__).parent.parent.parent
+        / "src/xagent/migrations/versions/20261012_migrate_zendesk_to_oauth.py"
+    )
+    spec = importlib.util.spec_from_file_location("zendesk_oauth_switch", switch_file)
+    switch = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(switch)
+
+    assert migration.ROW["name"] == switch.APP_NAME
+    assert migration.ROW["description"] == switch.LEGACY_DESCRIPTION
+    assert switch._legacy_catalog_row(migration.ROW)
+
+
+def test_seed_display_fields_still_match_the_registry():
+    """The OAuth switch leaves icon and category alone, so they must not
+    drift from the registry either."""
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
 
     migration = _load_migration_module()
-    registry_row = next(
-        r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "zendesk"
-    )
-    assert migration.ROW == registry_row
+    registry_row = get_builtin_public_mcp_app("zendesk")
+
+    assert registry_row is not None
+    for field in ("app_id", "name", "icon", "category"):
+        assert migration.ROW[field] == registry_row[field]
 
 
 def test_downgrade_removes_zendesk(tmp_path):
