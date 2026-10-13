@@ -464,7 +464,7 @@ describe("AgentBuilder edit-mode general-model seed", () => {
   })
 
   it("does not seed a read-only cross-user view", async () => {
-    // userDefaultGeneralRef holds the VIEWER's default; seeding here would
+    // userDefaultGeneral holds the VIEWER's default; seeding here would
     // render someone else's model as this agent's configuration.
     installApi({
       models: null,
@@ -492,11 +492,9 @@ describe("AgentBuilder edit-mode general-model seed", () => {
     expect((await savedModels()).general).toBe(DEFAULT_MODEL_ID)
   })
 
-  it("seeds when isInitialDataLoaded is the last dependency to land", async () => {
-    // Gating the user-default response also gates isInitialDataLoaded (both
-    // come from the same Promise.all), so this is not a race between the two
-    // fetches -- it is the case where the agent load commits first and the
-    // effect must still fire once the mount fetch finally reports in.
+  it("seeds when the user default is the last dependency to land", async () => {
+    // The agent load and the model list commit first; the effect must still
+    // fire once the user-default fetch finally reports in.
     const gateDefaults: Gate = { release: () => {} }
     installApi({ models: null, gateDefaults })
     render(<AgentBuilder agentId={AGENT_ID} />)

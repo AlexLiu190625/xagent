@@ -59,6 +59,8 @@ import { TaskConversationPanel } from "@/components/task/task-conversation-panel
 import { AgentTriggersDialog } from "./agent-triggers-dialog"
 import { AgentSshBindings } from "./agent-ssh-bindings"
 import { AgentFlowView } from "./agent-flow-view"
+import { useBuilderCatalog, type AgentModelConfig, type Model } from "./use-builder-catalog"
+import { BuilderListStatus } from "./builder-list-status"
 import {
   AgentTrigger,
   AgentTriggerType,
@@ -80,60 +82,6 @@ import {
   type UnsharedConnector,
   type UnsharedKnowledgeBase,
 } from "@/lib/team-sharing-sanitizers"
-
-interface KnowledgeBase {
-  name: string
-  [key: string]: any
-}
-
-interface Skill {
-  name: string
-  description?: string
-  when_to_use?: string
-  tags?: string[]
-  [key: string]: any
-}
-
-interface Tool {
-  name: string
-  description: string
-  type: string
-  category: string
-  enabled: boolean
-  always_available: boolean
-  [key: string]: any
-}
-
-interface Model {
-  id: number
-  model_id: string
-  model_name: string
-  model_provider: string
-  category: string
-  base_url?: string
-  is_default?: boolean
-  is_small_fast?: boolean
-  is_visual?: boolean
-  is_compact?: boolean
-}
-
-interface UserDefaultModel {
-  id: number
-  config_type: string
-  model: {
-    id: number
-    model_id: string
-    model_name: string
-    model_provider: string
-  }
-}
-
-interface AgentModelConfig {
-  general: number | null
-  small_fast: number | null
-  visual: number | null
-  compact: number | null
-}
 
 interface AgentBuilderProps {
   agentId?: string
@@ -286,9 +234,6 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   // Set once loadAgent decides to load an owner-scoped MCP list for an admin
   // cross-user view, so the mount-time self-scoped fetch won't clobber it.
   const ownerScopedMcpRef = useRef(false)
-  // The CURRENT user's general default (not necessarily the agent owner's),
-  // kept so the edit-mode seed below can run whichever mount fetch lands last.
-  const userDefaultGeneralRef = useRef<number | null>(null)
   const seededGeneralRef = useRef<number | null>(null)
   const router = useRouter()
   const searchParams = useSearchParams()
@@ -382,16 +327,15 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const hasUnresolvedConnectors = unsharedConnectors.some((c) => c.reason === "unresolved")
   const [templateRequirements, setTemplateRequirements] = useState<TemplateRequirements | null>(null)
 
-  // Data State
-  const [models, setModels] = useState<Model[]>([])
-  const [kbs, setKbs] = useState<KnowledgeBase[]>([])
-  const [skills, setSkills] = useState<Skill[]>([])
-  const [tools, setTools] = useState<Tool[]>([])
-  const [intrinsicToolNames, setIntrinsicToolNames] = useState<string[]>([])
-  const [skillLoaderTool, setSkillLoaderTool] = useState<string | null>(null)
-  const [mcpServers, setMcpServers] = useState<any[]>([])
+  // Data State: each picker's list loads, fails and retries on its own.
+  const {
+    models, modelsStatus, retryModels, userDefaultGeneral, modelDefaultsSettled,
+    kbs, kbsStatus, reloadKbs,
+    skills, skillsStatus, retrySkills,
+    tools, intrinsicToolNames, skillLoaderTool, toolsStatus, retryTools,
+    mcpServers, setMcpServers, mcpSettled,
+  } = useBuilderCatalog({ ownerScopedMcpRef, isEditMode, setModelConfig })
   const [isConnectMcpOpen, setIsConnectMcpOpen] = useState(false)
-  const [isInitialDataLoaded, setIsInitialDataLoaded] = useState(false)
 
   const refreshTriggerSummary = useCallback(async () => {
     if (!localAgentId) {
@@ -822,8 +766,12 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   }, [closeFilePreview, setTaskId])
 
   const loadedAgentId = originalData?.id
+  // previewConfigKey reads the model seed and the MCP list; opening a record
+  // before either lands would have it invalidated straight away. This waits
+  // for the mount-time MCP fetch only, not an admin's owner-scoped reload.
+  const previewInputsSettled = modelDefaultsSettled && mcpSettled
   useEffect(() => {
-    if (!localAgentId || !isInitialDataLoaded || String(loadedAgentId) !== localAgentId || readOnly) return
+    if (!localAgentId || !previewInputsSettled || String(loadedAgentId) !== localAgentId || readOnly) return
     // Saving a new agent must not replace its currently visible preview.
     if (lastPreview !== null) {
       setPreviewHistoryLoading(false)
@@ -857,134 +805,23 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     }
     void load()
     return () => { active = false }
-  }, [localAgentId, isInitialDataLoaded, loadedAgentId, readOnly, previewHistoryRetry, openPreviewRecord, lastPreview])
-
-  // Fetch Data
-  useEffect(() => {
-    const fetchData = async () => {
-      try {
-        const [kbRes, skillsRes, toolsRes, modelsRes, userDefaultsRes, mcpRes] = await Promise.all([
-          apiRequest(`${getApiUrl()}/api/kb/collections`),
-          apiRequest(`${getApiUrl()}/api/skills/`),
-          apiRequest(`${getApiUrl()}/api/tools/available?include_usage=false`),
-          apiRequest(`${getApiUrl()}/api/models/?category=llm`),
-          apiRequest(`${getApiUrl()}/api/models/user-default`),
-          apiRequest(`${getApiUrl()}/api/mcp/servers`)
-        ])
-
-        if (kbRes.ok) {
-          const kbData = await kbRes.json()
-          setKbs(kbData.collections || [])
-        }
-
-        if (skillsRes.ok) {
-          const skillsData = await skillsRes.json()
-          console.log("Skills API response:", skillsData)
-          setSkills(skillsData || [])
-        } else {
-          console.error("Skills API failed:", skillsRes.status, await skillsRes.text())
-        }
-
-        if (toolsRes.ok) {
-          const toolsData = await toolsRes.json()
-          // Filter only enabled tools
-          setTools((toolsData.tools || []).filter((t: Tool) => t.enabled))
-          // Unfiltered: the runtime injects these without reading ToolConfig.enabled.
-          setIntrinsicToolNames((toolsData.tools || []).filter((t: Tool) => t.always_available).map((t: Tool) => t.name))
-          setSkillLoaderTool(readNonEmptyString(toolsData.skill_loader_tool))
-        }
-
-        if (mcpRes.ok && !ownerScopedMcpRef.current) {
-          // Skip when an admin cross-user view has taken over the MCP list
-          // (loadAgent fetches the owner's servers); otherwise this mount fetch
-          // could resolve last and clobber the owner list with the admin's own.
-          const mcpData = await mcpRes.json()
-          // Re-check after the await: loadAgent may have claimed the owner-scoped
-          // list during the JSON parse, and we must not clobber it.
-          if (!ownerScopedMcpRef.current) setMcpServers(mcpData || [])
-        }
-
-        let availableModels: Model[] = []
-        if (modelsRes.ok) {
-          availableModels = await modelsRes.json()
-          setModels(availableModels || [])
-        }
-
-        if (userDefaultsRes.ok) {
-          const userDefaults = await userDefaultsRes.json()
-
-          // One pass: the general-default ref is needed in edit mode too (the
-          // seed effect above reads it), the rest only seeds a new agent.
-          // The shape guards are defensive -- fetchData's catch already
-          // swallows a malformed response, so no test can tell them apart.
-          const config: AgentModelConfig = {
-            general: null,
-            small_fast: null,
-            visual: null,
-            compact: null,
-          }
-          for (const m of Array.isArray(userDefaults) ? userDefaults : []) {
-            const id = m?.model?.id
-            if (!id) continue
-            if (m.config_type === 'general') {
-              config.general = id
-              userDefaultGeneralRef.current = id
-            }
-            else if (m.config_type === 'small_fast') config.small_fast = id
-            else if (m.config_type === 'visual') config.visual = id
-            else if (m.config_type === 'compact') config.compact = id
-          }
-
-          if (!isEditMode) {
-            // Fallback: If no general model set, pick first available LLM
-            if (!config.general && availableModels.length > 0) {
-              // models endpoint was called with ?category=llm so these should be LLMs
-              const firstLlm = availableModels[0]
-              if (firstLlm) {
-                config.general = firstLlm.id
-              }
-            }
-
-            setModelConfig(config)
-          }
-        }
-      } catch (error) {
-        console.error("Failed to fetch data:", error)
-      } finally {
-        setIsInitialDataLoaded(true)
-      }
-    }
-
-    fetchData()
-  }, [])
-
-  const refreshKbs = async () => {
-    try {
-      const kbRes = await apiRequest(`${getApiUrl()}/api/kb/collections`)
-      if (kbRes.ok) {
-        const kbData = await kbRes.json()
-        setKbs(kbData.collections || [])
-      }
-    } catch (error) {
-      console.error("Failed to refresh KBs:", error)
-    }
-  }
+  }, [localAgentId, previewInputsSettled, loadedAgentId, readOnly, previewHistoryRetry, openPreviewRecord, lastPreview])
 
   // Server-side creation paths persisted no model config, which rendered "--"
-  // and tripped the required-model guard on save. Both mount fetches must have
-  // landed before we can tell an unset slot from one still loading.
+  // and tripped the required-model guard on save. Seeds only once both the
+  // viewer's default and a model list containing it have landed.
   useEffect(() => {
     // Not in a read-only cross-user view: the default below is the viewer's,
     // so seeding there would render someone else's model as this agent's.
-    if (!isEditMode || readOnly || !isInitialDataLoaded || !originalData) return
+    if (!isEditMode || readOnly || !originalData) return
     if (seededGeneralRef.current !== null || modelConfig.general) return
-    const seeded = userDefaultGeneralRef.current
+    const seeded = userDefaultGeneral
     // Only an id the dropdown can actually show: seeding one that is missing
     // from the fetched list renders an empty Select while counting as dirty.
     if (!seeded || !models.some(m => m.id === seeded)) return
     seededGeneralRef.current = seeded
     setModelConfig(prev => ({ ...prev, general: seeded }))
-  }, [isEditMode, readOnly, isInitialDataLoaded, originalData, modelConfig.general, models])
+  }, [isEditMode, readOnly, originalData, modelConfig.general, models, userDefaultGeneral])
 
   // Load agent data in edit mode
   useEffect(() => {
@@ -1045,7 +882,9 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             const ownerMcpRes = await apiRequest(`${getApiUrl()}/api/mcp/servers?user_id=${agent.user_id}`)
             if (!active) return
             if (ownerMcpRes.ok) {
-              setMcpServers((await ownerMcpRes.json()) || [])
+              // A non-list body would break every connector lookup at render.
+              const ownerServers = await ownerMcpRes.json()
+              if (Array.isArray(ownerServers)) setMcpServers(ownerServers)
             }
           } else if (ownerScopedMcpRef.current) {
             // Switching back to a self-owned agent after an admin cross-user view:
@@ -1055,7 +894,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             const selfMcpRes = await apiRequest(`${getApiUrl()}/api/mcp/servers`)
             if (!active) return
             if (selfMcpRes.ok) {
-              setMcpServers((await selfMcpRes.json()) || [])
+              const selfServers = await selfMcpRes.json()
+              if (Array.isArray(selfServers)) setMcpServers(selfServers)
             }
           }
 
@@ -2038,7 +1878,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   }
 
   const isTemplateEntry = Boolean(templateId) && !isEditMode
-  const isTemplateRequirementsPending = isTemplateEntry && (!isInitialDataLoaded || loadingAgent || !templateRequirements)
+  // Of the catalog lists, only MCP feeds the requirement checks below.
+  const isTemplateRequirementsPending = isTemplateEntry && (!mcpSettled || loadingAgent || !templateRequirements)
   const isTemplateBuildFlow = isTemplateEntry && !isTemplateRequirementsPending
   const templateMissingKb = Boolean(
     isTemplateBuildFlow &&
@@ -2539,9 +2380,11 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               />
             </div>
           ) : (
-            <div className="text-sm text-muted-foreground">
-              {t("builds.configForm.model.noData")}
-            </div>
+            <BuilderListStatus status={modelsStatus} onRetry={retryModels}>
+              <div className="text-sm text-muted-foreground">
+                {t("builds.configForm.model.noData")}
+              </div>
+            </BuilderListStatus>
           )}
 
           <Dialog open={isModelConfigOpen} onOpenChange={setIsModelConfigOpen}>
@@ -2684,6 +2527,11 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             placeholder={t("builds.configForm.knowledgeBase.placeholder")}
             disabled={readOnly}
           />
+          {/* The picker stays mounted so saved KBs remain visible; a reload
+              after creating a KB keeps the loaded list without a status line. */}
+          {kbs.length === 0 && kbsStatus !== "ready" && (
+            <BuilderListStatus status={kbsStatus} onRetry={reloadKbs}>{null}</BuilderListStatus>
+          )}
         </div>
 
         {/* Skills - Multi Select */}
@@ -2721,9 +2569,11 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               disabled={readOnly}
             />
           ) : (
-            <div className="text-sm text-muted-foreground">
-              {t("builds.configForm.skills.noData")}
-            </div>
+            <BuilderListStatus status={skillsStatus} onRetry={retrySkills}>
+              <div className="text-sm text-muted-foreground">
+                {t("builds.configForm.skills.noData")}
+              </div>
+            </BuilderListStatus>
           )}
         </div>
 
@@ -2762,11 +2612,14 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               disabled={readOnly}
             />
           ) : (
-            <div className="text-sm text-muted-foreground">
-              {t("builds.configForm.tools.noData")}
-            </div>
+            <BuilderListStatus status={toolsStatus} onRetry={retryTools}>
+              <div className="text-sm text-muted-foreground">
+                {t("builds.configForm.tools.noData")}
+              </div>
+            </BuilderListStatus>
           )}
-          {selectedToolCategories.length > 0 && (
+          {/* The tool count is meaningless until the tools list has loaded. */}
+          {toolsStatus === "ready" && selectedToolCategories.length > 0 && (
             <div className="text-xs text-muted-foreground">
               {t("builds.configForm.tools.selectedCount", {
                 count: selectedToolCategories.length,
@@ -3344,7 +3197,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         open={isKbModalOpen}
         onOpenChange={setIsKbModalOpen}
         onSuccess={(createdCollections) => {
-          refreshKbs()
+          void reloadKbs()
           if (createdCollections && createdCollections.length > 0) {
             setSelectedKbs(prev => {
               const newKbs = Array.from(new Set([...prev, ...createdCollections]))
@@ -3396,9 +3249,11 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           }}
           onSuccess={() => {
             refreshMcpApps().catch(console.error)
+            // Keep the current list unless the refresh returns one: an error
+            // body here would break every connector lookup at render.
             apiRequest(`${getApiUrl()}/api/mcp/servers`)
-              .then(res => res.json())
-              .then(data => setMcpServers(data || []))
+              .then(res => (res.ok ? res.json() : null))
+              .then(data => { if (Array.isArray(data)) setMcpServers(data) })
               .catch(console.error)
           }}
         />

@@ -144,7 +144,7 @@ function agentResponse(ownerId: number, canEdit = true) {
   }
 }
 
-// Base handler for the mount-time fetchData resources + agent detail. `ownerId`
+// Base handler for the mount-time catalog resources + agent detail. `ownerId`
 // controls who owns the loaded agent; `agentPromise` lets a test defer the agent
 // response to drive the mid-flight teardown case.
 function installApi(
