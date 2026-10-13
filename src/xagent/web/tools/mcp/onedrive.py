@@ -115,6 +115,10 @@ _OUTPUT_DIR_ENV_VAR = "XAGENT_ONEDRIVE_OUTPUT_DIR"
 class _UploadError(RuntimeError):
     """Upload failure whose message is safe to expose to the caller."""
 
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
 
 class _GraphRequestError(RuntimeError):
     """Graph HTTP failure that keeps its status and Graph error code."""
@@ -333,6 +337,27 @@ def _error(message: str, *, details: Any = None) -> str:
     if details is not None:
         payload["details"] = details
     return json.dumps(payload, ensure_ascii=False)
+
+
+def _resource_locked_error(operation: str) -> str:
+    """Return a stable, caller-actionable contract for a Graph 423."""
+    return json.dumps(
+        {
+            "status": "error",
+            "message": (
+                f"The OneDrive item is locked, so it could not be {operation}. "
+                "Close the document in Word or Teams and retry later, or use a "
+                "different destination path to save a copy."
+            ),
+            "code": "resource_locked",
+            "retryable": True,
+            # Graph commonly omits the owner for driveItem 423 responses. Keep
+            # a stable field without exposing or guessing an identity.
+            "lock_owner": None,
+            "suggested_actions": ["close_document_and_retry", "save_as_copy"],
+        },
+        ensure_ascii=False,
+    )
 
 
 def _graph_headers(extra_headers: dict[str, str] | None = None) -> dict[str, str]:
@@ -1228,7 +1253,14 @@ def _upload_large_file_content(
                         "instead of success",
                         cancel_response.status_code,
                     )
-            raise RuntimeError(_safe_upload_error_message(exc)) from None
+            # Keep only the numeric status across the upload-URL redaction
+            # boundary. The original exception chain may contain the
+            # preauthenticated session URL, so it must not escape, but callers
+            # still need to distinguish a 423 lock from an ordinary failure.
+            raise _UploadError(
+                _safe_upload_error_message(exc),
+                status_code=_upload_status_code(exc),
+            ) from None
 
     return result
 
@@ -1538,7 +1570,11 @@ def onedrive_upload_file(
     a relative path resolves against this process's working directory.
     remote_path: the OneDrive path to upload to (e.g. "Reports/report.pdf"),
     overwriting any existing file there; defaults to the local file's own
-    name at the OneDrive root.
+    name at the OneDrive root. Prefer the format-specific connector when one
+    supports editing the existing Office document. If an existing item is
+    locked, this tool returns code="resource_locked"; do not retry the
+    same destination immediately. Close the document and retry later, or ask
+    the user before choosing a different remote_path to save a copy.
     mime_type: defaults to a guess from the remote filename, then the local
     filename, falling back to "application/octet-stream". It is sent on both
     simple uploads and upload-session chunks.
@@ -1629,6 +1665,8 @@ def onedrive_upload_file(
             logger.exception(
                 "Unexpected error uploading OneDrive file %s", local_file_path
             )
+        if _upload_status_code(e) in (409, 423):
+            return _resource_locked_error("overwritten")
         return _error(str(e))
 
 

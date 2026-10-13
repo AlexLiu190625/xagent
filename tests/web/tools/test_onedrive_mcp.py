@@ -1058,6 +1058,32 @@ def test_upload_large_file_content_does_not_forward_chunk_error_body(
     )
 
 
+def test_upload_large_file_content_preserves_423_across_url_redaction(monkeypatch):
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(return_value=MockResponse({"uploadUrl": "https://upload.example/s"})),
+    )
+    error_response = MockResponse(
+        {"error": {"message": "locked; secret=https://upload.example/s?token=secret"}},
+        status_code=423,
+    )
+    mock_delete = Mock(return_value=MockResponse({}, status_code=204))
+    _patch_session(
+        monkeypatch,
+        _FakeSession(put=Mock(return_value=error_response), delete=mock_delete),
+    )
+
+    with pytest.raises(onedrive._UploadError) as exc_info:
+        onedrive._upload_large_file_content(
+            "big.docx", io.BytesIO(b"x"), 1, "application/octet-stream"
+        )
+
+    assert onedrive._upload_status_code(exc_info.value) == 423
+    assert "token=secret" not in str(exc_info.value)
+    mock_delete.assert_called_once()
+
+
 def test_upload_large_file_content_never_leaks_upload_url_on_chunk_failure(
     monkeypatch, caplog
 ):
@@ -3076,6 +3102,100 @@ def test_upload_file_returns_error_payload_on_api_failure(
     assert "HTTP 500" in result["message"]
     # The response body is never forwarded; it may carry a preauthenticated URL.
     assert "boom" not in result["message"]
+
+
+def test_upload_file_returns_structured_lock_error_without_blind_retry(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    local_file = _upload_allowed_dirs_env / "report.docx"
+    local_file.write_bytes(b"content")
+    request = Mock(
+        return_value=MockResponse(
+            {
+                "error": {
+                    "code": "notAllowed",
+                    "message": "locked; secret=https://download.example/token",
+                }
+            },
+            status_code=423,
+        )
+    )
+    monkeypatch.setattr(onedrive.requests, "request", request)
+
+    result = json.loads(onedrive.onedrive_upload_file(str(local_file)))
+
+    assert result == {
+        "status": "error",
+        "message": (
+            "The OneDrive item is locked, so it could not be overwritten. "
+            "Close the document in Word or Teams and retry later, or use a "
+            "different destination path to save a copy."
+        ),
+        "code": "resource_locked",
+        "retryable": True,
+        "lock_owner": None,
+        "suggested_actions": ["close_document_and_retry", "save_as_copy"],
+    }
+    assert request.call_count == 1
+    assert "download.example" not in result["message"]
+
+
+def test_upload_file_maps_large_upload_423_to_structured_lock_error(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    local_file = _upload_allowed_dirs_env / "report.docx"
+    local_file.write_bytes(b"content")
+    monkeypatch.setattr(
+        onedrive.os,
+        "fstat",
+        Mock(return_value=Mock(st_size=onedrive._SIMPLE_UPLOAD_MAX_BYTES + 1)),
+    )
+    monkeypatch.setattr(
+        onedrive,
+        "_upload_large_file_content",
+        Mock(
+            side_effect=onedrive._UploadError(
+                "OneDrive upload fragment failed with HTTP 423", status_code=423
+            )
+        ),
+    )
+
+    result = json.loads(onedrive.onedrive_upload_file(str(local_file)))
+
+    assert result["status"] == "error"
+    assert result["code"] == "resource_locked"
+    assert result["retryable"] is True
+    assert result["suggested_actions"] == [
+        "close_document_and_retry",
+        "save_as_copy",
+    ]
+
+
+def test_upload_file_maps_create_session_423_from_cause_to_lock_error(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    local_file = _upload_allowed_dirs_env / "report.docx"
+    local_file.write_bytes(b"content")
+    monkeypatch.setattr(
+        onedrive.os,
+        "fstat",
+        Mock(return_value=Mock(st_size=onedrive._SIMPLE_UPLOAD_MAX_BYTES + 1)),
+    )
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                {"error": {"code": "notAllowed"}}, status_code=423
+            )
+        ),
+    )
+
+    result = json.loads(onedrive.onedrive_upload_file(str(local_file)))
+
+    assert result["status"] == "error"
+    assert result["code"] == "resource_locked"
+    assert result["retryable"] is True
 
 
 def test_upload_file_requires_completed_item_confirmation(
