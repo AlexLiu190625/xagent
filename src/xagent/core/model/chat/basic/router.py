@@ -32,7 +32,10 @@ three are read only when XROUTER_EMBEDDING_BACKEND is set):
                                 the artifact; "xinference" sends prompt
                                 embeddings to a remote OpenAI-compatible
                                 endpoint; "sentence-transformers" loads the
-                                model in process. Case-sensitive; any other
+                                model in process, rebuilt with upstream
+                                defaults (model from XROUTER_EMBEDDING_MODEL,
+                                max sequence length 512) instead of keeping the
+                                serialized backend. Case-sensitive; any other
                                 value fails the service build with ValueError
   XROUTER_EMBEDDING_MODEL       embedding model name (default
                                 Qwen/Qwen3-Embedding-0.6B); must be the model

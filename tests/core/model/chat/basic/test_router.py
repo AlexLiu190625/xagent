@@ -1171,18 +1171,6 @@ def test_build_service_keeps_serialized_backend_without_env(monkeypatch) -> None
     assert constructed[0]["embedding_backend"] is None
 
 
-def test_build_service_rejects_unknown_embedding_backend(monkeypatch) -> None:
-    from xagent.core.model.chat.basic import router
-
-    constructed = _stub_service_construction(monkeypatch)
-    monkeypatch.setenv("XROUTER_EMBEDDING_BACKEND", "carrier-pigeon")
-
-    with pytest.raises(ValueError, match="Unknown embedding backend"):
-        router._build_service("model.joblib", "models", "routers")
-
-    assert constructed == []
-
-
 def test_build_service_rejects_unknown_backend_before_loading_anything(
     monkeypatch,
 ) -> None:
