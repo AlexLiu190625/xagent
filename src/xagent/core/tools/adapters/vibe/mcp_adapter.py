@@ -53,6 +53,7 @@ from ...core.mcp.sessions import (
 )
 from ...core.mcp.tools import load_mcp_tools, raw_annotations_for
 from .base import AbstractBaseTool, ToolVisibility
+from .config import is_http_status_code
 from .connector_runtime import (
     ERROR_DELEGATED_AUTHORIZATION_FAILED,
     MISSING_RUNTIME_VALUE,
@@ -237,9 +238,12 @@ class MCPServerLoadFailure:
     ``error_type`` is the class name of the exception the load caught.
     ``cause_type`` is the class name of the exception behind it --
     ``error_type`` itself when that is not an exception group, otherwise the
-    first non-group member reached through ``.exceptions`` -- and
-    ``status_code`` the HTTP status that exception carries. Both are ``None``
-    when unknown.
+    first non-group member reached through ``.exceptions`` (the group itself
+    if none is found within the walk limit) -- and ``status_code`` the HTTP
+    status that exception carries, or ``None``.
+    Only the direct loader's retry loop sets these two; every other producer
+    leaves them ``None``, and the setup summary then reports ``error_type``
+    as the cause.
     """
 
     server_name: str
@@ -888,7 +892,7 @@ def _level_order_exception_nodes(exc: BaseException) -> Iterator[BaseException]:
             pending.append(current.__context__)
 
 
-def _load_failure_cause(exc: BaseException) -> BaseException | None:
+def _load_failure_cause(exc: BaseException) -> BaseException:
     """Return the exception behind an MCP load failure.
 
     That is ``exc`` itself when it is not an exception group, otherwise the
@@ -897,8 +901,8 @@ def _load_failure_cause(exc: BaseException) -> BaseException | None:
     member of an anyio ``ExceptionGroup``). ``__cause__``/``__context__`` are
     not followed: a group's context is whatever was being handled when it was
     raised, not why it was raised. Visits at most
-    ``_EXCEPTION_WALK_NODE_LIMIT`` nodes; returns ``None`` if that runs out
-    before a non-group member is found.
+    ``_EXCEPTION_WALK_NODE_LIMIT`` nodes; returns ``exc`` itself if that runs
+    out before a non-group member is found.
     """
     pending: list[BaseException] = [exc]
     index = 0
@@ -908,19 +912,14 @@ def _load_failure_cause(exc: BaseException) -> BaseException | None:
         if not isinstance(current, BaseExceptionGroup):
             return current
         pending.extend(current.exceptions)
-    return None
-
-
-# The range an HTTP status line can carry. Anything else read from an
-# exception is not reported as a status.
-_HTTP_STATUS_RANGE = range(100, 600)
+    return exc
 
 
 def _exception_http_status(exc: BaseException) -> int | None:
     """Return the HTTP status ``exc`` itself carries, or ``None``.
 
     Reads ``exc.response.status_code`` for an ``httpx.HTTPStatusError`` and
-    otherwise a ``status_code`` attribute, falling back to ``status``. Only an
+    otherwise a ``status_code`` attribute. Only an
     integer in 100..599 counts (``bool`` does not; an ``int`` subclass such
     as ``http.HTTPStatus`` is converted to a plain ``int``), so the result is
     always safe to put in a log line. A getter that raises counts as no
@@ -933,8 +932,6 @@ def _exception_http_status(exc: BaseException) -> int | None:
             value = exc.response.status_code
         else:
             value = getattr(exc, "status_code", None)
-            if value is None:
-                value = getattr(exc, "status", None)
         if isinstance(value, bool) or not isinstance(value, int):
             return None
         status = int(value)
@@ -945,7 +942,7 @@ def _exception_http_status(exc: BaseException) -> int | None:
             type(err).__name__,
         )
         return None
-    return status if status in _HTTP_STATUS_RANGE else None
+    return status if is_http_status_code(status) else None
 
 
 # A URL token ends only at whitespace or an angle bracket. A quote is NOT a
@@ -3304,8 +3301,8 @@ async def _load_direct_mcp_tools(
             failure_phase = current_phase
             error_type = type(e).__name__
             cause = _load_failure_cause(e)
-            cause_type = type(cause).__name__ if cause is not None else None
-            status_code = _exception_http_status(cause) if cause is not None else None
+            cause_type = type(cause).__name__
+            status_code = _exception_http_status(cause)
             if attempt < max_attempts - 1:
                 logger.warning(
                     "Attempt %d failed to load tools from MCP server %s during %s "

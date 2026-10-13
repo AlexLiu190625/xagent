@@ -1057,8 +1057,8 @@ class ToolFactory:
         reason: object = None,
         message: object = None,
         failure_code: object = None,
-        cause_type: object = None,
-        status_code: object = None,
+        cause_type: str | None = None,
+        status_code: int | None = None,
     ) -> Tool:
         """Build the shared server-scoped unavailable MCP tool."""
         from ....agent.result import normalize_tool_failure_code
@@ -1073,10 +1073,8 @@ class ToolFactory:
             kwargs["reason"] = reason
         if isinstance(message, str):
             kwargs["message"] = message
-        if isinstance(cause_type, str):
-            kwargs["cause_type"] = cause_type
-        if type(status_code) is int:
-            kwargs["status_code"] = status_code
+        kwargs["cause_type"] = cause_type
+        kwargs["status_code"] = status_code
         return UnavailableMCPTool(**kwargs)
 
     @staticmethod
@@ -1108,7 +1106,12 @@ class ToolFactory:
         failures: tuple["MCPServerLoadFailure", ...],
         configs_by_name: dict[str, dict[str, Any]],
     ) -> list[Tool]:
-        """Convert structured load failures to one unavailable tool per server."""
+        """Convert structured load failures to one unavailable tool per server.
+
+        A failure without a ``cause_type`` reports its ``error_type`` as the
+        cause, so the setup summary names the exception class whenever the
+        loader caught one.
+        """
         from .mcp_adapter import mcp_load_failure_message
 
         tools: list[Tool] = []
@@ -1128,7 +1131,7 @@ class ToolFactory:
                     server_id=server_id,
                     reason=failure.phase.value,
                     message=mcp_load_failure_message(failure.phase),
-                    cause_type=failure.cause_type,
+                    cause_type=failure.cause_type or failure.error_type,
                     status_code=failure.status_code,
                 )
             )

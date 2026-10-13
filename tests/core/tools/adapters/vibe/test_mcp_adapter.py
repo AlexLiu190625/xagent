@@ -5622,27 +5622,11 @@ def _nested_group_with_outer_context() -> BaseException:
     [
         pytest.param(
             "session",
-            lambda: ExceptionGroup("tg", [_status_error(401)]),
-            "ExceptionGroup",
-            "HTTPStatusError",
-            401,
-            id="group-401",
-        ),
-        pytest.param(
-            "session",
             lambda: ExceptionGroup("tg", [_status_error(403)]),
             "ExceptionGroup",
             "HTTPStatusError",
             403,
             id="group-403",
-        ),
-        pytest.param(
-            "session",
-            lambda: ExceptionGroup("tg", [_status_error(503)]),
-            "ExceptionGroup",
-            "HTTPStatusError",
-            503,
-            id="group-503",
         ),
         pytest.param(
             "session",
@@ -5659,16 +5643,6 @@ def _nested_group_with_outer_context() -> BaseException:
             "ConnectError",
             None,
             id="group-connect-error",
-        ),
-        pytest.param(
-            "session",
-            lambda: ExceptionGroup(
-                "outer", [ExceptionGroup("tg", [_status_error(403)])]
-            ),
-            "ExceptionGroup",
-            "HTTPStatusError",
-            403,
-            id="nested-group-403",
         ),
         pytest.param(
             "session",
@@ -5733,14 +5707,6 @@ def _nested_group_with_outer_context() -> BaseException:
             "_RaisingStatusGetter",
             None,
             id="status-getter-raises",
-        ),
-        pytest.param(
-            "session",
-            lambda: _StatusCarrier(status_code=None, status=401),
-            "_StatusCarrier",
-            "_StatusCarrier",
-            401,
-            id="status-attribute-fallback",
         ),
         pytest.param(
             "session",
@@ -5816,6 +5782,14 @@ def test_exception_status_getter_failure_is_logged_at_debug(caplog):
     )
 
 
+def test_load_failure_cause_past_the_walk_limit_is_the_caught_group():
+    exc: BaseException = ValueError("leaf")
+    for index in range(mcp_adapter_module._EXCEPTION_WALK_NODE_LIMIT):
+        exc = ExceptionGroup(f"level {index}", [exc])
+
+    assert mcp_adapter_module._load_failure_cause(exc) is exc
+
+
 @pytest.mark.parametrize(
     ("cause_type", "status_code", "expected"),
     [
@@ -5829,6 +5803,12 @@ def test_exception_status_getter_failure_is_logged_at_debug(caplog):
         ("HTTPStatusError", 99, ("HTTPStatusError", None)),
         ("HTTPStatusError", 600, ("HTTPStatusError", None)),
         ("HTTPStatusError", 403.0, ("HTTPStatusError", None)),
+        pytest.param(
+            "HTTPStatusError",
+            HTTPStatus.FORBIDDEN,
+            ("HTTPStatusError", None),
+            id="status-int-subclass",
+        ),
     ],
 )
 def test_unavailable_summary_sanitizes_cause_fields(cause_type, status_code, expected):
@@ -5837,7 +5817,12 @@ def test_unavailable_summary_sanitizes_cause_fields(cause_type, status_code, exp
     )
 
     assert (summary.cause_type, summary.status_code) == expected
-    assert MCPUnavailableSummary.from_values("srv", "initialize").cause_type is None
+
+
+def test_unavailable_summary_cause_fields_default_to_none():
+    summary = MCPUnavailableSummary.from_values("srv", "initialize")
+
+    assert (summary.cause_type, summary.status_code) == (None, None)
 
 
 def test_load_failure_cause_reaches_mcp_load_summary():
@@ -5865,6 +5850,47 @@ def test_load_failure_cause_reaches_mcp_load_summary():
     assert "status_code" not in result
     assert "cause_type" not in result
     assert "HTTPStatusError" not in json.dumps(result)
+
+
+@pytest.mark.parametrize(
+    ("phase", "error_type", "expected"),
+    [
+        pytest.param(
+            MCPFailurePhase.INITIALIZE, "TimeoutError", "TimeoutError", id="timeout"
+        ),
+        pytest.param(
+            MCPFailurePhase.SANDBOX_TOOL_WRAP,
+            "ValidationError",
+            "ValidationError",
+            id="sandbox-class-name",
+        ),
+        pytest.param(
+            MCPFailurePhase.SANDBOX_TOOL_WRAP,
+            "not a class; name",
+            None,
+            id="sandbox-garbage-dropped",
+        ),
+        pytest.param(MCPFailurePhase.NO_TOOLS_RETURNED, None, None, id="no-exception"),
+    ],
+)
+def test_load_failure_without_cause_reports_error_type_in_summary(
+    phase, error_type, expected
+):
+    failure = MCPServerLoadFailure(
+        server_name="Broken", phase=phase, error_type=error_type
+    )
+
+    tools = ToolFactory._unavailable_mcp_tools_from_load_failures(
+        (failure,), {"Broken": {"id": 7}}
+    )
+    summary = _build_mcp_load_summary([{"name": "Broken"}], tools)
+
+    (entry,) = summary.failures
+    assert (entry.reason, entry.cause_type, entry.status_code) == (
+        phase.value,
+        expected,
+        None,
+    )
 
 
 def _real_client_connection(transport: str, status_code: int) -> dict[str, Any]:

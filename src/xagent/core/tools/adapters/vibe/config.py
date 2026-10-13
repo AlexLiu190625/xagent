@@ -12,7 +12,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, TypeVar
+from typing import Any, Dict, List, Optional, TypeGuard, TypeVar
 
 from ..... import config as _root_config
 
@@ -102,6 +102,17 @@ _PUBLIC_MCP_UNAVAILABLE_REASONS = frozenset(
 )
 _DEFAULT_MCP_UNAVAILABLE_REASON = "mcp_server_unavailable"
 _PUBLIC_CAUSE_TYPE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
+
+
+def is_http_status_code(value: object) -> TypeGuard[int]:
+    """Whether ``value`` is an HTTP status a status line can carry.
+
+    Only an exact ``int`` in 100..599 counts: ``bool`` and other ``int``
+    subclasses do not.
+    """
+    return type(value) is int and 100 <= value <= 599
+
+
 _DEFAULT_MCP_SERVER_NAME = "MCP server"
 
 
@@ -142,11 +153,7 @@ class MCPUnavailableSummary:
             if type(cause_type) is str and _PUBLIC_CAUSE_TYPE_RE.fullmatch(cause_type)
             else None
         )
-        safe_status_code = (
-            status_code
-            if type(status_code) is int and 100 <= status_code <= 599
-            else None
-        )
+        safe_status_code = status_code if is_http_status_code(status_code) else None
         return cls(
             server_name=safe_server_name,
             reason=safe_reason,

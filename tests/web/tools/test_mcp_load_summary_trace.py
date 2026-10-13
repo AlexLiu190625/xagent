@@ -25,9 +25,17 @@ async def test_web_tool_config_emits_safe_audit_only_mcp_summary() -> None:
         mcp_load_summary_trace_task_id="42",
     )
     summary = MCPToolLoadSummary(
-        requested_servers=("Gmail", "Slack"),
+        requested_servers=("Gmail", "Slack", "Notion"),
         loaded_servers=("Gmail",),
-        failures=(MCPUnavailableSummary("Slack", "initialize"),),
+        failures=(
+            MCPUnavailableSummary("Slack", "initialize"),
+            MCPUnavailableSummary.from_values(
+                "Notion",
+                "initialize",
+                cause_type="HTTPStatusError",
+                status_code=403,
+            ),
+        ),
         successful_tool_count=3,
     )
 
@@ -39,7 +47,7 @@ async def test_web_tool_config_emits_safe_audit_only_mcp_summary() -> None:
         data={
             "__audit_only__": True,
             "event_type": "mcp_load_summary",
-            "requested_servers": ["Gmail", "Slack"],
+            "requested_servers": ["Gmail", "Slack", "Notion"],
             "loaded_servers": ["Gmail"],
             "failures": [
                 {
@@ -47,50 +55,19 @@ async def test_web_tool_config_emits_safe_audit_only_mcp_summary() -> None:
                     "reason": "initialize",
                     "error_type": None,
                     "status_code": None,
-                }
+                },
+                {
+                    "server_name": "Notion",
+                    "reason": "initialize",
+                    "error_type": "HTTPStatusError",
+                    "status_code": 403,
+                },
             ],
             "successful_tool_count": 3,
         },
         require_persisted=False,
     )
     assert config.get_parent_tracer() is workforce_parent_tracer
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("cause_type", "status_code"), [("HTTPStatusError", 403), (None, None)]
-)
-async def test_web_tool_config_emits_failure_cause_fields(
-    cause_type: str | None, status_code: int | None
-) -> None:
-    tracer = AsyncMock()
-    config = WebToolConfig(
-        db=None,
-        request=None,
-        user_id=7,
-        mcp_load_summary_tracer=tracer,
-        mcp_load_summary_trace_task_id="42",
-    )
-    summary = MCPToolLoadSummary(
-        requested_servers=("Slack",),
-        failures=(
-            MCPUnavailableSummary.from_values(
-                "Slack", "initialize", cause_type=cause_type, status_code=status_code
-            ),
-        ),
-    )
-
-    await config.emit_mcp_load_summary(summary)
-
-    emitted = tracer.trace_event.await_args.kwargs["data"]
-    assert emitted["failures"] == [
-        {
-            "server_name": "Slack",
-            "reason": "initialize",
-            "error_type": cause_type,
-            "status_code": status_code,
-        }
-    ]
 
 
 @pytest.mark.asyncio
