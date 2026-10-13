@@ -76,10 +76,9 @@ question instead of leaving a stale one behind. The injection layer
 reports which case it is -- ``UserMessageInjectionOutcome`` on
 ``AgentRunner.inject_user_message`` and everything that forwards its
 result, rather than the same truthy value a fresh write produces -- and
-the three injection sites that can see a replay close only on
-``POSTED_FRESH``.
+all four injection sites close only on ``POSTED_FRESH``.
 
-Those three are not exposed to the same degree, and the guard means
+The four are not exposed to the same degree, and the guard means
 something different at each. The online WebSocket site and the A2A
 resume-input site both read the id fresh on every attempt
 (``active_interaction_id_sync`` immediately before their own injection
@@ -93,11 +92,19 @@ no-op, not a hazard. Its guard is defense in depth, held in place so the
 site cannot quietly become dangerous if it is ever changed to derive its
 own key.
 
-The fourth production caller, the v1 ``POST .../reply`` resume-input
-path (``task_resume.py``), carries no guard at all and needs none: it
-builds its turn id as ``f"v1:reply:{task_id}:{uuid4()}"``, a value that
-is fresh on every single call, so it can never present a repeated turn
-id and can never reach the short circuit that produces a replay.
+The v1 ``POST .../reply`` resume-input path (``task_resume.py``) also
+reads its id fresh on every attempt, but it does not repeat a turn id in
+normal operation. Run inline, it builds its turn id as
+``f"v1:reply:{task_id}:{uuid4()}"``, fresh on every call. Under shared
+task execution its turn id is its ``RESUME_INPUT`` command id, and the
+command's handoff marks that command completed and commits before the
+injection starts; a completed command is not claimed again, so the same
+command is not injected twice. The client can choose that command id,
+though, and admission checks it only against this task's command rows,
+not against turn ids other paths accepted, so it could equal one of
+those; with the same text, the injection would short-circuit as a
+replay. Its guard is defense in depth: it keeps that case, or a change
+to that ordering, from retiring a live question.
 
 This module's own close statement, and the lock-ordering obligation each
 caller carries, are unchanged by that guard: it decides whether the call

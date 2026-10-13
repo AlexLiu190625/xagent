@@ -21,6 +21,7 @@ from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.user import User
 from xagent.web.services import (
+    task_command_transport,
     task_coordinator_runtime,
     task_coordinator_service,
     task_resume,
@@ -164,6 +165,43 @@ async def test_worker_uses_preacquired_lease_and_stable_turn_identity(
     assert prepare.call_args.kwargs["turn_id"] == command.command_id
     assert prepare.call_args.kwargs["preacquired_lease"].run_id == "run-1"
     assert module._read_reply_outcome(command.id)["outcome"] == "accepted"
+
+
+async def test_reply_command_is_completed_before_its_injection_starts(
+    reply, monkeypatch
+):
+    """The worker's handoff marks the RESUME_INPUT command completed and
+    commits before it calls into the reply's injection. The claim query
+    returns the claimed command before the handoff; at the injection it no
+    longer does and the stored command is completed, so the same command
+    cannot reach the injection a second time. The injection is reached with
+    the command id as its turn id."""
+    command = await claim(reply)
+
+    def stored_status_and_claimable() -> tuple[str, bool]:
+        with get_session_local()() as db:
+            return (
+                db.get(TaskExecutionCommand, command.id).status,
+                task_command_transport._claimable_query(
+                    db, runner_id="worker-1", command_db_id=command.id
+                ).first()
+                is not None,
+            )
+
+    assert stored_status_and_claimable() == (
+        task_command_transport.COMMAND_PROCESSING,
+        True,
+    )
+    observed: list[tuple[str, bool, str]] = []
+
+    async def at_injection_entry(ctx, *, preacquired_lease, preacquired_state, turn_id):
+        observed.append((*stored_status_and_claimable(), turn_id))
+
+    monkeypatch.setattr(task_resume, "resume_task_reply", at_injection_entry)
+    await execute_durable_task_command(command)
+    assert observed == [
+        (task_command_transport.COMMAND_COMPLETED, False, command.command_id)
+    ], observed
 
 
 @pytest.mark.parametrize("replaced", [False, True])

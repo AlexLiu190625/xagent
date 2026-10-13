@@ -2797,8 +2797,8 @@ async def handle_task_message(
                         # reports the distinction explicitly and this guard
                         # reads that report. See task_interaction_close's
                         # module docstring for the rule, the other sites,
-                        # and why the v1 reply resume-input path needs no
-                        # guard at all.
+                        # and why the v1 reply resume-input path's guard is
+                        # defense in depth.
                         #
                         # The run fence
                         # is live_task_lease.run_id, not task_run_id: posted

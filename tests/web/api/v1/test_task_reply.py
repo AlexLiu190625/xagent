@@ -12,6 +12,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import UUID
 
 import pytest
 
@@ -41,6 +42,7 @@ from xagent.web.services import task_resume
 from xagent.web.services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
 from xagent.web.services.llm_utils import AutoModelUnavailableError
 from xagent.web.services.task_execution_controller import TaskControlState
+from xagent.web.services.task_execution_host import enqueues_task_turns
 from xagent.web.services.task_interaction_close import (
     ActiveInteractionRead,
     ActiveInteractionUnavailable,
@@ -278,14 +280,10 @@ def test_reply_happy_path_resumes_the_same_run(mock_start_task):
 
 
 def test_reply_turn_id_is_never_reused_across_retries(mock_start_task):
-    """Documents a known structural boundary, not a behavior this endpoint
-    is expected to provide: every call mints ``turn_id`` from a fresh
-    ``uuid4()``, so even a client retry that resubmits the identical reply
-    body can never land on the same turn id twice. That means this call
-    site can never trigger AgentRunner.inject_user_message's turn_id
-    short-circuit and can never observe a POSTED_REPLAY outcome -- there is
-    no replay-skip guard to add here, and none should be, because the
-    condition it would guard against is unreachable through this path."""
+    """Run inline, every call mints ``turn_id`` from a fresh ``uuid4()``, so
+    even a client retry that resubmits the identical reply body never lands
+    on the same turn id twice, and this path never sees a POSTED_REPLAY from
+    AgentRunner.inject_user_message's turn_id short-circuit."""
     agent_id, full_key = _create_agent_with_key()
     task_id = _create_waiting_task(full_key, agent_id, run_id="run-original")
     _insert_question_message(task_id)
@@ -784,7 +782,10 @@ def test_update_reply_input_rolls_back_the_interaction_close_with_the_fence() ->
         task_id=task_id, runner_id="a-different-runner", run_id="run-reply-atomicity"
     )
     updated = task_resume._update_reply_input_sync(
-        stale_lease, "attempted text", row_id
+        stale_lease,
+        "attempted text",
+        row_id,
+        UserMessageInjectionOutcome.POSTED_FRESH,
     )
 
     assert updated is False
@@ -801,6 +802,174 @@ def test_update_reply_input_rolls_back_the_interaction_close_with_the_fence() ->
         # Unchanged from _create_task's original content, not overwritten
         # with the rejected fence write's "attempted text".
         assert refreshed.input == "hello"
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "injection_outcome",
+    list(UserMessageInjectionOutcome),
+    ids=lambda outcome: outcome.name,
+)
+def test_reply_input_closes_the_interaction_only_on_a_fresh_injection(
+    mock_start_task, injection_outcome: UserMessageInjectionOutcome
+):
+    """Calls the reply's fence-and-close function directly with each
+    injection outcome, on a task whose row matches the lease, so the fence
+    UPDATE lands in every case and only the guard decides whether the active
+    interaction row is retired. Only POSTED_FRESH closes it and clears the
+    marker; every other outcome, including any member added later, leaves
+    the row active and the marker set. Removing the guard turns the four
+    non-fresh cases red."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id, run_id="run-reply-guard")
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        task.status = TaskStatus.RUNNING
+        task.runner_id = "reply-guard-runner"
+        task.lease_attempt_id = "reply-guard-attempt"
+        task.interaction_protocol_version = 1
+        db.commit()
+    finally:
+        db.close()
+    row_id = _seed_active_interaction_row(
+        task_id, run_id="run-reply-guard", idempotency_key="reply-guard-q1"
+    )
+    lease = TaskLease(
+        task_id=task_id,
+        runner_id="reply-guard-runner",
+        run_id="run-reply-guard",
+        attempt_id="reply-guard-attempt",
+    )
+
+    updated = task_resume._update_reply_input_sync(
+        lease, "the reply", row_id, injection_outcome
+    )
+
+    expected = (
+        (("terminated", None, "answered_via_legacy_resume"), None)
+        if injection_outcome is UserMessageInjectionOutcome.POSTED_FRESH
+        else (("active", 1, None), 1)
+    )
+    assert updated is True
+    db = _direct_db_session()
+    try:
+        row = (
+            db.query(TaskInteractionRequest)
+            .filter(TaskInteractionRequest.id == row_id)
+            .one()
+        )
+        refreshed = db.query(Task).filter(Task.id == task_id).one()
+        assert refreshed.input == "the reply"
+        assert (
+            (row.status, row.active_slot, row.terminal_reason),
+            refreshed.interaction_protocol_version,
+        ) == expected
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "injection_outcome",
+    [
+        UserMessageInjectionOutcome.POSTED_FRESH,
+        UserMessageInjectionOutcome.POSTED_REPLAY,
+    ],
+    ids=lambda outcome: outcome.name,
+)
+async def test_inline_reply_passes_its_injection_outcome_to_the_close_guard(
+    mock_start_task, monkeypatch, injection_outcome: UserMessageInjectionOutcome
+):
+    """One inline v1 reply, called directly, under a fresh v1:reply turn id:
+    the fence function receives the outcome the injection reported, and the
+    input is written either way. POSTED_FRESH closes the row read before the
+    injection exactly once and clears the marker; POSTED_REPLAY leaves the
+    row active and the marker set. No command row is written, because a
+    process without shared task execution runs the reply inline."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id, run_id="run-inline-reply")
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        task.interaction_protocol_version = 1
+        owner_id = int(task.user_id)
+        db.commit()
+    finally:
+        db.close()
+    row_id = _seed_active_interaction_row(
+        task_id, run_id="run-inline-reply", idempotency_key="inline-reply-q1"
+    )
+    assert enqueues_task_turns() is False
+
+    fence_outcomes: list[UserMessageInjectionOutcome] = []
+    real_update = task_resume._update_reply_input_sync
+
+    def record_update(task_lease, text, interaction_id, injection_outcome):
+        fence_outcomes.append(injection_outcome)
+        return real_update(task_lease, text, interaction_id, injection_outcome)
+
+    closed_ids: list[int | None] = []
+    real_close = task_resume.close_legacy_resume_interaction
+
+    def record_close(db, *, task_id, run_id, interaction_id):
+        closed_ids.append(interaction_id)
+        return real_close(
+            db, task_id=task_id, run_id=run_id, interaction_id=interaction_id
+        )
+
+    async def schedule(**kwargs):
+        # Stand in for the resume: take ownership of the heartbeat.
+        kwargs["heartbeat_stop"].set()
+        await kwargs["heartbeat_task"]
+
+    monkeypatch.setattr(task_resume, "_update_reply_input_sync", record_update)
+    monkeypatch.setattr(task_resume, "close_legacy_resume_interaction", record_close)
+    monkeypatch.setattr(task_resume, "_schedule_waiting_reply_resume", schedule)
+    post = AsyncMock(return_value=injection_outcome)
+    agent_patch, _agent_service = _patch_agent_service(post)
+    with agent_patch:
+        await task_resume.resume_task_reply(
+            task_resume.TaskReplyInput(
+                task_id=task_id,
+                agent_id=agent_id,
+                task_owner_user_id=owner_id,
+                actor_user_id=owner_id,
+                run_id="run-inline-reply",
+                status=TaskStatus.WAITING_FOR_USER,
+                text="yes, continue",
+            )
+        )
+
+    prefix, _, suffix = post.await_args.kwargs["turn_id"].rpartition(":")
+    assert prefix == f"v1:reply:{task_id}"
+    assert str(UUID(suffix)) == suffix
+    assert fence_outcomes == [injection_outcome]
+    fresh = injection_outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    assert closed_ids == ([row_id] if fresh else [])
+    db = _direct_db_session()
+    try:
+        row = (
+            db.query(TaskInteractionRequest)
+            .filter(TaskInteractionRequest.id == row_id)
+            .one()
+        )
+        refreshed = db.query(Task).filter(Task.id == task_id).one()
+        assert refreshed.input == "yes, continue"
+        assert (
+            (row.status, row.active_slot, row.terminal_reason),
+            refreshed.interaction_protocol_version,
+        ) == (
+            (("terminated", None, "answered_via_legacy_resume"), None)
+            if fresh
+            else (("active", 1, None), 1)
+        )
+        assert (
+            db.query(TaskExecutionCommand)
+            .filter(TaskExecutionCommand.task_id == task_id)
+            .count()
+            == 0
+        )
     finally:
         db.close()
 

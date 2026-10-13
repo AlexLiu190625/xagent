@@ -306,7 +306,9 @@ def test_old_acquisition_cannot_commit_any_execution_result(
                 old, "stale", None, UserMessageInjectionOutcome.NOT_POSTED
             )
         elif writer == "reply_input":
-            assert not task_resume._update_reply_input_sync(old, "stale", None)
+            assert not task_resume._update_reply_input_sync(
+                old, "stale", None, UserMessageInjectionOutcome.POSTED_FRESH
+            )
         elif writer == "usage":
             from xagent.web.tracking.task_tracker import (
                 TokenUsage,

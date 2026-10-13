@@ -411,8 +411,8 @@ def _update_a2a_resume_input_sync(
             # agent has staged since rather than the question this call
             # answered, and closing on it would retire a live question.
             # See task_interaction_close's module docstring for the rule,
-            # the other sites, and why the v1 reply resume-input path
-            # needs no guard at all.
+            # the other sites, and why the v1 reply resume-input path's
+            # guard is defense in depth.
             if injection_outcome is UserMessageInjectionOutcome.POSTED_FRESH:
                 close_legacy_resume_interaction(
                     db,
@@ -901,7 +901,10 @@ async def _restore_reply_prelease_isolated(task_lease: TaskLease) -> bool:
 
 
 def _update_reply_input_sync(
-    task_lease: TaskLease, text: str, interaction_id: int | None
+    task_lease: TaskLease,
+    text: str,
+    interaction_id: int | None,
+    injection_outcome: UserMessageInjectionOutcome,
 ) -> bool:
     """Persist the reply's input only while the exact prelease remains current.
 
@@ -910,6 +913,11 @@ def _update_reply_input_sync(
     function's session does not open until after the injection has already
     committed. See ``task_interaction_close``'s module docstring for why
     the read has to precede the injection.
+
+    ``injection_outcome`` is the caller's own ``post_user_message`` report,
+    not re-derived here: a replayed turn id must not retire the close, and
+    only the call that produced the short circuit can say whether this was
+    one.
     """
     SessionLocal = get_session_local()
     with SessionLocal() as db:
@@ -950,12 +958,18 @@ def _update_reply_input_sync(
         # means.
         assert task_lease.run_id is not None
         if interaction_requests_table_exists(db):
-            close_legacy_resume_interaction(
-                db,
-                task_id=task_lease.task_id,
-                run_id=task_lease.run_id,
-                interaction_id=interaction_id,
-            )
+            # interaction_id was read by the caller before its injection. In
+            # normal operation this path does not repeat a turn id (a fresh
+            # uuid4 inline, the completed RESUME_INPUT command id under shared
+            # task execution), but the client can choose that command id;
+            # see task_interaction_close's module docstring.
+            if injection_outcome is UserMessageInjectionOutcome.POSTED_FRESH:
+                close_legacy_resume_interaction(
+                    db,
+                    task_id=task_lease.task_id,
+                    run_id=task_lease.run_id,
+                    interaction_id=interaction_id,
+                )
         db.commit()
         return True
 
@@ -1023,9 +1037,18 @@ async def resume_task_reply(
 ) -> TaskReplyResumeResult:
     """Resume an authorized SDK reply and return after background registration.
 
-    Each SDK request gets a fresh turn ID, preserving its existing lack of
-    client-message deduplication. The observed status preserves the initial
-    rejection semantics; the subsequent conditional claim checks current state.
+    When ``turn_id`` is not given, each call mints a fresh one; that is how
+    the inline path runs. Under shared task execution the reply is first
+    enqueued as a ``RESUME_INPUT`` command, and the worker later calls this
+    function with ``preacquired_lease`` and that command's id as
+    ``turn_id``; the command is already completed by then, so the same
+    command is not injected twice. So this path does not repeat a turn id
+    in normal operation, but the client can choose the command id and
+    admission checks it only against this task's command rows, so it could
+    equal a turn id another path accepted. The interaction close is guarded
+    on ``POSTED_FRESH`` (see ``_update_reply_input_sync``) for that case.
+    The observed status preserves the initial rejection semantics; the
+    subsequent conditional claim checks current state.
     """
     from .task_execution_host import enqueues_task_turns
 
@@ -1237,7 +1260,7 @@ async def resume_task_reply(
 
         updated = await run_db_io_cancellation_safe(
             lambda: _update_reply_input_sync(
-                task_lease, ctx.text, active_interaction_id
+                task_lease, ctx.text, active_interaction_id, posted
             )
         )
         if not updated:
