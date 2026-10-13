@@ -7,11 +7,12 @@ to the ToolFactory in a unified way.
 """
 
 import logging
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, TypeVar
+from typing import Any, Dict, List, Optional, TypeGuard, TypeVar
 
 from ..... import config as _root_config
 
@@ -100,19 +101,44 @@ _PUBLIC_MCP_UNAVAILABLE_REASONS = frozenset(
     }
 )
 _DEFAULT_MCP_UNAVAILABLE_REASON = "mcp_server_unavailable"
+_PUBLIC_CAUSE_TYPE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
+
+
+def is_http_status_code(value: object) -> TypeGuard[int]:
+    """Whether ``value`` is an HTTP status a status line can carry.
+
+    Only an exact ``int`` in 100..599 counts: ``bool`` and other ``int``
+    subclasses do not.
+    """
+    return type(value) is int and 100 <= value <= 599
+
+
 _DEFAULT_MCP_SERVER_NAME = "MCP server"
 
 
 @dataclass(frozen=True)
 class MCPUnavailableSummary:
-    """Public-safe identity and classification for one unavailable server."""
+    """Public-safe identity and classification for one unavailable server.
+
+    ``cause_type`` and ``status_code`` describe the exception behind a load
+    failure: a class name (exact ``str`` matching ``_PUBLIC_CAUSE_TYPE_RE``)
+    and an HTTP status (exact ``int`` in 100..599). Either is ``None`` when
+    unknown or when the value does not pass that check.
+    """
 
     server_name: str
     reason: str
+    cause_type: str | None = None
+    status_code: int | None = None
 
     @classmethod
     def from_values(
-        cls, server_name: object, reason: object
+        cls,
+        server_name: object,
+        reason: object,
+        *,
+        cause_type: object = None,
+        status_code: object = None,
     ) -> "MCPUnavailableSummary":
         safe_server_name = (
             server_name if type(server_name) is str else _DEFAULT_MCP_SERVER_NAME
@@ -122,7 +148,18 @@ class MCPUnavailableSummary:
             if type(reason) is str and reason in _PUBLIC_MCP_UNAVAILABLE_REASONS
             else _DEFAULT_MCP_UNAVAILABLE_REASON
         )
-        return cls(server_name=safe_server_name, reason=safe_reason)
+        safe_cause_type = (
+            cause_type
+            if type(cause_type) is str and _PUBLIC_CAUSE_TYPE_RE.fullmatch(cause_type)
+            else None
+        )
+        safe_status_code = status_code if is_http_status_code(status_code) else None
+        return cls(
+            server_name=safe_server_name,
+            reason=safe_reason,
+            cause_type=safe_cause_type,
+            status_code=safe_status_code,
+        )
 
 
 @dataclass(frozen=True)

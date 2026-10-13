@@ -2650,6 +2650,8 @@ class WebToolConfig(BaseToolConfig):
                     {
                         "server_name": failure.server_name,
                         "reason": failure.reason,
+                        "error_type": failure.cause_type,
+                        "status_code": failure.status_code,
                     }
                     for failure in summary.failures
                 ],

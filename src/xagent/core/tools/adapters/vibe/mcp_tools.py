@@ -203,6 +203,8 @@ def _build_mcp_load_summary(
             failure = MCPUnavailableSummary.from_values(
                 tool.server_name,
                 tool.unavailability_reason,
+                cause_type=tool.unavailability_cause_type,
+                status_code=tool.unavailability_status_code,
             )
             key = normalize_mcp_server_name(failure.server_name)
             failures_by_key.setdefault(key, failure)
