@@ -958,15 +958,11 @@ def _update_reply_input_sync(
         # means.
         assert task_lease.run_id is not None
         if interaction_requests_table_exists(db):
-            # Like the A2A site, interaction_id above was read fresh by this
-            # attempt, so on a replay it would name whatever the resumed
-            # agent has staged since. Neither way this path runs presents a
-            # repeated turn id: run inline, the turn id is a fresh uuid4 per
-            # call; under shared task execution it is the RESUME_INPUT
-            # command id, and that command is completed before the injection
-            # starts. The guard is defense in depth in case that ordering
-            # changes. See task_interaction_close's module docstring for the
-            # rule and the other sites.
+            # interaction_id was read by the caller before its injection. In
+            # normal operation this path does not repeat a turn id (a fresh
+            # uuid4 inline, the completed RESUME_INPUT command id under shared
+            # task execution), but the client can choose that command id;
+            # see task_interaction_close's module docstring.
             if injection_outcome is UserMessageInjectionOutcome.POSTED_FRESH:
                 close_legacy_resume_interaction(
                     db,
@@ -1046,10 +1042,13 @@ async def resume_task_reply(
     enqueued as a ``RESUME_INPUT`` command, and the worker later calls this
     function with ``preacquired_lease`` and that command's id as
     ``turn_id``; the command is already completed by then, so the same
-    command is not injected twice. The interaction close is still guarded
-    on ``POSTED_FRESH`` (see ``_update_reply_input_sync``) as defense in
-    depth. The observed status preserves the initial rejection semantics;
-    the subsequent conditional claim checks current state.
+    command is not injected twice. So this path does not repeat a turn id
+    in normal operation, but the client can choose the command id and
+    admission checks it only against this task's command rows, so it could
+    equal a turn id another path accepted. The interaction close is guarded
+    on ``POSTED_FRESH`` (see ``_update_reply_input_sync``) for that case.
+    The observed status preserves the initial rejection semantics; the
+    subsequent conditional claim checks current state.
     """
     from .task_execution_host import enqueues_task_turns
 
