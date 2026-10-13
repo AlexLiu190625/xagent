@@ -423,10 +423,11 @@ def create_external_command_error_event(
 
     When an external-scope command's terminal failure is reported to the
     task's audience, this is the frame. Not every one is reported: a cancel
-    rejected as ``task_not_found``, and a cancel whose target already
-    completed, end silently. The audience is anonymous, so the frame carries
-    the sentence, the task id and the time, and never the durable command
-    identity or the exception text.
+    rejection whose reason is not in
+    ``EXTERNAL_CANCEL_BROADCAST_REJECTION_REASONS``, and any cancel whose
+    target already completed, end silently. The audience is anonymous, so the
+    frame carries the sentence, the task id and the time, and never the
+    durable command identity or the exception text.
     ``asserted_code`` is the one way a code reaches it, written as
     ``error_code`` - the field clients already read on ``agent_error`` - so a
     client that does not render server prose still names the outcome. It is

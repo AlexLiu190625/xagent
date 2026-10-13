@@ -40,6 +40,7 @@ from xagent.web.services.external_task_cancel import (
     EXTERNAL_CANCEL_WAIT_SECONDS,
     EXTERNAL_TURN_INTERRUPTED_MESSAGE,
     cancel_external_task_unserialized,
+    external_cancel_target_ended,
 )
 from xagent.web.services.task_command_terminal_events import (
     TerminalTaskEventMessageCode,
@@ -1254,6 +1255,42 @@ async def test_rejected_external_cancel_stale_run_broadcasts(
     draft = terminal_event_draft_for_error(raised.value)
     assert draft is not None
     assert draft.message_code is expected_code
+    assert draft.include_command_identity is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "task_status",
+    [*TaskStatus, None],
+    ids=[*(status.value for status in TaskStatus), "unreadable"],
+)
+async def test_external_cancel_draft_classifies_by_the_broadcast_predicate(
+    monkeypatch: pytest.MonkeyPatch,
+    task_status: TaskStatus | None,
+) -> None:
+    """The persisted record names the turn over exactly when the frame may.
+
+    The terminal-event draft and the live frame each read the target's
+    status and classify it. Both go through ``external_cancel_target_ended``,
+    so a status the frame reports as "didn't go through" is never recorded
+    as an interrupted turn, and the reverse.
+    """
+    monkeypatch.setattr(
+        command_execution_service,
+        "_load_terminal_command_task_status",
+        AsyncMock(return_value=task_status),
+    )
+
+    draft = await command_execution_service._terminal_command_event_draft(
+        _external_cancel_command(task_id=1, agent_id=1),
+        RuntimeError("exhausted"),
+    )
+
+    assert draft.message_code is (
+        TerminalTaskEventMessageCode.EXTERNAL_TURN_INTERRUPTED
+        if external_cancel_target_ended(task_status)
+        else TerminalTaskEventMessageCode.EXTERNAL_CANCEL_NOT_APPLIED
+    )
     assert draft.include_command_identity is False
 
 

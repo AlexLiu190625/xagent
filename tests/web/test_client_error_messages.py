@@ -142,6 +142,17 @@ _FRONTEND_TABLE = (
 )
 
 
+def test_caller_asserted_code_sets_are_disjoint() -> None:
+    """A caller-asserted code names one outcome on one kind of frame.
+
+    The terminal ``task_error`` frame and the external command ``agent_error``
+    frame admit codes from separate sets. A code in both would let one frame
+    claim the other's outcome: "the turn ended interrupted" and "the stop may
+    not have taken effect" cannot share a code.
+    """
+    assert not (_CALLER_ASSERTED_TERMINAL_CODES & _CALLER_ASSERTED_COMMAND_ERROR_CODES)
+
+
 @pytest.mark.parametrize(
     "code",
     sorted(_CALLER_ASSERTED_TERMINAL_CODES | _CALLER_ASSERTED_COMMAND_ERROR_CODES),

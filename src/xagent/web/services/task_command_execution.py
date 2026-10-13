@@ -4829,7 +4829,7 @@ async def _terminal_command_event_draft(
         return TerminalTaskEventDraft(
             message_code=(
                 TerminalTaskEventMessageCode.EXTERNAL_TURN_INTERRUPTED
-                if task_status in {TaskStatus.COMPLETED, TaskStatus.FAILED}
+                if external_cancel_target_ended(task_status)
                 else TerminalTaskEventMessageCode.EXTERNAL_CANCEL_NOT_APPLIED
             ),
             resend_safe=False,

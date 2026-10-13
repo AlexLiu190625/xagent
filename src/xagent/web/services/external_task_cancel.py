@@ -137,7 +137,9 @@ def external_cancel_target_ended(task_status: TaskStatus | None) -> bool:
     ``None``, a row that is gone or could not be read - leaves the turn
     unconfirmed, so the broadcast says the stop did not go through and
     carries ``ClientErrorCode.EXTERNAL_STOP_NOT_APPLIED``. The sentence and
-    the code are both picked by this predicate.
+    the code are both picked by this predicate, from one status read. The
+    persisted terminal event's message code is picked by it too, from that
+    record's own status read.
     """
 
     return task_status in _TERMINAL_STATUSES
