@@ -1,8 +1,9 @@
-import base64
+import hashlib
 import json
 import logging
 import mimetypes
 import os
+import re
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote, urlsplit
@@ -34,14 +35,17 @@ _BINARY_UPLOAD_TIMEOUT_SECONDS = 120
 # rather than silently attempted and possibly failed by Graph.
 _SIMPLE_UPLOAD_MAX_BYTES = 4_000_000
 
-# sharepoint_get_file_content buffers the whole download into memory (and then
-# again as a base64 string in the tool result), so an unbounded download of a
-# large document-library file risks exhausting worker memory and blowing up
-# the tool output. Capped at the same order of magnitude as the simple-upload
-# limit above.
+# Both SharePoint content tools buffer the response before returning or
+# publishing it. Keep a hard 10 MB cap so a large document-library file cannot
+# exhaust worker memory; sharepoint_download_file documents this limit to
+# callers because it is also the maximum downloadable artifact size.
 _MAX_DOWNLOAD_BYTES = 10_000_000
 
 _UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_SHAREPOINT_FILE_ALLOWED_DIRS"
+_OUTPUT_DIR_ENV_VAR = "XAGENT_SHAREPOINT_OUTPUT_DIR"
+_UNSAFE_DOWNLOAD_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.() -]")
+_MAX_DOWNLOAD_FILENAME_LENGTH = 200
+_MAX_DOWNLOAD_SUFFIX_LENGTH = 20
 
 
 def _split_stem_suffix(base: str) -> tuple[str, str]:
@@ -567,11 +571,48 @@ def _caller_safe_drive_item(item: Any) -> Any:
     return item
 
 
-def _decode_bytes(content: bytes) -> tuple[str | None, str | None]:
-    try:
-        return content.decode("utf-8"), None
-    except UnicodeDecodeError:
-        return None, base64.b64encode(content).decode("ascii")
+def _download_output_dir() -> Path:
+    """Return the current task's output directory for binary downloads."""
+    base = os.environ.get(_OUTPUT_DIR_ENV_VAR, "").strip()
+    if not base:
+        raise RuntimeError(
+            "No task workspace configured for this connector "
+            f"({_OUTPUT_DIR_ENV_VAR} is unset) — sharepoint_download_file needs "
+            "a task workspace to write into."
+        )
+    output_dir = Path(base).expanduser().resolve() / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+def _safe_download_filename(name: str) -> str:
+    """Keep a remote SharePoint name as one safe local path segment."""
+    base = Path(str(name).strip()).name
+    stem, suffix = _split_stem_suffix(base)
+    stem = _UNSAFE_DOWNLOAD_FILENAME_CHARS.sub("_", stem).strip(" ._") or "file"
+    suffix = _UNSAFE_DOWNLOAD_FILENAME_CHARS.sub("_", suffix)[
+        :_MAX_DOWNLOAD_SUFFIX_LENGTH
+    ]
+    return stem[: max(1, _MAX_DOWNLOAD_FILENAME_LENGTH - len(suffix))] + suffix
+
+
+def _write_download_file(output_dir: Path, filename: str, content: bytes) -> Path:
+    """Write a completed download without clobbering an existing artifact."""
+    stem, suffix = _split_stem_suffix(filename)
+    counter = 0
+    while True:
+        candidate_name = filename if counter == 0 else f"{stem} ({counter}){suffix}"
+        candidate = output_dir / candidate_name
+        try:
+            with candidate.open("xb") as output:
+                output.write(content)
+        except FileExistsError:
+            counter += 1
+            continue
+        except BaseException:
+            candidate.unlink(missing_ok=True)
+            raise
+        return candidate
 
 
 def _guess_mime_type(name: str) -> str | None:
@@ -780,14 +821,30 @@ def sharepoint_search_files(
 def sharepoint_get_file_content(
     site_id: str, file_path: str, drive_id: str | None = None
 ) -> str:
-    """Download a file's content from a SharePoint document library by path.
-    Returns text when possible, otherwise base64. Rejected outright, rather
-    than returned truncated, when the encoded result would be too large for
-    a single tool response."""
+    """Read a text file from a SharePoint document library by path.
+
+    Binary content is never returned inline. Use sharepoint_download_file so
+    the real bytes become a durable workspace FileRef instead of Base64 in the
+    model context. This tool only returns UTF-8 text; use the download tool for
+    files in another encoding (such as UTF-16 or GBK) as well.
+    """
     try:
-        content = _graph_request(
-            "GET", _drive_content_path(site_id, file_path, drive_id), raw=True
-        )
+        content_path = _drive_content_path(site_id, file_path, drive_id)
+        if _name_looks_binary(file_path):
+            return _error(
+                f"{file_path!r} looks like a binary file and is not returned "
+                "inline. Use sharepoint_download_file to store it in the task "
+                "workspace."
+            )
+        content = _graph_request("GET", content_path, raw=True)
+        try:
+            text_content = content.decode("utf-8")
+        except UnicodeDecodeError:
+            return _error(
+                f"{file_path!r} is not UTF-8 text and is not returned inline. "
+                "Use sharepoint_download_file to store the original bytes in "
+                "the task workspace."
+            )
         # The runtime's generic output filter truncates any string value --
         # the JSON envelope _success returns below is one -- at
         # get_tool_max_output_length() characters without parsing it first,
@@ -797,28 +854,10 @@ def sharepoint_get_file_content(
         # before that filter ever sees it, trades that for an honest,
         # actionable error.
         max_output_length = get_tool_max_output_length()
-        text_content, base64_content = _decode_bytes(content)
-        if base64_content is not None:
-            # Base64 inflates the byte count by exactly 4 * ceil(n/3) --
-            # deterministically larger than len(content), so this is a
-            # safe, exact lower bound on the eventual JSON string's length
-            # without needing to build (and immediately discard) the full
-            # envelope to find out. This does NOT hold for the text_content
-            # branch below: decoding multi-byte UTF-8 (CJK, emoji, ...)
-            # produces FEWER characters than input bytes, so a byte-count
-            # check there would reject files that would have fit -- that
-            # branch instead falls through to the exact len(result) check.
-            if len(base64_content) > max_output_length:
-                return _error(
-                    f"{file_path!r} is too large to return inline "
-                    f"({len(content)} bytes downloaded, limit is "
-                    f"{max_output_length} characters)"
-                )
         result = _success(
             file_path=file_path,
             text_content=text_content,
-            base64_content=base64_content,
-            encoding="utf-8" if text_content is not None else "base64",
+            encoding="utf-8",
         )
         if len(result) > max_output_length:
             return _error(
@@ -830,6 +869,50 @@ def sharepoint_get_file_content(
     except Exception as e:
         logger.error(
             "Error downloading SharePoint file %s for site %s: %s",
+            file_path,
+            site_id,
+            e,
+        )
+        return _error(str(e))
+
+
+@mcp.tool()
+def sharepoint_download_file(
+    site_id: str,
+    file_path: str,
+    drive_id: str | None = None,
+    filename: str = "",
+) -> str:
+    """Download a SharePoint binary file into the current task workspace.
+
+    The MCP host registers the resulting path as a durable FileRef. Use this
+    for Office documents, PDFs, images, and other binary content instead of
+    putting Base64 into the model context. When a specialized Office tool is
+    available, prefer it for in-place edits; this tool is for retrieving the
+    real bytes for downstream processing. Downloads are capped at 10 MB.
+    """
+    output_path: Path | None = None
+    try:
+        content_path = _drive_content_path(site_id, file_path, drive_id)
+        output_dir = _download_output_dir()
+        output_name = _safe_download_filename(filename or Path(file_path).name)
+        content = _graph_request("GET", content_path, raw=True)
+        output_path = _write_download_file(output_dir, output_name, content)
+        mime_type = _guess_mime_type(output_path.name)
+        if mime_type in (None, "application/octet-stream"):
+            mime_type = _guess_mime_type(Path(file_path).name) or mime_type
+        return _success(
+            file_path=str(output_path),
+            filename=output_path.name,
+            size=len(content),
+            sha256=hashlib.sha256(content).hexdigest(),
+            mime_type=mime_type or "application/octet-stream",
+        )
+    except Exception as e:
+        if output_path is not None:
+            output_path.unlink(missing_ok=True)
+        logger.error(
+            "Error downloading SharePoint binary file %s for site %s: %s",
             file_path,
             site_id,
             e,

@@ -1,4 +1,6 @@
+import hashlib
 import json
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -550,15 +552,148 @@ def test_get_file_content_decodes_text(monkeypatch):
     assert result["encoding"] == "utf-8"
 
 
-def test_get_file_content_falls_back_to_base64_for_binary(monkeypatch):
+def test_get_file_content_directs_binary_to_workspace_download(monkeypatch):
     binary_content = b"\xff\xd8\xff\xe0binarydata"
     mock_request = Mock(return_value=MockResponse(content=binary_content))
     monkeypatch.setattr(sharepoint.requests, "request", mock_request)
 
     result = json.loads(sharepoint.sharepoint_get_file_content("root", "photo.jpg"))
 
+    assert result["status"] == "error"
+    assert "sharepoint_download_file" in result["message"]
+    assert "base64_content" not in result
+
+
+def test_get_file_content_rejects_binary_extension_even_for_utf8_bytes(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(content=b"valid utf-8 bytes"))
+    monkeypatch.setattr(sharepoint.requests, "request", mock_request)
+
+    result = json.loads(sharepoint.sharepoint_get_file_content("root", "report.docx"))
+
+    assert result["status"] == "error"
+    assert "sharepoint_download_file" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_get_file_content_rejects_non_utf8_text(monkeypatch):
+    monkeypatch.setattr(
+        sharepoint.requests,
+        "request",
+        Mock(return_value=MockResponse(content=b"\xff\xfeinvalid")),
+    )
+
+    result = json.loads(sharepoint.sharepoint_get_file_content("root", "notes.txt"))
+
+    assert result["status"] == "error"
+    assert "not UTF-8 text" in result["message"]
+
+
+def test_download_file_writes_binary_to_task_workspace(monkeypatch, tmp_path):
+    binary_content = b"\xff\xd8\xff\xe0binarydata"
+    monkeypatch.setenv("XAGENT_SHAREPOINT_OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        sharepoint.requests,
+        "request",
+        Mock(return_value=MockResponse(content=binary_content)),
+    )
+
+    result = json.loads(
+        sharepoint.sharepoint_download_file("root", "Reports/photo.jpg")
+    )
+
+    output_path = Path(result["file_path"])
     assert result["status"] == "success"
-    assert result["encoding"] == "base64"
+    assert output_path == tmp_path / "output" / "photo.jpg"
+    assert output_path.read_bytes() == binary_content
+    assert result["sha256"] == hashlib.sha256(binary_content).hexdigest()
+
+
+def test_download_file_requires_task_workspace(monkeypatch):
+    monkeypatch.delenv("XAGENT_SHAREPOINT_OUTPUT_DIR", raising=False)
+    mock_request = Mock(return_value=MockResponse(content=b"binary"))
+    monkeypatch.setattr(
+        sharepoint.requests,
+        "request",
+        mock_request,
+    )
+
+    result = json.loads(sharepoint.sharepoint_download_file("root", "file.bin"))
+
+    assert result["status"] == "error"
+    assert "XAGENT_SHAREPOINT_OUTPUT_DIR" in result["message"]
+    mock_request.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("../../x.docx", "x.docx"),
+        ("..", "file"),
+        ("", "file"),
+        (r"..\\x.docx", "x.docx"),
+    ],
+)
+def test_safe_download_filename_keeps_one_local_path_segment(name, expected):
+    assert sharepoint._safe_download_filename(name) == expected
+
+
+def test_download_file_uses_override_and_collision_suffix(monkeypatch, tmp_path):
+    content = b"binary"
+    monkeypatch.setenv("XAGENT_SHAREPOINT_OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        sharepoint.requests,
+        "request",
+        Mock(return_value=MockResponse(content=content)),
+    )
+
+    first = json.loads(
+        sharepoint.sharepoint_download_file(
+            "root", "Reports/photo.jpg", filename="renamed.bin"
+        )
+    )
+    second = json.loads(
+        sharepoint.sharepoint_download_file(
+            "root", "Reports/photo.jpg", filename="renamed.bin"
+        )
+    )
+
+    assert Path(first["file_path"]).name == "renamed.bin"
+    assert first["mime_type"] == "image/jpeg"
+    assert Path(second["file_path"]).name == "renamed (1).bin"
+    assert Path(first["file_path"]).read_bytes() == content
+    assert Path(second["file_path"]).read_bytes() == content
+
+
+def test_download_file_graph_error_leaves_no_partial_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("XAGENT_SHAREPOINT_OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        sharepoint.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=404, content=b"not found")),
+    )
+
+    result = json.loads(sharepoint.sharepoint_download_file("root", "file.bin"))
+
+    assert result["status"] == "error"
+    assert list((tmp_path / "output").iterdir()) == []
+
+
+def test_download_file_size_limit_leaves_no_partial_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("XAGENT_SHAREPOINT_OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        sharepoint.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                content=b"x" * (sharepoint._MAX_DOWNLOAD_BYTES + 1)
+            )
+        ),
+    )
+
+    result = json.loads(sharepoint.sharepoint_download_file("root", "file.bin"))
+
+    assert result["status"] == "error"
+    assert list((tmp_path / "output").iterdir()) == []
 
 
 def test_get_file_content_streams_with_identity_encoding(monkeypatch):
@@ -582,7 +717,7 @@ def test_get_file_content_rejects_declared_content_length_over_limit(monkeypatch
     )
     monkeypatch.setattr(sharepoint.requests, "request", mock_request)
 
-    result = json.loads(sharepoint.sharepoint_get_file_content("root", "huge.bin"))
+    result = json.loads(sharepoint.sharepoint_get_file_content("root", "huge.txt"))
 
     assert result["status"] == "error"
     assert "too large" in result["message"]
@@ -595,7 +730,7 @@ def test_get_file_content_rejects_streamed_body_over_limit(monkeypatch):
     mock_request = Mock(return_value=MockResponse(content=oversized_content))
     monkeypatch.setattr(sharepoint.requests, "request", mock_request)
 
-    result = json.loads(sharepoint.sharepoint_get_file_content("root", "huge.bin"))
+    result = json.loads(sharepoint.sharepoint_get_file_content("root", "huge.txt"))
 
     assert result["status"] == "error"
     assert "too large" in result["message"]
@@ -603,20 +738,20 @@ def test_get_file_content_rejects_streamed_body_over_limit(monkeypatch):
 
 def test_get_file_content_rejects_raw_content_over_output_limit(monkeypatch):
     # Below _MAX_DOWNLOAD_BYTES (10MB) but well above a small output-length
-    # limit -- rejected before _decode_bytes/_success ever run on it.
+    # limit -- rejected before _success ever runs on it.
     monkeypatch.setattr(sharepoint, "get_tool_max_output_length", lambda: 100)
     mock_request = Mock(return_value=MockResponse(content=b"x" * 200))
     monkeypatch.setattr(sharepoint.requests, "request", mock_request)
 
-    result = json.loads(sharepoint.sharepoint_get_file_content("root", "medium.bin"))
+    result = json.loads(sharepoint.sharepoint_get_file_content("root", "medium.txt"))
 
     assert result["status"] == "error"
     assert "too large" in result["message"]
 
 
-def test_get_file_content_rejects_encoded_result_over_output_limit(monkeypatch):
-    # Raw content itself is under the output limit, but base64 inflates it
-    # (4/3x) past the limit -- must still be caught by the second check.
+def test_get_file_content_never_encodes_binary_even_when_it_would_fit(monkeypatch):
+    # Keep binary bytes out of model context regardless of the generic output
+    # limit; the durable workspace download is the only supported path.
     monkeypatch.setattr(sharepoint, "get_tool_max_output_length", lambda: 100)
     binary_content = b"\xff\xd8\xff\xe0" + b"x" * 70  # 74 bytes, base64 ~100+ chars
     mock_request = Mock(return_value=MockResponse(content=binary_content))
@@ -625,7 +760,7 @@ def test_get_file_content_rejects_encoded_result_over_output_limit(monkeypatch):
     result = json.loads(sharepoint.sharepoint_get_file_content("root", "photo.jpg"))
 
     assert result["status"] == "error"
-    assert "too large" in result["message"]
+    assert "sharepoint_download_file" in result["message"]
 
 
 def test_get_file_content_accepts_multibyte_text_over_byte_count_limit(monkeypatch):
