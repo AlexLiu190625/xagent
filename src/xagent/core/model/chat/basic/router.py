@@ -1,14 +1,17 @@
 """Router LLM: a virtual model that delegates to xrouter-llm for selection.
 
-On every call it asks the xrouter-llm decision library (imported in-process, no
-external service) to pick ONE routing profile for the prompt, then dispatches
-the actual completion through the concrete saved model bound to that profile.
+On every call it asks the xrouter-llm decision library (imported in-process;
+only the prompt embedding may go to a remote service, see
+XROUTER_EMBEDDING_BACKEND below) to pick ONE routing profile for the prompt,
+then dispatches the actual completion through the concrete saved model bound to
+that profile.
 The legacy OpenRouter ``auto`` model remains supported and resolves every
 profile through its own OpenRouter credential pair.
 
 xrouter-llm ships a trained router, the model-profile registry, and the named
-router configs as package data, so the decision runs entirely in-process. The
-registry returns canonical ids (e.g. `anthropic/claude-opus-4.8`,
+router configs as package data, so the decision runs in-process except for the
+prompt embedding when a remote backend is selected. The registry returns
+canonical ids (e.g. `anthropic/claude-opus-4.8`,
 `openai/gpt-5.5`) which configured Auto maps to concrete model records.
 
 Every decision (prompt, candidate models with their predicted completion and
@@ -22,6 +25,26 @@ Env overrides (all optional; default to the bundled package data):
   XAGENT_XROUTER_DB             routing-decision SQLite history path
   XAGENT_XROUTER_EXCLUDED_MODELS comma-separated candidate model slugs to omit
   XAGENT_ROUTER_FALLBACK_MODEL  slug to use if routing fails
+
+Embedding backend for the predictor's prompt encoder (all optional; the last
+three are read only when XROUTER_EMBEDDING_BACKEND is set):
+  XROUTER_EMBEDDING_BACKEND     unset keeps the in-process backend serialized in
+                                the artifact; "xinference" sends prompt
+                                embeddings to a remote OpenAI-compatible
+                                endpoint; "sentence-transformers" loads the
+                                model in process, rebuilt with upstream
+                                defaults (model from XROUTER_EMBEDDING_MODEL,
+                                max sequence length 512) instead of keeping the
+                                serialized backend. Case-sensitive; any other
+                                value fails the service build with ValueError
+  XROUTER_EMBEDDING_MODEL       embedding model name (default
+                                Qwen/Qwen3-Embedding-0.6B); must be the model
+                                the artifact was trained with
+  XINFERENCE_BASE_URL           endpoint base URL ending in /v1, "/embeddings"
+                                is appended (default http://127.0.0.1:9997/v1)
+  XINFERENCE_API_KEY            bearer key for that endpoint; the same variable
+                                is read by the Xinference rerank client and as
+                                the DeepDoc Xinference fallback key
 """
 
 from __future__ import annotations
@@ -90,9 +113,12 @@ def _store_path() -> str:
         return "xrouter_calls.db"
 
 
-# A RoutingService loads a trained predictor plus a multilingual embedding model,
-# which is expensive, so build it once per (model, registry, configs) tuple and
-# share it across all RouterLLM instances.
+# A RoutingService holds a trained predictor whose prompt encoder runs a
+# multilingual embedding model (in process unless XROUTER_EMBEDDING_BACKEND
+# selects a remote backend), which is expensive, so build it once per
+# (model, registry, configs) tuple and share it across all RouterLLM instances.
+# The XROUTER_EMBEDDING_* / XINFERENCE_* variables are not part of that key:
+# they take effect when a process first builds the service.
 _SERVICE_LOCK = threading.Lock()
 _SERVICE_CACHE: dict[tuple[str, str, str], Any] = {}
 
@@ -100,14 +126,23 @@ _SERVICE_CACHE: dict[tuple[str, str, str], Any] = {}
 def _build_service(model_path: str, models_dir: str, routers_dir: str) -> Any:
     try:
         import joblib
-        from xrouter_llm import load_benchmark_profiles
+        from xrouter_llm import embedding_backend_from_env, load_benchmark_profiles
         from xrouter_llm.serving import RoutingService, load_router_configs
         from xrouter_llm.store import CallStore
-    except ImportError as exc:  # pragma: no cover - dependency missing
+    except ImportError as exc:  # pragma: no cover - dependency missing or too old
         raise RuntimeError(
-            "The 'router' (auto) provider needs the xrouter-llm package. "
-            "Install it with `pip install 'xagent[router]'` (or `pip install xrouter-llm`)."
+            "The 'router' (auto) provider needs xrouter-llm>=0.3.6; it is not "
+            "installed or the installed version is too old. Install it with "
+            "`pip install 'xagent[router]'` (or `pip install 'xrouter-llm>=0.3.6'`)."
         ) from exc
+
+    # Resolve the backend selected by XROUTER_EMBEDDING_BACKEND (see the module
+    # docstring) before loading anything. An unknown name raises ValueError here,
+    # and _get_service caches only successful builds, so a misconfigured process
+    # retries on every Auto call; failing first keeps each retry from reloading
+    # the artifact and rerunning the call-history migrations. None keeps the
+    # in-process backend serialized in the artifact.
+    embedding_backend = embedding_backend_from_env()
 
     predictor = joblib.load(model_path)
     if not hasattr(predictor, "predict"):
@@ -119,7 +154,15 @@ def _build_service(model_path: str, models_dir: str, routers_dir: str) -> Any:
     except Exception as exc:  # noqa: BLE001 - history must not break routing
         logger.warning("xrouter call history disabled (%s)", exc)
         store = _NullStore()
-    return RoutingService(predictor, profiles=profiles, configs=configs, store=store)
+    if embedding_backend is not None:
+        logger.info("xrouter embedding backend: %s", embedding_backend.name)
+    return RoutingService(
+        predictor,
+        profiles=profiles,
+        configs=configs,
+        store=store,
+        embedding_backend=embedding_backend,
+    )
 
 
 def _get_service() -> Any:
@@ -174,8 +217,9 @@ class RouterLLM(BaseLLM):
         )
         if self._candidate_models == ():
             raise ValueError("A configured Auto model needs at least one candidate")
-        # The auto model's own OpenRouter credentials. Routing is in-process (not
-        # an HTTP call), but these are used by the fallback resolver below when no
+        # The auto model's own OpenRouter credentials. Routing itself never calls
+        # OpenRouter (only the prompt embedding may call a remote embedding
+        # service), but these are used by the fallback resolver below when no
         # downstream OpenRouter model is injected (e.g. test-connection paths), so
         # the chosen slug still runs against the user's configured key/base_url.
         self._api_key = api_key
@@ -475,8 +519,9 @@ class RouterLLM(BaseLLM):
         preferred_input_modalities: tuple[str, ...] = (),
         advisory_input_modalities: tuple[str, ...] = (),
     ) -> str:
-        # The decision loads/embeds in-process and is CPU-bound, so run it in a
-        # worker thread to avoid blocking the event loop.
+        # The decision either embeds in-process (CPU-bound) or calls a remote
+        # embedding endpoint (blocking I/O), so run it in a worker thread to avoid
+        # blocking the event loop.
         try:
             selected = await asyncio.to_thread(
                 self._route_sync,
