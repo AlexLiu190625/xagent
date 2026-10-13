@@ -32,6 +32,7 @@ describe("client error wire contract", () => {
     ["invalid_message", "clientErrors.invalidMessage", "The message format is invalid."],
     ["message_outcome_unknown", "clientErrors.messageOutcomeUnknown", "The message may or may not have been applied. Check the conversation before sending it again."],
     ["external_turn_interrupted", "clientErrors.externalTurnInterrupted", "This response was interrupted."],
+    ["external_stop_not_applied", "clientErrors.externalStopNotApplied", "Stopping this response didn't go through — please try again."],
     ["upload_too_large", "clientErrors.uploadTooLarge", "File is too large. Please reduce the upload size and try again."],
     ["upload_proxy_error", "clientErrors.uploadProxyError", "Upload failed before reaching the application. Please check the server upload limit."],
     ["upload_failed", "clientErrors.uploadFailed", "Upload failed. Please try again."],

@@ -26,6 +26,10 @@ export const CLIENT_ERROR_CODES = [
   // cancel core when a turn ends interrupted after an external stop was
   // requested.
   "external_turn_interrupted",
+  // Sent on an agent_error frame's error_code field when an external stop
+  // request ended without the server confirming it took effect or that the
+  // turn is over.
+  "external_stop_not_applied",
   "upload_too_large",
   "upload_proxy_error",
   "upload_failed",
@@ -85,6 +89,7 @@ const CLIENT_ERROR_TRANSLATION_KEYS: Record<ClientErrorCode, TranslationKey> = {
   invalid_message: "clientErrors.invalidMessage",
   message_outcome_unknown: "clientErrors.messageOutcomeUnknown",
   external_turn_interrupted: "clientErrors.externalTurnInterrupted",
+  external_stop_not_applied: "clientErrors.externalStopNotApplied",
   upload_too_large: "clientErrors.uploadTooLarge",
   upload_proxy_error: "clientErrors.uploadProxyError",
   upload_failed: "clientErrors.uploadFailed",
@@ -118,6 +123,7 @@ const CLIENT_ERROR_FALLBACKS: Record<ClientErrorCode, string> = {
   invalid_message: "The message format is invalid.",
   message_outcome_unknown: "The message may or may not have been applied. Check the conversation before sending it again.",
   external_turn_interrupted: "This response was interrupted.",
+  external_stop_not_applied: "Stopping this response didn't go through — please try again.",
   upload_too_large: "File is too large. Please reduce the upload size and try again.",
   upload_proxy_error: "Upload failed before reaching the application. Please check the server upload limit.",
   upload_failed: "Upload failed. Please try again.",

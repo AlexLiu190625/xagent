@@ -43,6 +43,7 @@ const zh = {
     invalidMessage: "消息格式无效。",
     messageOutcomeUnknown: "该消息是否已成功发送尚不确定，请先查看对话内容后再决定是否重新发送。",
     externalTurnInterrupted: "此回答已被中断。",
+    externalStopNotApplied: "未能停止此回答，请重试。",
     uploadTooLarge: "文件过大，请减小上传大小后重试。",
     uploadProxyError: "上传请求未到达应用，请检查服务器的上传大小限制。",
     uploadFailed: "上传失败，请重试。",

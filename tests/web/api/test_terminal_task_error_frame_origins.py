@@ -11,8 +11,9 @@ client-visible code. Anything else (a literal, ``str(exc)``, a field read off
 the exception directly) is an unauthorized source, even if the value it
 produces happens to be a real closed-set member today.
 
-The second test pins the other way a code reaches the frame: a caller
-asserting it through ``asserted_code=``.
+The second test pins the other way a code reaches a frame: a caller
+asserting it through ``asserted_code=``, on the terminal frame or on the
+external command error frame.
 """
 
 from __future__ import annotations
@@ -188,5 +189,10 @@ def test_every_asserted_code_has_a_pinned_caller() -> None:
             "web/services/external_task_cancel.py",
             "_broadcast_external_cancel_terminal_event",
             "EXTERNAL_TURN_INTERRUPTED",
-        )
+        ),
+        (
+            "web/services/task_command_execution.py",
+            "_broadcast_terminal_command_error",
+            "EXTERNAL_STOP_NOT_APPLIED",
+        ),
     ]
