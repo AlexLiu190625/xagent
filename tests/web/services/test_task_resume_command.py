@@ -171,24 +171,31 @@ async def test_reply_command_is_completed_before_its_injection_starts(
     reply, monkeypatch
 ):
     """The worker's handoff marks the RESUME_INPUT command completed and
-    commits before it calls into the reply's injection. At that moment the
-    stored command is completed and the shared-execution claim query no
-    longer returns it, so the same command cannot reach the injection a
-    second time. The injection is reached with the command id as its turn
-    id."""
+    commits before it calls into the reply's injection. The claim query
+    returns the claimed command before the handoff; at the injection it no
+    longer does and the stored command is completed, so the same command
+    cannot reach the injection a second time. The injection is reached with
+    the command id as its turn id."""
     command = await claim(reply)
-    observed: list[tuple[str, bool, str]] = []
 
-    async def at_injection_entry(ctx, *, preacquired_lease, preacquired_state, turn_id):
+    def stored_status_and_claimable() -> tuple[str, bool]:
         with get_session_local()() as db:
-            stored = db.get(TaskExecutionCommand, command.id)
-            claimable = (
+            return (
+                db.get(TaskExecutionCommand, command.id).status,
                 task_command_transport._claimable_query(
                     db, runner_id="worker-1", command_db_id=command.id
                 ).first()
-                is not None
+                is not None,
             )
-            observed.append((stored.status, claimable, turn_id))
+
+    assert stored_status_and_claimable() == (
+        task_command_transport.COMMAND_PROCESSING,
+        True,
+    )
+    observed: list[tuple[str, bool, str]] = []
+
+    async def at_injection_entry(ctx, *, preacquired_lease, preacquired_state, turn_id):
+        observed.append((*stored_status_and_claimable(), turn_id))
 
     monkeypatch.setattr(task_resume, "resume_task_reply", at_injection_entry)
     await execute_durable_task_command(command)

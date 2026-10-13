@@ -53,13 +53,13 @@ legacy resume answers a question without ever retiring the marker that
 names it. That guard is a static, module-level check, not a proof that
 the close call runs on every code path.
 
-A fourth guard covers when a close call may run at all: every production
-call to close_legacy_resume_interaction or
-close_legacy_resume_interaction_sync outside task_interaction_close.py
-sits directly in the body of an ``if ... is
-UserMessageInjectionOutcome.POSTED_FRESH:`` branch, so a replayed
-injection does not reach any of them. It is a static check of source
-shape; what each site's guard buys is tested beside that site.
+A fourth guard covers when a close call may run at all: for every
+production call to close_legacy_resume_interaction or
+close_legacy_resume_interaction_sync outside task_interaction_close.py,
+the innermost enclosing condition is an ``if <name> is
+UserMessageInjectionOutcome.POSTED_FRESH:`` whose body holds the call, so
+a replayed injection does not reach any of them. It is a static check of
+source shape; what each site's guard buys is tested beside that site.
 """
 
 from __future__ import annotations
@@ -116,20 +116,24 @@ def _find_function(tree: ast.AST, name: str):
     raise AssertionError(f"function {name!r} not found")
 
 
+def _callee_name(call: ast.Call) -> str | None:
+    """The called attribute or bare name, or ``None`` for any other callee."""
+    func = call.func
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    if isinstance(func, ast.Name):
+        return func.id
+    return None
+
+
 def _call_lines(tree: ast.AST, *, attr: str) -> list[int]:
     """Line numbers of every Call whose callee name (attribute or bare
     name) matches ``attr``."""
-    lines = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        name = func.attr if isinstance(func, ast.Attribute) else None
-        if name is None and isinstance(func, ast.Name):
-            name = func.id
-        if name == attr:
-            lines.append(node.lineno)
-    return lines
+    return [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and _callee_name(node) == attr
+    ]
 
 
 def _key_share_lock_read_lines(tree: ast.AST) -> list[int]:
@@ -273,28 +277,16 @@ def _table_exists_guard_line_for_close_call(
         if not isinstance(node, ast.If):
             continue
         test = node.test
-        test_name = None
-        if isinstance(test, ast.Call):
-            func = test.func
-            test_name = (
-                func.attr
-                if isinstance(func, ast.Attribute)
-                else getattr(func, "id", None)
-            )
-        if test_name != TABLE_EXISTS_CHECK_NAME:
+        if not (
+            isinstance(test, ast.Call) and _callee_name(test) == TABLE_EXISTS_CHECK_NAME
+        ):
             continue
         for inner in ast.walk(node):
             if inner is node:
                 continue
             if not isinstance(inner, ast.Call):
                 continue
-            inner_func = inner.func
-            inner_name = (
-                inner_func.attr
-                if isinstance(inner_func, ast.Attribute)
-                else getattr(inner_func, "id", None)
-            )
-            if inner_name == close_call_attr:
+            if _callee_name(inner) == close_call_attr:
                 return node.lineno
     return None
 
@@ -539,8 +531,8 @@ CLOSE_CALL_NAMES = frozenset(
     {"close_legacy_resume_interaction", "close_legacy_resume_interaction_sync"}
 )
 # Every production close call, as (module stem, enclosing function). Each
-# is the one injection site of that function, and each must sit directly
-# under an `is POSTED_FRESH` branch.
+# is the one injection site of that function, and the innermost condition
+# around each must be an `is POSTED_FRESH` branch.
 EXPECTED_CLOSE_CALL_SITES = (
     ("task_command_execution", "handle_task_message"),
     ("task_execution", "execute_resume_background"),
@@ -553,8 +545,13 @@ APPROVED_UNGUARDED_CLOSE_CALL_SITES: frozenset[tuple[str, str]] = frozenset()
 
 
 def _is_fresh_injection_test(test: ast.expr) -> bool:
+    """``<name> is UserMessageInjectionOutcome.POSTED_FRESH``. The left side
+    must be a plain name, so an attribute (another enum member, or another
+    object's outcome) or a constant is rejected; which local variable the
+    name is cannot be seen here, and each site's own test covers that."""
     if not (
         isinstance(test, ast.Compare)
+        and isinstance(test.left, ast.Name)
         and len(test.ops) == 1
         and isinstance(test.ops[0], ast.Is)
         and len(test.comparators) == 1
@@ -573,8 +570,8 @@ def _close_calls_and_guards(tree: ast.AST) -> list[tuple[str, bool]]:
     """For each close call in ``tree``: the name of the function it is in,
     and whether its nearest enclosing condition (an ``if``, a conditional
     expression or a ``while``, looked for up to that function) is an
-    ``if ... is UserMessageInjectionOutcome.POSTED_FRESH:`` whose body holds
-    the call."""
+    ``if <name> is UserMessageInjectionOutcome.POSTED_FRESH:`` whose body
+    holds the call."""
     parents = {
         child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)
     }
@@ -582,11 +579,7 @@ def _close_calls_and_guards(tree: ast.AST) -> list[tuple[str, bool]]:
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        func = node.func
-        name = (
-            func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
-        )
-        if name not in CLOSE_CALL_NAMES:
+        if _callee_name(node) not in CLOSE_CALL_NAMES:
             continue
         guarded: bool | None = None
         function_name = "<module>"
@@ -607,20 +600,13 @@ def _close_calls_and_guards(tree: ast.AST) -> list[tuple[str, bool]]:
     return found
 
 
-def test_every_close_call_sits_directly_under_a_fresh_injection_guard() -> None:
-    """Each production call that retires an interaction row runs only when
-    its own injection wrote a fresh turn: the nearest condition around it is
-    ``if <outcome> is UserMessageInjectionOutcome.POSTED_FRESH:``, with the
-    call in that branch's body. Nested inside another condition is fine as
-    long as the guard is the innermost one. Scans every source file under
-    the installed xagent package, except task_interaction_close.py, whose
-    lock-reading wrapper delegating to the unlocked function is the
-    implementation, not a call site.
-
-    Each site's behavior is tested beside it; this only pins the shape, so
-    a fifth close called directly by name, or a guard that is removed,
-    inverted, compared with ``==`` or moved outward, turns this red. A close
-    passed as a value (for example through ``partial``) is not seen."""
+def test_every_close_calls_innermost_condition_is_a_fresh_injection_guard() -> None:
+    """Each production close call's innermost enclosing condition is
+    ``if <name> is UserMessageInjectionOutcome.POSTED_FRESH:`` with the call
+    in its body. Scans the installed xagent package except
+    task_interaction_close.py, whose wrapper delegation is not a call site.
+    A close passed as a value (for example through ``partial``) is not
+    seen; each site's behavior is tested beside it."""
     root = Path(next(iter(xagent.__path__)))
     sites: list[tuple[str, str]] = []
     unguarded: set[tuple[str, str]] = set()

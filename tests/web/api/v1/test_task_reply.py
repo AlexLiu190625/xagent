@@ -283,11 +283,7 @@ def test_reply_turn_id_is_never_reused_across_retries(mock_start_task):
     """Run inline, every call mints ``turn_id`` from a fresh ``uuid4()``, so
     even a client retry that resubmits the identical reply body never lands
     on the same turn id twice, and this path never sees a POSTED_REPLAY from
-    AgentRunner.inject_user_message's turn_id short-circuit. Under shared
-    task execution the turn id is the RESUME_INPUT command id instead, and
-    that command is completed before the injection starts. The close in
-    _update_reply_input_sync is still guarded on POSTED_FRESH, as defense in
-    depth."""
+    AgentRunner.inject_user_message's turn_id short-circuit."""
     agent_id, full_key = _create_agent_with_key()
     task_id = _create_waiting_task(full_key, agent_id, run_id="run-original")
     _insert_question_message(task_id)
@@ -874,15 +870,23 @@ def test_reply_input_closes_the_interaction_only_on_a_fresh_injection(
         db.close()
 
 
-async def test_inline_reply_closes_the_interaction_once_on_a_fresh_injection(
-    mock_start_task, monkeypatch
+@pytest.mark.parametrize(
+    "injection_outcome",
+    [
+        UserMessageInjectionOutcome.POSTED_FRESH,
+        UserMessageInjectionOutcome.POSTED_REPLAY,
+    ],
+    ids=lambda outcome: outcome.name,
+)
+async def test_inline_reply_passes_its_injection_outcome_to_the_close_guard(
+    mock_start_task, monkeypatch, injection_outcome: UserMessageInjectionOutcome
 ):
-    """One ordinary inline v1 reply, called directly: the injection reports
-    POSTED_FRESH under a fresh v1:reply turn id, the fence function receives
-    that outcome, and the close runs exactly once on the row read before the
-    injection, as it did before the close was guarded. No command row is
-    written, because a process without shared task execution runs the reply
-    inline."""
+    """One inline v1 reply, called directly, under a fresh v1:reply turn id:
+    the fence function receives the outcome the injection reported, and the
+    input is written either way. POSTED_FRESH closes the row read before the
+    injection exactly once and clears the marker; POSTED_REPLAY leaves the
+    row active and the marker set. No command row is written, because a
+    process without shared task execution runs the reply inline."""
     agent_id, full_key = _create_agent_with_key()
     task_id = _create_waiting_task(full_key, agent_id, run_id="run-inline-reply")
     db = _direct_db_session()
@@ -922,7 +926,7 @@ async def test_inline_reply_closes_the_interaction_once_on_a_fresh_injection(
     monkeypatch.setattr(task_resume, "_update_reply_input_sync", record_update)
     monkeypatch.setattr(task_resume, "close_legacy_resume_interaction", record_close)
     monkeypatch.setattr(task_resume, "_schedule_waiting_reply_resume", schedule)
-    post = AsyncMock(return_value=UserMessageInjectionOutcome.POSTED_FRESH)
+    post = AsyncMock(return_value=injection_outcome)
     agent_patch, _agent_service = _patch_agent_service(post)
     with agent_patch:
         await task_resume.resume_task_reply(
@@ -940,9 +944,9 @@ async def test_inline_reply_closes_the_interaction_once_on_a_fresh_injection(
     prefix, _, suffix = post.await_args.kwargs["turn_id"].rpartition(":")
     assert prefix == f"v1:reply:{task_id}"
     assert str(UUID(suffix)) == suffix
-    assert fence_outcomes == [UserMessageInjectionOutcome.POSTED_FRESH]
-    assert fence_outcomes[0] is UserMessageInjectionOutcome.POSTED_FRESH
-    assert closed_ids == [row_id]
+    assert fence_outcomes == [injection_outcome]
+    fresh = injection_outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    assert closed_ids == ([row_id] if fresh else [])
     db = _direct_db_session()
     try:
         row = (
@@ -950,14 +954,15 @@ async def test_inline_reply_closes_the_interaction_once_on_a_fresh_injection(
             .filter(TaskInteractionRequest.id == row_id)
             .one()
         )
-        assert (row.status, row.active_slot, row.terminal_reason) == (
-            "terminated",
-            None,
-            "answered_via_legacy_resume",
-        )
+        refreshed = db.query(Task).filter(Task.id == task_id).one()
+        assert refreshed.input == "yes, continue"
         assert (
-            db.query(Task).filter(Task.id == task_id).one().interaction_protocol_version
-            is None
+            (row.status, row.active_slot, row.terminal_reason),
+            refreshed.interaction_protocol_version,
+        ) == (
+            (("terminated", None, "answered_via_legacy_resume"), None)
+            if fresh
+            else (("active", 1, None), 1)
         )
         assert (
             db.query(TaskExecutionCommand)
