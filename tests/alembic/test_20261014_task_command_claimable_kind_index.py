@@ -31,7 +31,7 @@ from xagent.web.models.user import User
 from xagent.web.services import task_command_transport as transport
 
 REVISION = "20261014_task_cmd_claimable_kind"
-DOWN_REVISION = "20261012_zendesk_oauth"
+DOWN_REVISION = "20261013_atlassian_mcp_scope"
 TABLE = "task_execution_commands"
 INDEX = "ix_task_commands_claimable_kind"
 INDEX_COLUMNS = ("kind", "id")

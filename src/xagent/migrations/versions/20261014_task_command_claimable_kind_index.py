@@ -14,7 +14,7 @@ Accepted cost: every insert, and every status change that leaves a row
 ``pending`` or ``processing``, maintains one more index entry.
 
 Revision ID: 20261014_task_cmd_claimable_kind
-Revises: 20261012_zendesk_oauth
+Revises: 20261013_atlassian_mcp_scope
 Create Date: 2026-10-14
 
 """
@@ -26,7 +26,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20261014_task_cmd_claimable_kind"
-down_revision: Union[str, None] = "20261012_zendesk_oauth"
+down_revision: Union[str, None] = "20261013_atlassian_mcp_scope"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
