@@ -3541,7 +3541,7 @@ async def test_schedule_bg_preserves_public_safe_required_mcp_failure(
         run_id="run-a",
         attempt_id="test-attempt",
     )
-    public_message = "Required MCP servers are unavailable."
+    public_message = "Required MCP servers are unavailable: mcp_server_unavailable."
 
     with (
         patch(

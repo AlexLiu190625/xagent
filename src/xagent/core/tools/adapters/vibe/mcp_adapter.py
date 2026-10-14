@@ -11,7 +11,7 @@ import logging
 import math
 import os
 import re
-from collections.abc import Coroutine, Iterator
+from collections.abc import Coroutine, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
@@ -89,7 +89,13 @@ _DESCRIPTION_BOUND_ARGS_MAX_CHARS = 4096
 
 
 class MCPFailurePhase(str, Enum):
-    """Public-safe phase where an MCP server failed to load."""
+    """Public-safe phase where an MCP server failed to load.
+
+    ``AUTH_REJECTED`` is recorded instead of the handshake phase when the
+    transport raised an ``httpx.HTTPStatusError`` with status 401 or 403:
+    the server, or whatever answers in front of it, refused the request
+    outright.
+    """
 
     SESSION_START = "session_start"
     INITIALIZE = "initialize"
@@ -98,6 +104,7 @@ class MCPFailurePhase(str, Enum):
     SANDBOX_LIST_TOOLS = "sandbox_list_tools"
     SANDBOX_TOOL_WRAP = "sandbox_tool_wrap"
     NO_TOOLS_RETURNED = "no_tools_returned"
+    AUTH_REJECTED = "auth_rejected"
 
 
 _DEFAULT_UNAVAILABLE_MCP_MESSAGE = "MCP server credentials are unavailable."
@@ -111,7 +118,14 @@ _MCP_LOAD_FAILURE_MESSAGES: dict[MCPFailurePhase, str] = {
     MCPFailurePhase.SANDBOX_LIST_TOOLS: "MCP server tools could not be loaded.",
     MCPFailurePhase.SANDBOX_TOOL_WRAP: ("Some MCP server tools could not be prepared."),
     MCPFailurePhase.NO_TOOLS_RETURNED: "MCP server returned no available tools.",
+    MCPFailurePhase.AUTH_REJECTED: "MCP server refused the connection.",
 }
+# HTTP statuses that end a load's retries. A 401 means the credentials were
+# not accepted, and every attempt of a load sends the same credentials, so a
+# retry cannot change that answer. A 403 can also come from a firewall or a
+# rate limit in front of the server and may clear later; it is still treated
+# as final, trading a retry for not repeating a request the server refused.
+_AUTH_REJECTED_HTTP_STATUSES = frozenset({401, 403})
 
 
 def mcp_load_failure_message(phase: MCPFailurePhase) -> str:
@@ -3404,7 +3418,9 @@ class UnavailableMCPTool(AbstractBaseTool):
     ``unavailable_server`` is the raw configured name, shown to anyone who can
     see the trace, including anonymous share viewers (#1041).
     ``cause_type`` and ``status_code`` are kept for the setup summary only and
-    are not part of the result.
+    are not part of the result. A record whose reason is ``auth_rejected`` is
+    kept only for the setup summary and the failure policy;
+    ``model_visible_mcp_tools`` removes it before the list reaches an agent.
     """
 
     read_only = True
@@ -3513,6 +3529,23 @@ class UnavailableMCPTool(AbstractBaseTool):
 
     def return_value_as_string(self, value: Any) -> str:
         return _mcp_return_value_as_string(value)
+
+
+def model_visible_mcp_tools(tools: Iterable[Any]) -> list[Any]:
+    """Drop the record of a server that refused the load (``auth_rejected``).
+
+    The model cannot act on a refused connection, so that record is kept only
+    for the setup summary and the failure policy. Call this only after both
+    have read the full list: the record is how they learn about the failure.
+    """
+    return [
+        tool
+        for tool in tools
+        if not (
+            isinstance(tool, UnavailableMCPTool)
+            and tool.unavailability_reason == MCPFailurePhase.AUTH_REJECTED.value
+        )
+    ]
 
 
 def _build_mcp_tool_adapter(
@@ -3884,11 +3917,14 @@ async def _load_direct_mcp_tools(
         recorder.instrument(connection) if recorder is not None else connection
     )
 
+    loaded = False
+    attempts = 0
     for attempt in range(max_attempts):
         if recorder is not None:
             # Also outside the try-block, so it ends the load instead of being
             # retried: an abandoned load must not open another session.
             recorder.raise_if_sealed()
+        attempts = attempt + 1
         current_phase = MCPFailurePhase.SESSION_START
         try:
             async with create_session(session_connection) as session:
@@ -3897,6 +3933,7 @@ async def _load_direct_mcp_tools(
                 # Use the shared loader to keep pagination behavior consistent.
                 current_phase = MCPFailurePhase.LIST_TOOLS
                 mcp_tools = await load_mcp_tools(session)
+            loaded = True
             break
         except Exception as e:
             failure_phase = current_phase
@@ -3904,7 +3941,15 @@ async def _load_direct_mcp_tools(
             cause = _load_failure_cause(e)
             cause_type = type(cause).__name__
             status_code = _exception_http_status(cause)
-            if attempt < max_attempts - 1:
+            # Only a transport-level HTTP error counts: a status attribute on
+            # any other exception type is logged but does not end the retries.
+            rejected = (
+                isinstance(cause, httpx.HTTPStatusError)
+                and status_code in _AUTH_REJECTED_HTTP_STATUSES
+            )
+            if rejected:
+                failure_phase = MCPFailurePhase.AUTH_REJECTED
+            if not rejected and attempt < max_attempts - 1:
                 logger.warning(
                     "Attempt %d failed to load tools from MCP server %s during %s "
                     "(%s; cause=%s status=%s); retrying",
@@ -3916,30 +3961,31 @@ async def _load_direct_mcp_tools(
                     status_code,
                 )
                 await asyncio.sleep(1)
-            else:
-                logger.warning(
-                    "Giving up loading tools from MCP server %s during %s after "
-                    "%d attempt(s) (%s; cause=%s status=%s)",
-                    server_name,
-                    current_phase.value,
-                    attempt + 1,
-                    error_type,
-                    cause_type,
-                    status_code,
-                )
-                # The traceback stays at DEBUG: an exception message or a
-                # traceback can carry secrets from the connection (e.g. an
-                # oauth-authenticated request's URL or headers), so the
-                # WARNING above carries only class names and an integer HTTP
-                # status. Opt-in: set XAGENT_LOG_LEVEL=DEBUG (or run with
-                # --debug) to capture the traceback when reproducing a failure.
-                logger.debug(
-                    "Exhausted retries loading tools from MCP server %s during %s",
-                    server_name,
-                    current_phase.value,
-                    exc_info=True,
-                )
-    else:
+                continue
+            logger.warning(
+                "Giving up loading tools from MCP server %s during %s after "
+                "%d attempt(s) (%s; cause=%s status=%s)",
+                server_name,
+                current_phase.value,
+                attempts,
+                error_type,
+                cause_type,
+                status_code,
+            )
+            # The traceback stays at DEBUG: an exception message or a
+            # traceback can carry secrets from the connection (e.g. an
+            # oauth-authenticated request's URL or headers), so the
+            # WARNING above carries only class names and an integer HTTP
+            # status. Opt-in: set XAGENT_LOG_LEVEL=DEBUG (or run with
+            # --debug) to capture the traceback when reproducing a failure.
+            logger.debug(
+                "Exhausted retries loading tools from MCP server %s during %s",
+                server_name,
+                current_phase.value,
+                exc_info=True,
+            )
+            break
+    if not loaded:
         return MCPLoadResult(
             tools=(),
             loaded_servers=(),
@@ -3948,7 +3994,7 @@ async def _load_direct_mcp_tools(
                     server_name=server_name,
                     phase=failure_phase,
                     error_type=error_type,
-                    attempts=max_attempts,
+                    attempts=attempts,
                     cause_type=cause_type,
                     status_code=status_code,
                 ),
