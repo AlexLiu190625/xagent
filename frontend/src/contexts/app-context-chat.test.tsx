@@ -7654,6 +7654,46 @@ describe("AppProvider websocket message routing", () => {
     ).toEqual(["failed"])
   })
 
+  // How each way a stop can fail to take effect reaches this page today. A
+  // stop that finds the turn already over is answered with no code; one the
+  // server could not confirm carries external_stop_not_applied. Neither is the
+  // interruption code, so each stays an ordinary failure notice and releases
+  // the control.
+  it.each([
+    { cell: "the turn had already failed for another reason", message: "This response was interrupted.", status: "failed", extra: {}, shown: "agent.logs.event.messages.errorPrefix Unknown error" },
+    { cell: "the run moved on before the stop arrived", message: "Stopping this response didn't go through — please try again.", status: "running", extra: { error_code: "external_stop_not_applied" }, shown: "agent.logs.event.messages.errorPrefix clientErrors.externalStopNotApplied" },
+    { cell: "a settlement the stop did not cause landed first", message: "This response was interrupted.", status: "failed", extra: {}, shown: "agent.logs.event.messages.errorPrefix Unknown error" },
+    { cell: "lease recovery paused the run mid-stop", message: "Stopping this response didn't go through — please try again.", status: "paused", extra: { error_code: "external_stop_not_applied" }, shown: "agent.logs.event.messages.errorPrefix clientErrors.externalStopNotApplied" },
+  ])("shows a stop that did not take effect as a failure: $cell", ({ message, status, extra, shown }) => {
+    const taskId = 1041
+    render(
+      <AppProvider
+        token="token"
+        transport={{ ...makeSessionTransport(makeSessionConnection(), { taskStop: "enabled" }), legacyErrorProse: "untrusted" }}
+      >
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(taskId)))
+    act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+    act(() => getSessionControls().stopTask())
+    act(() => webSocketOptions.current?.onMessage?.({
+      type: "agent_error",
+      timestamp: "2026-05-27T05:00:03Z",
+      task_id: taskId,
+      ...({ message, status, ...extra } as Record<string, unknown>),
+    }))
+    const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{
+      content: string
+      status?: string
+    }>
+    expect(messages.map((entry) => [entry.content, entry.status])).toEqual([
+      [shown, "failed"],
+    ])
+    expect(screen.getByTestId("stop-state").textContent).toBe("idle")
+  })
+
   it("keeps the stop intent across a reconnect and a waiting turn", () => {
     const assertNeutral = () => {
       const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{
@@ -7917,14 +7957,18 @@ describe("AppProvider websocket message routing", () => {
     }
   })
 
-  it("releases the stop control on a codeless failure without retiring the intent", () => {
-    // The server sends the same codeless agent_error for a stop it could not
-    // apply and for any other external-scope command that fails on this task,
-    // so this frame cannot say which of them happened. It returns the control
-    // to pressable -- a button left on "Stopping..." would contradict the
-    // sentence the visitor has just been shown -- and leaves the stop intent
-    // standing, so this task's own terminal frame still renders as the
-    // stopped turn it is.
+  // A stop the server could not confirm is answered with an agent_error
+  // carrying external_stop_not_applied; an older server, or any other
+  // external-scope command failing on this task, sends the same frame with no
+  // code. Neither names which stop press it answers, so each returns the
+  // control to pressable -- a button left on "Stopping..." would contradict
+  // the sentence the visitor has just been shown -- and leaves the stop intent
+  // standing, so this task's own terminal frame still renders as the stopped
+  // turn it is.
+  it.each([
+    { shape: "carries no code", extra: {} },
+    { shape: "carries external_stop_not_applied", extra: { error_code: "external_stop_not_applied", status: "running" } },
+  ])("releases the stop control without retiring the intent when the stop answer $shape", ({ extra }) => {
     const taskId = 1206
     render(
       <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(), { taskStop: "enabled" })}>
@@ -7944,6 +7988,7 @@ describe("AppProvider websocket message routing", () => {
       ...({
         message: "Stopping this response didn't go through — please try again.",
         error: "Stopping this response didn't go through — please try again.",
+        ...extra,
       } as Record<string, unknown>),
     }))
     expect(screen.getByTestId("stop-state").textContent).toBe("idle")
@@ -8058,9 +8103,9 @@ describe("AppProvider websocket message routing", () => {
         unmount()
       }
 
-      // 2) an agent_error carrying an error_code is a different producer's
-      // coded failure, not the codeless stop-rejection -- it must not reset
-      // the button.
+      // 2) an agent_error carrying any other error_code is a different
+      // producer's coded failure, not an answer to the stop -- it must not
+      // reset the button.
       {
         const taskId = 1209
         const { unmount } = render(
@@ -8080,6 +8125,8 @@ describe("AppProvider websocket message routing", () => {
           ...({ message: "Message processing failed.", error_code: "message_processing_failed" } as Record<string, unknown>),
         }))
         expect(screen.getByTestId("stop-state").textContent).toBe("stopping")
+        act(() => { vi.advanceTimersByTime(30_001) })
+        expect(screen.getByTestId("stop-state").textContent).toBe("timed_out")
         unmount()
       }
     } finally {

@@ -138,15 +138,15 @@ type SessionConversationState =
 
 // The stop control's own state. The server sends no acknowledgement frame for
 // a stop, so "stopping" ends in one of six ways: this task's terminal frame,
-// the local timeout above, a codeless agent_error for this task, a reconnect
-// (the button's own state is per-connection and cannot outlive the connection
-// it was set on), the control ceasing to be available while the run pauses
-// without ending (see the effect keyed on canStopTask), or a later stop
-// attempt that the socket refuses, which moves the state straight to
-// "not_sent" (see stopTask). The codeless agent_error only returns the
-// control to pressable. It does not say whether the stop was applied: the
-// server sends the same frame for any other external-scope command that
-// fails on this task.
+// the local timeout above, an agent_error for this task that carries no code
+// or carries external_stop_not_applied, a reconnect (the button's own state is
+// per-connection and cannot outlive the connection it was set on), the
+// control ceasing to be available while the run pauses without ending (see
+// the effect keyed on canStopTask), or a later stop attempt that the socket
+// refuses, which moves the state straight to "not_sent" (see stopTask). That
+// agent_error only returns the control to pressable and does not end the stop
+// intent: it is broadcast to every connection on the task without naming
+// which stop press it answers.
 export type SessionStopState = "idle" | "stopping" | "timed_out" | "not_sent"
 
 type SessionConversationAction =
@@ -2531,9 +2531,10 @@ export function AppProvider({
   // Per task, not per connection: "the visitor asked to stop task N" stays
   // true across a token-refresh reconnect and across an isProcessing dip. It
   // is cleared by that task's own terminal frame -- failure or completion --
-  // and by this connection binding a different task. Nothing else clears it: a
-  // codeless agent_error cannot be read as "this stop was rejected" (see the
-  // agent_error handler), so it releases the control without touching this.
+  // and by this connection binding a different task. Nothing else clears it:
+  // an agent_error, coded external_stop_not_applied or codeless, is broadcast
+  // to every connection on the task without naming which stop press it
+  // answers, so it releases the control and leaves the intent standing.
   const stopIntentTaskIdRef = useRef<number | null>(null)
   const previousBoundSessionTaskIdRef = useRef<number | null>(null)
 
@@ -6500,27 +6501,28 @@ export function AppProvider({
             status: "failed",
           },
         })
-        // A failed external command on this task is answered on this channel,
-        // not on the terminal one: it is broadcast as an agent_error that
-        // deliberately carries no error_code, because the anonymous audience
-        // is shown nothing it cannot act on. A stop the server could not
-        // apply is one of those failures, and it is not the only one: the
-        // same four fields and the same task id go out when any other
-        // external-scope command on this task ends in a terminal rejection.
-        // The sentence is no better a key than the missing code: a transport
-        // that marks legacy prose untrusted replaces it before it can be
-        // read. So this frame cannot say whether the stop was applied, and
-        // nothing here reads it as saying so -- the stop intent is left
-        // standing, to be retired only by this task's own terminal frame or
-        // by this connection binding a different task. What the frame does
-        // answer is the button: the visitor has just been shown a sentence
-        // about a failure on this task, and a control still stuck on
-        // "Stopping..." would contradict it, so the control leaves "stopping"
-        // here rather than waiting out the local 30-second window. A
-        // structured marker that would let a client tell a rejected stop from
-        // any other failure is tracked in xorbitsai/xagent#2247.
+        // A stop the server could not confirm is answered on this channel,
+        // not on the terminal one, as an agent_error carrying
+        // external_stop_not_applied. A stop that found the turn already
+        // over, a server that predates that code, and any other
+        // external-scope command that fails on this task are answered with
+        // the same frame and no code at all. Either way the frame is broadcast
+        // to every connection on the task and does not name which stop press
+        // it answers, so it cannot end the stop intent: a second press on
+        // this page, or a press on another page bound to the same task, may
+        // still take effect, and the intent is left standing to be retired
+        // only by this task's own terminal frame or by this connection
+        // binding a different task. What the frame does answer is the
+        // button: the visitor has just been shown a sentence about a failure
+        // on this task, and a control still stuck on "Stopping..." would
+        // contradict it, so the control leaves "stopping" here rather than
+        // waiting out the local 30-second window. Any other code names a
+        // different failure and leaves the control alone.
         if (
-          !getWebSocketErrorCodeField(message).present
+          (
+            !getWebSocketErrorCodeField(message).present
+            || agentErrorCode === "external_stop_not_applied"
+          )
           && stopIntentTaskIdRef.current !== null
           && controlEnvelope.taskId === stopIntentTaskIdRef.current
         ) {
