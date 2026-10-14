@@ -427,6 +427,19 @@ const taskErrorMessage = (
   ...({ message, error: message } as Record<string, unknown>),
 })
 
+// The frame the external cancel core broadcasts once the turn it was asked to
+// stop has ended: the same terminal frame, carrying the interruption code.
+const interruptedTurnMessage = (
+  taskId: number,
+  extra: Record<string, unknown> = {},
+): TestWebSocketMessage => ({
+  ...taskErrorMessage(taskId),
+  ...({ code: "external_turn_interrupted", ...extra } as Record<string, unknown>),
+})
+
+// The interruption code's sentence as this file's identity translator renders it.
+const STOPPED_TURN_TEXT = "clientErrors.externalTurnInterrupted"
+
 const taskCompletedMessage = (taskId: number): TestWebSocketMessage => ({
   type: "task_completed",
   timestamp: "2026-05-27T05:09:00Z",
@@ -7519,18 +7532,126 @@ describe("AppProvider websocket message routing", () => {
     act(() => getSessionControls().stopTask())
     expect(screen.getByTestId("stop-state").textContent).toBe("stopping")
 
-    act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(1001)))
+    act(() => webSocketOptions.current?.onMessage?.(interruptedTurnMessage(1001)))
 
     const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{
       content: string
       isResult?: boolean
       status?: string
     }>
-    const stopped = messages.find((message) => message.content === "This response was interrupted.")
+    const stopped = messages.find((message) => message.content === STOPPED_TURN_TEXT)
     expect(stopped).toBeDefined()
     expect(stopped?.isResult).toBe(true)
     expect(stopped?.status).not.toBe("failed")
     expect(screen.getByTestId("stop-state").textContent).toBe("idle")
+  })
+
+  it("renders a stopped turn in the client's own words on a page that distrusts server prose", () => {
+    render(
+      <AppProvider
+        token="token"
+        transport={{ ...makeSessionTransport(makeSessionConnection(), { taskStop: "enabled" }), legacyErrorProse: "untrusted" }}
+      >
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(1011)))
+    act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+    act(() => getSessionControls().stopTask())
+    act(() => webSocketOptions.current?.onMessage?.(interruptedTurnMessage(1011)))
+
+    const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{
+      content: string
+      isResult?: boolean
+      status?: string
+    }>
+    expect(messages.map((message) => [message.content, message.status, message.isResult])).toEqual([
+      [STOPPED_TURN_TEXT, "completed", true],
+    ])
+  })
+
+  it("renders a terminal failure that is not an interruption as a failure even with a stop pending", () => {
+    const transport = { ...makeSessionTransport(makeSessionConnection(), { taskStop: "enabled" }), legacyErrorProse: "untrusted" as const }
+    const readMessages = () => JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{
+      content: string
+      status?: string
+    }>
+
+    // 1) a connector-runtime failure lands before the stop is applied.
+    {
+      const taskId = 1021
+      const { unmount } = render(
+        <AppProvider token="token" transport={transport}>
+          <SessionControlsProbe />
+          <StateProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(taskId)))
+      act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+      act(() => getSessionControls().stopTask())
+      act(() => webSocketOptions.current?.onMessage?.({
+        ...taskErrorMessage(taskId, "This connector needs a runtime credential."),
+        ...({ code: "runtime_secret_unavailable" } as Record<string, unknown>),
+      }))
+      expect(readMessages().map((message) => [message.content, message.status])).toEqual([
+        ["clientErrors.runtimeSecretUnavailable", "failed"],
+      ])
+      expect(screen.getByTestId("stop-state").textContent).toBe("idle")
+      // That failure ended the intent: a later interruption of the same task
+      // that this visitor did not ask for is not rendered as their stop.
+      act(() => webSocketOptions.current?.onMessage?.(interruptedTurnMessage(taskId, { run_id: "run-later", state_version: 2 })))
+      expect(readMessages().map((message) => message.status)).toEqual(["failed", "failed"])
+      unmount()
+    }
+
+    // 2) the stop was never confirmed, and a codeless failure ends the turn later.
+    {
+      const taskId = 1022
+      vi.useFakeTimers()
+      try {
+        const { unmount } = render(
+          <AppProvider token="token" transport={transport}>
+            <SessionControlsProbe />
+            <StateProbe />
+          </AppProvider>
+        )
+        act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(taskId)))
+        act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+        act(() => getSessionControls().stopTask())
+        act(() => { vi.advanceTimersByTime(30_001) })
+        act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(taskId, "Task execution failed.")))
+        expect(readMessages().map((message) => [message.content, message.status])).toEqual([
+          ["agent.logs.event.messages.errorPrefix Unknown error", "failed"],
+        ])
+        unmount()
+      } finally {
+        vi.useRealTimers()
+      }
+    }
+  })
+
+  it("adds no bubble for a stopped turn whose frame names a message the display events already carry", () => {
+    render(
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(), { taskStop: "enabled" })}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(1031)))
+    act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+    act(() => getSessionControls().stopTask())
+    act(() => webSocketOptions.current?.onMessage?.({
+      ...interruptedTurnMessage(1031),
+      ...({ message_id: "execution_message_1031" } as Record<string, unknown>),
+    }))
+    expect(JSON.parse(screen.getByTestId("messages").textContent || "[]")).toEqual([])
+    expect(screen.getByTestId("stop-state").textContent).toBe("idle")
+    // The frame still ended the intent even though it added no bubble.
+    act(() => webSocketOptions.current?.onMessage?.(interruptedTurnMessage(1031, { run_id: "run-later", state_version: 2 })))
+    expect(
+      (JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{ status?: string }>).map((message) => message.status)
+    ).toEqual(["failed"])
   })
 
   it("keeps the stop intent across a reconnect and a waiting turn", () => {
@@ -7540,7 +7661,7 @@ describe("AppProvider websocket message routing", () => {
         isResult?: boolean
         status?: string
       }>
-      const stopped = messages.find((message) => message.content === "This response was interrupted.")
+      const stopped = messages.find((message) => message.content === STOPPED_TURN_TEXT)
       expect(stopped).toBeDefined()
       expect(stopped?.isResult).toBe(true)
       expect(stopped?.status).not.toBe("failed")
@@ -7568,7 +7689,7 @@ describe("AppProvider websocket message routing", () => {
       )
       expect(screen.getByTestId("stop-state").textContent).toBe("idle")
 
-      act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(taskId)))
+      act(() => webSocketOptions.current?.onMessage?.(interruptedTurnMessage(taskId)))
       assertNeutral()
       unmount()
     }
@@ -7594,7 +7715,7 @@ describe("AppProvider websocket message routing", () => {
       } as TestWebSocketMessage))
       expect(screen.getByTestId("can-stop-task").textContent).toBe("false")
 
-      act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(taskId)))
+      act(() => webSocketOptions.current?.onMessage?.(interruptedTurnMessage(taskId)))
       assertNeutral()
       unmount()
     }
@@ -7617,7 +7738,7 @@ describe("AppProvider websocket message routing", () => {
         act(() => { vi.advanceTimersByTime(30_001) })
         expect(screen.getByTestId("stop-state").textContent).toBe("timed_out")
 
-        act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(taskId)))
+        act(() => webSocketOptions.current?.onMessage?.(interruptedTurnMessage(taskId)))
         assertNeutral()
         unmount()
       } finally {
@@ -7634,16 +7755,14 @@ describe("AppProvider websocket message routing", () => {
         status?: string
       }>
       const failed = messages.find((message) => message.status === "failed")
-      expect(failed).toBeDefined()
-      expect(failed?.content).toContain("agent.logs.event.messages.errorPrefix")
+      expect(failed?.content).toBe(STOPPED_TURN_TEXT)
       // isResult is deliberately not asserted here: a terminal task_error is
       // this turn's result whether or not the visitor asked to stop, so the
-      // flag is true on both branches and cannot tell them apart. What
-      // separates them is the wording -- the prefixed sentence checked above
-      // versus the bare one assertNeutral looks for -- so the absence of the
-      // neutral bubble is the assertion that actually bites.
+      // flag is true on both branches and cannot tell them apart. Both
+      // branches also read the same coded sentence, so what separates them is
+      // the status: no bubble with that sentence may be anything but failed.
       expect(
-        messages.some((message) => message.content === "This response was interrupted.")
+        messages.some((message) => message.content === STOPPED_TURN_TEXT && message.status !== "failed")
       ).toBe(false)
     }
 
@@ -7657,7 +7776,7 @@ describe("AppProvider websocket message routing", () => {
       )
       act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(1201)))
       act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
-      act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(1201)))
+      act(() => webSocketOptions.current?.onMessage?.(interruptedTurnMessage(1201)))
       assertRed()
       unmount()
     }
@@ -7688,7 +7807,7 @@ describe("AppProvider websocket message routing", () => {
       const beforeCount = (
         JSON.parse(screen.getByTestId("messages").textContent || "[]") as unknown[]
       ).length
-      act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(oldTaskId)))
+      act(() => webSocketOptions.current?.onMessage?.(interruptedTurnMessage(oldTaskId)))
       // The view has already moved to newTaskId, and oldTaskId was added to
       // retiredSessionTaskIdsRef in the same reset that rebound the
       // connection. The session lineage guard in handleSessionMessage
@@ -7702,7 +7821,7 @@ describe("AppProvider websocket message routing", () => {
       }>
       expect(messages).toHaveLength(beforeCount)
       expect(
-        messages.find((message) => message.content === "This response was interrupted.")
+        messages.find((message) => message.content === STOPPED_TURN_TEXT)
       ).toBeUndefined()
       unmount()
     }
@@ -7722,7 +7841,7 @@ describe("AppProvider websocket message routing", () => {
       act(() => getSessionControls().stopTask())
       expect(screen.getByTestId("stop-state").textContent).toBe("not_sent")
 
-      act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(taskId)))
+      act(() => webSocketOptions.current?.onMessage?.(interruptedTurnMessage(taskId)))
       assertRed()
       unmount()
     }
@@ -7741,7 +7860,7 @@ describe("AppProvider websocket message routing", () => {
       act(() => getSessionControls().stopTask())
       act(() => webSocketOptions.current?.onMessage?.(taskCompletedMessage(taskId)))
       act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:05Z" }))
-      act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(taskId)))
+      act(() => webSocketOptions.current?.onMessage?.(interruptedTurnMessage(taskId)))
       assertRed()
       unmount()
     }
@@ -7779,18 +7898,18 @@ describe("AppProvider websocket message routing", () => {
       expect(rejection?.status).toBe("failed")
       expect(rejection?.isResult).toBeFalsy()
       expect(
-        afterRejection.some((message) => message.content === "This response was interrupted.")
+        afterRejection.some((message) => message.content === STOPPED_TURN_TEXT)
       ).toBe(false)
 
       // The rejection did not retire the intent, so this task's own terminal
       // frame still renders as the stopped turn it is.
-      act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(taskId)))
+      act(() => webSocketOptions.current?.onMessage?.(interruptedTurnMessage(taskId)))
       const afterTerminal = JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{
         content: string
         isResult?: boolean
         status?: string
       }>
-      const stopped = afterTerminal.find((message) => message.content === "This response was interrupted.")
+      const stopped = afterTerminal.find((message) => message.content === STOPPED_TURN_TEXT)
       expect(stopped).toBeDefined()
       expect(stopped?.isResult).toBe(true)
       expect(stopped?.status).not.toBe("failed")
@@ -7829,13 +7948,13 @@ describe("AppProvider websocket message routing", () => {
     }))
     expect(screen.getByTestId("stop-state").textContent).toBe("idle")
 
-    act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(taskId)))
+    act(() => webSocketOptions.current?.onMessage?.(interruptedTurnMessage(taskId)))
     const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{
       content: string
       isResult?: boolean
       status?: string
     }>
-    const stopped = messages.find((message) => message.content === "This response was interrupted.")
+    const stopped = messages.find((message) => message.content === STOPPED_TURN_TEXT)
     expect(stopped).toBeDefined()
     expect(stopped?.isResult).toBe(true)
     expect(stopped?.status).not.toBe("failed")
@@ -7858,25 +7977,29 @@ describe("AppProvider websocket message routing", () => {
     act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(taskId)))
     act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
     act(() => getSessionControls().stopTask())
-    act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(taskId)))
+    act(() => webSocketOptions.current?.onMessage?.(interruptedTurnMessage(taskId)))
 
     const afterStop = JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{
       content: string
       status?: string
     }>
-    expect(afterStop.find((message) => message.content === "This response was interrupted.")?.status).not.toBe("failed")
+    const stopped = afterStop.find((message) => message.content === STOPPED_TURN_TEXT)
+    expect(stopped).toBeDefined()
+    expect(stopped?.status).not.toBe("failed")
 
-    // The next turn of the same task starts and fails on its own.
+    // The next turn of the same task starts and is interrupted by a stop this
+    // visitor did not send (another tab, a scheduled stop). A distinct
+    // (run_id, state_version) keeps it from collapsing into the first bubble.
     act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:11:00Z" }))
-    act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(taskId, "The connector timed out.")))
+    act(() => webSocketOptions.current?.onMessage?.(interruptedTurnMessage(taskId, { run_id: "run-next", state_version: 2 })))
 
     const afterFailure = JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{
       content: string
       status?: string
     }>
-    const failure = afterFailure.find((message) => message.content.includes("The connector timed out."))
-    expect(failure).toBeDefined()
-    expect(failure?.status).toBe("failed")
+    expect(
+      afterFailure.filter((message) => message.content === STOPPED_TURN_TEXT).map((message) => message.status)
+    ).toEqual(["completed", "failed"])
   })
 
   it("recovers the stop control on the local timeout", () => {
@@ -8031,19 +8154,18 @@ describe("AppProvider websocket message routing", () => {
       act(() => { vi.advanceTimersByTime(30_001) })
       expect(screen.getByTestId("stop-state").textContent).toBe("not_sent")
 
-      act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(1401)))
+      act(() => webSocketOptions.current?.onMessage?.(interruptedTurnMessage(1401)))
       const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{
         content: string
         isResult?: boolean
         status?: string
       }>
       const failed = messages.find((message) => message.status === "failed")
-      expect(failed).toBeDefined()
-      expect(failed?.content).toContain("agent.logs.event.messages.errorPrefix")
-      // See assertRed above for why the neutral bubble's absence, not
-      // isResult, is what distinguishes an un-neutralized failure here.
+      expect(failed?.content).toBe(STOPPED_TURN_TEXT)
+      // See assertRed above for why the status, not isResult or the wording,
+      // is what distinguishes an un-neutralized failure here.
       expect(
-        messages.some((message) => message.content === "This response was interrupted.")
+        messages.some((message) => message.content === STOPPED_TURN_TEXT && message.status !== "failed")
       ).toBe(false)
     } finally {
       vi.useRealTimers()

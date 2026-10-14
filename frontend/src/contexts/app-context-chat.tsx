@@ -2747,8 +2747,9 @@ export function AppProvider({
   // unconfirmed-timeout window, and the control returns pressable with no
   // record of the earlier press. Accepted as it stands: the per-task stop
   // intent lives in a ref this effect does not touch, so the turn still
-  // renders as a stopped turn when its own terminal frame arrives — what is
-  // lost is the button's memory of the press, not the outcome of the stop.
+  // renders as a stopped turn when its own terminal frame says it was
+  // interrupted — what is lost is the button's memory of the press, not the
+  // outcome of the stop.
   useEffect(() => {
     if (canStopTask) return
     clearStopTimeout()
@@ -6083,9 +6084,9 @@ export function AppProvider({
         // A stop intent lives until this task's next terminal frame, and a
         // normal completion is the other terminal frame. Without this, an
         // intent recorded for a turn that finished on its own would still be
-        // standing when a later turn of the same task genuinely fails, and
-        // that failure would render as a stopped turn. Rendering below is
-        // untouched.
+        // standing when a later turn of the same task is interrupted by a stop
+        // this visitor did not ask for, and that turn would render as this
+        // visitor's stopped turn. Rendering below is untouched.
         if (
           stopIntentTaskIdRef.current !== null
           && controlEnvelope.taskId === stopIntentTaskIdRef.current
@@ -6573,7 +6574,7 @@ export function AppProvider({
         }
 
         const stopIntentTaskId = stopIntentTaskIdRef.current
-        // A stop intent is answered by this task's TERMINAL frame only.
+        // A stop intent ends with this task's TERMINAL frame only.
         // errorFrame.isTerminal is the discriminator: the root "error" type is
         // a mixed channel that also carries rejected chat messages and
         // rejected pause/resume while the task is still RUNNING, and a
@@ -6581,10 +6582,20 @@ export function AppProvider({
         // Reading a rejection as the stopped turn would both render a live
         // turn as finished and retire the intent before the real terminal
         // frame arrives, leaving that frame to render as a plain failure.
-        const isVisitorStoppedTurn =
+        const endsStopIntent =
           errorFrame.isTerminal
           && stopIntentTaskId !== null
           && controlEnvelope.taskId === stopIntentTaskId
+        // Only a turn the server itself says was interrupted renders as the
+        // stopped turn. Any other terminal failure -- a connector-runtime code
+        // that raced the stop, or a codeless failure after the stop was lost
+        // or timed out -- is a real failure and keeps the red bubble and its
+        // own wording, though it still ends the intent.
+        const isVisitorStoppedTurn =
+          endsStopIntent
+          && errorFrame.terminalErrorCode === "external_turn_interrupted"
+        // A frame that names a message_id adds no bubble below: that message
+        // is drawn from its own display event. It still ends the intent.
         if (
           !message.message_id && !isDuplicateMessageForViewedTask(
             errorFrame.dedupText,
@@ -6598,16 +6609,11 @@ export function AppProvider({
               ? {
                   id: generateMessageId("msg-stopped"),
                   role: "assistant",
-                  // The server's own sentence, no prefix: the persisted
-                  // transcript row a reload replays carries this same text, so
-                  // a live-only prefix would make the two views disagree. On a
-                  // transport that marks legacy prose untrusted the live text
-                  // is currently a constant instead of that sentence, so the
-                  // two views do not yet agree there (xorbitsai/xagent#1958).
-                  // dedupText, not bubbleContent, is that sentence:
-                  // bubbleContent is the prefixed or connector-runtime wording
-                  // this branch exists to suppress.
-                  content: errorFrame.dedupText,
+                  // The client's own sentence for the interruption code, read
+                  // from the same table as every other coded bubble and with no
+                  // error prefix. A reload replays the persisted English row,
+                  // so the two views differ only in language.
+                  content: errorFrame.bubbleContent,
                   timestamp: message.timestamp,
                   // The turn ended because the visitor asked it to, so this is
                   // the turn's result. status is not "failed", which keeps the
@@ -6629,10 +6635,9 @@ export function AppProvider({
                 },
           })
         }
-        if (isVisitorStoppedTurn) {
+        if (endsStopIntent) {
           stopIntentTaskIdRef.current = null
-          clearStopTimeout()
-          setStopState("idle")
+          releaseStopControl()
         }
         break
       }
