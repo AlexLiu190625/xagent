@@ -1303,6 +1303,21 @@ describe("ChatInput", () => {
     expect(toastErrorMock).toHaveBeenCalledTimes(notificationHandled ? 0 : 1)
   })
 
+  it.each([false, true])("notifies a failed send only while the input is mounted (unmounted: %s)", async unmounted => {
+    let fail!: (error: Error) => void
+    const onSend = vi.fn(() => new Promise<void>((_resolve, reject) => { fail = reject }))
+    const { container, unmount } = render(
+      <ChatInput hideConfig hideFileUpload inputValue="late failure" onInputChange={vi.fn()} onSend={onSend} readOnlyConfig />
+    )
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce())
+    if (unmounted) unmount()
+
+    await act(async () => { fail(new Error("connection lost")) })
+
+    expect(toastErrorMock).toHaveBeenCalledTimes(unmounted ? 0 : 1)
+  })
+
   it("localizes coded send failures without displaying their raw message", async () => {
     const onSend = vi.fn().mockRejectedValue(Object.assign(
       new Error("provider token=secret"),

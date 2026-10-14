@@ -61,7 +61,11 @@ const webSocketOptions = vi.hoisted(() => ({
 }))
 const sendChatMessageMock = vi.hoisted(() => vi.fn())
 const sendRawMessageMock = vi.hoisted(() => vi.fn())
-const wsHarness = vi.hoisted(() => ({ isConnected: true }))
+const wsHarness = vi.hoisted(() => ({
+  isConnected: true,
+  connectionPhase: "connected" as string,
+  loginIdentity: "auth:0" as string | null,
+}))
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const routerPushMock = vi.hoisted(() => vi.fn())
 // Mutable so connector-runtime dialog tests (which render the real
@@ -132,6 +136,8 @@ vi.mock("@/hooks/use-websocket", async (importOriginal) => ({
     webSocketOptions.all.push(options)
     return {
       isConnected: wsHarness.isConnected,
+      connectionPhase: wsHarness.connectionPhase,
+      getLoginIdentity: () => wsHarness.loginIdentity,
       connectionError: null,
       sendMessage: sendRawMessageMock,
       sendChatMessage: sendChatMessageMock,
@@ -162,7 +168,12 @@ import {
   useApp,
 } from "./app-context-chat"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
-import { MessageDeliveryError } from "@/hooks/use-websocket"
+import { MAX_RECONNECT_CHAIN_MS, MessageDeliveryError } from "@/hooks/use-websocket"
+import {
+  RESEND_RECONNECT_DEADLINE_MS,
+  mayResend,
+  type ResendOwnership,
+} from "./chat-delivery-resend"
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer"
 import { TASK_ERROR_EVENT, type TaskErrorEventDetail } from "@/lib/task-error-events"
 import type { Translate } from "@/contexts/i18n-context"
@@ -11118,5 +11129,75 @@ describe("opens the first gate and the session check from one place each", () =>
 
   it("calls openSessionCheck only from the task page", () => {
     expect(callers(/\bopenSessionCheck\s*\(/g)).toEqual([{ file: "app/task/[id]/page-client.tsx", calls: 1 }])
+  })
+})
+
+describe("resend after reconnect", () => {
+  const ack = { client_message_id: "a", turn_id: "a" }
+  const connectionLost = (message: string) =>
+    new MessageDeliveryError(message, "outcome_unknown", { connectionLost: true })
+  const tree = (token = "token") => (
+    <AppProvider token={token}><SeedRunningTask /><SessionControlsProbe /></AppProvider>
+  )
+
+  beforeEach(() => {
+    sendChatMessageMock.mockReset()
+    sendChatMessageMock.mockResolvedValue(ack)
+    wsHarness.isConnected = true
+    wsHarness.connectionPhase = "connected"
+    wsHarness.loginIdentity = "auth:0"
+  })
+  afterEach(() => cleanup())
+
+  type Scene = { rerender: (ui: React.ReactElement) => void; unmount: () => void }
+  const sameLogin = ({ rerender }: Scene) => rerender(tree("token-2"))
+  const login = (identity: string | null) => () => { wsHarness.loginIdentity = identity }
+  const notSent = new MessageDeliveryError("not sent", "not_sent")
+  // [name, ids, rejections in call order (default: every first call is lost), change, wakes by reconnecting, ids sent, first call's rejection settles it]
+  it.each<[string, string[], Error[] | undefined, (scene: Scene) => void, boolean, string[], number | "ok"]>([
+    ["nothing changed, three messages", ["a", "b", "c"], undefined, () => {}, true, ["a", "b", "c", "a", "b", "c"], "ok"],
+    ["a token refresh of the same login", ["a"], undefined, sameLogin, true, ["a", "a"], "ok"],
+    ["a switch to another task", ["a"], undefined, () => act(() => getSessionControls().setTaskId(2, { navigate: false })), true, ["a"], 0],
+    ["another account", ["a"], undefined, login("auth:1"), true, ["a"], 0],
+    ["another guest token", ["a"], undefined, login("external:1"), true, ["a"], 0],
+    ["a login that cannot be read", ["a"], undefined, login(null), true, ["a"], 0],
+    ["a first failure that was not sent", ["a"], [notSent], () => {}, true, ["a"], 0],
+    ["two lost connections", ["a"], [connectionLost("first"), connectionLost("again")], () => {}, true, ["a", "a"], 1],
+    ["the phase turning lost", ["a"], undefined, ({ rerender }) => { wsHarness.connectionPhase = "lost"; rerender(tree()) }, false, ["a"], 0],
+    ["an unmount", ["a"], undefined, ({ unmount }) => unmount(), false, ["a"], 0],
+  ])("resends after %s", async (_name, ids, rejections, change, reconnects, expectedIds, settlesWith) => {
+    const failures = rejections ?? ids.map(() => connectionLost("first"))
+    failures.forEach(error => sendChatMessageMock.mockRejectedValueOnce(error))
+    const { rerender, unmount } = render(tree())
+    await act(async () => {})
+    const results = ids.map(id => getSessionControls()
+      .sendMessage(`m-${id}`, { clientMessageId: id }).then(() => "ok", (error: Error) => error))
+    await act(async () => {})
+
+    change({ rerender, unmount })
+    if (reconnects) act(() => webSocketOptions.current?.onConnect?.())
+    let settled: unknown[] = []
+    await act(async () => { settled = await Promise.all(results) })
+
+    expect(sendChatMessageMock.mock.calls.map(call => call[3])).toEqual(expectedIds)
+    expect(settled[0]).toBe(settlesWith === "ok" ? "ok" : failures[settlesWith])
+  })
+
+  const bound = (taskId: number | null, deliveryGeneration = 0, phase = "bound"): ResendOwnership =>
+    ({ loginIdentity: "widget-session:0", boundTaskId: taskId, session: { deliveryGeneration, phase } })
+  it.each<[string, ResendOwnership, ResendOwnership, boolean]>([
+    ["nothing changed", bound(5), bound(5), true],
+    ["another delivery generation", bound(5), bound(5, 1), false],
+    ["a replacement conversation under way", bound(5), bound(5, 0, "replacement_sending"), false],
+    ["a task bound where there was none", bound(null, 0, "unbound"), bound(5), true],
+    ["another bound task", bound(5), bound(6), false],
+    ["a login that was never readable", { ...bound(5), loginIdentity: null }, { ...bound(5), loginIdentity: null }, false],
+  ])("a Session send after %s", (_name, first, now, resends) => {
+    expect(mayResend(first, now)).toBe(resends)
+  })
+
+  it("keeps the resend window at 90 seconds and no shorter than the reconnect chain", () => {
+    expect(RESEND_RECONNECT_DEADLINE_MS).toBe(90_000)
+    expect(RESEND_RECONNECT_DEADLINE_MS).toBeGreaterThanOrEqual(MAX_RECONNECT_CHAIN_MS)
   })
 })

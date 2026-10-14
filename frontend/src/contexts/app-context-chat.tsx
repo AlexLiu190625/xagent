@@ -386,6 +386,7 @@ import {
   type WebSocketConnection,
   type WebSocketConnectionFailure,
 } from "@/hooks/use-websocket"
+import { ResendWaiters, mayResend, sendWithResend, type ResendOwnership } from "./chat-delivery-resend"
 import { generateClientMessageId, getApiUrl, getUploadApiUrl, shouldAutoOpenTaskPreview } from "@/lib/utils"
 import { apiRequest, classifyUploadError, getApiErrorMessage, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
 import { clientErrorTranslationKey, readClientErrorCode, type ClientErrorCode } from "@/lib/client-errors"
@@ -2704,6 +2705,7 @@ export function AppProvider({
     mountedRef.current = true
     return () => {
       mountedRef.current = false
+      resendWaitersRef.current.release(false)
       messageDeliveryCountRef.current = 0
       discardSessionPreAdoptionBuffer()
       rejectSessionResetFlight(
@@ -2807,7 +2809,10 @@ export function AppProvider({
     }
   }, [dispatchSessionConversation, releaseStopControl, requireSessionReload, sessionConnectionIdentity])
 
+  const resendWaitersRef = useRef(new ResendWaiters())
+
   const onConnect = useCallback(() => {
+    resendWaitersRef.current.release(true)
     if (sessionTransport?.history === "none") {
       const connectionIdentity = sessionConnectionIdentityRef.current
       if (connectionIdentity && connectionIdentity === sessionConnectionIdentity) {
@@ -2897,6 +2902,8 @@ export function AppProvider({
     resumeTask: wsResumeTask,
     requestStatus,
     connect,
+    connectionPhase,
+    getLoginIdentity,
   } = useWebSocket({
     taskId: state.taskId || undefined,
     token,
@@ -2957,6 +2964,44 @@ export function AppProvider({
     releaseStopControl()
   }, [canStopTask, releaseStopControl])
 
+  // The Session's host page reconnects it, so only the other transports treat
+  // `lost` as the end of the wait.
+  useEffect(() => {
+    if (sessionTransport === undefined && connectionPhase === "lost") {
+      resendWaitersRef.current.release(false)
+    }
+  }, [connectionPhase, sessionTransport])
+
+  // A send whose connection was lost is sent once more on the next connection
+  // if the login, task and Session state it was sent from still hold.
+  // `beforeAttempt` runs before each attempt.
+  const sendChatWithResend = useCallback((
+    args: Parameters<typeof sendChatMessage>,
+    beforeAttempt?: () => void,
+  ) => {
+    const capture = (): ResendOwnership => ({
+      loginIdentity: getLoginIdentity(),
+      boundTaskId: sessionTransport
+        ? sessionConversationRef.current.taskId
+        : stateRef.current.taskId,
+      session: sessionTransport
+        ? {
+          deliveryGeneration: deliveryGenerationRef.current,
+          phase: sessionConversationRef.current.phase,
+        }
+        : null,
+    })
+    const first = capture()
+    return sendWithResend(
+      () => {
+        beforeAttempt?.()
+        return sendChatMessage(...args)
+      },
+      resendWaitersRef.current,
+      () => mayResend(first, capture()),
+    )
+  }, [getLoginIdentity, sendChatMessage, sessionTransport])
+
   useEffect(() => {
     if (!sessionTransport || isConnected) return
     if (
@@ -3004,13 +3049,13 @@ export function AppProvider({
         targetTaskId: pendingMessage.targetTaskId
       })
       void Promise.resolve(
-        sendChatMessage(
+        sendChatWithResend([
           pendingMessage.message,
           pendingMessage.files,
           pendingMessage.force,
           pendingMessage.clientMessageId,
           pendingMessage.requestId,
-        )
+        ])
       ).then(() => {
         pendingMessage.resolve?.()
         setPendingMessage(current => current === pendingMessage ? null : current)
@@ -3020,7 +3065,7 @@ export function AppProvider({
         setPendingMessage(current => current === pendingMessage ? null : current)
       })
     }
-  }, [isConnected, pendingMessage, sendChatMessage])
+  }, [isConnected, pendingMessage, sendChatWithResend])
 
   // A queued message can only ever flush to its target task. If the task is
   // switched away before that socket connects (e.g. the widget's "New
@@ -7137,12 +7182,13 @@ export function AppProvider({
       }
       beginSessionMessageDelivery()
       try {
-        await sendChatMessage(
-          message,
-          files,
-          config?.force,
-          clientMessageId,
-          requestId,
+        await sendChatWithResend(
+          [message, files, config?.force, clientMessageId, requestId],
+          () => {
+            // A resend runs on the connection that replaced the lost one.
+            sessionDeliveryOwner.connectionIdentity =
+              sessionConnectionIdentityRef.current ?? sessionDeliveryOwner.connectionIdentity
+          },
         )
         if (startsReplacementConversation) {
           if (!replacementSendStillOwned()) {
@@ -7486,7 +7532,7 @@ export function AppProvider({
         taskId: state.taskId, clientMessageId, text: message, files: files ?? [],
       })
       try {
-        await sendChatMessage(message, files, config?.force, clientMessageId, requestId)
+        await sendChatWithResend([message, files, config?.force, clientMessageId, requestId])
       } catch (error) {
         connectorRuntimeDialogRef.current.discardPendingDelivery(clientMessageId)
         throw error
@@ -7579,7 +7625,7 @@ export function AppProvider({
     endSessionMessageDelivery,
     filesDisabled,
     queuePendingMessage,
-    sendChatMessage,
+    sendChatWithResend,
     sessionTransport,
     state.currentTask?.status,
     state.taskId,

@@ -51,6 +51,11 @@ export const deriveConnectionPhase = (facts: ConnectionPhaseFacts): ConnectionPh
 
 const MESSAGE_DUPLICATE_THRESHOLD = 2000 // Same message within 2 seconds is considered duplicate
 const HANDSHAKE_TIMEOUT_MS = 10_000
+// Longest span from the first lost connection to the last attempt giving up:
+// every delay at its jitter ceiling plus a full handshake wait per attempt.
+export const MAX_RECONNECT_CHAIN_MS =
+  RECONNECT_DELAYS_MS.reduce((sum, delay) => sum + delay, 0) * (1 + RECONNECT_JITTER)
+  + RECONNECT_DELAYS_MS.length * HANDSHAKE_TIMEOUT_MS
 const MAX_AUTH_REFRESH_RETRIES = 3
 const SESSION_BINDING_PROTOCOL = "xagent-session-binding-v1"
 const SESSION_TASK_PROTOCOL_PREFIX = "xagent-session-task."
@@ -90,6 +95,7 @@ interface MessageDeliveryErrorOptions {
   retryWithNewId?: boolean
   userFacing?: boolean
   errorCode?: ClientErrorCode | null
+  connectionLost?: boolean
 }
 
 export class MessageDeliveryError extends Error {
@@ -115,6 +121,14 @@ export class MessageDeliveryError extends Error {
    * `rejected` errors get no default code.
    */
   readonly errorCode: ClientErrorCode | null
+  /**
+   * The connection carrying the message ended (closed, errored, declared dead
+   * or replaced by a descriptor change) while it awaited acknowledgement, so
+   * the same id may be sent once more on the next connection. False for a
+   * caller disconnect, an unmount, a delivery-generation change and an
+   * acknowledgement timeout on a connection that is still alive.
+   */
+  readonly connectionLost: boolean
 
   constructor(
     message: string,
@@ -126,6 +140,7 @@ export class MessageDeliveryError extends Error {
     this.disposition = disposition
     this.retryWithNewId = options.retryWithNewId ?? false
     this.userFacing = options.userFacing ?? false
+    this.connectionLost = options.connectionLost ?? false
     this.errorCode = options.errorCode
       ?? (disposition === "outcome_unknown" && !this.userFacing
         ? "message_outcome_unknown"
@@ -465,6 +480,12 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
   // the zone would be rejected as different content while the first command may
   // still be executing. Cleared on either terminal ack below.
   const attemptTimezonesRef = useRef(new Map<string, string | undefined>())
+  // Same key and lifetime: uploaded files of a same-id retry on the same task,
+  // so the retry carries the file ids the first attempt already sent.
+  const attemptUploadsRef = useRef(new Map<string, {
+    taskId: number
+    files: Array<{ file_id: string; name?: string; size?: number; type?: string }>
+  }>())
   const recentMessagesRef = useRef<RecentMessage[]>([])
   const callbacksRef = useRef<WebSocketCallbacks>({
     onConnectionClose,
@@ -516,9 +537,23 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     }
   }, [syncPhase])
 
-  const connectionKeyFor = useCallback((connection: WebSocketConnection) => (
-    `${connection.identity}|${loginKindOf(connection)}:${loginGenerationRef.current}`
+  const loginIdentityFor = useCallback((connection: WebSocketConnection) => (
+    `${loginKindOf(connection)}:${loginGenerationRef.current}`
   ), [])
+
+  // Which login the current connection belongs to; carries no credential.
+  const getLoginIdentity = useCallback(() => (
+    connectionRef.current ? loginIdentityFor(connectionRef.current) : null
+  ), [loginIdentityFor])
+
+  const connectionKeyFor = useCallback((connection: WebSocketConnection) => (
+    `${connection.identity}|${loginIdentityFor(connection)}`
+  ), [loginIdentityFor])
+
+  const releaseAttemptBindings = useCallback((clientMessageId: string) => {
+    attemptTimezonesRef.current.delete(clientMessageId)
+    attemptUploadsRef.current.delete(clientMessageId)
+  }, [])
 
   const rejectPendingDeliveries = useCallback((
     error: Error,
@@ -762,7 +797,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       })
     }
     const wasCurrent = retireOwner(owner, {
-      pendingError: deliveryError("Connection lost before the message was accepted.", "outcome_unknown"),
+      pendingError: deliveryError("Connection lost before the message was accepted.", "outcome_unknown", { connectionLost: true }),
       preparationError: deliveryError("Connection lost before the message was prepared.", "not_sent"),
       close: { code: 1000, reason: "Connection liveness timeout" },
       notifyDisconnect: true,
@@ -910,7 +945,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     const previousOwner = socketOwnerRef.current
     if (previousOwner) {
       retireOwner(previousOwner, {
-        pendingError: deliveryError("Connection replaced before the message was accepted.", "outcome_unknown"),
+        pendingError: deliveryError("Connection replaced before the message was accepted.", "outcome_unknown", { connectionLost: true }),
         preparationError: deliveryError("Connection replaced before the message was prepared.", "not_sent"),
         close: {
           code: 1000,
@@ -961,7 +996,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         if (!isCurrentOwner(owner)) return
         const handshakeError = new Error("WebSocket connection handshake timed out.")
         const wasCurrent = retireOwner(owner, {
-          pendingError: deliveryError("Connection timed out before the message was accepted.", "outcome_unknown"),
+          pendingError: deliveryError("Connection timed out before the message was accepted.", "outcome_unknown", { connectionLost: true }),
           preparationError: deliveryError("Connection timed out before the message was prepared.", "not_sent"),
           close: { code: 1000, reason: "Handshake timeout" },
           notifyDisconnect: true,
@@ -986,7 +1021,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           // A protocol mismatch is reported as a terminal connection failure;
           // suppressing disconnect avoids starting a second recovery path.
           const wasCurrent = retireOwner(owner, {
-            pendingError: deliveryError("Connection closed before the message was accepted.", "outcome_unknown"),
+            pendingError: deliveryError("Connection closed before the message was accepted.", "outcome_unknown", { connectionLost: true }),
             preparationError: deliveryError("Connection closed before the message was prepared.", "not_sent"),
             close: { code: 1002, reason: "WebSocket subprotocol mismatch" },
             notifyDisconnect: false,
@@ -1018,7 +1053,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         }
 
         const wasCurrent = retireOwnerCore(owner, {
-          pendingError: deliveryError("Connection closed before the message was accepted.", "outcome_unknown"),
+          pendingError: deliveryError("Connection closed before the message was accepted.", "outcome_unknown", { connectionLost: true }),
           preparationError: deliveryError("Connection closed before the message was prepared.", "not_sent"),
           notifyDisconnect: false,
         })
@@ -1122,7 +1157,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         console.error("WebSocket error")
         const connectionError = new Error("WebSocket connection failed. The backend WebSocket endpoint may not be available.")
         const wasCurrent = retireOwner(owner, {
-          pendingError: deliveryError("Connection failed before the message was accepted.", "outcome_unknown"),
+          pendingError: deliveryError("Connection failed before the message was accepted.", "outcome_unknown", { connectionLost: true }),
           preparationError: deliveryError("Connection failed before the message was prepared.", "not_sent"),
           close: { code: 1000, reason: "WebSocket transport error" },
           notifyDisconnect: true,
@@ -1186,7 +1221,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
               ) {
                 // Terminal for this id: accepted, or rejected without a
                 // same-id retry. An unknown outcome keeps the binding.
-                attemptTimezonesRef.current.delete(clientMessageId)
+                releaseAttemptBindings(clientMessageId)
               }
               if (data.type === 'message_accepted') {
                 pending.resolve({
@@ -1249,7 +1284,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
               // sockets, and no same-id retry is in flight, so the binding can
               // never be reused; release it. outcome_unknown is excluded so a
               // still-allowed same-id retry keeps its first attempt's zone.
-              attemptTimezonesRef.current.delete(clientMessageId)
+              releaseAttemptBindings(clientMessageId)
             }
             return
           }
@@ -1400,6 +1435,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     connectionKeyFor,
     isCurrentOwner,
     notifyDisconnect,
+    releaseAttemptBindings,
     reportPermanentFailure,
     retireOwner,
     retireOwnerCore,
@@ -1584,7 +1620,10 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           }))
         let uploadedFiles: Array<{ file_id: string; name?: string; size?: number; type?: string }> = []
 
-        if (filesToUpload.length > 0 && uploadFiles) {
+        const cachedUpload = attemptUploadsRef.current.get(clientMessageId)
+        if (cachedUpload?.taskId === currentTaskId && filesToUpload.length > 0) {
+          uploadedFiles = cachedUpload.files
+        } else if (filesToUpload.length > 0 && uploadFiles) {
           uploadedFiles = await Promise.race([
             uploadFiles(filesToUpload, {
               taskId: currentTaskId,
@@ -1661,6 +1700,9 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           ...file,
           file_id: normalizedUploadedFileIds[index],
         }))
+        if (filesToUpload.length > 0) {
+          attemptUploadsRef.current.set(clientMessageId, { taskId: currentTaskId, files: normalizedUploadedFiles })
+        }
         const allFiles = [...preUploadedFiles, ...normalizedUploadedFiles]
         const normalizedFileIds = normalizeUploadFileIds(
           allFiles.map(file => file.file_id),
@@ -1739,7 +1781,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           pendingDeliveriesRef.current.delete(clientMessageId)
           // Nothing reached the server, so a same-id retry may re-resolve the
           // zone freely; drop the binding rather than leak it.
-          attemptTimezonesRef.current.delete(clientMessageId)
+          releaseAttemptBindings(clientMessageId)
           pending.reject(deliveryError(
             error instanceof Error ? error.message : String(error),
             "not_sent",
@@ -1777,7 +1819,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       const disposition =
         error instanceof MessageDeliveryError ? error.disposition : "not_sent"
       if (disposition !== "outcome_unknown") {
-        attemptTimezonesRef.current.delete(clientMessageId)
+        releaseAttemptBindings(clientMessageId)
       }
       if (error instanceof MessageDeliveryError) throw error
       const errorCode = typeof error === "object" && error !== null
@@ -1798,7 +1840,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         preparationsRef.current.delete(clientMessageId)
       }
     }
-  }, [isCurrentOwner, retireDeadOwner, syncPhase, uploadFiles])
+  }, [isCurrentOwner, releaseAttemptBindings, retireDeadOwner, syncPhase, uploadFiles])
 
   const getCurrentTaskConnection = useCallback(() => {
     const connection = connectionRef.current
@@ -1892,7 +1934,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       )
       if (owner && ownsCurrentSocket) {
         retireOwner(owner, {
-          pendingError: deliveryError("Connection replaced before the message was accepted.", "outcome_unknown"),
+          pendingError: deliveryError("Connection replaced before the message was accepted.", "outcome_unknown", { connectionLost: mountedRef.current }),
           preparationError: deliveryError("Message not sent: the connection changed before delivery.", "not_sent"),
           close: {
             code: 1000,
@@ -1904,7 +1946,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       }
       if (ownedDescriptorKey !== null) {
         rejectPendingDeliveries(
-          deliveryError("Connection replaced before the message was accepted.", "outcome_unknown"),
+          deliveryError("Connection replaced before the message was accepted.", "outcome_unknown", { connectionLost: mountedRef.current }),
           pending => pending.descriptorKey === ownedDescriptorKey,
         )
         rejectPreparations(
@@ -1935,6 +1977,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
   return {
     isConnected,
     connectionPhase,
+    getLoginIdentity,
     lastMessage,
     connectionError,
     connect: connectFromCaller,

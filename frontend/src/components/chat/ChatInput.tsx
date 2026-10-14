@@ -157,10 +157,18 @@ export function ChatInput({
   const deliveryAttemptRef = useRef<{ key: string; clientMessageId: string } | null>(null);
   const draftRequestSnapshotRef = useRef<{ requestId: string | undefined } | null>(null);
   const dragDepthRef = useRef(0);
+  const mountedRef = useRef(false);
   const { t } = useI18n();
   const { user } = useAuth();
   const { openFilePreview } = useApp();
   const voiceInput = useVoiceInputControls({ enabled: voiceInputEnabled });
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!autoFocus || !editorRef.current) return;
@@ -913,6 +921,8 @@ export function ChatInput({
       // persistent error. Keep retry state, but do not duplicate its notice.
       if (typeof error === "object" && error !== null
         && (error as { notificationHandled?: unknown }).notificationHandled === true) return;
+      // A resend can fail long after the user left; no toast for a gone input.
+      if (!mountedRef.current) return;
       const errorCode = typeof error === "object" && error !== null
         ? readClientErrorCode((error as { errorCode?: unknown }).errorCode)
         : null;
