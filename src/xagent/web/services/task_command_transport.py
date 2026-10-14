@@ -1541,6 +1541,21 @@ async def _persist_task_command_disposition(
     return persisted
 
 
+def _owner_lease_recovery_settled(runner_id: str, now: datetime) -> Any:
+    """Skip tasks whose RUNNING owner is another runner with an expired lease.
+
+    Such a task needs lease recovery before acquisition. Our own owner can
+    still process commands: expiry alone does not revoke its immutable lease
+    identity.
+    """
+    return or_(
+        Task.runner_id == runner_id,
+        task_status_predicate.ne(TaskStatus.RUNNING),
+        Task.lease_expires_at.is_(None),
+        Task.lease_expires_at >= now,
+    )
+
+
 def _find_command_candidate(
     command_db_id: int | None,
     busy_task_ids: tuple[int, ...] = (),
@@ -1553,21 +1568,37 @@ def _find_command_candidate(
             _claimable_query(db, runner_id=runner_id, command_db_id=command_db_id)
             .filter(
                 TaskExecutionCommand.task_id.notin_(busy_task_ids),
-                # A different expired RUNNING owner needs recovery before
-                # acquisition. Our own owner can still process commands:
-                # expiry alone does not revoke its immutable lease identity.
-                or_(
-                    Task.runner_id == runner_id,
-                    task_status_predicate.ne(TaskStatus.RUNNING),
-                    Task.lease_expires_at.is_(None),
-                    Task.lease_expires_at >= _utc_now(),
-                ),
+                _owner_lease_recovery_settled(runner_id, _utc_now()),
             )
             .first()
         )
         return (
             (int(row.id), int(row.task_id), TaskCommandKind(row.kind)) if row else None
         )
+
+
+def count_claimable_task_commands(db: Session, *, runner_id: str) -> int:
+    """Count the commands the dispatcher could claim, seen from ``runner_id``.
+
+    Uses the dispatcher's own readiness predicates: claim availability, team
+    admission, the earlier-unfinished-command gate and runner routing, plus,
+    with shared execution, the owner lease-recovery filter. Process-local
+    state such as the dispatcher's busy-task list is not applied, so the
+    result describes database state only.
+
+    This is not a backlog depth. Only the first unfinished command of each
+    task passes the filter, and with team admission only the head ticket of
+    each bucket does.
+
+    The query runs in ``db``. Unlike the dispatcher's ``first()`` lookup, a
+    count evaluates the correlated admission and earlier-command subqueries
+    for every candidate row, so callers that need a bound should set a
+    statement timeout on that session.
+    """
+    query = _claimable_query(db, runner_id=runner_id, command_db_id=None)
+    if get_shared_task_execution_enabled():
+        query = query.filter(_owner_lease_recovery_settled(runner_id, _utc_now()))
+    return query.order_by(None).count()
 
 
 async def dispatch_one_task_command(
