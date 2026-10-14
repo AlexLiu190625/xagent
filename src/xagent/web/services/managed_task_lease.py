@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from ..models.database import release_db_connection_if_clean
 from ..models.task import Task, TaskStatus
+from ..models.task_auto_recovery import TaskAutoRecoveryState
 from .assistant_history_safety import (
     ASSISTANT_RESPONSE_MESSAGE_TYPE,
     assistant_history_values_for_persistence,
@@ -71,7 +72,9 @@ def finalize_managed_task_lease_result(
     leave it off, their tasks are never eligible), a FAILED result that reports
     an interruption is decided as the other result paths decide it: a
     recoverable run rests PAUSED with no failure transcript, error or result,
-    and its channel result says it was interrupted (as lease recovery's does).
+    and its channel result says it was interrupted (as lease recovery's does),
+    unless the pause scheduled an automatic resume: then no channel result is
+    written and the channel waits for the resumed run's answer.
     It follows ``settlement_pause_enabled``, as on the other paths. A
     database connectivity failure while deciding raises
     ``InterruptionSettlementDeferred`` after rolling back, keeping the lease
@@ -202,11 +205,19 @@ def finalize_managed_task_lease_result(
             ):
                 db.rollback()
                 return False
+            stored: dict[str, Any] | None = channel_result
             if paused:
-                channel_result = interrupted_channel_result()
-            setattr(
-                command, "result", {**command.result, "channel_result": channel_result}
-            )
+                # A scheduled resume holds the reply: the reader decides from
+                # the recovery row (``_read_channel_result``), and the resumed
+                # run stores its answer here. Anything else is interrupted.
+                stored = (
+                    None
+                    if recorded is not None
+                    and recorded.state == TaskAutoRecoveryState.SCHEDULED.value
+                    else interrupted_channel_result()
+                )
+            if stored is not None:
+                setattr(command, "result", {**command.result, "channel_result": stored})
             if not paused:
                 # A pause keeps the previous output, as lease recovery does.
                 setattr(

@@ -798,7 +798,11 @@ def test_pause_projects_like_lease_recovery(
     right = _full_projection(factory, recovered, recovered_lease)
     if path == "channel":
         # Lease recovery leaves no channel result; a reader derives this one.
-        assert left.pop("channel_result") == interrupted_channel_result()
+        # A scheduled resume (this task's kind is scheduled; a channel task's
+        # is not yet) leaves none either: the channel waits for the resume.
+        assert left.pop("channel_result") == (
+            None if auto_resume == "true" else interrupted_channel_result()
+        )
     _assert_recovers_like_lease_recovery(
         factory,
         paused,
