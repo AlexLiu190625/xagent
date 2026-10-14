@@ -39,6 +39,8 @@ import { getApiUrl, cn } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
 import { ConnectMcpDialog, AppIntegration } from "@/components/mcp/connect-mcp-dialog"
 import { OfficialMcpSettingsDialog } from "@/components/mcp/official-mcp-settings-dialog"
+import { NeedsReconnectBadge } from "@/components/mcp/needs-reconnect-badge"
+import { needsReconnect, type McpConnectionStatus } from "@/lib/mcp-connection-status"
 import { sanitizeConnectorStatusEntry } from "@/lib/team-sharing-sanitizers"
 import { CustomApiForm, MCPServerFormData } from "@/components/mcp/custom-api-form"
 import { CustomMcpForm } from "@/components/mcp/custom-mcp-form"
@@ -94,6 +96,7 @@ export interface MCPServer {
   connected_account?: string
   app_id?: string
   provider?: string
+  connection_status?: McpConnectionStatus | null
   user_env?: Record<string, string>
   can_edit_global?: boolean
   runtime_input_schema?: Record<string, any> | null
@@ -617,6 +620,8 @@ function ToolsPageContent() {
         is_connected: true,
         provider: provider,
         connected_account: server.connected_account,
+        // The settings dialog names its login action Reconnect from this.
+        connection_status: server.connection_status,
         is_custom: false,
         // This reconstruction path is only reached for oauth servers (gated
         // above); set auth_type explicitly so the settings dialog's isKeyBased
@@ -1057,6 +1062,7 @@ function ToolsPageContent() {
                 {t('tools.mcp.sharing.needsConfig')}
               </span>
             )}
+            {needsReconnect(server) && <NeedsReconnectBadge />}
           </div>
         </div>
         <div className="mb-1 truncate text-[9.5px] font-bold uppercase tracking-[0.07em] text-muted-foreground">
