@@ -2482,7 +2482,6 @@ export function AppProvider({
   // endpoint reads a stop frame.
   const taskStopEnabled = transport?.capabilities?.taskStop === "enabled"
   const sessionConversationPhase = state.sessionConversation.phase
-  const isSessionInteractionLocked = sessionConversationPhase === "reload_required"
   const voiceInputEnabled = resolveTransportCapability(
     sessionTransport,
     sessionTransport?.voice,
@@ -2912,12 +2911,6 @@ export function AppProvider({
     && isConnected
     && state.isProcessing
     && sessionConversationPhase === "bound"
-    // Redundant by construction: "bound" and "reload_required" are two
-    // mutually exclusive members of one union (see SessionConversationState),
-    // so the line above already excludes the locked phase. Kept so the rule
-    // "a session that needs a reload offers no stop control" is readable here
-    // instead of being inferred.
-    && !isSessionInteractionLocked
 
   // The control's own state lasts only as long as the control is available,
   // and availability is wider than "this run is over": a task that pauses to
@@ -6665,7 +6658,7 @@ export function AppProvider({
         }
         break
     }
-  }, [clearStopTimeout, trustLegacyErrorProse])
+  }, [releaseStopControl, trustLegacyErrorProse])
 
   const handleSessionMessage = (
     message: WebSocketMessage,
@@ -7892,7 +7885,8 @@ export function AppProvider({
           isConversationResetPending:
             state.sessionConversation.phase === "reset_requested",
           isMessageDeliveryPending: messageDeliveryCount > 0,
-          isSessionInteractionLocked,
+          isSessionInteractionLocked:
+            state.sessionConversation.phase === "reload_required",
           sessionConversationState: state.sessionConversation.phase,
           setTaskId,
           requestStatus,
