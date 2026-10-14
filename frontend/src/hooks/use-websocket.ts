@@ -488,7 +488,8 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     normalizedConnection !== null && autoConnect ? "connecting" : "idle",
   )
 
-  // Called once at the end of every entry point, never from internal helpers or
+  // Called at the end of every entry point (the retry timer callback also calls
+  // it before its stale-attempt early return), never from internal helpers or
   // layout effects, so a half-applied state is not rendered.
   const syncPhase = useCallback(() => {
     if (!mountedRef.current) return

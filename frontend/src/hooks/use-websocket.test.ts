@@ -832,7 +832,7 @@ describe("useWebSocket message delivery", () => {
         disposition: "outcome_unknown",
         errorCode: "message_outcome_unknown",
       })
-      if (frameAfterSend) act(() => socket.receive({ type: "status_update" }))
+      if (frameAfterSend) act(() => socket.receive({ type: "heartbeat" }))
       await act(async () => {
         vi.advanceTimersByTime(30000)
       })
@@ -3944,6 +3944,8 @@ describe("useWebSocket normalized connections", () => {
       it("starts a fresh key when another account takes over the same task", () => {
         const hook = mountChat()
         act(() => socketAt(0).open())
+        // Spend one reconnect slot under the old principal first.
+        act(() => socketAt(0).triggerClose(1006))
 
         authState.user = { id: "user-2" }
         authState.token = "token-2"
