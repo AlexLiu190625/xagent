@@ -968,7 +968,7 @@ def apply_interruption_outcome_no_commit(
     task: Task,
     decision: InterruptionDecision,
     error: str | None,
-) -> None:
+) -> RecordedInterruption | None:
     """The tail every settling path shares once it has written the outcome.
 
     ``task`` must be the row as the caller's settling write left it (PAUSED
@@ -986,13 +986,9 @@ def apply_interruption_outcome_no_commit(
     the transaction, and everything staged so far is flushed first.
     ``error`` becomes the row's operator-only ``last_error``. The row is
     gated by the settlement switch (``disabled`` when it is off for an eligible
-    task and a reason it would pause for).
-
-    With ``XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED`` on, a pause recorded here
-    is scheduled like a lease-expiry pause, and its TriggerRun stays RUNNING
-    for the resumed run to settle. The settling paths announce only their
-    ``task_paused`` for now, not the scheduled resume: a viewer learns of it
-    when the sweeper dispatches it (``resuming``), or from a later stop.
+    task and a reason it would pause for). Returns what was recorded, for the
+    caller to announce after its commit (``SettlementReport.recovery``);
+    ``None`` when the recording was skipped.
     """
 
     if decision.outcome is InterruptionOutcome.FAIL_UNKNOWN_TOOL_EFFECT:
@@ -1028,6 +1024,7 @@ def apply_interruption_outcome_no_commit(
         recorded = snapshot
     if decision.pause:
         _project_interruption_pause_no_commit(db, task, recorded)
+    return recorded
 
 
 def _project_interruption_pause_no_commit(

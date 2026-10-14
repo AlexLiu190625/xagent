@@ -137,7 +137,7 @@ from .task_lease_service import (
     validate_preacquired_task_lease_isolated,
 )
 from .task_runtime import mcp_runtime_authorization_policy_required
-from .task_settlement_report import SettlementReport
+from .task_settlement_report import RecordedInterruption, SettlementReport
 from .task_setup_snapshot import load_task_setup_snapshot_sync
 
 logger = logging.getLogger(__name__)
@@ -1773,8 +1773,10 @@ async def publish_settlement_pause(task_id: int, report: SettlementReport) -> No
 
     Publishes only when ``report`` records a committed pause. The message and
     ``interruption_reason`` say whether the user's own pause request or a
-    system interruption stopped the run. Best effort: the PAUSED row is
-    already committed, so a failed broadcast is only logged.
+    system interruption stopped the run. A pause that automatic recovery
+    planned (``report.recovery``) is then announced as
+    ``task_recovery_update``. Best effort: the PAUSED row is already
+    committed, so a failed broadcast is only logged.
     """
     reason = report.paused_for
     if reason is None:
@@ -1805,19 +1807,25 @@ async def publish_settlement_pause(task_id: int, report: SettlementReport) -> No
             task_id,
             exc_info=True,
         )
+    from .task_auto_resume import publish_recovery_notices, recorded_notice
+
+    notice = recorded_notice(report.recovery)
+    if notice is not None:
+        await publish_recovery_notices((notice,))
 
 
 def _pause_interrupted_run_no_commit(
     db: Session, lease: TaskLease, decision: InterruptionDecision, *, error: str
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any], RecordedInterruption | None] | None:
     """Pause and release an interrupted run with its projections, uncommitted.
 
-    Returns the paused control snapshot, or ``None`` when the fenced write
-    missed. This path keeps its own writer rather than the ORM transition
-    the result paths use: like ``fail_and_release_task_lease_no_commit`` it
-    settles and releases in one fenced UPDATE (RUNNING, exact run and
-    attempt), which is what this function's FAILED branch has always
-    written, and it emits no control-state fact for that write.
+    Returns the paused control snapshot and what was recorded for automatic
+    recovery, or ``None`` when the fenced write missed. This path keeps its
+    own writer rather than the ORM transition the result paths use: like
+    ``fail_and_release_task_lease_no_commit`` it settles and releases in one
+    fenced UPDATE (RUNNING, exact run and attempt), which is what this
+    function's FAILED branch has always written, and it emits no
+    control-state fact for that write.
     """
     from .task_execution_controller import task_control_snapshot
     from .task_execution_event_writer import stage_result_fact_no_commit
@@ -1826,7 +1834,9 @@ def _pause_interrupted_run_no_commit(
         return None
     db.expire_all()
     task = db.query(Task).filter(Task.id == lease.task_id).one()
-    apply_interruption_outcome_no_commit(db, task=task, decision=decision, error=error)
+    recorded = apply_interruption_outcome_no_commit(
+        db, task=task, decision=decision, error=error
+    )
     stage_result_fact_no_commit(db, task, interruption_pause_result())
     logger.warning(
         "task_id=%s run_id=%s component=settlement paused interrupted run "
@@ -1836,7 +1846,7 @@ def _pause_interrupted_run_no_commit(
         decision.reason.value,
         error,
     )
-    return task_control_snapshot(task).as_dict()
+    return task_control_snapshot(task).as_dict(), recorded
 
 
 def settle_task_lease_isolated(
@@ -1907,14 +1917,16 @@ def settle_task_lease_isolated(
                     else None
                 )
                 if decision is not None and decision.pause:
-                    paused_state = _pause_interrupted_run_no_commit(
+                    paused = _pause_interrupted_run_no_commit(
                         settle_db, lease, decision, error=error_message
                     )
-                    if paused_state is not None:
+                    if paused is not None:
+                        paused_state, recorded = paused
                         settle_db.commit()
                         if report is not None:
                             report.control_state = dict(paused_state)
                             report.paused_for = decision.reason
+                            report.recovery = recorded
                         invalidate_task_cache_best_effort(lease.task_id)
                         return True
                     failed = False

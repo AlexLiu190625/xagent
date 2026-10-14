@@ -40,6 +40,7 @@ from tests.web.services.test_persistence_failure_pause import (
     PERSISTENCE_RESULT,
     _assert_no_failure_in_model_context,
     _assert_paused,
+    _assert_recovers_like_lease_recovery,
     _assistant_lines,
     _break_decision,
     _checkpoint,
@@ -139,7 +140,6 @@ from xagent.web.services.task_execution_context_service import (
     TaskExecutionRecoverySnapshot,
 )
 from xagent.web.services.task_execution_event_writer import append_fact_no_commit
-from xagent.web.services.task_lease_recovery import TASK_LEASE_PAUSED_TRIGGER_ERROR
 from xagent.web.services.task_lease_service import (
     TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR,
     CheckpointRecoveryResolution,
@@ -151,7 +151,10 @@ from xagent.web.services.task_orchestrator import (
     TaskTurnPayload,
     settle_task_lease_isolated,
 )
-from xagent.web.services.task_settlement_report import SettlementReport
+from xagent.web.services.task_settlement_report import (
+    RecordedInterruption,
+    SettlementReport,
+)
 
 canonical = canonical_fixture
 engine = engine_fixture
@@ -730,6 +733,11 @@ def test_channel_pause_fills_the_report_after_the_commit(canonical):
     assert report.paused_for is InterruptionReason.LLM_UNAVAILABLE
     assert report.control_state["status"] == "paused"
     assert report.control_state["run_id"] == lease.run_id
+    # Channel tasks are not scheduled yet, so nothing announces this; pin
+    # the snapshot for when the channel hold lands.
+    with factory() as db:
+        row = db.get(TaskAutoRecovery, ids["task"])
+        assert report.recovery == RecordedInterruption.from_row(row)
 
 
 def test_channel_pause_leaves_the_report_empty_when_the_commit_fails(canonical):
@@ -755,7 +763,11 @@ def test_channel_pause_leaves_the_report_empty_when_the_commit_fails(canonical):
 
 
 @PAUSE_CASES
-def test_pause_projects_like_lease_recovery(canonical, path, reason):
+@pytest.mark.parametrize("auto_resume", ["true", "false"])
+def test_pause_projects_like_lease_recovery(
+    canonical, monkeypatch, path, reason, auto_resume
+):
+    monkeypatch.setenv(AUTO_RESUME_SWITCH, auto_resume)
     factory, _tid = canonical
     paused, recovered = _projected_task(factory), _projected_task(factory)
     paused_lease = _prepare_run(factory, paused)
@@ -769,8 +781,13 @@ def test_pause_projects_like_lease_recovery(canonical, path, reason):
     if path == "channel":
         # Lease recovery leaves no channel result; a reader derives this one.
         assert left.pop("channel_result") == interrupted_channel_result()
-    assert left.pop("trigger_run")[1] == TASK_INTERRUPTION_PAUSED_TRIGGER_ERROR
-    assert right.pop("trigger_run")[1] == TASK_LEASE_PAUSED_TRIGGER_ERROR
+    _assert_recovers_like_lease_recovery(
+        factory,
+        paused,
+        recovered,
+        (left.pop("trigger_run"), right.pop("trigger_run")),
+        auto_resume=auto_resume,
+    )
     # Only lease recovery reconciles orphaned delivery rows.
     left.pop("delivery")
     right.pop("delivery")
@@ -780,12 +797,12 @@ def test_pause_projects_like_lease_recovery(canonical, path, reason):
     assert left["assistant"] == []
     assert left["settled"] == [PAUSED_FACT]
     task, row, events = _state(factory, paused["task"])
-    assert (row.reason, row.state) == (reason, "manual")
+    assert row.reason == reason
     assert row.paused_state_version == task.state_version
     assert row.last_error == RESULTS[reason]["error"]
-    assert [(e.event, e.detail["task_status"]) for e in events] == [
+    assert [(e.event, e.detail.get("task_status")) for e in events] == [
         ("interrupted", "paused")
-    ]
+    ] + ([("scheduled", None)] if auto_resume == "true" else [])
     _assert_no_failure_in_model_context(factory, paused["task"])
 
 

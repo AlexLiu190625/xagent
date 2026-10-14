@@ -1049,7 +1049,7 @@ def _trigger_run(factory: sessionmaker, run_id: int) -> TriggerRun:
 
 def _recorded(batch: Any) -> list[Any]:
     """What the batch's committed pauses recorded for automatic recovery."""
-    return [pause.recorded for pause in batch.paused if pause.recorded]
+    return [pause.report.recovery for pause in batch.paused if pause.report.recovery]
 
 
 def _notices(batch: Any) -> list[Any]:
@@ -1081,7 +1081,7 @@ def test_scheduled_resume_keeps_the_trigger_run_running(factory):
         report.control_state["run_id"],
         report.control_state["state_version"],
     ) == ("paused", task.run_id, task.state_version)
-    recorded = pause.recorded
+    recorded = report.recovery
     assert (recorded.task_id, recorded.state, recorded.attempt) == (
         ids[0],
         "scheduled",

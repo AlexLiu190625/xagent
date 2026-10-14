@@ -109,7 +109,7 @@ from .task_lease_service import (
     lock_task_lease_no_commit,
     task_lease_attempt_predicate,
 )
-from .task_settlement_report import SettlementReport
+from .task_settlement_report import RecordedInterruption, SettlementReport
 
 if TYPE_CHECKING:
     from .task_setup_snapshot import TaskSetupSnapshot
@@ -1998,8 +1998,8 @@ def _apply_result_interruption(
     task: Task,
     decision: InterruptionDecision,
     result: dict[str, Any],
-) -> None:
-    apply_interruption_outcome_no_commit(
+) -> RecordedInterruption | None:
+    return apply_interruption_outcome_no_commit(
         db,
         task=task,
         decision=decision,
@@ -2125,6 +2125,7 @@ def _finalize_task_execution_result_isolated(
         # its files.
         control_commit_pending = False
         interruption_pause_reason: InterruptionReason | None = None
+        interruption_recovery: RecordedInterruption | None = None
         final_control_snapshot: TaskControlSnapshot | None = None
         final_task_status = pre_run_status.value
         # Set only when this transaction settles the result as FAILED.
@@ -2235,7 +2236,7 @@ def _finalize_task_execution_result_isolated(
                         status=TaskStatus.PAUSED,
                         expected_run_id=expected_run_id,
                     )
-                    _apply_result_interruption(
+                    interruption_recovery = _apply_result_interruption(
                         finalize_db, task_updated, interruption, result
                     )
                     interruption_pause_reason = interruption.reason
@@ -2398,6 +2399,7 @@ def _finalize_task_execution_result_isolated(
                     else {}
                 ),
                 paused_for=interruption_pause_reason,
+                recovery=interruption_recovery,
             ),
             error_code=(
                 presentation.error_code
@@ -3110,6 +3112,7 @@ def _finalize_resumed_task(
 
         interruption: InterruptionDecision | None = None
         pause_reason: InterruptionReason | None = None
+        pause_recovery: RecordedInterruption | None = None
         if result.get("injection_outcome_unknown") and (
             success or status in {"waiting_for_user", "interrupted"}
         ):
@@ -3189,9 +3192,10 @@ def _finalize_resumed_task(
             # Projects the workforce run itself for a pause.
             if not interruption.pause:
                 sync_workforce_run_status(db, task, final_task_status)
-            _apply_result_interruption(db, task, interruption, result)
+            recorded = _apply_result_interruption(db, task, interruption, result)
             if interruption.pause:
                 pause_reason = interruption.reason
+                pause_recovery = recorded
         else:
             sync_workforce_run_status(db, task, final_task_status)
         if final_task_status in {TaskStatus.COMPLETED, TaskStatus.FAILED}:
@@ -3223,7 +3227,9 @@ def _finalize_resumed_task(
         finalized["final_status"] = final_task_status.value
         # Filled only now that the commit succeeded.
         finalized["report"] = SettlementReport(
-            control_state=control_snapshot.as_dict(), paused_for=pause_reason
+            control_state=control_snapshot.as_dict(),
+            paused_for=pause_reason,
+            recovery=pause_recovery,
         )
         return finalized
     finally:
