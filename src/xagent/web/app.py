@@ -1597,6 +1597,25 @@ async def stop_runtime_performance_monitor(app_instance: FastAPI) -> None:
     await asyncio.to_thread(shutdown_runtime_performance_telemetry)
 
 
+def start_app_process_diagnostics(app_instance: FastAPI) -> None:
+    """Start this process's diagnostics line once per app lifespan; never raises."""
+
+    from .services.process_diagnostics import start_process_diagnostics
+
+    existing = getattr(app_instance.state, "process_diagnostics_task", None)
+    if existing is not None and not existing.done():
+        return
+    app_instance.state.process_diagnostics_task = start_process_diagnostics()
+
+
+async def stop_app_process_diagnostics(app_instance: FastAPI) -> None:
+    from .services.process_diagnostics import stop_process_diagnostics
+
+    task = getattr(app_instance.state, "process_diagnostics_task", None)
+    app_instance.state.process_diagnostics_task = None
+    await stop_process_diagnostics(task)
+
+
 async def _initialize_database_and_admit_runtime(app_instance: FastAPI) -> None:
     """Prepare the database, admit the host, then open runtime work ingress."""
     with _startup_phase("database init"):
@@ -2205,6 +2224,7 @@ async def startup_event() -> None:
     if auto_migrate:
         start_temp_file_cleanup_task(app)
     start_runtime_performance_monitor(app)
+    start_app_process_diagnostics(app)
 
 
 @app.on_event("shutdown")
@@ -2321,23 +2341,28 @@ async def shutdown_event() -> None:
     from .services.task_execution import background_task_manager
     from .services.task_lease_service import wait_for_heartbeat_manager_idle
 
-    await close_task_coordinators()
-    await background_task_manager.shutdown()
-    await wait_for_heartbeat_manager_idle()
-    if get_shared_task_execution_enabled():
-        from .api.websocket import manager
-        from .services.task_event_bridge import stop_task_event_bridge
+    # The diagnostics line keeps reporting while execution drains, and is
+    # stopped even when a shutdown step below fails.
+    try:
+        await close_task_coordinators()
+        await background_task_manager.shutdown()
+        await wait_for_heartbeat_manager_idle()
+        if get_shared_task_execution_enabled():
+            from .api.websocket import manager
+            from .services.task_event_bridge import stop_task_event_bridge
 
-        await manager.stop_stream_reconciliation()
-        await stop_task_event_bridge()
+            await manager.stop_stream_reconciliation()
+            await stop_task_event_bridge()
 
-    from .services.trace_database import close_trace_database_runtime
+        from .services.trace_database import close_trace_database_runtime
 
-    await close_trace_database_runtime()
+        await close_trace_database_runtime()
 
-    # Export task-finalization metrics and post-drain gauges before stopping
-    # telemetry. Exporter shutdown must not delay cancellation of live tasks.
-    await stop_runtime_performance_monitor(app)
+        # Export task-finalization metrics and post-drain gauges before stopping
+        # telemetry. Exporter shutdown must not delay cancellation of live tasks.
+        await stop_runtime_performance_monitor(app)
+    finally:
+        await stop_app_process_diagnostics(app)
 
     from .services.task_runtime import shutdown_task_runtime_hook_executor
 

@@ -1,9 +1,13 @@
 """Test cases for the OpenAI-compatible image model."""
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
+from openai import AsyncOpenAI
+from pydantic import RootModel
 
 from xagent.core.model.image.openai import OpenAIImageModel
 
@@ -23,6 +27,134 @@ def _model(model_name):
     client.images.edit = AsyncMock(return_value=_response())
     model._client = client
     return model, client
+
+
+def _sdk_response_payload():
+    return {
+        "created": 1,
+        "data": [{"b64_json": "aGVsbG8="}],
+        "usage": {
+            "input_tokens": 5,
+            "input_tokens_details": {"image_tokens": 2, "text_tokens": 3},
+            "output_tokens": 7,
+            "output_tokens_details": {"image_tokens": 7, "text_tokens": 0},
+            "total_tokens": 12,
+        },
+    }
+
+
+def _sdk_model(handler):
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    model = OpenAIImageModel(model_name="gpt-image-1", api_key="test-key")
+    model._client = AsyncOpenAI(
+        api_key="test-key",
+        max_retries=0,
+        http_client=http_client,
+    )
+    return model, http_client
+
+
+class _ToolReturn(RootModel[dict]):
+    """The return boundary FunctionTool applies to dict-returning tools."""
+
+
+class TestSdkUsageSerialization:
+    @pytest.mark.asyncio
+    async def test_generate_returns_plain_usage_for_tool_result(self):
+        requests = []
+
+        async def handler(request):
+            requests.append(request)
+            return httpx.Response(200, json=_sdk_response_payload())
+
+        model, http_client = _sdk_model(handler)
+        try:
+            result = await model.generate_image(
+                prompt="a cat",
+                transparent_background=True,
+            )
+        finally:
+            await http_client.aclose()
+
+        assert len(requests) == 1
+        request = json.loads(requests[0].content)
+        assert request["background"] == "transparent"
+        assert request["output_format"] == "png"
+        assert result["image_url"] == "data:image/png;base64,aGVsbG8="
+        assert type(result["usage"]) is dict
+        assert result["usage"] == _sdk_response_payload()["usage"]
+        assert (
+            _ToolReturn.model_validate(result).model_dump()["usage"] == result["usage"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_edit_returns_plain_usage_for_tool_result(self, tmp_path):
+        requests = []
+
+        async def handler(request):
+            requests.append(request)
+            return httpx.Response(200, json=_sdk_response_payload())
+
+        source = tmp_path / "in.png"
+        source.write_bytes(b"stub")
+        model, http_client = _sdk_model(handler)
+        try:
+            result = await model.edit_image(
+                image_url=str(source),
+                prompt="cut out the cat",
+                transparent_background=True,
+            )
+        finally:
+            await http_client.aclose()
+
+        assert len(requests) == 1
+        assert b'name="background"' in requests[0].content
+        assert b"transparent" in requests[0].content
+        assert b'name="output_format"' in requests[0].content
+        assert b"png" in requests[0].content
+        assert result["image_url"] == "data:image/png;base64,aGVsbG8="
+        assert type(result["usage"]) is dict
+        assert result["usage"] == _sdk_response_payload()["usage"]
+        assert (
+            _ToolReturn.model_validate(result).model_dump()["usage"] == result["usage"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_usage_dump_failure_does_not_fail_generated_image(
+        self, caplog, monkeypatch
+    ):
+        events = []
+
+        def record_usage(*args, **kwargs):
+            events.append("metered")
+
+        monkeypatch.setattr(
+            "xagent.core.model.image.openai.record_image_usage", record_usage
+        )
+
+        class BrokenUsage:
+            input_tokens = 5
+            output_tokens = 7
+            total_tokens = 12
+
+            def model_dump(self, **kwargs):
+                events.append("dumped")
+                raise TypeError("broken usage serializer")
+
+        model, client = _model("gpt-image-1")
+        client.images.generate.return_value = SimpleNamespace(
+            data=[SimpleNamespace(url="https://example.com/out.png", b64_json=None)],
+            usage=BrokenUsage(),
+            id="req-1",
+        )
+
+        result = await model.generate_image(prompt="a cat")
+
+        client.images.generate.assert_awaited_once()
+        assert result["image_url"] == "https://example.com/out.png"
+        assert result["usage"] == {}
+        assert events == ["metered", "dumped"]
+        assert "after metering" in caplog.text
 
 
 class TestTransparencyCapability:

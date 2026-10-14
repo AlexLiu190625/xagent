@@ -35,7 +35,7 @@ from .task_lease_service import (
     run_task_lease_heartbeat,
     stop_task_lease_heartbeat,
 )
-from .task_settlement_report import SettlementReport
+from .task_settlement_report import RecordedInterruption, SettlementReport
 from .workforce_runtime import sync_workforce_run_status
 
 logger = logging.getLogger(__name__)
@@ -72,8 +72,8 @@ def finalize_managed_task_lease_result(
     an interruption is decided as the other result paths decide it: a
     recoverable run rests PAUSED with no failure transcript, error or result,
     and its channel result says it was interrupted (as lease recovery's does).
-    It needs ``XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED`` (off by default), as
-    on the other paths. A database connectivity failure while deciding raises
+    It follows ``settlement_pause_enabled``, as on the other paths. A
+    database connectivity failure while deciding raises
     ``InterruptionSettlementDeferred`` after rolling back, keeping the lease
     for TTL recovery; any other decision fault settles as before. Every
     decided interruption is recorded in ``task_auto_recovery``.
@@ -101,6 +101,7 @@ def finalize_managed_task_lease_result(
     from .task_orchestrator import invalidate_task_cache_best_effort
 
     run_error = error_message
+    recorded: RecordedInterruption | None = None
     try:
         interruption: InterruptionDecision | None = None
         if settle_interruption and status == TaskStatus.FAILED:
@@ -154,7 +155,7 @@ def finalize_managed_task_lease_result(
             # Projects the workforce run itself for a pause.
             if not paused:
                 sync_workforce_run_status(db, task, status)
-            apply_interruption_outcome_no_commit(
+            recorded = apply_interruption_outcome_no_commit(
                 db, task=task, decision=interruption, error=run_error
             )
         else:
@@ -226,6 +227,7 @@ def finalize_managed_task_lease_result(
         if report is not None:
             report.control_state = dict(paused_state)
             report.paused_for = interruption.reason
+            report.recovery = recorded
         logger.warning(
             "task_id=%s run_id=%s component=settlement paused interrupted "
             "channel run (reason=%s): %s",

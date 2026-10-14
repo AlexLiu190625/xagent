@@ -1316,7 +1316,7 @@ async def test_dispatch_claim_pool_wait_does_not_block_event_loop(
         session_threads.append(get_ident())
         return SessionLocal()
 
-    monkeypatch.setattr(database_module, "get_session_local", lambda: session_factory)
+    monkeypatch.setattr(database_module, "_SessionLocal", session_factory)
 
     held_connection = engine.connect()
     loop_thread = get_ident()
@@ -1381,7 +1381,7 @@ async def test_command_handler_pool_timeout_does_not_checkout_again(
         )
         task_id = int(task.id)
 
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     held_connections = []
     checkout_probe = ExitStack()
 
@@ -1531,7 +1531,7 @@ async def test_real_final_disposition_pool_timeout_stays_off_event_loop(
             payload={"type": "pause_task"},
         )
 
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     held_connections = []
     checkout_probe = ExitStack()
 
@@ -3166,7 +3166,7 @@ async def test_dispatcher_worker_recovers_from_a_lock_timeout_and_claims_once_re
             payload={"type": "pause_task"},
         )
 
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     monkeypatch.setattr(task_command_transport_module, "DISPATCHER_IDLE_SECONDS", 0.01)
     monkeypatch.setattr(
         task_command_transport_module, "_dispatcher_wakeup", asyncio.Event()
