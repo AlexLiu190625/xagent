@@ -552,8 +552,7 @@ describe("widget session mode", () => {
     "after %i ms of correlated open, admits exactly %i recoveries from the remaining rapid budget",
     async (stableMs, admittedRecoveries) => {
       vi.useFakeTimers()
-      // The server rotates the reconnect token on every exchange; a constant
-      // token would keep one 30 s retry deadline running across the whole window.
+      // A rotating token, as on the server; a constant one keeps a 30 s deadline alive.
       let exchanges = 0
       fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(200, exchangeBody({
         reconnect_token: `rt_${exchanges++}`,
