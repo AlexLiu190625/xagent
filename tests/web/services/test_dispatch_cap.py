@@ -22,9 +22,23 @@ from xagent.web.models.task import Task
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.task_command_terminal_event import TaskCommandTerminalEvent
 from xagent.web.models.user import User
+
+# Imported up front: modules that bind ``get_session_local`` at import time must
+# not first load while a test has replaced it.
+from xagent.web.services import (  # noqa: F401
+    task_command_execution,
+)
 from xagent.web.services import task_command_transport as transport
 from xagent.web.services import task_coordinator_runtime as runtime
-from xagent.web.services import task_execution, task_execution_admission
+from xagent.web.services import (  # noqa: F401
+    task_execution,
+    task_execution_admission,
+    task_orchestrator,
+    task_resume,
+    task_resume_command,
+    task_start,
+    task_start_consumer,
+)
 from xagent.web.services.task_command_transport import (
     TaskCommandDeferred,
     TaskCommandKind,
@@ -548,7 +562,6 @@ async def test_dispatch_reservation_released_after_real_handler(
     from xagent.web.api import websocket as websocket_api
     from xagent.web.models.database import get_session_local
     from xagent.web.models.task import TaskStatus
-    from xagent.web.services import task_command_execution, task_orchestrator
 
     manager = real_host.manager
     release = asyncio.Event()
@@ -611,8 +624,6 @@ async def test_dispatch_reservation_released_after_real_handler(
         )
 
     if kind == "start":
-        from xagent.web.services import task_start
-
         created = await task_start.create_sdk_task(
             agent_id=real_host.agent,
             task_owner_user_id=real_host.user_id,
@@ -678,7 +689,6 @@ async def test_dispatch_reservation_released_after_real_handler(
         from xagent.core.agent.context import ContextManager
         from xagent.core.agent.registry import ExecutionRegistry
         from xagent.core.agent.runner import AgentRunner
-        from xagent.web.services import task_resume, task_resume_command
 
         target = stage(
             None,
