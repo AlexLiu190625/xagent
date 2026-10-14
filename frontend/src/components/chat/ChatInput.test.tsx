@@ -1879,25 +1879,41 @@ describe("ChatInput", () => {
     expect(container.querySelector('button[type="submit"]')).toBeDisabled()
   })
 
-  it("disables the stop square while a stop is in flight", () => {
+  it("keeps the stop square focusable but inert while a stop is in flight", () => {
     const onStop = vi.fn()
-    const { unmount } = render(
-      <ChatInput
-        compact
-        hideConfig
-        hideFileUpload
-        inputValue=""
-        isLoading
-        onInputChange={vi.fn()}
-        onSend={vi.fn()}
-        onStop={onStop}
-        stopState="stopping"
-        taskStatus="running"
-      />
-    )
-    expect(
-      screen.getByRole("button", { name: "widgetSession.stoppingResponse" })
-    ).toBeDisabled()
+    const stopProps = {
+      compact: true,
+      hideConfig: true,
+      hideFileUpload: true,
+      inputValue: "",
+      isLoading: true,
+      onInputChange: vi.fn(),
+      onSend: vi.fn(),
+      onStop,
+      taskStatus: "running",
+    }
+    const { rerender, unmount } = render(<ChatInput {...stopProps} stopState="idle" />)
+    const button = screen.getByRole("button", { name: "widgetSession.stopResponse" })
+    expect(button).not.toHaveAttribute("aria-disabled")
+
+    rerender(<ChatInput {...stopProps} stopState="stopping" />)
+    const pending = screen.getByRole("button", { name: "widgetSession.stoppingResponse" })
+    expect(pending).toBe(button)
+    expect(pending).not.toBeDisabled()
+    expect(pending).toHaveAttribute("aria-disabled", "true")
+    // classList, not a substring match: Button's base classes already contain
+    // "disabled:pointer-events-none", which a substring check would find.
+    expect(pending.classList.contains("pointer-events-none")).toBe(true)
+    expect(pending.classList.contains("opacity-50")).toBe(true)
+
+    // jsdom refuses focus() on a natively disabled button, so this fails if
+    // the stop square goes back to `disabled`.
+    pending.blur()
+    pending.focus()
+    expect(document.activeElement).toBe(pending)
+
+    fireEvent.click(pending)
+    expect(onStop).not.toHaveBeenCalled()
     unmount()
 
     const secondRender = render(
@@ -1963,6 +1979,66 @@ describe("ChatInput", () => {
       />
     )
     expect(screen.queryByText("widgetSession.stopTimedOut")).not.toBeInTheDocument()
+  })
+
+  it("keeps the stop hint region mounted and changes only its text", () => {
+    const commonProps = {
+      compact: true,
+      hideConfig: true,
+      hideFileUpload: true,
+      isLoading: true,
+      onInputChange: vi.fn(),
+      onSend: vi.fn(),
+      onStop: vi.fn(),
+      taskStatus: "running",
+    }
+    const { rerender, unmount } = render(
+      <ChatInput {...commonProps} inputValue="" stopState="stopping" />
+    )
+    const region = screen.getByRole("status")
+    expect(region.textContent).toBe("")
+    expect(region.className).not.toContain("mb-3")
+    expect(
+      screen.getByRole("button", { name: "widgetSession.stoppingResponse" })
+    ).not.toHaveAttribute("aria-describedby")
+
+    rerender(<ChatInput {...commonProps} inputValue="" stopState="timed_out" />)
+    expect(screen.getByRole("status")).toBe(region)
+    expect(region.textContent).toBe("widgetSession.stopTimedOut")
+    expect(region.className).toContain("mb-3")
+    expect(
+      screen.getByRole("button", { name: "widgetSession.stopResponse" })
+    ).toHaveAttribute("aria-describedby", region.id)
+
+    rerender(<ChatInput {...commonProps} inputValue="draft" stopState="timed_out" />)
+    expect(screen.getByRole("status")).toBe(region)
+    expect(region.textContent).toBe("")
+
+    rerender(<ChatInput {...commonProps} inputValue="" stopState="not_sent" />)
+    expect(screen.getByRole("status")).toBe(region)
+    expect(region.textContent).toBe("widgetSession.stopNotSent")
+    unmount()
+
+    const wide = render(
+      <ChatInput
+        {...commonProps}
+        compact={false}
+        inputValue=""
+        stopState="timed_out"
+      />
+    )
+    expect(screen.queryByRole("status")).toBeNull()
+    wide.unmount()
+
+    render(
+      <ChatInput
+        {...commonProps}
+        onStop={undefined}
+        inputValue=""
+        stopState="timed_out"
+      />
+    )
+    expect(screen.queryByRole("status")).toBeNull()
   })
 
   it("swaps the compact submit control for a stop square", () => {
@@ -2114,4 +2190,37 @@ describe("ChatInput", () => {
     ).not.toBeInTheDocument()
     expect(container.querySelector('button[type="submit"]')).toBeInTheDocument()
   })
+
+  it.each([
+    ["a wide composer with onStop", { compact: false, onStop: vi.fn() }],
+    ["a compact composer without onStop", { compact: true, onStop: undefined }],
+  ])(
+    "does not hold sending for a pending stop in %s",
+    async (_label, stopControlProps) => {
+      const onSend = vi.fn()
+      const { container } = render(
+        <ChatInput
+          {...stopControlProps}
+          hideConfig
+          hideFileUpload
+          inputValue="please also do X"
+          isLoading
+          onInputChange={vi.fn()}
+          onSend={onSend}
+          readOnlyConfig
+          stopState="stopping"
+          taskStatus="running"
+        />
+      )
+
+      expect(container.querySelector('button[type="submit"]')).not.toBeDisabled()
+      expect(
+        screen.queryByRole("button", { name: "widgetSession.stoppingResponse" })
+      ).toBeNull()
+
+      fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+      await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1))
+    }
+  )
 })

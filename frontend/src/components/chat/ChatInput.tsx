@@ -677,13 +677,19 @@ export function ChatInput({
       };
     }
   }, [currentInteractionRequestId, hasDraft]);
-  const isStopInFlight = stopState === "stopping";
+  // The stop control exists only in the compact toolbar, and only when the
+  // caller passes onStop. Every stop rule in this composer -- the stop square,
+  // its hints, the "Stopping..." names and the hold on sending -- keys on this
+  // one condition, so a composer without the stop control behaves the same
+  // whatever stopState it is handed.
+  const offersStopControl = compact && !!onStop;
+  const isStopInFlight = offersStopControl && stopState === "stopping";
   const canSubmit = () => {
     const isUploadingFiles = uploadingFiles.size > 0;
     // A stop request the server has not answered yet still owns this turn, so
-    // the composer accepts nothing new until it resolves: the send control
-    // stays in its slot, dimmed and inert, instead of delivering a message
-    // into the run the visitor has just asked to end.
+    // a composer that offers the stop control accepts nothing new until it
+    // resolves: the send control stays in its slot, dimmed and inert, instead
+    // of delivering a message into the run the visitor has just asked to end.
     return hasDraft && !isInputBusy && !isUploadingFiles && !isStopInFlight;
   };
   const canPauseTask =
@@ -703,7 +709,7 @@ export function ChatInput({
   // turn being stopped. The not-sent and timed-out hints both explain that
   // control, so each is gated on exactly the same condition; a hint with no
   // visible control on screen would have nothing to refer to.
-  const showStopButton = compact && !!onStop && !hasDraft;
+  const showStopButton = offersStopControl && !hasDraft;
   // The stop control and the send control take turns in the same slot, so the
   // size and the box styling come from here instead of each of them carrying
   // its own copy: the slot keeps one shape whichever control is on screen.
@@ -711,7 +717,11 @@ export function ChatInput({
     size: "icon" as const,
     className: cn(
       "h-8 w-8 rounded-lg transition-all duration-300",
-      isDimmed && "bg-muted text-muted-foreground/50"
+      // opacity-50 and pointer-events-none repeat what Button's `disabled:`
+      // styles give a natively disabled control, so the stop control -- which
+      // uses aria-disabled to keep focus -- looks and behaves under the
+      // pointer exactly like the send control when either is dimmed.
+      isDimmed && "bg-muted text-muted-foreground/50 opacity-50 pointer-events-none"
     ),
   });
   // Two outcomes, two sentences: "timed_out" means the request went out and
@@ -733,6 +743,13 @@ export function ChatInput({
   const sendButtonLabel = isStopInFlight
     ? t("widgetSession.stoppingResponse")
     : t("common.send");
+  // The hint's status region stays mounted for as long as this composer
+  // offers the stop control, and only its text changes: a status region that
+  // appears together with its text is not announced by many screen readers.
+  // It is empty when there is nothing to say (no hint, or a draft has put the
+  // send control in the stop control's slot), and composers without the stop
+  // control do not render it at all.
+  const stopHintText = showStopHint ? t(stopHintKey) : "";
 
   const handleDragEnter = (e: React.DragEvent<HTMLFormElement>) => {
     if (
@@ -1039,14 +1056,17 @@ export function ChatInput({
   }, [filesDisabled, message, promptHighlightTerms]);
 
   return (
-    <div className="space-y-3">
-      {showStopHint && (
+    // No space-y here: the hint region below is mounted while it is empty, so
+    // it carries its own gap and only while it has text, which keeps the
+    // composer from shifting when the region mounts.
+    <div>
+      {offersStopControl && (
         <p
           id={stopHintId}
           role="status"
-          className="text-xs text-muted-foreground"
+          className={cn("text-xs text-muted-foreground", stopHintText && "mb-3")}
         >
-          {t(stopHintKey)}
+          {stopHintText}
         </p>
       )}
       {/* Input area */}
@@ -1215,8 +1235,15 @@ export function ChatInput({
                 <Button
                   type="button"
                   {...composerActionButtonProps(isStopInFlight)}
-                  onClick={onStop}
-                  disabled={isStopInFlight}
+                  // Not `disabled`: the visitor has just pressed this button,
+                  // and disabling a focused button drops keyboard focus to the
+                  // page. While a stop is pending it stays focusable, reports
+                  // itself unavailable, reads "Stopping...", and ignores presses.
+                  aria-disabled={isStopInFlight || undefined}
+                  onClick={() => {
+                    if (isStopInFlight) return;
+                    onStop?.();
+                  }}
                   aria-label={stopButtonLabel}
                   title={stopButtonLabel}
                   aria-describedby={showStopHint ? stopHintId : undefined}
