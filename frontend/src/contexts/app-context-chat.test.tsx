@@ -7694,6 +7694,32 @@ describe("AppProvider websocket message routing", () => {
     expect(screen.getByTestId("stop-state").textContent).toBe("idle")
   })
 
+  it("withdraws the stop control while the socket is down", () => {
+    const buildTree = () => (
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(), { taskStop: "enabled" })}>
+        <SessionControlsProbe />
+      </AppProvider>
+    )
+    const { rerender } = render(buildTree())
+    act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(1051)))
+    act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+    act(() => getSessionControls().stopTask())
+    expect(screen.getByTestId("stop-state").textContent).toBe("stopping")
+
+    act(() => {
+      wsHarness.isConnected = false
+      rerender(buildTree())
+    })
+    expect(screen.getByTestId("can-stop-task").textContent).toBe("false")
+    expect(screen.getByTestId("stop-state").textContent).toBe("idle")
+
+    act(() => {
+      wsHarness.isConnected = true
+      rerender(buildTree())
+    })
+    expect(screen.getByTestId("can-stop-task").textContent).toBe("true")
+  })
+
   it("keeps the stop intent across a reconnect and a waiting turn", () => {
     const assertNeutral = () => {
       const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{

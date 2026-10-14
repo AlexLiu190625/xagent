@@ -2044,13 +2044,14 @@ describe("ChatInput", () => {
     )
 
     // The draft keeps the send control in the slot, as it always has; what
-    // changes while a stop is outstanding is that the control cannot act.
-    const submitButton = screen.getByRole("button", { name: "common.send" })
+    // changes while a stop is outstanding is that the control cannot act, and
+    // that it says why: it carries the stop control's "Stopping..." name.
+    const submitButton = container.querySelector('button[type="submit"]') as HTMLButtonElement
     expect(submitButton).toBeDisabled()
     expect(submitButton.className).toContain("bg-muted text-muted-foreground/50")
-    expect(
-      screen.queryByRole("button", { name: "widgetSession.stoppingResponse" })
-    ).not.toBeInTheDocument()
+    expect(submitButton).toHaveAccessibleName("widgetSession.stoppingResponse")
+    expect(submitButton).toHaveAttribute("title", "widgetSession.stoppingResponse")
+    expect(screen.getAllByRole("button", { name: "widgetSession.stoppingResponse" })).toEqual([submitButton])
 
     fireEvent.click(submitButton)
     fireEvent.submit(container.querySelector("form") as HTMLFormElement)

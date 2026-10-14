@@ -727,6 +727,12 @@ export function ChatInput({
   const stopButtonLabel = isStopInFlight
     ? t("widgetSession.stoppingResponse")
     : t("widgetSession.stopResponse");
+  // With a draft the send control takes the stop control's slot, and while a
+  // stop is in flight it is inert (see canSubmit). It carries the same
+  // "Stopping..." name the stop control would, so the reason stays on screen.
+  const sendButtonLabel = isStopInFlight
+    ? t("widgetSession.stoppingResponse")
+    : t("common.send");
 
   const handleDragEnter = (e: React.DragEvent<HTMLFormElement>) => {
     if (
@@ -1222,8 +1228,8 @@ export function ChatInput({
                   type="submit"
                   {...composerActionButtonProps(!canSubmit())}
                   disabled={!canSubmit()}
-                  aria-label={t("common.send")}
-                  title={t("common.send")}
+                  aria-label={sendButtonLabel}
+                  title={sendButtonLabel}
                 >
                   {isInputBusy ? (
                     <Sparkles className="h-4 w-4 animate-pulse" />

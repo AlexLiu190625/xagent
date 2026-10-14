@@ -141,12 +141,12 @@ type SessionConversationState =
 // the local timeout above, an agent_error for this task that carries no code
 // or carries external_stop_not_applied, a reconnect (the button's own state is
 // per-connection and cannot outlive the connection it was set on), the
-// control ceasing to be available while the run pauses without ending (see
-// the effect keyed on canStopTask), or a later stop attempt that the socket
-// refuses, which moves the state straight to "not_sent" (see stopTask). That
-// agent_error only returns the control to pressable and does not end the stop
-// intent: it is broadcast to every connection on the task without naming
-// which stop press it answers.
+// control ceasing to be available while the run pauses without ending or
+// while the socket is down (see the effect keyed on canStopTask), or a later
+// stop attempt that the socket refuses, which moves the state straight to
+// "not_sent" (see stopTask). That agent_error only returns the control to
+// pressable and does not end the stop intent: it is broadcast to every
+// connection on the task without naming which stop press it answers.
 export type SessionStopState = "idle" | "stopping" | "timed_out" | "not_sent"
 
 type SessionConversationAction =
@@ -2478,24 +2478,11 @@ export function AppProvider({
   // wrong default here — this must stay off everywhere except the transports
   // that explicitly request it.
   const linksOpenInNewTab = transport?.capabilities?.linksOpenInNewTab === "enabled"
-  // Deliberately not resolveTransportCapability, for the same reason as the
-  // line above: that helper defaults every capability to "enabled" for
-  // non-session transports, which would hand a stop control to the guest
-  // widget and the main app. Neither of their endpoints reads a stop frame,
-  // so the button there would do nothing.
+  // Default-closed for the same reason as the line above: only the session
+  // endpoint reads a stop frame.
   const taskStopEnabled = transport?.capabilities?.taskStop === "enabled"
   const sessionConversationPhase = state.sessionConversation.phase
   const isSessionInteractionLocked = sessionConversationPhase === "reload_required"
-  const canStopTask =
-    taskStopEnabled
-    && state.isProcessing
-    && sessionConversationPhase === "bound"
-    // Redundant by construction: "bound" and "reload_required" are two
-    // mutually exclusive members of one union (see SessionConversationState),
-    // so the line above already excludes the locked phase. Kept so the rule
-    // "a session that needs a reload offers no stop control" is readable here
-    // instead of being inferred.
-    && !isSessionInteractionLocked
   const voiceInputEnabled = resolveTransportCapability(
     sessionTransport,
     sessionTransport?.voice,
@@ -2741,22 +2728,6 @@ export function AppProvider({
     state.taskId,
   ])
 
-  // The control's own state lasts only as long as the control is available,
-  // and availability is wider than "this run is over": a task that pauses to
-  // ask the visitor a question also stops counting as processing, so a stop
-  // still outstanding at that moment loses its "stopping" state and its
-  // unconfirmed-timeout window, and the control returns pressable with no
-  // record of the earlier press. Accepted as it stands: the per-task stop
-  // intent lives in a ref this effect does not touch, so the turn still
-  // renders as a stopped turn when its own terminal frame says it was
-  // interrupted — what is lost is the button's memory of the press, not the
-  // outcome of the stop.
-  useEffect(() => {
-    if (canStopTask) return
-    clearStopTimeout()
-    setStopState("idle")
-  }, [canStopTask, clearStopTimeout])
-
   const boundSessionTaskId =
     state.sessionConversation.phase === "bound"
       ? state.sessionConversation.taskId
@@ -2934,6 +2905,35 @@ export function AppProvider({
     onConnect: onConnect, // Pass the callback
     autoConnect: true,
   })
+
+  const canStopTask =
+    taskStopEnabled
+    // A press while the socket is down can only end in "not_sent".
+    && isConnected
+    && state.isProcessing
+    && sessionConversationPhase === "bound"
+    // Redundant by construction: "bound" and "reload_required" are two
+    // mutually exclusive members of one union (see SessionConversationState),
+    // so the line above already excludes the locked phase. Kept so the rule
+    // "a session that needs a reload offers no stop control" is readable here
+    // instead of being inferred.
+    && !isSessionInteractionLocked
+
+  // The control's own state lasts only as long as the control is available,
+  // and availability is wider than "this run is over": a task that pauses to
+  // ask the visitor a question also stops counting as processing, and a
+  // dropped socket makes the control unavailable too, so a stop still
+  // outstanding at that moment loses its "stopping" state and its
+  // unconfirmed-timeout window, and the control returns pressable with no
+  // record of the earlier press. Accepted as it stands: the per-task stop
+  // intent lives in a ref this effect does not touch, so the turn still
+  // renders as a stopped turn when its own terminal frame says it was
+  // interrupted — what is lost is the button's memory of the press, not the
+  // outcome of the stop.
+  useEffect(() => {
+    if (canStopTask) return
+    releaseStopControl()
+  }, [canStopTask, releaseStopControl])
 
   useEffect(() => {
     if (!sessionTransport || isConnected) return
