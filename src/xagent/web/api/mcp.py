@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import secrets
 import shlex
 import weakref
@@ -95,6 +96,8 @@ from ..services.mcp_oauth import (
     _same_url,
     create_mcp_oauth_http_client,
     discover_mcp_oauth_metadata,
+    mcp_oauth_required_scope,
+    mcp_oauth_required_scope_is_set,
     normalize_mcp_oauth_scope,
     oauth_error_log_payload,
     oauth_error_message,
@@ -494,8 +497,21 @@ class MCPOAuthGrantResponse(BaseModel):
     revoked_at: Optional[str]
 
 
+class MCPOAuthConfigurationError(BaseModel):
+    """A server configuration error that keeps every grant from being usable."""
+
+    code: str
+    message: str
+
+
 class MCPOAuthStatusResponse(BaseModel):
-    """MCP OAuth connection status for the current user."""
+    """MCP OAuth connection status for the current user.
+
+    ``configuration_error`` is set when the server's OAuth configuration
+    cannot say which scope a grant must cover (an invalid ``required_scope``).
+    No grant is listed then, and connecting again does not help until the
+    configuration is fixed.
+    """
 
     server_id: int
     auth_type: Optional[str]
@@ -503,6 +519,7 @@ class MCPOAuthStatusResponse(BaseModel):
     issuer: Optional[str]
     scope: Optional[str]
     grants: list[MCPOAuthGrantResponse]
+    configuration_error: Optional[MCPOAuthConfigurationError] = None
 
 
 # Create router
@@ -678,6 +695,22 @@ def _redirect_after_with_params(
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
 
 
+# A provider's error redirect names its error with a short ASCII code (RFC 6749
+# section 4.1.2.1). Only a value of that shape is passed on or logged.
+_MCP_OAUTH_PROVIDER_ERROR_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+
+
+def _mcp_oauth_provider_error_code(value: str) -> str:
+    """Return the provider's ``error`` when it is code-shaped, else a fallback.
+
+    The provider's free-text ``error_description`` is never read, shown or
+    logged.
+    """
+    if _MCP_OAUTH_PROVIDER_ERROR_RE.fullmatch(value):
+        return value
+    return "unknown_error"
+
+
 def _mcp_oauth_callback_error_redirect(
     flow_state: MCPOAuthFlowState,
     *,
@@ -699,17 +732,22 @@ def _mcp_oauth_callback_error_redirect_for_path(
     *,
     error_code: str,
     message: str,
+    provider_error: str | None = None,
 ) -> RedirectResponse:
-    redirect_path = _redirect_after_with_params(
-        raw_redirect_after,
+    params: tuple[tuple[str, str], ...] = (
+        ("mcp_oauth_error", error_code),
         (
-            ("mcp_oauth_error", error_code),
-            (
-                "mcp_oauth_error_message",
-                oauth_error_message(message, "MCP OAuth authorization failed"),
-            ),
+            "mcp_oauth_error_message",
+            oauth_error_message(message, "MCP OAuth authorization failed"),
         ),
     )
+    if provider_error is not None:
+        # Part of the redirect contract for pages that embed the connect flow
+        # through redirect_after: they read this sanitized code to explain a
+        # provider's refusal without parsing mcp_oauth_error_message. The web
+        # UI only strips it.
+        params += (("mcp_oauth_provider_error", provider_error),)
+    redirect_path = _redirect_after_with_params(raw_redirect_after, params)
     response = RedirectResponse(_mcp_oauth_redirect_after_url(redirect_path))
     _clear_mcp_oauth_state_cookie(response)
     return response
@@ -801,6 +839,47 @@ def _scope_string(scopes: list[str] | tuple[str, ...] | str | None) -> str:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": exc.code, "message": exc.message},
         ) from exc
+
+
+def _validated_mcp_oauth_required_scope(auth_config: dict[str, Any]) -> Any:
+    """Return ``mcp_oauth_required_scope`` or raise its error as a 400."""
+    try:
+        return mcp_oauth_required_scope(auth_config)
+    except MCPOAuthDiscoveryError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
+
+
+def _explicit_mcp_oauth_required_scope(server: MCPServer) -> str:
+    """The ``required_scope`` a new grant for ``server`` must cover, or ``""``.
+
+    Only an explicitly configured ``required_scope`` is enforced when a grant
+    is stored. Without one, a grant narrower than the requested scope is still
+    stored as before; it just does not count as usable. A blank
+    ``required_scope`` counts as none (``mcp_oauth_required_scope_is_set``).
+    """
+    auth_config = cast(Any, server).auth
+    if (
+        not isinstance(auth_config, dict)
+        or auth_config.get("type") != "mcp_oauth"
+        or not mcp_oauth_required_scope_is_set(auth_config)
+    ):
+        return ""
+    return str(_validated_mcp_oauth_required_scope(auth_config))
+
+
+def _mcp_oauth_selected_scope(server: MCPServer) -> str:
+    """The scope grant selection requires of a grant for ``server``, or ``""``.
+
+    It is ``required_scope`` when set and otherwise the whole ``scope``, as
+    ``mcp_oauth_required_scope`` gives it to grant selection and the runtime.
+    """
+    auth_config = cast(Any, server).auth
+    if not isinstance(auth_config, dict) or auth_config.get("type") != "mcp_oauth":
+        return ""
+    return _scope_string(_validated_mcp_oauth_required_scope(auth_config) or "")
 
 
 def _bounded_mcp_oauth_value(
@@ -1798,13 +1877,105 @@ def _trusted_mcp_oauth_owner_key(resource_owner_key: str, *, user_id: int) -> st
     return owner_key
 
 
+def _delete_superseded_mcp_oauth_grants(
+    db: Session,
+    *,
+    flow_state: MCPOAuthFlowState,
+    token_data: dict[str, Any],
+    granted_scope: str,
+    selected_scope: str,
+) -> None:
+    """Delete the owner's other active grants that a new grant replaces.
+
+    The grant lookup hash includes the granted scope, so an authorization that
+    grants a different scope stores a new row next to the earlier one, and
+    both can stay usable. When the new grant covers ``selected_scope``, the
+    scope grant selection requires, the owner's other active grants for the
+    same server, client, issuer and resource are deleted; the row with the
+    granted scope is the one this authorization updates. A new grant that
+    selection would not use replaces nothing, so a grant still in use is kept.
+    Nor does a new grant that cannot be refreshed: when ``token_data`` has no
+    refresh token and its access token expires, the new grant stops working
+    at that expiry, while an earlier grant may still be refreshed. So a grant
+    that cannot be refreshed does not replace one that can.
+    The deletion runs in the callback transaction, so a callback that fails
+    afterwards rolls it back.
+
+    The rows are deleted rather than marked revoked, as when a user removes the
+    server: a revoked row is never swept, and it would keep its lookup hash,
+    which a later refresh of the new grant could collide with. Their tokens
+    are not revoked at the provider: they were issued to the same client for
+    the same account, and a provider may revoke that whole authorization,
+    including the tokens just stored.
+    """
+    if not set(selected_scope.split()).issubset(granted_scope.split()):
+        return
+    if (
+        not token_data.get("refresh_token")
+        and oauth_token_expires_at(token_data) is not None
+    ):
+        return
+    deleted = (
+        db.query(MCPOAuthGrant)
+        .filter(
+            MCPOAuthGrant.mcp_server_id == flow_state.mcp_server_id,
+            MCPOAuthGrant.user_id == flow_state.user_id,
+            MCPOAuthGrant.resource_owner_key == flow_state.resource_owner_key,
+            MCPOAuthGrant.mcp_oauth_client_id == flow_state.mcp_oauth_client_id,
+            MCPOAuthGrant.issuer == flow_state.issuer,
+            MCPOAuthGrant.resource == flow_state.resource,
+            MCPOAuthGrant.status == "active",
+            MCPOAuthGrant.scope != granted_scope,
+        )
+        .delete(synchronize_session="fetch")
+    )
+    if deleted:
+        logger.info(
+            "MCP OAuth callback replaced earlier grants: server_id=%s count=%s",
+            flow_state.mcp_server_id,
+            deleted,
+        )
+
+
 def _upsert_mcp_oauth_grant(
     db: Session,
     *,
     flow_state: MCPOAuthFlowState,
     token_data: dict[str, Any],
+    required_scope: str = "",
+    selected_scope: str = "",
 ) -> MCPOAuthGrant:
+    """Store the granted scope as the provider returned it.
+
+    A token response without ``scope`` was granted the requested scope (RFC
+    6749 section 5.1). When ``required_scope`` is given and the granted scope
+    does not cover it, nothing is stored: such a grant could never be used, so
+    the authorization fails with ``insufficient_scope`` instead of reporting a
+    connection that is not usable, and the owner's existing grants stay as
+    they are. A stored grant that covers ``selected_scope``, the scope grant
+    selection requires, replaces the owner's other active grants for the same
+    client, issuer and resource when the token response has a refresh token
+    or an access token that does not expire
+    (``_delete_superseded_mcp_oauth_grants``).
+    """
     scope = _scope_string(str(token_data.get("scope") or flow_state.scope))
+    missing_scopes = set(required_scope.split()) - set(scope.split())
+    if missing_scopes:
+        logger.warning(
+            "MCP OAuth callback did not connect: server_id=%s "
+            "reason=insufficient_scope missing_scope=%s",
+            flow_state.mcp_server_id,
+            " ".join(sorted(missing_scopes)),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "insufficient_scope",
+                "message": (
+                    "The provider did not grant every scope this connection requires."
+                ),
+            },
+        )
     lookup_hash = mcp_oauth_grant_lookup_hash(
         flow_state.mcp_server_id,
         flow_state.user_id,
@@ -1813,6 +1984,13 @@ def _upsert_mcp_oauth_grant(
         flow_state.issuer,
         flow_state.resource,
         scope,
+    )
+    _delete_superseded_mcp_oauth_grants(
+        db,
+        flow_state=flow_state,
+        token_data=token_data,
+        granted_scope=scope,
+        selected_scope=selected_scope,
     )
     existing = (
         db.query(MCPOAuthGrant)
@@ -6004,12 +6182,24 @@ async def mcp_oauth_callback(
             message=message,
         )
     if error:
+        # The provider refused or failed the authorization before any token
+        # exchange, so report it as the provider's error rather than as a
+        # failed exchange. The redirect carries the code so the page that
+        # receives it can explain it.
+        provider_error = _mcp_oauth_provider_error_code(error)
+        logger.warning(
+            "MCP OAuth callback did not connect: server_id=%s reason=provider_error "
+            "provider_error=%s",
+            flow_identity.server_id,
+            provider_error,
+        )
         return _mcp_oauth_callback_error_redirect_for_path(
             callback_redirect_after,
-            error_code="token_exchange_failed",
-            message=oauth_error_message(
-                {"error": error}, "MCP OAuth authorization failed"
+            error_code="provider_error",
+            message=(
+                f"The provider did not authorize the connection ({provider_error})."
             ),
+            provider_error=provider_error,
         )
     if not code:
         return _mcp_oauth_callback_error_redirect_for_path(
@@ -6053,6 +6243,8 @@ async def mcp_oauth_callback(
             db,
             flow_state=locked_flow_state,
             token_data=token_data,
+            required_scope=_explicit_mcp_oauth_required_scope(lifecycle[0]),
+            selected_scope=_mcp_oauth_selected_scope(lifecycle[0]),
         )
         failure_stage = "commit_grant"
         db.commit()
@@ -6173,6 +6365,9 @@ async def _connect_mcp_oauth_for_owner(
         lifecycle_generation=association_generation,
     )
     auth_config = _get_mcp_oauth_config(server)
+    # A required scope that is not part of the requested scope is a
+    # configuration error; report it before any provider request.
+    _validated_mcp_oauth_required_scope(auth_config)
     discovery = await _discover_mcp_oauth_for_server(server, auth_config)
 
     redirect_uri = (
@@ -6331,7 +6526,25 @@ async def get_mcp_oauth_status(
         issuer=auth_config.get("issuer") if isinstance(auth_config, dict) else None,
         scope=auth_config.get("scope") if isinstance(auth_config, dict) else None,
         grants=[_mcp_oauth_grant_response(grant) for grant in grants],
+        configuration_error=_mcp_oauth_configuration_error(
+            auth_config if isinstance(auth_config, dict) else {}
+        ),
     )
+
+
+def _mcp_oauth_configuration_error(
+    auth_config: dict[str, Any],
+) -> MCPOAuthConfigurationError | None:
+    """The error that makes grant selection match nothing, if there is one.
+
+    The grant selector has no side effects and returns no grant for such a
+    configuration; status reports why instead of only "not connected".
+    """
+    try:
+        mcp_oauth_required_scope(auth_config)
+    except MCPOAuthDiscoveryError as exc:
+        return MCPOAuthConfigurationError(code=exc.code, message=exc.message)
+    return None
 
 
 async def revoke_mcp_oauth_grants_for_owner(
