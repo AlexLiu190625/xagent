@@ -206,6 +206,8 @@ BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS = (
 BACKGROUND_JOB_MAX_RETRIES = "XAGENT_BACKGROUND_JOB_MAX_RETRIES"
 BACKGROUND_JOB_STALE_SECONDS = "XAGENT_BACKGROUND_JOB_STALE_SECONDS"
 BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS = "XAGENT_BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS"
+KB_MILVUS_CLEANUP_INTERVAL_SECONDS = "XAGENT_KB_MILVUS_CLEANUP_INTERVAL_SECONDS"
+KB_MILVUS_CLEANUP_ENABLED = "XAGENT_KB_MILVUS_CLEANUP_ENABLED"
 TASKLESS_UPLOAD_TTL_SECONDS = "XAGENT_TASKLESS_UPLOAD_TTL_SECONDS"
 ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS = "XAGENT_ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS"
 TASK_CLEANUP_RETRY_INTERVAL_SECONDS = "XAGENT_TASK_CLEANUP_RETRY_INTERVAL_SECONDS"
@@ -1466,6 +1468,20 @@ def get_background_job_sweep_interval_seconds() -> int:
         300,
         minimum=30,
     )
+
+
+def get_kb_milvus_cleanup_interval_seconds() -> int:
+    """Return how often the leftover Milvus rows of a Milvus deployment are purged."""
+    return _get_positive_int_env(
+        KB_MILVUS_CLEANUP_INTERVAL_SECONDS,
+        3600,
+        minimum=300,
+    )
+
+
+def get_kb_milvus_cleanup_enabled() -> bool:
+    """Return whether the scheduled leftover Milvus row purge runs at all."""
+    return _get_bool_env(KB_MILVUS_CLEANUP_ENABLED, True)
 
 
 def get_taskless_upload_ttl_seconds() -> int:
