@@ -1,7 +1,7 @@
-"""One runtime diagnostics log line per minute from every execution process.
+"""One runtime diagnostics log line per minute from every app and worker process.
 
-Each process that admits task execution (``combined``, ``web`` and every
-``worker``) logs one INFO line per window, whether or not anything happened::
+Every app process (``combined`` or ``web`` role) and every ``worker`` logs one
+INFO line per window, whether or not anything happened::
 
     runtime diagnostics role=worker pid=4242 window_s=60.0 inflight=1
     resume_inflight=0 started_1m=2 finished_1m=1 ok=1 failed=0 cancelled=0
@@ -12,6 +12,11 @@ appearing for two windows is gone or has a blocked event loop, and an idle
 process is told apart from a dead one only because idle windows are logged
 too. It needs no metrics backend; the OpenTelemetry gauges in
 ``xagent.web.app`` are separate and unchanged.
+
+In shared mode the ``web`` role only accepts work: it does not consume task
+commands (``consumes_task_commands()`` is False), so its line reports
+liveness and event-loop lag only, with ``inflight=0`` and zero execution
+counts.
 
 Field meanings:
 
@@ -26,8 +31,10 @@ Field meanings:
   window. ``failed`` counts runs that raised or whose runner handled a setup
   or run exception; ``ok`` is every other non-cancelled finish, which
   includes paused runs, runs that lost their lease and runs whose agent
-  reported an unsuccessful result without raising. It describes how the
-  execution ended in this process, not the task's stored status.
+  reported an unsuccessful result without raising. A resume run that handles
+  its own failure also counts as ``ok``: the resume path returns normally and
+  has no failure flag. These buckets describe how the execution ended in this
+  process, not the task's stored status.
 - ``window_s``: actual seconds covered; longer than 60 when the loop was
   blocked at flush time.
 - ``gate_held_s``: seconds claim loops waited on a per-process in-flight cap.
@@ -208,7 +215,9 @@ async def stop_process_diagnostics(task: asyncio.Task[None] | None) -> None:
     """Stop the loop and log one final line for the partial last window.
 
     Callers stop it after execution has drained, so the final line reports
-    the executions that shutdown cancelled.
+    the executions that shutdown cancelled. Callers also stop it when a
+    shutdown step from the drain onward raised; the final line then reports
+    what had finished by that point.
     """
 
     if task is None:

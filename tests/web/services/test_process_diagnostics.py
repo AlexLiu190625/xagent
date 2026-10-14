@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import os
+import sys
+from types import ModuleType
 
 import pytest
 
@@ -12,6 +15,7 @@ from xagent.web.services import process_diagnostics
 from xagent.web.services.task_execution import BackgroundTaskManager
 
 LOGGER = process_diagnostics.__name__
+MANAGER_LOGGER = "xagent.web.services.task_execution"
 
 
 @pytest.fixture
@@ -95,7 +99,8 @@ async def test_flush_logs_one_line_per_window(manager, monkeypatch, caplog, busy
         ("flag_raises", "failed"),
     ],
 )
-async def test_finish_outcome_bucket(manager, outcome, bucket):
+async def test_finish_outcome_bucket(manager, caplog, outcome, bucket):
+    caplog.set_level(logging.ERROR, logger=MANAGER_LOGGER)
     handled_failure = outcome.startswith("flagged")
     release = asyncio.Event()
 
@@ -123,6 +128,49 @@ async def test_finish_outcome_bucket(manager, outcome, bucket):
     assert {"ok": ok, "failed": failed, "cancelled": cancelled} == {
         name: int(name == bucket) for name in ("ok", "failed", "cancelled")
     }
+    raised_reports = [
+        r
+        for r in caplog.records
+        if r.getMessage() == "Background execution for task 1 raised"
+    ]
+    assert len(raised_reports) == int(outcome == "raised")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["register", "promote"])
+async def test_unawaited_execution_error_is_logged_once_with_traceback(
+    manager, caplog, entry
+):
+    failure = RuntimeError("boom")
+
+    async def run() -> None:
+        raise failure
+
+    task = asyncio.create_task(run())
+    if entry == "register":
+        manager.register_task(7, task)
+    else:
+        assert manager.reserve_resume(7)
+        manager.register_reserved_resume(7, task, run_id="run-7")
+        manager.promote_resume_task(7, task)
+    caplog.set_level(logging.ERROR)
+    # asyncio.wait does not retrieve the exception: nothing awaits the handle.
+    await asyncio.wait({task})
+    await _settle()
+    del task
+    gc.collect()
+
+    # Every record carrying this exception, from any logger: asyncio's own
+    # "never retrieved" report would be a second one.
+    reports = [
+        (r.name, r.levelno, r.getMessage())
+        for r in caplog.records
+        if r.exc_info is not None and r.exc_info[1] is failure
+    ]
+    assert reports == [
+        (MANAGER_LOGGER, logging.ERROR, "Background execution for task 7 raised")
+    ]
+    assert _counts(manager) == (1, 0, 1, 0)
 
 
 @pytest.mark.asyncio
@@ -318,3 +366,85 @@ async def test_app_lifespan_starts_one_diagnostics_task_and_stops_it(manager):
     await app_module.stop_app_process_diagnostics(test_app)
     assert test_app.state.process_diagnostics_task is None
     assert first.cancelled()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failing_step", [None, "drain"], ids=["drain_returns", "drain_raises"]
+)
+async def test_app_shutdown_stops_diagnostics_after_the_drain(
+    monkeypatch, failing_step
+):
+    from xagent.web import app as app_module
+
+    order: list[str] = []
+
+    async def record(name: str) -> None:
+        order.append(name)
+        if name == failing_step:
+            raise RuntimeError("drain failed")
+
+    class _Channel:
+        enabled = False
+
+        async def stop(self) -> None:
+            return None
+
+    class _Sandboxes:
+        async def cleanup(self) -> None:
+            return None
+
+    for module_name, attribute in (
+        ("xagent.web.channels.telegram.bot", "get_telegram_channel"),
+        ("xagent.web.channels.feishu.bot", "get_feishu_channel"),
+        ("xagent.web.channels.slack.bot", "get_slack_channel"),
+    ):
+        fake = ModuleType(module_name)
+        setattr(fake, attribute, lambda: _Channel())
+        monkeypatch.setitem(sys.modules, module_name, fake)
+    monkeypatch.setattr(app_module, "flush_langfuse", lambda: None)
+    for name in (
+        "stop_runtime_performance_monitor",
+        "stop_orphan_upload_gc_task",
+        "stop_retention_purge_task",
+        "stop_task_cleanup_retry_task",
+        "stop_uploaded_file_recovery_task",
+        "stop_task_auto_resume_task",
+        "stop_task_lease_recovery_task",
+    ):
+        monkeypatch.setattr(app_module, name, lambda _app: record("other"))
+    monkeypatch.setattr(
+        app_module, "stop_app_process_diagnostics", lambda _app: record("diagnostics")
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.task_execution.background_task_manager.shutdown",
+        lambda: record("drain"),
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.task_lease_service.wait_for_heartbeat_manager_idle",
+        lambda: record("other"),
+    )
+    for name in (
+        "_task_command_dispatcher_task",
+        "_sandbox_idle_sweep_task",
+        "_file_storage_startup_sync_task",
+        "_trigger_dispatcher_task",
+        "_migration_task",
+    ):
+        monkeypatch.setattr(app_module, name, None)
+    monkeypatch.setattr(
+        "xagent.web.sandbox_manager.get_sandbox_manager", lambda: _Sandboxes()
+    )
+    app_module.app.state.metadata_rebuild_task = None
+    for attribute in ("telegram_task", "slack_task"):
+        if hasattr(app_module.app.state, attribute):
+            monkeypatch.delattr(app_module.app.state, attribute)
+
+    if failing_step is None:
+        await app_module.shutdown_event()
+    else:
+        with pytest.raises(RuntimeError, match="drain failed"):
+            await app_module.shutdown_event()
+
+    stops = [name for name in order if name != "other"]
+    assert stops == ["drain", "diagnostics"]

@@ -4657,7 +4657,10 @@ class BackgroundTaskManager:
         ``failure_flag`` reports a failure the task handled itself and then
         returned from normally; it is read once, when the task finishes, and
         must be a cheap read of state the task already holds. Without it only
-        an exception escaping the task counts as a failure.
+        an exception escaping the task counts as a failure. The manager logs
+        that exception exactly once, with its traceback, and asyncio adds no
+        second report; a path that also awaits the handle may log it again
+        there.
         """
         if self._shutting_down:
             task.cancel()
@@ -4675,7 +4678,7 @@ class BackgroundTaskManager:
         task.add_done_callback(
             lambda finished: self.cleanup_task(task_id, expected_task=finished)
         )
-        self._count_execution_start(task, failure_flag)
+        self._count_execution_start(task_id, task, failure_flag)
         logger.info(f"Registered background task for task {task_id}")
 
     def resume_admission_state(
@@ -4795,7 +4798,12 @@ class BackgroundTaskManager:
         self._resume_owner_started_at.pop(task_id, None)
 
     def promote_resume_task(self, task_id: int, task: asyncio.Task) -> None:
-        """Make a resume coordinator the task's execution and count it as started."""
+        """Make a resume coordinator the task's execution and count it as started.
+
+        It is counted without a failure flag: only an exception escaping the
+        coordinator counts as failed, and that exception is logged as for
+        ``register_task``.
+        """
 
         if self._shutting_down:
             raise RuntimeError("Background task manager is shutting down")
@@ -4805,11 +4813,12 @@ class BackgroundTaskManager:
                 f"Task {task_id} resume coordinator is not registered or no longer current"
             )
         self.running_tasks[task_id] = task
-        self._count_execution_start(task, None)
+        self._count_execution_start(task_id, task, None)
         logger.info("Promoted resume coordinator for task %s", task_id)
 
     def _count_execution_start(
         self,
+        task_id: int,
         task: asyncio.Task,
         failure_flag: Callable[[], bool] | None,
     ) -> None:
@@ -4818,11 +4827,14 @@ class BackgroundTaskManager:
         self._counted_tasks.add(task)
         self._window_started += 1
         task.add_done_callback(
-            lambda finished: self._count_execution_finish(finished, failure_flag)
+            lambda finished: self._count_execution_finish(
+                task_id, finished, failure_flag
+            )
         )
 
     def _count_execution_finish(
         self,
+        task_id: int,
         task: asyncio.Task,
         failure_flag: Callable[[], bool] | None,
     ) -> None:
@@ -4831,7 +4843,16 @@ class BackgroundTaskManager:
         if task.cancelled():
             self._window_finished_cancelled += 1
             return
-        failed = task.exception() is not None
+        exc = task.exception()
+        if exc is not None:
+            # Reading the exception marks it retrieved, which silences
+            # asyncio's "Task exception was never retrieved" report for a
+            # handle nobody awaits. Report it here instead; this callback is
+            # attached once per task object, so it is reported once.
+            logger.error(
+                "Background execution for task %s raised", task_id, exc_info=exc
+            )
+        failed = exc is not None
         if not failed and failure_flag is not None:
             try:
                 failed = bool(failure_flag())
@@ -4865,7 +4886,9 @@ class BackgroundTaskManager:
         "failed" means the task raised, or reported through its failure flag
         that it handled a failure. "ok" is every other non-cancelled finish,
         which includes runs that paused, lost their lease, or whose agent
-        reported an unsuccessful result without raising.
+        reported an unsuccessful result without raising. A resume coordinator
+        is counted without a failure flag, so a resume run that handles its
+        own failure and returns normally counts as "ok".
         """
 
         counts = (
