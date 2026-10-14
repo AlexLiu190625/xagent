@@ -7734,6 +7734,35 @@ describe("AppProvider websocket message routing", () => {
       expect(getSessionControls().state.stoppedTurnAnchorIds).toEqual([])
     })
 
+    it("keeps the record when the next turn's task_info re-adopts the same task", () => {
+      mountSession(1106)
+      addUserMessage("user-a")
+      stopAndSettle(interruptedTurnMessage(1106))
+      expect(getSessionControls().state.stoppedTurnAnchorIds).toEqual(["user-a"])
+      addUserMessage("user-b")
+      act(() => webSocketOptions.current?.onMessage?.(
+        taskInfoMessage(1106, { status: "pending", state_version: 3 }),
+      ))
+      expect(getSessionControls().state.taskId).toBe(1106)
+      expect(getSessionControls().state.stoppedTurnAnchorIds).toEqual(["user-a"])
+    })
+
+    it("clears the record when a different task is adopted", () => {
+      mountSession(1107)
+      addUserMessage("user-a")
+      stopAndSettle(interruptedTurnMessage(1107))
+      expect(getSessionControls().state.stoppedTurnAnchorIds).toEqual(["user-a"])
+      act(() => getSessionControls().dispatch({
+        type: "ADOPT_SESSION_TASK",
+        payload: {
+          taskId: 2207,
+          task: { id: 2207, title: "Other", status: "running", description: "", created_at: "2026-05-27T05:00:00Z", updated_at: "2026-05-27T05:00:00Z" } as never,
+        },
+      }))
+      expect(getSessionControls().state.taskId).toBe(2207)
+      expect(getSessionControls().state.stoppedTurnAnchorIds).toEqual([])
+    })
+
     it.each([
       { action: "RESET_SESSION_CONVERSATION", dispatchIt: () => getSessionControls().dispatch({ type: "RESET_SESSION_CONVERSATION" }) },
       { action: "RESET_STATE", dispatchIt: () => getSessionControls().dispatch({ type: "RESET_STATE" }) },

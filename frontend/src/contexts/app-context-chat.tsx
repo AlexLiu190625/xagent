@@ -1513,7 +1513,11 @@ function projectAppState(state: AppState, action: AppAction): AppState {
         taskId: action.payload.taskId,
         currentTask: clearStaleAutoRecovery(withDagTerminatedAt(action.payload.task)),
         taskRuntimeExtensions: {},
-        stoppedTurnAnchorIds: [],
+        // The server re-sends task_info for the same task at the start of
+        // every turn, so adopting the task already bound must keep the record
+        // of the turns the visitor stopped; only a different task drops it.
+        stoppedTurnAnchorIds:
+          state.taskId === action.payload.taskId ? state.stoppedTurnAnchorIds : [],
       }
 
     case "MARK_TURN_STOPPED":

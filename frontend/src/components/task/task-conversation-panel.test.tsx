@@ -1792,6 +1792,21 @@ describe("TaskConversationPanel", () => {
       for (const text of FAILURE_TEXTS) expect(screen.queryByText(text)).toBeNull()
     })
 
+    it("re-renders the process as interrupted when only the record changes", () => {
+      appState.messages = [user("u1", 1000), stoppedBubble(2000)]
+      appState.traceEvents = cutOffTurn("a", 1100)
+      appState.stoppedTurnAnchorIds = []
+
+      const { container, rerender } = render(<TaskConversationPanel mode="page" />)
+      expect(container.querySelector("svg[data-icon='interrupted']")).toBeNull()
+
+      appState.stoppedTurnAnchorIds = ["u1"]
+      rerender(<TaskConversationPanel mode="page" />)
+
+      expect(container.querySelector("svg[data-icon='interrupted']")).not.toBeNull()
+      expect(container.querySelector(".text-red-500")).toBeNull()
+    })
+
     it("leaves a later turn running normally after the stopped one", () => {
       appState.messages = [user("u1", 1000), stoppedBubble(2000), user("u2", 3000)]
       appState.traceEvents = [...cutOffTurn("a", 1100), ...cutOffTurn("b", 3100)]

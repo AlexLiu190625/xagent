@@ -467,7 +467,9 @@ export function TaskConversationPanel({
       // A turn the visitor stopped is recorded by the id of the user message
       // that opened it (the group's anchor). That record outranks both the
       // task status and the inferred status, for the current turn and for
-      // earlier ones alike. The turn's own bubble already says it was
+      // earlier ones. It is kept while the same task stays bound and is
+      // cleared when the bound task changes or the conversation or its
+      // messages are reset. The turn's own bubble already says it was
       // interrupted, so the process does not repeat it.
       const isVisitorStoppedGroup =
         !!anchor && state.stoppedTurnAnchorIds.includes(anchor.id)
