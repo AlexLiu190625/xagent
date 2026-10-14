@@ -107,7 +107,7 @@ export const resolveTraceProcessStatus = ({
   if (
     inferred &&
     isStoppedTraceProcessStatus(inferred) &&
-    !(inferred === "interrupted" && explicit)
+    !(inferred === "interrupted" && (explicit === "running" || explicit === "pending"))
   ) {
     return inferred
   }

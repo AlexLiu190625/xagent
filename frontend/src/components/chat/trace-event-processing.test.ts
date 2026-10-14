@@ -147,6 +147,11 @@ describe("processTraceEvents settling of stopped processes", () => {
 
   const unknownError = "traceEventRenderer.unknownError"
   const reported: Settled["actions"][number] = ["failed", "boom"]
+  // Known existing behaviour, pinned as it is today: a running action stays
+  // spinning under a step that has already settled, under "completed" when the
+  // step failed and under "paused" or "waiting_for_user" when the step completed
+  // or failed. A later fix that settles these actions should update the
+  // `spinning` entries in those rows; that change is not a regression.
   const spinning: Settled["actions"][number] = ["running", undefined]
 
   const expectations: Record<string, Record<Shape, Settled>> = {

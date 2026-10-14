@@ -186,12 +186,13 @@ function formatActionContent(value: unknown, filesDisabled = false): string {
 // DAGNode.data: this status is derived locally from the trace event stream
 // itself (dag_step_start/dag_step_end/etc.), not read off StepExecution, and
 // mixes in whole-TASK states ("paused", "waiting_for_user") that the other
-// three don't carry at the step level. A step only becomes "interrupted" when
-// the whole process ends as "interrupted"; no trace event marks a single step
-// as interrupted. No trace event distinguishes a step being
-// "clarification_invalidated" from plain "running" either, so a step in that
-// state renders here as "running" rather than reporting an unknown/wrong
-// status.
+// three don't carry at the step level. A step only becomes "interrupted"
+// through the process-level status in processTraceEvents' final settling
+// pass. A per-step "interrupted" status is ignored: a react_task_end whose
+// data.status is "interrupted" still marks its step "completed". No trace
+// event distinguishes a step being "clarification_invalidated" from plain
+// "running", so a step in that state renders here as "running" rather than
+// reporting an unknown/wrong status.
 interface ProcessedStep {
   stepId: string;
   stepName: string;
@@ -937,7 +938,6 @@ export function processTraceEvents(
           runningActions.forEach((action) => {
             action.status = 'interrupted';
           });
-          return;
         }
       });
     }

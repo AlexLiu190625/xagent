@@ -1587,7 +1587,6 @@ describe("TaskConversationPanel", () => {
 
     beforeEach(() => {
       realChatMessage.enabled = true
-      Element.prototype.scrollIntoView = vi.fn()
     })
 
     it("keeps a resumed run spinning after a pause in the same turn", () => {
