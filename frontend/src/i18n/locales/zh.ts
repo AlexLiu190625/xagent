@@ -4677,6 +4677,7 @@ const zh = {
       agentExecutionLoadError: "无法加载 Agent 执行详情。",
       retryAgentExecution: "重试",
       placeholder: "告诉 {manager} 要做什么...",
+      messageRequired: "请先输入消息再开始运行。",
       inputHint: "你的团队负责人将自动协调各子 Agent。",
       readyTitle: "随时准备就绪",
       readyDesc: "发送消息，{manager} 将协调团队完成你的请求。",
