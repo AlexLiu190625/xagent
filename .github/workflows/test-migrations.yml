@@ -130,6 +130,10 @@ on:
       - 'tests/web/services/test_marker_residue_postgresql.py'
       - 'tests/web/services/interaction_marker_shared.py'
       - 'src/xagent/web/services/task_resume.py'
+      - 'src/xagent/web/api/websocket.py'
+      - 'src/xagent/web/services/agent_service_manager.py'
+      - 'src/xagent/web/models/agent.py'
+      - 'tests/web/services/task_lease_shared.py'
       - 'src/xagent/web/models/chat_message.py'
       - 'src/xagent/web/models/user.py'
       - 'src/xagent/web/models/user_oauth.py'
@@ -346,6 +350,10 @@ jobs:
             tests/web/services/test_marker_residue_postgresql.py
             tests/web/services/interaction_marker_shared.py
             src/xagent/web/services/task_resume.py
+            src/xagent/web/api/websocket.py
+            src/xagent/web/services/agent_service_manager.py
+            src/xagent/web/models/agent.py
+            tests/web/services/task_lease_shared.py
             src/xagent/web/models/chat_message.py
             src/xagent/web/models/user.py
             src/xagent/web/models/user_oauth.py
@@ -794,7 +802,7 @@ jobs:
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         shell: bash
         run: |
-          pytest tests/web/services/test_marker_residue_postgresql.py -m postgresql -rs 2>&1 | tee pg.log
+          pytest tests/web/services/test_marker_residue_postgresql.py -m postgresql 2>&1 | tee pg.log
           if grep -Eq '(^|[^0-9])[0-9]+ skipped' pg.log; then
             echo "::error::Postgres-only cells were skipped; skipped is not passed"
             exit 1
