@@ -22,7 +22,11 @@ from pydantic.alias_generators import to_camel
 
 from xagent.core.model.chat.basic.claude import _fix_pydantic_schema_for_claude
 from xagent.core.tools.adapters.vibe import mcp_adapter as mcp_adapter_module
-from xagent.core.tools.adapters.vibe.config import MCPUnavailableSummary
+from xagent.core.tools.adapters.vibe.config import (
+    MCPFailurePolicy,
+    MCPUnavailableSummary,
+    RequiredMCPUnavailableError,
+)
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
 from xagent.core.tools.adapters.vibe.mcp_adapter import (
     _FIELD_TEXT_MAX_CHARS,
@@ -46,7 +50,10 @@ from xagent.core.tools.adapters.vibe.mcp_adapter import (
     load_mcp_tools_as_agent_tools,
     redact_urls_in_text,
 )
-from xagent.core.tools.adapters.vibe.mcp_tools import _build_mcp_load_summary
+from xagent.core.tools.adapters.vibe.mcp_tools import (
+    _build_mcp_load_summary,
+    _finish_mcp_setup,
+)
 from xagent.core.tools.adapters.vibe.tool_naming_limits import (
     MAX_AGENT_TOOL_NAME_LENGTH,
 )
@@ -5691,125 +5698,11 @@ def _assert_load_warnings_are_safe(records: list[logging.LogRecord]) -> None:
         assert all(arg is None or type(arg) in (int, str) for arg in record.args)
 
 
-def _nested_group_with_outer_context() -> BaseException:
-    outer = ExceptionGroup("outer", [ExceptionGroup("tg", [_status_error(403)])])
-    outer.__context__ = RuntimeError("handled earlier")
-    return outer
+async def _load_with_failing_session(
+    monkeypatch, build, *, fail_in: str = "session"
+) -> tuple[Any, AsyncMock]:
+    """Load one stdio server where the ``fail_in`` step raises ``build()`` on every attempt."""
 
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("fail_in", "build", "error_type", "cause_type", "status_code"),
-    [
-        pytest.param(
-            "session",
-            lambda: ExceptionGroup("tg", [_status_error(403)]),
-            "ExceptionGroup",
-            "HTTPStatusError",
-            403,
-            id="group-403",
-        ),
-        pytest.param(
-            "session",
-            lambda: httpx.ConnectError("refused"),
-            "ConnectError",
-            "ConnectError",
-            None,
-            id="plain-connect-error",
-        ),
-        pytest.param(
-            "session",
-            lambda: ExceptionGroup("tg", [httpx.ConnectError("refused")]),
-            "ExceptionGroup",
-            "ConnectError",
-            None,
-            id="group-connect-error",
-        ),
-        pytest.param(
-            "session",
-            lambda: _nested_group_with_outer_context(),
-            "ExceptionGroup",
-            "HTTPStatusError",
-            403,
-            id="nested-group-ignores-outer-context",
-        ),
-        pytest.param(
-            "session",
-            lambda: ExceptionGroup("tg", [RuntimeError("first"), _status_error(403)]),
-            "ExceptionGroup",
-            "RuntimeError",
-            None,
-            id="first-member-wins",
-        ),
-        pytest.param(
-            "session",
-            lambda: _StatusCarrier(status_code=403),
-            "_StatusCarrier",
-            "_StatusCarrier",
-            403,
-            id="non-httpx-status-code",
-        ),
-        pytest.param(
-            "session",
-            lambda: _StatusCarrier(status_code="403"),
-            "_StatusCarrier",
-            "_StatusCarrier",
-            None,
-            id="status-code-str",
-        ),
-        pytest.param(
-            "session",
-            lambda: _StatusCarrier(status_code=True),
-            "_StatusCarrier",
-            "_StatusCarrier",
-            None,
-            id="status-code-bool",
-        ),
-        pytest.param(
-            "session",
-            lambda: _StatusCarrier(status_code=999),
-            "_StatusCarrier",
-            "_StatusCarrier",
-            None,
-            id="status-code-out-of-range",
-        ),
-        pytest.param(
-            "session",
-            lambda: _StatusCarrier(status_code=403.0),
-            "_StatusCarrier",
-            "_StatusCarrier",
-            None,
-            id="status-code-float",
-        ),
-        pytest.param(
-            "session",
-            lambda: _RaisingStatusGetter("boom"),
-            "_RaisingStatusGetter",
-            "_RaisingStatusGetter",
-            None,
-            id="status-getter-raises",
-        ),
-        pytest.param(
-            "session",
-            lambda: _StatusCarrier(status_code=HTTPStatus.FORBIDDEN),
-            "_StatusCarrier",
-            "_StatusCarrier",
-            403,
-            id="http-status-enum",
-        ),
-        pytest.param(
-            "list_tools",
-            lambda: ExceptionGroup("tg", [_status_error(403)]),
-            "ExceptionGroup",
-            "HTTPStatusError",
-            403,
-            id="list-tools-403",
-        ),
-    ],
-)
-async def test_direct_load_failure_reports_cause_and_status(
-    monkeypatch, caplog, fail_in, build, error_type, cause_type, status_code
-):
     class FakeSession:
         async def initialize(self):
             return None
@@ -5823,21 +5716,111 @@ async def test_direct_load_failure_reports_cause_and_status(
     async def fake_load_tools(_session):
         raise build()
 
+    sleep = AsyncMock()
     monkeypatch.setattr(mcp_adapter_module, "create_session", fake_create_session)
     monkeypatch.setattr(mcp_adapter_module, "load_mcp_tools", fake_load_tools)
-    monkeypatch.setattr(mcp_adapter_module.asyncio, "sleep", AsyncMock())
-    caplog.set_level("WARNING")
-
+    monkeypatch.setattr(mcp_adapter_module.asyncio, "sleep", sleep)
     result = await load_mcp_tools_as_agent_tools(
         {"broken": {"transport": "stdio", "command": "python", "args": []}}
     )
+    return result, sleep
+
+
+def _backoff_sleeps(sleep: AsyncMock) -> int:
+    return len([call for call in sleep.await_args_list if call.args == (1,)])
+
+
+def _nested_group_with_outer_context() -> BaseException:
+    outer = ExceptionGroup("outer", [ExceptionGroup("tg", [_status_error(403)])])
+    outer.__context__ = RuntimeError("handled earlier")
+    return outer
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("build", "error_type", "cause_type", "status_code"),
+    [
+        pytest.param(
+            lambda: httpx.ConnectError("refused"),
+            "ConnectError",
+            "ConnectError",
+            None,
+            id="plain-connect-error",
+        ),
+        pytest.param(
+            lambda: ExceptionGroup("tg", [httpx.ConnectError("refused")]),
+            "ExceptionGroup",
+            "ConnectError",
+            None,
+            id="group-connect-error",
+        ),
+        pytest.param(
+            lambda: ExceptionGroup("tg", [RuntimeError("first"), _status_error(403)]),
+            "ExceptionGroup",
+            "RuntimeError",
+            None,
+            id="first-member-wins",
+        ),
+        pytest.param(
+            lambda: _StatusCarrier(status_code=403),
+            "_StatusCarrier",
+            "_StatusCarrier",
+            403,
+            id="non-httpx-status-code",
+        ),
+        pytest.param(
+            lambda: _StatusCarrier(status_code="403"),
+            "_StatusCarrier",
+            "_StatusCarrier",
+            None,
+            id="status-code-str",
+        ),
+        pytest.param(
+            lambda: _StatusCarrier(status_code=True),
+            "_StatusCarrier",
+            "_StatusCarrier",
+            None,
+            id="status-code-bool",
+        ),
+        pytest.param(
+            lambda: _StatusCarrier(status_code=999),
+            "_StatusCarrier",
+            "_StatusCarrier",
+            None,
+            id="status-code-out-of-range",
+        ),
+        pytest.param(
+            lambda: _StatusCarrier(status_code=403.0),
+            "_StatusCarrier",
+            "_StatusCarrier",
+            None,
+            id="status-code-float",
+        ),
+        pytest.param(
+            lambda: _RaisingStatusGetter("boom"),
+            "_RaisingStatusGetter",
+            "_RaisingStatusGetter",
+            None,
+            id="status-getter-raises",
+        ),
+        pytest.param(
+            lambda: _StatusCarrier(status_code=HTTPStatus.FORBIDDEN),
+            "_StatusCarrier",
+            "_StatusCarrier",
+            403,
+            id="http-status-enum",
+        ),
+    ],
+)
+async def test_direct_load_failure_reports_cause_and_status(
+    monkeypatch, caplog, build, error_type, cause_type, status_code
+):
+    caplog.set_level("WARNING")
+
+    result, _ = await _load_with_failing_session(monkeypatch, build)
 
     (failure,) = result.failures
-    assert failure.phase is (
-        MCPFailurePhase.SESSION_START
-        if fail_in == "session"
-        else MCPFailurePhase.LIST_TOOLS
-    )
+    assert failure.phase is MCPFailurePhase.SESSION_START
     assert failure.error_type == error_type
     assert failure.cause_type == cause_type
     assert failure.status_code == status_code
@@ -5996,16 +5979,16 @@ def _real_client_connection(transport: str, status_code: int) -> dict[str, Any]:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("transport", "status_code", "phase"),
+    ("transport", "status_code", "handshake_phase", "rejected"),
     [
-        ("streamable_http", 401, MCPFailurePhase.INITIALIZE),
-        ("streamable_http", 403, MCPFailurePhase.INITIALIZE),
-        ("streamable_http", 503, MCPFailurePhase.INITIALIZE),
-        ("sse", 401, MCPFailurePhase.SESSION_START),
+        ("streamable_http", 401, MCPFailurePhase.INITIALIZE, True),
+        ("streamable_http", 403, MCPFailurePhase.INITIALIZE, True),
+        ("streamable_http", 503, MCPFailurePhase.INITIALIZE, False),
+        ("sse", 401, MCPFailurePhase.SESSION_START, True),
     ],
 )
 async def test_real_client_load_failure_shapes(
-    monkeypatch, caplog, transport, status_code, phase
+    monkeypatch, caplog, transport, status_code, handshake_phase, rejected
 ):
     # The backoff patch below replaces ``asyncio.sleep`` process-wide; anyio
     # binds that name when its asyncio backend is first imported.
@@ -6020,12 +6003,221 @@ async def test_real_client_load_failure_shapes(
     )
 
     (failure,) = result.failures
-    assert failure.phase is phase
+    assert failure.phase.value == (
+        "auth_rejected" if rejected else handshake_phase.value
+    )
     assert failure.error_type == "ExceptionGroup"
     assert failure.cause_type == "HTTPStatusError"
     assert failure.status_code == status_code
-    assert failure.attempts == 3
-    assert len([c for c in sleep.await_args_list if c.args == (1,)]) == 2
+    expected_attempts = 1 if rejected else 3
+    assert failure.attempts == expected_attempts
+    assert _backoff_sleeps(sleep) == expected_attempts - 1
     records = _load_warnings(caplog)
-    assert len(records) == 3
+    assert len(records) == expected_attempts
+    assert f"during {handshake_phase.value}" in records[-1].getMessage()
     _assert_load_warnings_are_safe(records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fail_in", "build", "status_code", "logged_phase"),
+    [
+        pytest.param(
+            "session",
+            lambda: ExceptionGroup("tg", [_status_error(401)]),
+            401,
+            "session_start",
+            id="group-401",
+        ),
+        pytest.param(
+            "session",
+            lambda: ExceptionGroup("tg", [_status_error(403)]),
+            403,
+            "session_start",
+            id="group-403",
+        ),
+        pytest.param(
+            "session",
+            _nested_group_with_outer_context,
+            403,
+            "session_start",
+            id="nested-group-ignores-outer-context",
+        ),
+        pytest.param(
+            "list_tools",
+            lambda: ExceptionGroup("tg", [_status_error(403)]),
+            403,
+            "list_tools",
+            id="list-tools-403",
+        ),
+    ],
+)
+async def test_direct_load_auth_rejection_is_not_retried(
+    monkeypatch, caplog, fail_in, build, status_code, logged_phase
+):
+    caplog.set_level("WARNING")
+
+    result, sleep = await _load_with_failing_session(
+        monkeypatch, build, fail_in=fail_in
+    )
+
+    (failure,) = result.failures
+    assert failure.phase.value == "auth_rejected"
+    assert failure.error_type == "ExceptionGroup"
+    assert failure.cause_type == "HTTPStatusError"
+    assert failure.status_code == status_code
+    assert failure.attempts == 1
+    assert _backoff_sleeps(sleep) == 0
+    (record,) = _load_warnings(caplog)
+    message = record.getMessage()
+    assert message.startswith("Giving up loading tools")
+    assert f"during {logged_phase} after 1 attempt(s)" in message
+    assert f"cause=HTTPStatusError status={status_code}" in message
+    _assert_load_warnings_are_safe([record])
+
+
+@pytest.mark.asyncio
+async def test_direct_load_stops_at_a_rejection_after_a_retryable_failure(
+    monkeypatch, caplog
+):
+    caplog.set_level("WARNING")
+    errors = iter(
+        [
+            ExceptionGroup("tg", [_status_error(503)]),
+            ExceptionGroup("tg", [_status_error(401)]),
+        ]
+    )
+
+    result, sleep = await _load_with_failing_session(monkeypatch, lambda: next(errors))
+
+    (failure,) = result.failures
+    assert failure.phase.value == "auth_rejected"
+    assert failure.status_code == 401
+    assert failure.attempts == 2
+    assert _backoff_sleeps(sleep) == 1
+    assert len(_load_warnings(caplog)) == 2
+
+
+def test_auth_rejected_phase_is_public():
+    assert MCPUnavailableSummary.from_values("x", "auth_rejected").reason == (
+        "auth_rejected"
+    )
+    assert mcp_adapter_module.mcp_load_failure_message(
+        MCPFailurePhase.AUTH_REJECTED
+    ) == ("MCP server refused the connection.")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "policy", [MCPFailurePolicy.BEST_EFFORT, MCPFailurePolicy.STRICT]
+)
+async def test_auth_rejected_failure_reaches_summary_but_not_model(policy):
+    failure = MCPServerLoadFailure(
+        server_name="Rejected",
+        phase=MCPFailurePhase.AUTH_REJECTED,
+        error_type="ExceptionGroup",
+        attempts=1,
+        cause_type="HTTPStatusError",
+        status_code=403,
+    )
+    healthy = SimpleNamespace(name="healthy_tool", source_server="healthy")
+    unavailable = ToolFactory._unavailable_mcp_tools_from_load_failures(
+        (failure,), {"Rejected": {"id": 7}}
+    )
+    tools = [*unavailable, healthy]
+    summary = _build_mcp_load_summary(
+        [{"name": "Rejected"}, {"name": "healthy"}], tools
+    )
+    emitted: list[Any] = []
+
+    class _Config:
+        def get_mcp_failure_policy(self):
+            return policy
+
+        async def emit_mcp_load_summary(self, summary):
+            emitted.append(summary)
+
+    config = _Config()
+
+    if policy is MCPFailurePolicy.STRICT:
+        with pytest.raises(RequiredMCPUnavailableError) as exc_info:
+            await _finish_mcp_setup(config, summary, tools)
+        assert exc_info.value.summaries[0].reason == "auth_rejected"
+        assert str(exc_info.value) == (
+            "Required MCP servers are unavailable: auth_rejected (HTTP 403)."
+        )
+        assert "Rejected" not in str(exc_info.value)
+    else:
+        returned = await _finish_mcp_setup(config, summary, tools)
+        assert returned == [healthy]
+
+    (emitted_summary,) = emitted
+    (entry,) = emitted_summary.failures
+    assert (entry.reason, entry.status_code) == ("auth_rejected", 403)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "policy", [MCPFailurePolicy.BEST_EFFORT, MCPFailurePolicy.STRICT]
+)
+async def test_registry_path_hides_auth_rejected_placeholder_after_summary(
+    monkeypatch, policy
+):
+    from xagent.core.tools.adapters.vibe import mcp_tools
+
+    healthy = SimpleNamespace(name="healthy_tool", source_server="healthy")
+    load = AsyncMock(
+        return_value=mcp_adapter_module.MCPLoadResult(
+            tools=(healthy,),
+            loaded_servers=("healthy",),
+            failures=(
+                MCPServerLoadFailure(
+                    server_name="Rejected",
+                    phase=MCPFailurePhase.AUTH_REJECTED,
+                    error_type="ExceptionGroup",
+                    attempts=1,
+                    cause_type="HTTPStatusError",
+                    status_code=403,
+                ),
+            ),
+        )
+    )
+    monkeypatch.setattr(mcp_adapter_module, "load_mcp_tools_as_agent_tools", load)
+    emitted: list[Any] = []
+
+    class _Config:
+        async def get_mcp_server_configs(self):
+            return [
+                {
+                    "id": id_,
+                    "name": name,
+                    "transport": "sse",
+                    "config": {"url": f"https://example.invalid/{name}"},
+                }
+                for id_, name in ((1, "Rejected"), (2, "healthy"))
+            ]
+
+        def get_sandbox(self):
+            return None
+
+        def get_mcp_failure_policy(self):
+            return policy
+
+        async def emit_mcp_load_summary(self, summary):
+            emitted.append(summary)
+
+    if policy is MCPFailurePolicy.STRICT:
+        with pytest.raises(RequiredMCPUnavailableError) as exc_info:
+            await mcp_tools.create_mcp_tools(_Config())
+        assert exc_info.value.summaries[0].reason == "auth_rejected"
+        assert str(exc_info.value) == (
+            "Required MCP servers are unavailable: auth_rejected (HTTP 403)."
+        )
+    else:
+        tools = await mcp_tools.create_mcp_tools(_Config())
+        assert tools == [healthy]
+
+    (summary,) = emitted
+    (entry,) = summary.failures
+    assert (entry.server_name, entry.reason) == ("Rejected", "auth_rejected")
+    assert (entry.cause_type, entry.status_code) == ("HTTPStatusError", 403)

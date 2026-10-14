@@ -580,6 +580,36 @@ class TestToolFactoryMCPIntegration:
         assert result["error"] == "MCP server could not be started."
         assert "BearerSecretError" not in repr(result)
 
+    @pytest.mark.parametrize(
+        "policy", [MCPFailurePolicy.BEST_EFFORT, MCPFailurePolicy.STRICT]
+    )
+    @patch("xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools")
+    async def test_create_mcp_tools_hides_auth_rejected_placeholder(
+        self, mock_load_mcp, policy, test_db, sample_stdio_config
+    ):
+        manager = DatabaseMCPServerManager(test_db)
+        manager.add_server(manager.create_config(**sample_stdio_config))
+        mock_load_mcp.return_value = MCPLoadResult(
+            tools=(),
+            loaded_servers=(),
+            failures=(
+                MCPServerLoadFailure(
+                    server_name=sample_stdio_config["name"],
+                    phase=MCPFailurePhase.AUTH_REJECTED,
+                    error_type="ExceptionGroup",
+                    cause_type="HTTPStatusError",
+                    status_code=403,
+                ),
+            ),
+        )
+
+        if policy is MCPFailurePolicy.STRICT:
+            with pytest.raises(RequiredMCPUnavailableError) as exc_info:
+                await ToolFactory.create_mcp_tools(test_db, mcp_failure_policy=policy)
+            assert exc_info.value.summaries[0].reason == "auth_rejected"
+        else:
+            assert await ToolFactory.create_mcp_tools(test_db) == []
+
     @patch("xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools")
     async def test_create_mcp_tools_enforces_strict_failure_policy(
         self, mock_load_mcp, test_db, sample_stdio_config

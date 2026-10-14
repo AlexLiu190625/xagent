@@ -1059,6 +1059,7 @@ class ToolFactory:
         failure_code: object = None,
         cause_type: str | None = None,
         status_code: int | None = None,
+        exposed_to_model: bool = True,
     ) -> Tool:
         """Build the shared server-scoped unavailable MCP tool."""
         from ....agent.result import normalize_tool_failure_code
@@ -1075,6 +1076,7 @@ class ToolFactory:
             kwargs["message"] = message
         kwargs["cause_type"] = cause_type
         kwargs["status_code"] = status_code
+        kwargs["exposed_to_model"] = exposed_to_model
         return UnavailableMCPTool(**kwargs)
 
     @staticmethod
@@ -1112,7 +1114,10 @@ class ToolFactory:
         cause, so the setup summary names the exception class whenever the
         loader caught one.
         """
-        from .mcp_adapter import mcp_load_failure_message
+        from .mcp_adapter import (
+            mcp_load_failure_exposed_to_model,
+            mcp_load_failure_message,
+        )
 
         tools: list[Tool] = []
         seen_servers: set[str] = set()
@@ -1133,6 +1138,7 @@ class ToolFactory:
                     message=mcp_load_failure_message(failure.phase),
                     cause_type=failure.cause_type or failure.error_type,
                     status_code=failure.status_code,
+                    exposed_to_model=mcp_load_failure_exposed_to_model(failure.phase),
                 )
             )
         return tools
@@ -1148,6 +1154,8 @@ class ToolFactory:
             MCPUnavailableSummary.from_values(
                 tool.server_name,
                 tool.unavailability_reason,
+                cause_type=tool.unavailability_cause_type,
+                status_code=tool.unavailability_status_code,
             )
             for tool in tools
             if isinstance(tool, UnavailableMCPTool)
@@ -1401,7 +1409,10 @@ class ToolFactory:
                 load_user_env_overrides,
                 load_user_env_sources,
             )
-            from .mcp_adapter import load_mcp_tools_as_agent_tools
+            from .mcp_adapter import (
+                load_mcp_tools_as_agent_tools,
+                model_visible_mcp_tools,
+            )
 
             query = db.query(MCPServer)
             if user_id:
@@ -1520,7 +1531,7 @@ class ToolFactory:
                 mcp_failure_policy,
                 cls._mcp_unavailable_summaries(unavailable_tools),
             )
-            return unavailable_tools + list(load_result.tools)
+            return model_visible_mcp_tools(unavailable_tools + list(load_result.tools))
         except ConnectorRuntimeError:
             raise
         except RequiredMCPUnavailableError:
