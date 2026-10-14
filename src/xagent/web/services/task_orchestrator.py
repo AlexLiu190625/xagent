@@ -1893,8 +1893,9 @@ def settle_task_lease_isolated(
     undecidable run raises ``InterruptionSettlementDeferred``, retaining the
     lease for TTL recovery as above. When automatic recovery does not apply
     the run fails as without ``interruption``: with a settlement switch off
-    by the very same statements; for an ineligible task with the same outcome but
-    after an extra row lock and eligibility read. Every decided interruption
+    by the very same statements; for an ineligible task, or unusable model
+    output on a task kind automatic resume does not schedule, with the same
+    outcome but after an extra row lock and eligibility read. Every decided interruption
     is recorded in ``task_auto_recovery``. ``report``, when supplied,
     also receives the recorded reason of a committed pause.
 

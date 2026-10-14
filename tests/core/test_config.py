@@ -3798,7 +3798,7 @@ _AUTO_RESUME_INT_SETTINGS = [
 ]
 
 _AUTO_RESUME_BOOL_SETTINGS = [
-    ("TASK_INFRA_FAILURE_PAUSE_ENABLED", "get_task_infra_failure_pause_enabled", False),
+    ("TASK_INFRA_FAILURE_PAUSE_ENABLED", "get_task_infra_failure_pause_enabled", True),
     ("TASK_AUTO_RESUME_ENABLED", "get_task_auto_resume_enabled", True),
 ]
 
@@ -3833,6 +3833,7 @@ class TestTaskAutoRecoveryConfig:
         assert env_var == f"XAGENT_{const}"
         read = getattr(config, getter)
 
+        monkeypatch.delenv(config.TASK_AUTO_RESUME_ENABLED, raising=False)
         monkeypatch.delenv(env_var, raising=False)
         assert read() is default
 
@@ -3856,6 +3857,27 @@ class TestTaskAutoRecoveryConfig:
             with caplog.at_level(logging.WARNING, logger="xagent.config"):
                 assert read() is default
             assert env_var in caplog.text
+
+    @pytest.mark.parametrize("auto_resume", [True, False])
+    def test_infra_failure_pause_follows_auto_resume_unless_set(
+        self, monkeypatch, auto_resume
+    ):
+        monkeypatch.setenv(config.TASK_AUTO_RESUME_ENABLED, str(auto_resume).lower())
+        read = config.get_task_infra_failure_pause_enabled
+
+        for unset in (None, "", "maybe"):
+            if unset is None:
+                monkeypatch.delenv(
+                    config.TASK_INFRA_FAILURE_PAUSE_ENABLED, raising=False
+                )
+            else:
+                monkeypatch.setenv(config.TASK_INFRA_FAILURE_PAUSE_ENABLED, unset)
+            assert read() is auto_resume
+
+        monkeypatch.setenv(config.TASK_INFRA_FAILURE_PAUSE_ENABLED, "true")
+        assert read() is True
+        monkeypatch.setenv(config.TASK_INFRA_FAILURE_PAUSE_ENABLED, "false")
+        assert read() is False
 
     def test_example_env_documents_every_setting(self):
         example = (Path(config.__file__).parents[2] / "example.env").read_text()
