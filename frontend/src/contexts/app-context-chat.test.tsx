@@ -7654,6 +7654,101 @@ describe("AppProvider websocket message routing", () => {
     ).toEqual(["failed"])
   })
 
+  describe("stopped-turn record", () => {
+    const addUserMessage = (id: string, timestamp = "2026-05-27T05:00:01Z") =>
+      act(() => getSessionControls().dispatch({
+        type: "ADD_MESSAGE",
+        payload: { id, role: "user", content: `question ${id}`, timestamp },
+      }))
+    const stopAndSettle = (frame: TestWebSocketMessage) => {
+      act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+      act(() => getSessionControls().stopTask())
+      act(() => webSocketOptions.current?.onMessage?.(frame))
+    }
+    const mountSession = (taskId: number) => {
+      const view = render(
+        <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(), { taskStop: "enabled" })}>
+          <SessionControlsProbe />
+          <StateProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(taskId)))
+      return view
+    }
+
+    it("records the turn the visitor stopped under the user message that opened it", () => {
+      mountSession(1101)
+      addUserMessage("user-first", "2026-05-27T05:00:01Z")
+      addUserMessage("user-second", "2026-05-27T05:00:03Z")
+      stopAndSettle(interruptedTurnMessage(1101))
+      expect(getSessionControls().state.stoppedTurnAnchorIds).toEqual(["user-second"])
+    })
+
+    it("records the turn even when the terminal frame names a message and adds no bubble", () => {
+      mountSession(1102)
+      addUserMessage("user-only")
+      stopAndSettle({
+        ...interruptedTurnMessage(1102),
+        ...({ message_id: "execution_message_1102" } as Record<string, unknown>),
+      })
+      expect(
+        (JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{ role: string }>)
+          .filter((message) => message.role === "assistant")
+      ).toEqual([])
+      expect(getSessionControls().state.stoppedTurnAnchorIds).toEqual(["user-only"])
+    })
+
+    it("records nothing, and keeps the stopped bubble, when no user message opened the turn", () => {
+      mountSession(1103)
+      stopAndSettle(interruptedTurnMessage(1103))
+      expect(getSessionControls().state.stoppedTurnAnchorIds).toEqual([])
+      expect(screen.getByTestId("messages").textContent).toContain(STOPPED_TURN_TEXT)
+    })
+
+    it.each([
+      {
+        cell: "a coded interruption with no local stop",
+        stop: false,
+        frame: (taskId: number) => interruptedTurnMessage(taskId),
+      },
+      {
+        cell: "a different terminal failure while a stop is pending",
+        stop: true,
+        frame: (taskId: number) => ({
+          ...taskErrorMessage(taskId, "This connector needs a runtime credential."),
+          ...({ code: "runtime_secret_unavailable" } as Record<string, unknown>),
+        }),
+      },
+      {
+        cell: "a codeless terminal failure while a stop is pending",
+        stop: true,
+        frame: (taskId: number) => taskErrorMessage(taskId, "Task execution failed."),
+      },
+    ])("does not record the turn for $cell", ({ stop, frame }) => {
+      const taskId = 1104
+      mountSession(taskId)
+      addUserMessage("user-failed")
+      act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+      if (stop) act(() => getSessionControls().stopTask())
+      act(() => webSocketOptions.current?.onMessage?.(frame(taskId)))
+      expect(getSessionControls().state.stoppedTurnAnchorIds).toEqual([])
+    })
+
+    it.each([
+      { action: "RESET_SESSION_CONVERSATION", dispatchIt: () => getSessionControls().dispatch({ type: "RESET_SESSION_CONVERSATION" }) },
+      { action: "RESET_STATE", dispatchIt: () => getSessionControls().dispatch({ type: "RESET_STATE" }) },
+      { action: "CLEAR_MESSAGES", dispatchIt: () => getSessionControls().dispatch({ type: "CLEAR_MESSAGES" }) },
+      { action: "SET_TASK_ID to another task", dispatchIt: () => getSessionControls().dispatch({ type: "SET_TASK_ID", payload: 99 }) },
+    ])("clears the record on $action", ({ dispatchIt }) => {
+      mountSession(1105)
+      addUserMessage("user-reset")
+      stopAndSettle(interruptedTurnMessage(1105))
+      expect(getSessionControls().state.stoppedTurnAnchorIds).toEqual(["user-reset"])
+      act(() => { dispatchIt() })
+      expect(getSessionControls().state.stoppedTurnAnchorIds).toEqual([])
+    })
+  })
+
   // How each way a stop can fail to take effect reaches this page today. A
   // stop that finds the turn already over is answered with no code; one the
   // server could not confirm carries external_stop_not_applied. Neither is the

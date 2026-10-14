@@ -20,6 +20,7 @@ const appState = vi.hoisted(() => ({
   isProcessing: false,
   isHistoryLoading: false,
   taskId: 42,
+  stoppedTurnAnchorIds: [] as string[],
   filePreview: { isOpen: false, fileId: "", fileName: "", viewMode: "preview" },
   dagExecution: null,
   steps: [],
@@ -301,6 +302,7 @@ describe("TaskConversationPanel", () => {
     realChatMessage.enabled = false
     appState.messages = []
     appState.traceEvents = []
+    appState.stoppedTurnAnchorIds = []
     appState.currentTask = null
     appState.taskRuntimeExtensions = {}
     appState.taskId = 42
@@ -1687,6 +1689,120 @@ describe("TaskConversationPanel", () => {
       expect(icon?.querySelector("line[x1='9'][y1='15'][x2='15'][y2='9']")).not.toBeNull()
       expect(stepTwo.querySelector(".animate-spin")).toBeNull()
       expect(container.querySelector(".animate-spin")).toBeNull()
+    })
+  })
+  describe("a turn the visitor stopped", () => {
+    const traceEvent = (id: string, type: string, stepId: string, timestamp: number, data: Record<string, unknown> = {}) => (
+      { event_id: id, event_type: type, step_id: stepId, timestamp: String(timestamp), data }
+    )
+    const failedTask = {
+      id: "42",
+      title: "Task",
+      description: "Task",
+      status: "failed",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+    }
+    const STOPPED_BUBBLE = "This response was interrupted."
+    const user = (id: string, timestamp: number) => ({ id, role: "user", content: `question ${id}`, timestamp: String(timestamp) })
+    const stoppedBubble = (timestamp: number) => ({
+      id: "msg-stopped-1",
+      role: "assistant",
+      content: STOPPED_BUBBLE,
+      timestamp: String(timestamp),
+      status: "completed",
+      isResult: true,
+    })
+    // A turn cut off while a tool was still running: no terminal trace event.
+    const cutOffTurn = (prefix: string, start: number) => [
+      traceEvent(`${prefix}-start`, "react_task_start", `react_${prefix}`, start, { pattern: "ReActPattern" }),
+      traceEvent(`${prefix}-tool`, "tool_execution_start", `react_${prefix}`, start + 100, { tool_name: "web_search" }),
+    ]
+    const FAILURE_TEXTS = ["traceEventRenderer.unknownError", "common.errors.unknown"]
+
+    beforeEach(() => {
+      realChatMessage.enabled = true
+      appState.currentTask = failedTask
+    })
+
+    it("shows the stopped turn's process as interrupted, not as a red failure", () => {
+      appState.messages = [user("u1", 1000), stoppedBubble(2000)]
+      appState.traceEvents = cutOffTurn("a", 1100)
+      appState.stoppedTurnAnchorIds = ["u1"]
+
+      const { container } = render(<TaskConversationPanel mode="page" />)
+
+      const icon = container.querySelector("svg[data-icon='interrupted']")
+      expect(icon).not.toBeNull()
+      expect(icon?.querySelector("line[x1='9'][y1='15'][x2='15'][y2='9']")).not.toBeNull()
+      expect(container.querySelector(".text-red-500")).toBeNull()
+      expect(container.querySelector(".animate-spin")).toBeNull()
+      for (const text of FAILURE_TEXTS) expect(screen.queryByText(text)).toBeNull()
+    })
+
+    it("still shows a failure for a turn the visitor did not stop", () => {
+      appState.messages = [user("u1", 1000), stoppedBubble(2000)]
+      appState.traceEvents = cutOffTurn("a", 1100)
+      appState.stoppedTurnAnchorIds = []
+
+      const { container } = render(<TaskConversationPanel mode="page" />)
+
+      expect(container.querySelector("svg[data-icon='interrupted']")).toBeNull()
+      expect(container.querySelector(".text-red-500")).not.toBeNull()
+    })
+
+    it("marks the turn when no bubble was added for its terminal frame", () => {
+      appState.messages = [user("u1", 1000)]
+      appState.traceEvents = cutOffTurn("a", 1100)
+      appState.stoppedTurnAnchorIds = ["u1"]
+
+      const { container } = render(<TaskConversationPanel mode="page" />)
+
+      expect(container.querySelector("svg[data-icon='interrupted']")).not.toBeNull()
+      expect(container.querySelector(".text-red-500")).toBeNull()
+      for (const text of FAILURE_TEXTS) expect(screen.queryByText(text)).toBeNull()
+    })
+
+    it("shows the interruption once, in the turn's own bubble", () => {
+      appState.messages = [user("u1", 1000), stoppedBubble(2000)]
+      appState.traceEvents = cutOffTurn("a", 1100)
+      appState.stoppedTurnAnchorIds = ["u1"]
+
+      render(<TaskConversationPanel mode="page" />)
+
+      expect(screen.getAllByText(STOPPED_BUBBLE)).toHaveLength(1)
+      // The step icon's screen-reader label carries the same words; only the
+      // visible "Interrupted" line must be absent.
+      expect(
+        screen
+          .queryAllByText("agent.layout.status.interrupted")
+          .filter((element) => !element.classList.contains("sr-only"))
+      ).toHaveLength(0)
+    })
+
+    it("says the turn was interrupted when there is no trace and no bubble to say it", () => {
+      appState.messages = [user("u1", 1000)]
+      appState.traceEvents = []
+      appState.stoppedTurnAnchorIds = ["u1"]
+
+      const { container } = render(<TaskConversationPanel mode="page" />)
+
+      expect(screen.getByText("agent.layout.status.interrupted")).toBeInTheDocument()
+      expect(container.querySelector(".text-red-500")).toBeNull()
+      for (const text of FAILURE_TEXTS) expect(screen.queryByText(text)).toBeNull()
+    })
+
+    it("leaves a later turn running normally after the stopped one", () => {
+      appState.messages = [user("u1", 1000), stoppedBubble(2000), user("u2", 3000)]
+      appState.traceEvents = [...cutOffTurn("a", 1100), ...cutOffTurn("b", 3100)]
+      appState.stoppedTurnAnchorIds = ["u1"]
+      appState.currentTask = { ...failedTask, status: "running" }
+
+      const { container } = render(<TaskConversationPanel mode="page" />)
+
+      expect(container.querySelectorAll("svg[data-icon='interrupted']")).toHaveLength(1)
+      expect(container.querySelector(".animate-spin")).not.toBeNull()
+      expect(container.querySelector(".text-red-500")).toBeNull()
     })
   })
 })
