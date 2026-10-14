@@ -2,6 +2,8 @@ import React from "react"
 import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
+import type { SessionStopState } from "@/contexts/app-context-chat"
+
 type PanelTraceEvent = {
   event_id?: string
   event_type?: string
@@ -34,7 +36,7 @@ const appControls = vi.hoisted(() => ({
   voiceInputEnabled: true,
   taskControlsEnabled: true,
   canStopTask: false,
-  stopState: "idle" as const,
+  stopState: "idle" as SessionStopState,
   isConversationResetPending: false,
   isMessageDeliveryPending: false,
   isSessionInteractionLocked: false,
@@ -603,6 +605,20 @@ describe("TaskConversationPanel", () => {
     rerender(<TaskConversationPanel mode="page" />)
 
     expect(chatInputProps.current?.onStop).toBeUndefined()
+  })
+
+  it("forwards the stop state to the composer", () => {
+    appControls.canStopTask = true
+    appControls.stopState = "stopping"
+
+    const { rerender } = render(<TaskConversationPanel mode="page" />)
+
+    expect(chatInputProps.current?.stopState).toBe("stopping")
+
+    appControls.stopState = "timed_out"
+    rerender(<TaskConversationPanel mode="page" />)
+
+    expect(chatInputProps.current?.stopState).toBe("timed_out")
   })
 
   it("does not offer a retained waiting request identity from a different task", () => {
