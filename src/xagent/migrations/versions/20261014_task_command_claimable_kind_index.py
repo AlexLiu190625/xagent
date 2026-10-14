@@ -1,25 +1,15 @@
 """add partial index on task_execution_commands for claimable commands by kind
 
-The dispatcher looks for the oldest claimable ``resume_input`` command before
-it falls back to the oldest claimable command of any kind. That lookup filters
-on ``kind`` and orders by ``id``, and only ever concerns commands that are
-still ``pending`` or ``processing``; every other row is settled history. A
-partial index scoped to the claimable statuses keeps the lookup cheap however
-large the history grows.
+The dispatcher's reply-first lookup filters ``kind`` and orders by ``id`` over
+commands that are still ``pending`` or ``processing``; a partial index scoped
+to those statuses keeps it cheap as settled commands accumulate.
 
-On PostgreSQL, ``CREATE INDEX`` alone takes a SHARE lock that blocks writes to
-the table for as long as the build runs, and every command enqueue and every
-status change writes to it. This mirrors 20260927_pending_delivery_index.py:
-build the index with ``CONCURRENTLY`` outside the migration's own transaction
-(``autocommit_block()``), detect and rebuild a leftover ``INVALID`` index from
-an interrupted attempt, rebuild an index whose columns or predicate differ, and
-keep the operation idempotent. Non-PostgreSQL dialects keep the plain,
-transactional ``CREATE INDEX`` path.
+On PostgreSQL the index is built ``CONCURRENTLY`` in ``autocommit_block()`` so
+writes are not blocked, and an ``INVALID`` index or one whose columns or
+predicate differ is rebuilt. Other dialects use a plain ``CREATE INDEX``.
 
-Accepted cost: a partial index whose predicate reads ``status`` disables
-PostgreSQL's HOT (heap-only tuple) update optimization for a command row whose
-``status`` changes, so each transition (pending, processing, completed or
-failed) costs one extra index maintenance for that row.
+Accepted cost: the predicate reads ``status``, so each status change of a
+command row is a non-HOT update with one extra index maintenance.
 
 Revision ID: 20261014_task_cmd_claimable_kind
 Revises: 20261012_zendesk_oauth
@@ -46,23 +36,11 @@ INDEX_COLUMNS = ("kind", "id")
 REQUIRED_COLUMNS = (*INDEX_COLUMNS, "status")
 PREDICATE = sa.text("status IN ('pending', 'processing')")
 
-POSTGRES_INDEX_VALIDITY_SQL = sa.text(
+# A same-named (kind, id) index with a stale or missing partial predicate has
+# the same column list as a correct one, so the deparsed predicate is read too.
+POSTGRES_INDEX_STATE_SQL = sa.text(
     """
-    SELECT i.indisvalid
-    FROM pg_catalog.pg_index AS i
-    WHERE i.indexrelid = pg_catalog.to_regclass(:index_name)
-    """
-)
-
-# A same-named (kind, id) index that lacks -- or has a stale -- partial
-# predicate is column-list-identical to a correct one, so the column check
-# cannot tell them apart. ``pg_get_expr(indpred, indrelid)`` deparses the
-# stored predicate back into SQL text (NULL when the index is not partial at
-# all); comparing that against our own PREDICATE catches both a plain,
-# non-partial (kind, id) index and one scoped to the wrong statuses.
-POSTGRES_INDEX_PREDICATE_SQL = sa.text(
-    """
-    SELECT pg_catalog.pg_get_expr(i.indpred, i.indrelid)
+    SELECT i.indisvalid, pg_catalog.pg_get_expr(i.indpred, i.indrelid)
     FROM pg_catalog.pg_index AS i
     WHERE i.indexrelid = pg_catalog.to_regclass(:index_name)
     """
@@ -98,30 +76,15 @@ def _index_columns(inspector: sa.Inspector, index_name: str) -> tuple[str, ...] 
     return None
 
 
-def _postgres_index_validity() -> bool | None:
-    """Return whether the current-schema index exists and is usable."""
+def _postgres_index_state() -> tuple[bool, str | None] | None:
+    """Return (is valid, deparsed predicate) of the index, or None if absent."""
 
-    return (
+    row = (
         op.get_bind()
-        .execute(
-            POSTGRES_INDEX_VALIDITY_SQL,
-            {"index_name": INDEX},
-        )
-        .scalar_one_or_none()
+        .execute(POSTGRES_INDEX_STATE_SQL, {"index_name": INDEX})
+        .one_or_none()
     )
-
-
-def _postgres_index_predicate() -> str | None:
-    """Return the current-schema index's deparsed predicate, if any."""
-
-    return (
-        op.get_bind()
-        .execute(
-            POSTGRES_INDEX_PREDICATE_SQL,
-            {"index_name": INDEX},
-        )
-        .scalar_one_or_none()
-    )
+    return None if row is None else (bool(row[0]), row[1])
 
 
 def _normalize_pg_predicate(expression: str) -> str:
@@ -133,20 +96,15 @@ def _normalize_pg_predicate(expression: str) -> str:
     ``= ANY (ARRAY[...])`` (this migration's own predicate comes back as
     ``((status)::text = ANY ((ARRAY['pending'::character varying,
     'processing'::character varying])::text[]))``), and does not guarantee
-    whitespace. None of that changes what the predicate selects, so both
-    sides are reduced to the column and its sorted set of literal values.
+    whitespace. None of that changes what the predicate selects, so the
+    comparison removes casts, parentheses and whitespace, restores an
+    ``= ANY (ARRAY[...])`` list to ``IN``, and compares the whole string.
     """
 
     normalized = expression.lower()
-    # A cast to an array type, then any scalar cast, are dropped.
-    normalized = re.sub(r"::[a-z_ ]+\[\]", "", normalized)
-    normalized = re.sub(r"::[a-z_ ]+(\([0-9]+\))?", "", normalized)
-    normalized = re.sub(r"\s+", " ", normalized)
-    column = re.match(r"^[\s(]*([a-z_]+)", normalized)
-    values = sorted(re.findall(r"'([^']*)'", normalized))
-    if column is None:
-        return normalized
-    return f"{column.group(1)}:{','.join(values)}"
+    normalized = re.sub(r"::[a-z_ ]+(\([0-9]+\))?(\[\])?", "", normalized)
+    normalized = re.sub(r"[()\s]", "", normalized)
+    return re.sub(r"=anyarray\[(.*)\]$", r"in\1", normalized)
 
 
 def _postgres_predicate_matches_expected(expression: str | None) -> bool:
@@ -167,18 +125,18 @@ def _upgrade_postgresql() -> None:
     if not set(REQUIRED_COLUMNS) <= _columns(inspector):
         return
 
-    validity = _postgres_index_validity()
+    state = _postgres_index_state()
     existing_columns = _index_columns(inspector, INDEX)
-    is_up_to_date = (
-        validity is True
+    if (
+        state is not None
+        and state[0]
         and existing_columns == INDEX_COLUMNS
-        and _postgres_predicate_matches_expected(_postgres_index_predicate())
-    )
-    if is_up_to_date:
+        and _postgres_predicate_matches_expected(state[1])
+    ):
         return
 
     with op.get_context().autocommit_block():
-        if validity is not None or existing_columns is not None:
+        if state is not None or existing_columns is not None:
             op.drop_index(
                 INDEX,
                 table_name=TABLE,
@@ -234,29 +192,13 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     context = op.get_context()
-    is_postgresql = context.dialect.name == "postgresql"
-    if context.as_sql:
-        if is_postgresql:
-            with context.autocommit_block():
-                op.drop_index(
-                    INDEX,
-                    table_name=TABLE,
-                    postgresql_concurrently=True,
-                )
-        else:
-            op.drop_index(INDEX, table_name=TABLE)
-        return
-
-    if is_postgresql:
+    if context.dialect.name == "postgresql":
         with context.autocommit_block():
             op.drop_index(
                 INDEX,
                 table_name=TABLE,
-                if_exists=True,
+                if_exists=not context.as_sql,
                 postgresql_concurrently=True,
             )
-        return
-
-    inspector = _inspector()
-    if INDEX in _indexes(inspector):
+    elif context.as_sql or INDEX in _indexes(_inspector()):
         op.drop_index(INDEX, table_name=TABLE)

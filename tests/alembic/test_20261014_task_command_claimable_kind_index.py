@@ -173,15 +173,19 @@ def test_postgres_deparsed_in_list_matches_the_expected_predicate() -> None:
     )
 
     assert migration._postgres_predicate_matches_expected(deparsed)
-    assert migration._postgres_predicate_matches_expected(
-        "(status IN ('processing', 'pending'))"
-    )
     assert not migration._postgres_predicate_matches_expected(
         "((status)::text = 'pending'::text)"
     )
     assert not migration._postgres_predicate_matches_expected(
         "((status)::text = ANY ((ARRAY['pending'::character varying, "
         "'completed'::character varying])::text[]))"
+    )
+    assert not migration._postgres_predicate_matches_expected(
+        "((status)::text <> ALL ((ARRAY['pending'::character varying, "
+        "'processing'::character varying])::text[]))"
+    )
+    assert not migration._postgres_predicate_matches_expected(
+        "(((status)::text > 'pending'::text) AND ((status)::text < 'processing'::text))"
     )
     assert not migration._postgres_predicate_matches_expected(None)
 
