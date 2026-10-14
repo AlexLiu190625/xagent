@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs"
 import { resolve } from "node:path"
 import { useLayoutEffect } from "react"
-import { act, renderHook, waitFor } from "@testing-library/react"
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import {
@@ -129,6 +129,10 @@ function writeAuthCache(
     refreshExpiresAt: refreshExpiresIn ? now + refreshExpiresIn * 1000 : undefined,
   }))
 }
+
+// Hooks left mounted keep their real reconnect timers and would open sockets
+// into a later test's MockWebSocket.instances.
+afterEach(() => cleanup())
 
 describe("useWebSocket message delivery", () => {
   beforeEach(() => {
