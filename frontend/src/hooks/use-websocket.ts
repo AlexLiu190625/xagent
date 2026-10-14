@@ -4,7 +4,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { useAuth } from "@/contexts/auth-context"
 import type { AuthSessionSnapshot } from "@/lib/auth-cache"
 import { apiRequest, classifyUploadError, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
-import { clientErrorFallback, readClientErrorCode, type ClientErrorCode } from "@/lib/client-errors"
+import { clientErrorFallback, readClientErrorCode, readServerRejectionCode, type ClientErrorCode } from "@/lib/client-errors"
 import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
 import { generateClientMessageId, getWsUrl, getUploadApiUrl } from "@/lib/utils"
 import { isFinalAnswerStreamEventType } from "@/lib/streaming-final-answer"
@@ -74,6 +74,17 @@ export class MessageDeliveryError extends Error {
    * internal English in front of a visitor.
    */
   readonly userFacing: boolean
+  /**
+   * Display key for this failure; callers localize it with
+   * clientErrorTranslationKey. It may be a client-derived code, so a non-null
+   * value is not necessarily what the server sent, and it does not imply that
+   * `message` is safe to show (`userFacing` alone says that). For an
+   * `outcome_unknown` error, an omitted errorCode and an explicit `null` are
+   * equivalent: both become `message_outcome_unknown`, so a send that may have
+   * landed is never worded as a plain failure. Such an error stays code-less
+   * only when it is constructed with `userFacing: true`. `not_sent` and
+   * `rejected` errors get no default code.
+   */
   readonly errorCode: ClientErrorCode | null
 
   constructor(
@@ -86,7 +97,10 @@ export class MessageDeliveryError extends Error {
     this.disposition = disposition
     this.retryWithNewId = options.retryWithNewId ?? false
     this.userFacing = options.userFacing ?? false
-    this.errorCode = options.errorCode ?? null
+    this.errorCode = options.errorCode
+      ?? (disposition === "outcome_unknown" && !this.userFacing
+        ? "message_outcome_unknown"
+        : null)
   }
 }
 
@@ -974,7 +988,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
                 })
               } else {
                 const hasErrorCode = Object.prototype.hasOwnProperty.call(data, "error_code")
-                const errorCode = readClientErrorCode(data.error_code)
+                const errorCode = readServerRejectionCode(data.error_code)
                 const hasLegacyRejectionMessage = (
                   typeof data.message === "string"
                   && data.message.trim() !== ""
@@ -991,15 +1005,26 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
                     : trustLegacyRejectionMessage
                       ? data.message
                       : "Message was rejected."
-                pending.reject(deliveryError(
-                  rejectionMessage,
+                const disposition: MessageDeliveryDisposition = (
                   data.rejection_outcome === "not_accepted"
                     ? "rejected"
-                    : "outcome_unknown",
+                    : "outcome_unknown"
+                )
+                // A definitive rejection with no usable server code still gets
+                // wording of its own; an unknown outcome takes the default
+                // code from the error constructor.
+                const displayCode = errorCode ?? (
+                  !trustLegacyRejectionMessage && disposition === "rejected"
+                    ? "message_not_accepted"
+                    : null
+                )
+                pending.reject(deliveryError(
+                  rejectionMessage,
+                  disposition,
                   {
                     retryWithNewId: data.retry_with_new_id === true,
                     userFacing: errorCode !== null || trustLegacyRejectionMessage,
-                    errorCode,
+                    errorCode: displayCode,
                   },
                 ))
               }
@@ -1238,7 +1263,11 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       || !isCurrentOwner(owner)
       || (connection.chatTaskIdMode === "required" && !connection.taskId)
     ) {
-      throw deliveryError("Message not sent: the connection is not ready.", "not_sent")
+      throw deliveryError(
+        "Message not sent: the connection is not ready.",
+        "not_sent",
+        { errorCode: "connection_not_ready" },
+      )
     }
     if (connection.chatTaskIdMode === "omit" && files && files.length > 0) {
       throw deliveryError("File delivery is not supported for this connection.", "not_sent")

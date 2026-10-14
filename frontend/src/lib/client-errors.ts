@@ -33,13 +33,17 @@ export const CLIENT_ERROR_CODES = [
   "upload_too_large",
   "upload_proxy_error",
   "upload_failed",
+  // Client-only codes: also add each one to CLIENT_ONLY_ERROR_CODES below.
+  "connection_not_ready",
+  "message_not_accepted",
   // Connector-runtime codes that reach the client on a terminal task_error
   // frame's `code` field. They come from V1ErrorCode rather than the backend's
   // ClientErrorCode enum -- this list is not the whole ClientErrorCode enum:
   // "model_error" is left out because it only rides on task_completed and
   // trace_error, never on a task_error frame, "auto_model_unavailable" is not
-  // listed either, and the three upload_* codes are client-side only. It stays
-  // one table so a code has one wording for every audience. Only codes with a
+  // listed either, and the five client-only codes (the upload_* codes,
+  // connection_not_ready and message_not_accepted) are derived by the client.
+  // It stays one table so a code has one wording for every audience. Only codes with a
   // producer that can
   // reach that frame today are listed: a listed code nothing produces is an
   // entry with no expiry date. Which codes those are is a fact about this
@@ -93,6 +97,8 @@ const CLIENT_ERROR_TRANSLATION_KEYS: Record<ClientErrorCode, TranslationKey> = {
   upload_too_large: "clientErrors.uploadTooLarge",
   upload_proxy_error: "clientErrors.uploadProxyError",
   upload_failed: "clientErrors.uploadFailed",
+  connection_not_ready: "clientErrors.connectionNotReady",
+  message_not_accepted: "clientErrors.messageNotAccepted",
   missing_runtime_context: "clientErrors.missingRuntimeContext",
   runtime_secret_unavailable: "clientErrors.runtimeSecretUnavailable",
   scheduled_secret_unavailable: "clientErrors.scheduledSecretUnavailable",
@@ -127,6 +133,8 @@ const CLIENT_ERROR_FALLBACKS: Record<ClientErrorCode, string> = {
   upload_too_large: "File is too large. Please reduce the upload size and try again.",
   upload_proxy_error: "Upload failed before reaching the application. Please check the server upload limit.",
   upload_failed: "Upload failed. Please try again.",
+  connection_not_ready: "Not connected. Your message was not sent.",
+  message_not_accepted: "The message was not accepted.",
   missing_runtime_context: "This connector needs additional runtime input before it can run.",
   runtime_secret_unavailable: "This connector needs a runtime credential that is not available.",
   scheduled_secret_unavailable: "A scheduled run needs a runtime credential that is not available.",
@@ -140,6 +148,22 @@ export function readClientErrorCode(value: unknown): ClientErrorCode | null {
   return typeof value === "string" && CLIENT_ERROR_CODE_SET.has(value)
     ? value as ClientErrorCode
     : null
+}
+
+// Codes this client derives itself. A message_rejected frame that names one
+// is treated as naming an unrecognised code: the server has no business
+// telling the client that it is "not connected".
+export const CLIENT_ONLY_ERROR_CODES: ReadonlySet<ClientErrorCode> = new Set([
+  "upload_too_large",
+  "upload_proxy_error",
+  "upload_failed",
+  "connection_not_ready",
+  "message_not_accepted",
+])
+
+export function readServerRejectionCode(value: unknown): ClientErrorCode | null {
+  const code = readClientErrorCode(value)
+  return code !== null && !CLIENT_ONLY_ERROR_CODES.has(code) ? code : null
 }
 
 export function clientErrorTranslationKey(code: ClientErrorCode): TranslationKey {

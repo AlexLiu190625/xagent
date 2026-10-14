@@ -47,6 +47,8 @@ const en = {
     uploadTooLarge: "File is too large. Please reduce the upload size and try again.",
     uploadProxyError: "Upload failed before reaching the application. Please check the server upload limit.",
     uploadFailed: "Upload failed. Please try again.",
+    connectionNotReady: "Not connected. Your message was not sent.",
+    messageNotAccepted: "The message was not accepted.",
     missingRuntimeContext: "This connector needs additional runtime input before it can run.",
     runtimeSecretUnavailable: "This connector needs a runtime credential that is not available.",
     scheduledSecretUnavailable: "A scheduled run needs a runtime credential that is not available.",

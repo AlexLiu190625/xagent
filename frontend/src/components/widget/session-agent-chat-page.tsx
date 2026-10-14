@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useCallback, useMemo, useState } from "react"
+import React, { useCallback, useEffect, useMemo, useState } from "react"
 import { Loader2 } from "lucide-react"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
@@ -12,6 +12,11 @@ import {
 } from "@/contexts/app-context-chat"
 import { useI18n } from "@/contexts/i18n-context"
 import type { WebSocketConnection } from "@/hooks/use-websocket"
+import { readSendErrorCode } from "@/components/chat/clarification-delivery"
+import {
+  clientErrorTranslationKey,
+  type ClientErrorCode,
+} from "@/lib/client-errors"
 import {
   buildWidgetSessionWebSocketUrl,
   useWidgetSession,
@@ -73,18 +78,29 @@ function SessionConversationContent({
   } = useApp()
   const { t } = useI18n()
   const [resetError, setResetError] = useState(false)
-  const [startMessageError, setStartMessageError] = useState(false)
+  // The failure is stored as a code, not as text, so the line is translated
+  // at render time and follows a locale switch. It is only a note on the
+  // start page; the toast raised by the composer is the failure signal.
+  const [startMessageFailure, setStartMessageFailure] =
+    useState<{ code: ClientErrorCode | null } | null>(null)
+  const conversationEstablished = state.taskId !== null
+
+  // A conversation that is reset back to the start page must not bring an
+  // earlier failure line back with it.
+  useEffect(() => {
+    if (conversationEstablished) setStartMessageFailure(null)
+  }, [conversationEstablished])
 
   const handleStartMessage = useCallback(async (
     message: string,
     files: File[],
     config?: Record<string, unknown>,
   ) => {
-    setStartMessageError(false)
+    setStartMessageFailure(null)
     try {
       await sendMessage(message, config, files)
     } catch (error) {
-      setStartMessageError(true)
+      setStartMessageFailure({ code: readSendErrorCode(error) })
       throw error
     }
   }, [sendMessage])
@@ -132,7 +148,6 @@ function SessionConversationContent({
     )
   }
 
-  const hasEstablishedConversation = state.taskId !== null
   const reloadRequired = isSessionInteractionLocked
   const resetDisabled =
     reloadRequired || isConversationResetPending || isMessageDeliveryPending
@@ -165,7 +180,7 @@ function SessionConversationContent({
             </p>
           </div>
           <WidgetChromeControls
-            newConversation={hasEstablishedConversation ? {
+            newConversation={conversationEstablished ? {
               label: isConversationResetPending
                 ? t("widgetSession.resetting")
                 : t("widgetSession.startNewConversation"),
@@ -190,9 +205,11 @@ function SessionConversationContent({
             {t("widgetSession.resetFailed")}
           </p>
         ) : null}
-        {startMessageError && !reloadRequired ? (
+        {startMessageFailure && !reloadRequired && !conversationEstablished ? (
           <p className="mt-2 text-xs text-destructive" role="alert">
-            {t("widgetSession.startMessageFailed")}
+            {startMessageFailure.code
+              ? t(clientErrorTranslationKey(startMessageFailure.code))
+              : t("widgetSession.startMessageFailed")}
           </p>
         ) : null}
         {reloadRequired ? (
@@ -203,7 +220,7 @@ function SessionConversationContent({
       </header>
 
       <div className="min-h-0 flex-1">
-        {hasEstablishedConversation ? (
+        {conversationEstablished ? (
           <TaskConversationPanel
             mode="page"
             showTaskActions={false}

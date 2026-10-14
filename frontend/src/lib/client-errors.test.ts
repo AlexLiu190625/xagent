@@ -3,9 +3,11 @@ import { describe, expect, it } from "vitest"
 import en from "@/i18n/locales/en"
 import {
   CLIENT_ERROR_CODES,
+  CLIENT_ONLY_ERROR_CODES,
   clientErrorFallback,
   clientErrorTranslationKey,
   readClientErrorCode,
+  readServerRejectionCode,
 } from "@/lib/client-errors"
 
 describe("client error wire contract", () => {
@@ -36,6 +38,8 @@ describe("client error wire contract", () => {
     ["upload_too_large", "clientErrors.uploadTooLarge", "File is too large. Please reduce the upload size and try again."],
     ["upload_proxy_error", "clientErrors.uploadProxyError", "Upload failed before reaching the application. Please check the server upload limit."],
     ["upload_failed", "clientErrors.uploadFailed", "Upload failed. Please try again."],
+    ["connection_not_ready", "clientErrors.connectionNotReady", "Not connected. Your message was not sent."],
+    ["message_not_accepted", "clientErrors.messageNotAccepted", "The message was not accepted."],
     ["missing_runtime_context", "clientErrors.missingRuntimeContext", "This connector needs additional runtime input before it can run."],
     ["runtime_secret_unavailable", "clientErrors.runtimeSecretUnavailable", "This connector needs a runtime credential that is not available."],
     ["scheduled_secret_unavailable", "clientErrors.scheduledSecretUnavailable", "A scheduled run needs a runtime credential that is not available."],
@@ -50,6 +54,30 @@ describe("client error wire contract", () => {
   it("rejects unknown and non-string codes", () => {
     expect(readClientErrorCode("provider_secret")).toBeNull()
     expect(readClientErrorCode({ error_code: "upload_failed" })).toBeNull()
+  })
+
+  it.each([
+    "upload_too_large",
+    "upload_proxy_error",
+    "upload_failed",
+    "connection_not_ready",
+    "message_not_accepted",
+  ] as const)("readServerRejectionCode treats %s as unrecognised", (code) => {
+    expect(readServerRejectionCode(code)).toBeNull()
+  })
+
+  it("readServerRejectionCode passes a server code through", () => {
+    expect(readServerRejectionCode("task_busy")).toBe("task_busy")
+  })
+
+  it("keeps the client-only code set to exactly the codes the client derives itself", () => {
+    expect([...CLIENT_ONLY_ERROR_CODES].sort()).toEqual([
+      "connection_not_ready",
+      "message_not_accepted",
+      "upload_failed",
+      "upload_proxy_error",
+      "upload_too_large",
+    ])
   })
 
   it("keeps the fallback strings identical to the English locale", () => {
