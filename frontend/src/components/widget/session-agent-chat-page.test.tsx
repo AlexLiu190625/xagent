@@ -501,6 +501,25 @@ describe("SessionAgentChatPage", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument()
   })
 
+  it("clears the previous start-message failure while a resend is pending", async () => {
+    setBridge("active", activeSession())
+    render(<SessionAgentChatPage />)
+    await failStartMessage(new Error("first failure"))
+    expect(screen.getByRole("alert")).toHaveTextContent("widgetSession.startMessageFailed")
+
+    app.sendMessage.mockReturnValueOnce(new Promise<void>(() => undefined))
+    const onSend = app.startProps?.onSend as (
+      message: string,
+      files: File[],
+      config?: Record<string, unknown>,
+    ) => Promise<void>
+    act(() => {
+      void onSend("hi again", [], {})
+    })
+
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+  })
+
   it("lets the reload-required notice take priority over the start-message failure", async () => {
     setBridge("active", activeSession())
     const { rerender } = render(<SessionAgentChatPage />)

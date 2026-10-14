@@ -42,24 +42,24 @@ export const CLIENT_ERROR_CODES = [
   // "model_error" is left out because it only rides on task_completed and
   // trace_error, never on a task_error frame, "auto_model_unavailable" is not
   // listed either, and the five client-only codes (the upload_* codes,
-  // connection_not_ready and message_not_accepted) are derived by the
-  // client. It stays one table so a code has one wording for every
-  // audience. Only codes with a producer that can reach that frame today are
-  // listed: a listed code nothing produces is an entry with no expiry date. Which codes those are is a fact about this
-  // repository's raise sites, not a property the wire holds -- the field is
-  // typed as a bare string and validated against the connector-runtime closed
-  // set the server keeps next to its fallback table, and a resolver installed
-  // through set_connector_runtime_resolver lives outside this repository and
-  // can raise any member of that set. The closed set has eight members, and
-  // only five have their own entry below; the other three --
-  // connector_not_found, runtime_context_immutable, and
+  // connection_not_ready and message_not_accepted) are derived by the client.
+  // It stays one table so a code has one wording for every audience. Only codes
+  // with a producer that can reach that frame today are listed: a listed code
+  // nothing produces is an entry with no expiry date. Which codes those are is
+  // a fact about this repository's raise sites, not a property the wire holds
+  // -- the field is typed as a bare string and validated against the
+  // connector-runtime closed set the server keeps next to its fallback table,
+  // and a resolver installed through set_connector_runtime_resolver lives
+  // outside this repository and can raise any member of that set. The closed
+  // set has eight members, and only five have their own entry below; the other
+  // three -- connector_not_found, runtime_context_immutable, and
   // runtime_secret_not_allowed -- have no producer that can reach a terminal
-  // frame in this repository today, so they keep the generic prefixed
-  // wording. Two further connector-runtime codes are outside the closed set
-  // entirely (mcp_oauth_authorization_failed, delegated_authorization_failed):
-  // each names the outcome of an authorization check, so the server drops
-  // them before this frame is built. A code this table does not list keeps
-  // the generic prefixed wording.
+  // frame in this repository today, so they keep the generic prefixed wording.
+  // Two further connector-runtime codes are outside the closed set entirely
+  // (mcp_oauth_authorization_failed, delegated_authorization_failed): each
+  // names the outcome of an authorization check, so the server drops them
+  // before this frame is built. A code this table does not list keeps the
+  // generic prefixed wording.
   "missing_runtime_context",
   "runtime_secret_unavailable",
   "scheduled_secret_unavailable",
