@@ -26,8 +26,10 @@ export const mayResend = (first: ResendOwnership, now: ResendOwnership): boolean
 // deadline.
 export class ResendWaiters {
   private waiting: Array<(reconnected: boolean) => void> = []
+  private ended = false
 
   wait(): Promise<boolean> {
+    if (this.ended) return Promise.resolve(false)
     return new Promise((resolve) => {
       const settle = (reconnected: boolean) => {
         clearTimeout(timer)
@@ -39,7 +41,14 @@ export class ResendWaiters {
     })
   }
 
+  // While no reconnect is coming, current and later waits end at once.
+  setEnded(ended: boolean) {
+    this.ended = ended
+    if (ended) this.release(false)
+  }
+
   release(reconnected: boolean) {
+    if (reconnected) this.ended = false
     for (const settle of [...this.waiting]) settle(reconnected)
   }
 }

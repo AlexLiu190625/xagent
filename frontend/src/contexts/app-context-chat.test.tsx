@@ -11165,8 +11165,10 @@ describe("resend after reconnect", () => {
     ["two lost connections", ["a"], [connectionLost("first"), connectionLost("again")], () => {}, true, ["a", "a"], 1],
     ["the phase turning lost", ["a"], undefined, ({ rerender }) => { wsHarness.connectionPhase = "lost"; rerender(tree()) }, false, ["a"], 0],
     ["an unmount", ["a"], undefined, ({ unmount }) => unmount(), false, ["a"], 0],
+    ["a phase that was already lost", ["a"], undefined, () => {}, false, ["a"], 0],
   ])("resends after %s", async (_name, ids, rejections, change, reconnects, expectedIds, settlesWith) => {
     const failures = rejections ?? ids.map(() => connectionLost("first"))
+    if (_name === "a phase that was already lost") wsHarness.connectionPhase = "lost"
     failures.forEach(error => sendChatMessageMock.mockRejectedValueOnce(error))
     const { rerender, unmount } = render(tree())
     await act(async () => {})
@@ -11181,6 +11183,27 @@ describe("resend after reconnect", () => {
 
     expect(sendChatMessageMock.mock.calls.map(call => call[3])).toEqual(expectedIds)
     expect(settled[0]).toBe(settlesWith === "ok" ? "ok" : failures[settlesWith])
+  })
+
+  it("resends a Session send once on the new connection although its phase reads lost", async () => {
+    wsHarness.connectionPhase = "lost"
+    sendChatMessageMock.mockRejectedValueOnce(connectionLost("first"))
+    const sessionTree = (identity: string) => (
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(identity))}>
+        <SessionControlsProbe /><StateProbe />
+      </AppProvider>
+    )
+    const { rerender } = render(sessionTree("session-one"))
+    const outcome = getSessionControls().sendMessage("Resent turn", { clientMessageId: "s-1" }).then(() => "ok", (error: Error) => error)
+    await act(async () => {})
+
+    rerender(sessionTree("session-two"))
+    act(() => webSocketOptions.current?.onConnect?.())
+    await act(async () => { expect(await outcome).toBe("ok") })
+
+    expect(sendChatMessageMock.mock.calls.map(call => call[3])).toEqual(["s-1", "s-1"])
+    // The bubble guard compares against the connection of the resend.
+    expect(screen.getByTestId("messages").textContent).toContain("Resent turn")
   })
 
   const bound = (taskId: number | null, deliveryGeneration = 0, phase = "bound"): ResendOwnership =>

@@ -2967,9 +2967,7 @@ export function AppProvider({
   // The Session's host page reconnects it, so only the other transports treat
   // `lost` as the end of the wait.
   useEffect(() => {
-    if (sessionTransport === undefined && connectionPhase === "lost") {
-      resendWaitersRef.current.release(false)
-    }
+    resendWaitersRef.current.setEnded(sessionTransport === undefined && connectionPhase === "lost")
   }, [connectionPhase, sessionTransport])
 
   // A send whose connection was lost is sent once more on the next connection

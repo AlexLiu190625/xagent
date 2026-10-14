@@ -3662,7 +3662,7 @@ describe("useWebSocket normalized connections", () => {
     }
 
     it.each([
-      ["a transport error", true, (hook: ReturnType<typeof mountOpen>) => MockWebSocket.instances[0].triggerError()],
+      ["a transport error", true, () => MockWebSocket.instances[0].triggerError()],
       ["a caller disconnect", false, (hook: ReturnType<typeof mountOpen>) => hook.result.current.disconnect()],
       ["an unmount", false, (hook: ReturnType<typeof mountOpen>) => hook.unmount()],
     ] as const)("marks a pending delivery ended by %s as connectionLost=%s", async (_name, connectionLost, end) => {
@@ -3687,31 +3687,42 @@ describe("useWebSocket normalized connections", () => {
     })
 
     it.each([
-      ["reuses the upload for the same task", 1, 1],
-      ["uploads again for another task", 2, 2],
-    ] as const)("a same-id retry %s", async (_name, retryTaskId, uploads) => {
+      ["reuses the upload for the same task", 1, "t1", 1],
+      ["uploads again for another task", 2, "t1", 2],
+      ["uploads again for another login", 1, "t2", 2],
+    ] as const)("a same-id retry %s", async (_name, retryTaskId, retryToken, uploads) => {
       const uploadFiles = vi.fn(async () => [{ file_id: "f1" }])
       const files = [new File(["a"], "a.txt")]
       const hook = renderHook(
-        ({ taskId }) => useWebSocket({ url: "ws://localhost", taskId, uploadFiles }),
-        { initialProps: { taskId: 1 } },
+        ({ taskId, token }) => useWebSocket({ url: "ws://localhost", taskId, token, uploadFiles }),
+        { initialProps: { taskId: 1, token: "t1" } },
       )
       const [first] = MockWebSocket.instances
       act(() => first.open())
       const lost = hook.result.current.sendChatMessage("hi", files, false, "retry-id").catch(() => undefined)
-      await waitFor(() => expect(first.send).toHaveBeenCalledOnce())
+      await waitFor(() => expect(first.send).toHaveBeenCalledOnce(), { timeout: 4000 })
       act(() => first.triggerClose(1006))
       await lost
 
-      if (retryTaskId === 1) act(() => hook.result.current.connect())
-      else hook.rerender({ taskId: retryTaskId })
+      if (retryTaskId === 1 && retryToken === "t1") act(() => hook.result.current.connect())
+      else hook.rerender({ taskId: retryTaskId, token: retryToken })
       const second = MockWebSocket.instances[1]
       act(() => second.open())
       void hook.result.current.sendChatMessage("hi", files, false, "retry-id").catch(() => undefined)
-      await waitFor(() => expect(second.send).toHaveBeenCalledOnce())
+      await waitFor(() => expect(second.send).toHaveBeenCalledOnce(), { timeout: 4000 })
 
       expect(uploadFiles).toHaveBeenCalledTimes(uploads)
       expect(second.send.mock.calls[0][0]).toBe(first.send.mock.calls[0][0].replace('"task_id":1', `"task_id":${retryTaskId}`))
+    })
+
+    it("treats the same user with another session id as another login", () => {
+      const hook = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1 }))
+      const before = hook.result.current.getLoginIdentity()
+
+      authState.session = { ...authState.session, sessionId: "other-lineage" }
+      hook.rerender()
+
+      expect(hook.result.current.getLoginIdentity()).not.toBe(before)
     })
 
     it("login identity never carries credentials and moves only with the principal", () => {

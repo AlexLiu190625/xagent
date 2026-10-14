@@ -480,10 +480,11 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
   // the zone would be rejected as different content while the first command may
   // still be executing. Cleared on either terminal ack below.
   const attemptTimezonesRef = useRef(new Map<string, string | undefined>())
-  // Same key and lifetime: uploaded files of a same-id retry on the same task,
-  // so the retry carries the file ids the first attempt already sent.
+  // Same key and lifetime: uploaded files of a same-id retry on the same task
+  // and login, so the retry carries the file ids the first attempt already sent.
   const attemptUploadsRef = useRef(new Map<string, {
     taskId: number
+    loginIdentity: string
     files: Array<{ file_id: string; name?: string; size?: number; type?: string }>
   }>())
   const recentMessagesRef = useRef<RecentMessage[]>([])
@@ -1621,7 +1622,12 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         let uploadedFiles: Array<{ file_id: string; name?: string; size?: number; type?: string }> = []
 
         const cachedUpload = attemptUploadsRef.current.get(clientMessageId)
-        if (cachedUpload?.taskId === currentTaskId && filesToUpload.length > 0) {
+        const loginIdentity = loginIdentityFor(connection)
+        if (
+          cachedUpload?.taskId === currentTaskId
+          && cachedUpload.loginIdentity === loginIdentity
+          && filesToUpload.length > 0
+        ) {
           uploadedFiles = cachedUpload.files
         } else if (filesToUpload.length > 0 && uploadFiles) {
           uploadedFiles = await Promise.race([
@@ -1701,7 +1707,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           file_id: normalizedUploadedFileIds[index],
         }))
         if (filesToUpload.length > 0) {
-          attemptUploadsRef.current.set(clientMessageId, { taskId: currentTaskId, files: normalizedUploadedFiles })
+          attemptUploadsRef.current.set(clientMessageId, { taskId: currentTaskId, loginIdentity, files: normalizedUploadedFiles })
         }
         const allFiles = [...preUploadedFiles, ...normalizedUploadedFiles]
         const normalizedFileIds = normalizeUploadFileIds(
@@ -1840,7 +1846,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         preparationsRef.current.delete(clientMessageId)
       }
     }
-  }, [isCurrentOwner, releaseAttemptBindings, retireDeadOwner, syncPhase, uploadFiles])
+  }, [isCurrentOwner, loginIdentityFor, releaseAttemptBindings, retireDeadOwner, syncPhase, uploadFiles])
 
   const getCurrentTaskConnection = useCallback(() => {
     const connection = connectionRef.current
