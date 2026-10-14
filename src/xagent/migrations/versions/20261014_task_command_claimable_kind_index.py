@@ -8,8 +8,8 @@ On PostgreSQL the index is built ``CONCURRENTLY`` in ``autocommit_block()`` so
 writes are not blocked, and an ``INVALID`` index or one whose columns or
 predicate differ is rebuilt. Other dialects use a plain ``CREATE INDEX``.
 
-Accepted cost: the predicate reads ``status``, so each status change of a
-command row is a non-HOT update with one extra index maintenance.
+Accepted cost: every insert, and every status change that leaves a row
+``pending`` or ``processing``, maintains one more index entry.
 
 Revision ID: 20261014_task_cmd_claimable_kind
 Revises: 20261012_zendesk_oauth
