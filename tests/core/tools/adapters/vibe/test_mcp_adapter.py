@@ -21,6 +21,10 @@ from pydantic import BaseModel, ConfigDict, create_model
 from pydantic.alias_generators import to_camel
 
 from xagent.core.model.chat.basic.claude import _fix_pydantic_schema_for_claude
+from xagent.core.model.chat.basic.gemini import (
+    _flatten_json_schema,
+    _sanitize_schema_for_gemini,
+)
 from xagent.core.tools.adapters.vibe import mcp_adapter as mcp_adapter_module
 from xagent.core.tools.adapters.vibe.config import MCPUnavailableSummary
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
@@ -525,7 +529,7 @@ async def test_mcp_upload_file_ref_is_staged_and_cleaned_after_connector_call(
         inputSchema={
             "type": "object",
             "properties": {
-                "local_file_path": {"type": "string"},
+                "local_file_path": {"type": "string", "pattern": r"^/task/"},
                 "remote_path": {"type": "string"},
             },
         },
@@ -1908,10 +1912,10 @@ def test_normalize_args_by_schema_falls_back_to_raw_wrap_on_digit_limit_value_er
 def test_normalize_args_by_schema_recovers_edge_case_shapes(value, expected):
     """Pins the current, intentional behavior for shapes the recovery
     doesn't specially validate: item types inside a recovered list aren't
-    checked against the schema's `items` type here (a real MCP tool call
-    still gets independently validated against its own typed arg model
-    downstream), and a decoded empty string is treated like any other
-    decoded scalar rather than being special-cased as "no value"."""
+    checked against the schema's `items` type in this normalization helper
+    (``run_json_async`` validates the emitted nested schema before calling the
+    server), and a decoded empty string is treated like any other decoded
+    scalar rather than being special-cased as "no value"."""
     adapter = MCPToolAdapter(
         mcp_tool=_google_analytics_run_report_mcp_tool(),
         connection={"transport": "stdio", "command": "python", "args": []},
@@ -2257,6 +2261,113 @@ def test_build_args_model_handles_multi_value_type_list():
 
     assert args_model(value="abc").value == "abc"
     assert args_model(value=123).value == 123
+
+
+def test_build_args_model_preserves_required_nullable_schema():
+    mcp_tool = SimpleNamespace(
+        name="required_nullable_tool",
+        description="Accept a required string or null",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "value": {
+                    "anyOf": [
+                        {"type": "string", "enum": ["a", "b"]},
+                        {"type": "null"},
+                    ],
+                    "description": "Required nullable value",
+                }
+            },
+            "required": ["value"],
+        },
+    )
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={"transport": "stdio", "command": "python", "args": []},
+    )
+
+    args_model = adapter.args_type()
+
+    assert args_model(value=None).value is None
+    assert args_model(value="a").value == "a"
+
+    fixed = _fix_pydantic_schema_for_claude(args_model.model_json_schema())
+    assert fixed["properties"]["value"] == {
+        "description": "Required nullable value",
+        "enum": ["a", "b"],
+        "type": "string",
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_json_async_preserves_explicit_null_for_required_nullable(
+    monkeypatch,
+):
+    adapter = _schema_adapter(
+        {
+            "value": {
+                "anyOf": [{"type": "string"}, {"type": "null"}],
+            }
+        },
+        ["value"],
+    )
+    called: dict[str, Any] = {}
+
+    class _FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            called["arguments"] = arguments
+            return CallToolResult(content=[], isError=False)
+
+    @asynccontextmanager
+    async def _fake_create_session(_connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", _fake_create_session)
+
+    result = await adapter.run_json_async({"value": None})
+
+    assert result["is_error"] is False
+    assert called["arguments"] == {"value": None}
+
+
+@pytest.mark.asyncio
+async def test_run_json_async_drops_optional_and_unknown_explicit_nulls(monkeypatch):
+    adapter = _schema_adapter(
+        {
+            "required_value": {"type": "string"},
+            "optional_value": {"type": "string"},
+        },
+        ["required_value"],
+    )
+    called: dict[str, Any] = {}
+
+    class _FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            called["arguments"] = arguments
+            return CallToolResult(content=[], isError=False)
+
+    @asynccontextmanager
+    async def _fake_create_session(_connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", _fake_create_session)
+
+    result = await adapter.run_json_async(
+        {
+            "required_value": "required",
+            "optional_value": None,
+            "unknown": None,
+        }
+    )
+
+    assert result["is_error"] is False
+    assert called["arguments"] == {"required_value": "required"}
 
 
 @pytest.mark.asyncio
@@ -4584,8 +4695,9 @@ def test_rejected_metadata_is_reported_once_per_tool(caplog):
         "bad_minimum": {"type": "number", "minimum": float("inf")},
         "bad_format": {"type": "string", "format": "not-a-known-format"},
         "bad_description": {"type": "string", "description": 123},
-        # Four keys this adapter never reads: they reach neither the emitted
-        # schema nor the field's type.
+        # Three keys this adapter never reads: they reach neither the emitted
+        # schema nor the field's type. ``const`` is converted to a single-value
+        # enum and therefore is intentionally retained.
         "unread_keys": {
             "type": "integer",
             "exclusiveMinimum": 1,
@@ -4607,7 +4719,7 @@ def test_rejected_metadata_is_reported_once_per_tool(caplog):
     ]
     assert len(lines) == 1
     assert lines[0] == (
-        "MCP tool reject_probe dropped 7 field schema metadata keys and 1 unreadable field schemas"
+        "MCP tool reject_probe dropped 6 field schema metadata keys and 1 unreadable field schemas"
     )
 
 
@@ -4675,6 +4787,7 @@ def test_enum_survives_when_a_non_finite_default_was_replaced():
     "declared_default,enum_expected",
     [
         ("metric", True),
+        ("imperial", True),
         (None, False),
         ("celsius", False),
     ],
@@ -4723,6 +4836,24 @@ def test_optional_field_metadata_is_nested_in_the_non_null_branch():
     assert field["default"] is None
     assert "description" not in field
     assert "enum" not in field
+
+
+def test_optional_union_description_survives_claude_schema_fix():
+    emitted = _emitted_schema(
+        {
+            "city": {
+                "anyOf": [{"type": "string"}, {"type": "null"}],
+                "description": "City name",
+            }
+        }
+    )
+
+    fixed = _fix_pydantic_schema_for_claude(emitted)
+
+    assert fixed["properties"]["city"] == {
+        "description": "City name",
+        "type": "string",
+    }
 
 
 @pytest.mark.parametrize("is_required", [True, False])
@@ -4832,36 +4963,554 @@ def test_nested_bool_and_number_enum_members_stay_apart(
     assert ("enum" in carrier) is enum_expected
 
 
-def test_nested_field_metadata_is_not_extracted():
-    """Only the tool's own top-level fields are read.
-
-    A nested object or an array item schema is flattened to a bare Python
-    type here, so metadata written inside one does not reach the model. This
-    pins the documented boundary rather than asserting it is desirable.
-    """
+def test_nested_object_and_array_schema_reaches_the_model():
+    """Nested MCP requirements survive the adapter boundary."""
     emitted = _emitted_schema(
         {
             "address": {
                 "type": "object",
                 "description": "Postal address.",
                 "properties": {
-                    "street": {"type": "string", "description": "STREET_DESC"}
+                    "street": {
+                        "type": "string",
+                        "description": "STREET_DESC",
+                        "enum": ["Main", "High"],
+                    }
                 },
+                "required": ["street"],
+                "additionalProperties": False,
             },
             "tags": {
                 "type": "array",
                 "description": "Labels.",
-                "items": {"type": "string", "description": "ITEM_DESC"},
+                "items": {
+                    "type": "string",
+                    "description": "ITEM_DESC",
+                    "enum": ["urgent", "normal"],
+                },
             },
         },
         ["address", "tags"],
     )
-    serialized = _compact_json(emitted)
+    address = emitted["properties"]["address"]
+    tags = emitted["properties"]["tags"]
 
-    assert emitted["properties"]["address"]["description"] == "Postal address."
-    assert emitted["properties"]["tags"]["description"] == "Labels."
-    assert "STREET_DESC" not in serialized
-    assert "ITEM_DESC" not in serialized
+    assert address["description"] == "Postal address."
+    assert address["required"] == ["street"]
+    assert address["additionalProperties"] is False
+    assert address["properties"]["street"] == {
+        "description": "STREET_DESC",
+        "enum": ["Main", "High"],
+        "type": "string",
+    }
+    assert tags["description"] == "Labels."
+    assert tags["items"] == {
+        "description": "ITEM_DESC",
+        "enum": ["urgent", "normal"],
+        "type": "string",
+    }
+
+
+def test_nested_mcp_schema_survives_claude_and_gemini_provider_passes():
+    emitted = _emitted_schema(
+        {
+            "params": {
+                "type": "object",
+                "properties": {
+                    "includeFields": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["customer", "owner", "dates"],
+                        },
+                    }
+                },
+                "required": ["includeFields"],
+                "additionalProperties": False,
+            }
+        },
+        ["params"],
+    )
+
+    claude = _fix_pydantic_schema_for_claude(emitted)
+    gemini = _sanitize_schema_for_gemini(_flatten_json_schema(emitted))
+
+    for provider_schema in (claude, gemini):
+        params = provider_schema["properties"]["params"]
+        assert params["required"] == ["includeFields"]
+        assert params["properties"]["includeFields"]["items"]["enum"] == [
+            "customer",
+            "owner",
+            "dates",
+        ]
+
+
+def test_union_schema_is_gemini_compatible_and_const_discriminators_survive():
+    from google.genai import types
+
+    emitted = _emitted_schema(
+        {
+            "choice": {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {"kind": {"const": "alpha"}},
+                        "required": ["kind"],
+                    },
+                    {
+                        "type": "object",
+                        "properties": {"kind": {"const": "beta"}},
+                        "required": ["kind"],
+                    },
+                ]
+            },
+            "bounded": {
+                "allOf": [
+                    {"type": "string", "minLength": 1},
+                    {"type": "string", "maxLength": 32},
+                ]
+            },
+        },
+        ["choice", "bounded"],
+    )
+
+    choice = emitted["properties"]["choice"]
+    assert "oneOf" not in choice
+    assert "anyOf" in choice
+    assert [option["properties"]["kind"]["enum"] for option in choice["anyOf"]] == [
+        ["alpha"],
+        ["beta"],
+    ]
+    assert "allOf" not in emitted["properties"]["bounded"]
+
+    gemini = _sanitize_schema_for_gemini(_flatten_json_schema(emitted))
+    types.Tool(
+        function_declarations=[
+            types.FunctionDeclaration(
+                name="probe",
+                description="probe",
+                parameters=gemini,
+            )
+        ]
+    )
+
+
+def test_gemini_sanitizer_normalizes_nullable_and_non_string_schema_values():
+    emitted = _sanitize_schema_for_gemini(
+        {
+            "type": "object",
+            "properties": {
+                "nullable": {"type": ["string", "null"]},
+                "nullable_enum": {
+                    "type": "string",
+                    "enum": ["a", "b", None],
+                },
+                "numbers": {"type": "integer", "enum": [1, 2]},
+                "numeric_const": {"type": "integer", "const": 1},
+                "const": {"type": "string"},
+                "allOf": {"type": "string"},
+                "additionalProperties": {"type": "string"},
+            },
+        }
+    )
+
+    types_schema = emitted["properties"]["nullable"]
+    assert types_schema["type"] == "string"
+    assert types_schema["nullable"] is True
+    assert emitted["properties"]["nullable_enum"]["enum"] == ["a", "b"]
+    assert emitted["properties"]["nullable_enum"]["nullable"] is True
+    assert "enum" not in emitted["properties"]["numbers"]
+    assert "const" not in emitted["properties"]["numeric_const"]
+    assert set(emitted["properties"]) >= {
+        "const",
+        "allOf",
+        "additionalProperties",
+    }
+    from google.genai import types
+
+    types.Tool(
+        function_declarations=[
+            types.FunctionDeclaration(
+                name="probe",
+                description="probe",
+                parameters=emitted,
+            )
+        ]
+    )
+
+
+def test_lossy_union_is_omitted_instead_of_narrowed_to_null():
+    emitted = mcp_adapter_module._nested_schema_for_emission(
+        {
+            "oneOf": [
+                {"$ref": "#/$defs/Model"},
+                {"type": "null"},
+            ]
+        },
+        is_required=False,
+    )
+
+    assert "oneOf" not in emitted
+    assert "anyOf" not in emitted
+
+
+def test_dropped_nested_properties_do_not_leave_a_closed_unsatisfiable_object():
+    emitted = _emitted_schema(
+        {
+            "params": {
+                "type": "object",
+                "properties": {
+                    "a": {"type": "string"},
+                    "dropped": {"$ref": "#/$defs/Missing"},
+                    "c": {"type": "integer"},
+                },
+                "required": ["a", "dropped"],
+                "additionalProperties": False,
+            }
+        },
+        ["params"],
+    )
+
+    params = emitted["properties"]["params"]
+    assert set(params["properties"]) == {"a", "dropped", "c"}
+    assert params["required"] == ["a", "dropped"]
+    assert params["additionalProperties"] is True
+
+
+def test_nested_budget_exhaustion_falls_back_to_later_top_level_metadata():
+    wide_object = {
+        "type": "object",
+        "properties": {
+            f"field_{index}": {"type": "string"}
+            for index in range(mcp_adapter_module._NESTED_SCHEMA_MAX_NODES - 1)
+        },
+    }
+    emitted = _emitted_schema(
+        {
+            "wide": wide_object,
+            "later": {
+                "type": "string",
+                "description": "later field",
+                "enum": ["a", "b"],
+            },
+        }
+    )
+
+    later = _metadata_carrier(emitted["properties"]["later"])
+    assert later["description"] == "later field"
+    assert later["enum"] == ["a", "b"]
+
+
+def test_nested_optional_properties_accept_null_for_legacy_server_behavior():
+    adapter = _schema_adapter(
+        {
+            "params": {
+                "type": "object",
+                "properties": {"limit": {"type": "integer"}},
+            }
+        },
+        ["params"],
+    )
+
+    assert adapter._nested_argument_error({"params": {"limit": None}}) is None
+
+
+def test_nested_required_nullable_properties_and_items_accept_null():
+    adapter = _schema_adapter(
+        {
+            "params": {
+                "type": "object",
+                "properties": {
+                    "value": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                    "values": {
+                        "type": "array",
+                        "items": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                    },
+                    "openapi_nullable": {
+                        "type": "string",
+                        "nullable": True,
+                    },
+                },
+                "required": ["value", "values", "openapi_nullable"],
+            }
+        },
+        ["params"],
+    )
+
+    assert (
+        adapter._nested_argument_error(
+            {
+                "params": {
+                    "value": None,
+                    "values": ["a", None],
+                    "openapi_nullable": None,
+                }
+            }
+        )
+        is None
+    )
+
+
+def test_property_named_pattern_is_not_removed_from_local_validation():
+    adapter = _schema_adapter(
+        {
+            "filter": {
+                "type": "object",
+                "properties": {"pattern": {"type": "string"}},
+                "required": ["pattern"],
+                "additionalProperties": False,
+            }
+        },
+        ["filter"],
+    )
+
+    assert adapter._nested_argument_error({"filter": {"pattern": "*.py"}}) is None
+
+
+def test_pattern_inside_object_enum_literal_is_not_removed():
+    adapter = _schema_adapter(
+        {"value": {"type": "object", "enum": [{"pattern": "*.py"}]}}
+    )
+
+    assert adapter._nested_argument_error({"value": {"pattern": "*.py"}}) is None
+
+
+def test_duplicate_nested_required_names_are_deduplicated():
+    adapter = _schema_adapter(
+        {
+            "params": {
+                "type": "object",
+                "properties": {"x": {"type": "string"}},
+                "required": ["x", "x"],
+            }
+        },
+        ["params"],
+    )
+
+    emitted = adapter.args_type().model_json_schema()
+    assert emitted["properties"]["params"]["required"] == ["x"]
+    assert adapter._args_validator is not None
+
+
+def test_nested_union_does_not_hide_object_siblings_from_claude():
+    emitted = _emitted_schema(
+        {
+            "params": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+                "oneOf": [{"type": "object"}, {"type": "null"}],
+            }
+        },
+        ["params"],
+    )
+
+    params = emitted["properties"]["params"]
+    assert params["anyOf"][1] == {"type": "null"}
+    assert params["anyOf"][0]["required"] == ["name"]
+    claude = _fix_pydantic_schema_for_claude(emitted)
+    assert claude["properties"]["params"]["required"] == ["name"]
+
+
+def test_discriminated_union_error_stays_at_union_boundary():
+    adapter = _schema_adapter(
+        {
+            "choice": {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"const": "alpha"},
+                            "name": {"type": "string"},
+                        },
+                        "required": ["kind", "name"],
+                    },
+                    {
+                        "type": "object",
+                        "properties": {"kind": {"const": "beta"}},
+                        "required": ["kind"],
+                    },
+                ]
+            }
+        },
+        ["choice"],
+    )
+
+    error = adapter._nested_argument_error({"choice": {"kind": "alpha"}})
+
+    assert error is not None
+    assert error.validator == "anyOf"
+    assert list(error.path) == ["choice"]
+
+
+def test_optional_discriminated_union_error_stays_at_union_boundary():
+    adapter = _schema_adapter(
+        {
+            "choice": {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"const": "alpha"},
+                            "name": {"type": "string"},
+                        },
+                        "required": ["kind", "name"],
+                    },
+                    {
+                        "type": "object",
+                        "properties": {"kind": {"const": "beta"}},
+                        "required": ["kind"],
+                    },
+                ]
+            }
+        }
+    )
+
+    error = adapter._nested_argument_error({"choice": {"kind": "alpha"}})
+
+    assert error is not None
+    assert error.validator == "anyOf"
+    assert list(error.path) == ["choice"]
+
+
+def test_wrong_type_error_names_the_expected_type():
+    adapter = _schema_adapter(
+        {
+            "params": {
+                "type": "object",
+                "properties": {"count": {"type": "integer"}},
+                "required": ["count"],
+            }
+        },
+        ["params"],
+    )
+
+    error = adapter._nested_argument_error({"params": {"count": "many"}})
+
+    assert error is not None
+    result = adapter._invalid_arguments_result(error)
+    assert result["content"][0]["text"] == (
+        "Invalid MCP tool arguments at params.count: "
+        'the value has the wrong type (expected "integer"). '
+        "Check the tool schema and retry."
+    )
+
+
+@pytest.mark.asyncio
+async def test_invalid_default_does_not_reject_omitted_argument(monkeypatch):
+    adapter = _schema_adapter({"limit": {"type": "integer", "default": "10"}})
+    called = {}
+
+    class _FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            called["arguments"] = arguments
+            return CallToolResult(content=[], isError=False)
+
+    @asynccontextmanager
+    async def _fake_create_session(_connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", _fake_create_session)
+
+    result = await adapter.run_json_async({})
+
+    assert result["is_error"] is False
+    assert called["arguments"] == {"limit": "10"}
+
+
+def test_nested_pattern_is_omitted_from_local_validation():
+    adapter = _schema_adapter(
+        {"params": {"type": "string", "pattern": "["}}, ["params"]
+    )
+
+    assert adapter._args_validator is not None
+    assert adapter._nested_argument_error({"params": "anything"}) is None
+
+
+@pytest.mark.asyncio
+async def test_nested_required_argument_is_rejected_before_mcp_execution(monkeypatch):
+    adapter = _schema_adapter(
+        {
+            "params": {
+                "type": "object",
+                "properties": {
+                    "includeFields": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["customer", "owner", "dates"],
+                        },
+                    }
+                },
+                "required": ["includeFields"],
+            }
+        },
+        ["params"],
+        tool_name="get_projects",
+    )
+    create_session_mock = AsyncMock()
+    monkeypatch.setattr(mcp_adapter_module, "create_session", create_session_mock)
+
+    result = await adapter.run_json_async({"params": {}})
+
+    assert result == {
+        "content": [
+            {
+                "text": (
+                    "Invalid MCP tool arguments at params.includeFields: "
+                    "a required value is missing. Check the tool schema and retry."
+                )
+            }
+        ],
+        "is_error": True,
+    }
+    create_session_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_nested_enum_argument_is_rejected_before_mcp_execution(monkeypatch):
+    adapter = _schema_adapter(
+        {
+            "params": {
+                "type": "object",
+                "properties": {
+                    "includeFields": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["customer", "owner", "dates"],
+                        },
+                    }
+                },
+                "required": ["includeFields"],
+            }
+        },
+        ["params"],
+        tool_name="get_projects",
+    )
+    create_session_mock = AsyncMock()
+    monkeypatch.setattr(mcp_adapter_module, "create_session", create_session_mock)
+
+    result = await adapter.run_json_async(
+        {"params": {"includeFields": ["customerName"]}}
+    )
+
+    assert result == {
+        "content": [
+            {
+                "text": (
+                    "Invalid MCP tool arguments at params.includeFields.0: "
+                    'the value is outside the allowed enum ["customer","owner","dates"]. '
+                    "Check the tool schema and retry."
+                )
+            }
+        ],
+        "is_error": True,
+    }
+    create_session_mock.assert_not_called()
 
 
 def test_an_unusable_numeric_bound_costs_only_its_own_key():
