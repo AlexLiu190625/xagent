@@ -606,7 +606,15 @@ class TestToolFactoryMCPIntegration:
         if policy is MCPFailurePolicy.STRICT:
             with pytest.raises(RequiredMCPUnavailableError) as exc_info:
                 await ToolFactory.create_mcp_tools(test_db, mcp_failure_policy=policy)
-            assert exc_info.value.summaries[0].reason == "auth_rejected"
+            (summary,) = exc_info.value.summaries
+            assert (summary.reason, summary.cause_type, summary.status_code) == (
+                "auth_rejected",
+                "HTTPStatusError",
+                403,
+            )
+            assert str(exc_info.value) == (
+                "Required MCP servers are unavailable: auth_rejected (HTTP 403)."
+            )
         else:
             assert await ToolFactory.create_mcp_tools(test_db) == []
 

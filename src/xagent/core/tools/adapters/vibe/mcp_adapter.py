@@ -118,25 +118,17 @@ _MCP_LOAD_FAILURE_MESSAGES: dict[MCPFailurePhase, str] = {
     MCPFailurePhase.NO_TOOLS_RETURNED: "MCP server returned no available tools.",
     MCPFailurePhase.AUTH_REJECTED: "MCP server refused the connection.",
 }
-# HTTP statuses with which a server refuses a load's request outright. A 401
-# means the credentials were not accepted; a 403 can also come from a
-# firewall or a rate limit in front of the server. The load reuses one
-# connection for every attempt, so retrying cannot change either answer.
+# HTTP statuses that end a load's retries. A 401 means the credentials were
+# not accepted, and every attempt of a load sends the same credentials, so a
+# retry cannot change that answer. A 403 can also come from a firewall or a
+# rate limit in front of the server and may clear later; it is still treated
+# as final, trading a retry for not repeating a request the server refused.
 _AUTH_REJECTED_HTTP_STATUSES = frozenset({401, 403})
 
 
 def mcp_load_failure_message(phase: MCPFailurePhase) -> str:
     """Return the public-safe message owned by an MCP load failure phase."""
     return _MCP_LOAD_FAILURE_MESSAGES[phase]
-
-
-def mcp_load_failure_exposed_to_model(phase: MCPFailurePhase) -> bool:
-    """Whether the placeholder for a load failure is offered to the model.
-
-    A refused connection is a definitive answer the model cannot act on, so
-    its record is kept only for the setup summary and the failure policy.
-    """
-    return phase is not MCPFailurePhase.AUTH_REJECTED
 
 
 class MCPWriteHint(Enum):
@@ -2858,8 +2850,8 @@ class UnavailableMCPTool(AbstractBaseTool):
     ``unavailable_server`` is the raw configured name, shown to anyone who can
     see the trace, including anonymous share viewers (#1041).
     ``cause_type`` and ``status_code`` are kept for the setup summary only and
-    are not part of the result. A record with ``exposed_to_model`` False is kept
-    only for the setup summary and the failure policy;
+    are not part of the result. A record whose reason is ``auth_rejected`` is
+    kept only for the setup summary and the failure policy;
     ``model_visible_mcp_tools`` removes it before the list reaches an agent.
     """
 
@@ -2876,7 +2868,6 @@ class UnavailableMCPTool(AbstractBaseTool):
         message: str = _DEFAULT_UNAVAILABLE_MCP_MESSAGE,
         cause_type: str | None = None,
         status_code: int | None = None,
-        exposed_to_model: bool = True,
     ) -> None:
         from ....agent.result import normalize_tool_failure_code
         from .base import ToolCategory
@@ -2888,7 +2879,6 @@ class UnavailableMCPTool(AbstractBaseTool):
         self._reason = reason
         self._cause_type = cause_type
         self._status_code = status_code
-        self._exposed_to_model = exposed_to_model
         self._message = message
         self._name = _format_unavailable_mcp_tool_name(server_name, server_id)
         self.source_server = normalize_mcp_server_name(server_name)
@@ -2917,11 +2907,6 @@ class UnavailableMCPTool(AbstractBaseTool):
     def unavailability_status_code(self) -> int | None:
         """Diagnostic for the setup summary; never part of the tool result."""
         return self._status_code
-
-    @property
-    def exposed_to_model(self) -> bool:
-        """Whether this record is offered to the model as a tool."""
-        return self._exposed_to_model
 
     @property
     def description(self) -> str:
@@ -2979,15 +2964,19 @@ class UnavailableMCPTool(AbstractBaseTool):
 
 
 def model_visible_mcp_tools(tools: Iterable[Any]) -> list[Any]:
-    """Drop unavailable-server records that are not offered to the model.
+    """Drop the record of a server that refused the load (``auth_rejected``).
 
-    Call it only after the setup summary and the failure policy have read the
-    full list: those records are how they learn about the failure.
+    The model cannot act on a refused connection, so that record is kept only
+    for the setup summary and the failure policy. Call this only after both
+    have read the full list: the record is how they learn about the failure.
     """
     return [
         tool
         for tool in tools
-        if not (isinstance(tool, UnavailableMCPTool) and not tool.exposed_to_model)
+        if not (
+            isinstance(tool, UnavailableMCPTool)
+            and tool.unavailability_reason == MCPFailurePhase.AUTH_REJECTED.value
+        )
     ]
 
 

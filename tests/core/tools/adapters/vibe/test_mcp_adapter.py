@@ -6019,6 +6019,56 @@ async def test_real_client_load_failure_shapes(
 
 
 @pytest.mark.asyncio
+async def test_real_client_sse_rejected_message_post_is_retried(monkeypatch, caplog):
+    # The sse client logs a failed message POST and closes the session, so the
+    # 401 reaches the loader as an ``McpError`` with no HTTP status. That is
+    # not an ``httpx.HTTPStatusError``, so the load keeps retrying.
+    import anyio._backends._asyncio  # noqa: F401
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=b"event: endpoint\ndata: /messages/?session_id=x\n\n",
+            )
+        return httpx.Response(401)
+
+    def factory(headers=None, timeout=None, auth=None) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            headers=headers,
+            timeout=timeout,
+            auth=auth,
+        )
+
+    sleep = AsyncMock()
+    monkeypatch.setattr(mcp_adapter_module.asyncio, "sleep", sleep)
+    caplog.set_level("WARNING")
+
+    result = await load_mcp_tools_as_agent_tools(
+        {
+            "srv": {
+                "transport": "sse",
+                "url": _SECRET_URL,
+                "headers": {"Authorization": "Bearer SECRET"},
+                "httpx_client_factory": factory,
+            }
+        }
+    )
+
+    (failure,) = result.failures
+    assert failure.phase is MCPFailurePhase.INITIALIZE
+    assert failure.cause_type == "McpError"
+    assert failure.status_code is None
+    assert failure.attempts == 3
+    assert _backoff_sleeps(sleep) == 2
+    records = _load_warnings(caplog)
+    assert len(records) == 3
+    _assert_load_warnings_are_safe(records)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("fail_in", "build", "status_code", "logged_phase"),
     [

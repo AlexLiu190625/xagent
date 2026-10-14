@@ -214,8 +214,15 @@ async def test_connection_test_keeps_partial_tools_and_reports_safe_failures(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("phase", "attempts", "message"),
+    [
+        (MCPFailurePhase.INITIALIZE, 3, "MCP server initialization failed."),
+        (MCPFailurePhase.AUTH_REJECTED, 1, "MCP server refused the connection."),
+    ],
+)
 async def test_connection_test_reports_structured_load_failure_without_exception_text(
-    monkeypatch,
+    monkeypatch, phase, attempts, message
 ):
     async def load_tools(*args, **kwargs):
         return MCPLoadResult(
@@ -224,9 +231,9 @@ async def test_connection_test_reports_structured_load_failure_without_exception
             failures=(
                 MCPServerLoadFailure(
                     server_name="test",
-                    phase=MCPFailurePhase.INITIALIZE,
+                    phase=phase,
                     error_type="BearerSecretError",
-                    attempts=3,
+                    attempts=attempts,
                 ),
             ),
         )
@@ -242,10 +249,12 @@ async def test_connection_test_reports_structured_load_failure_without_exception
     )
 
     assert response.success is False
-    assert response.message == "MCP server initialization failed."
+    assert response.message == message
     assert response.details == {
         "tool_count": 0,
-        "failures": [{"server_name": "test", "phase": "initialize", "attempts": 3}],
+        "failures": [
+            {"server_name": "test", "phase": phase.value, "attempts": attempts}
+        ],
     }
     assert "BearerSecretError" not in repr(response)
 

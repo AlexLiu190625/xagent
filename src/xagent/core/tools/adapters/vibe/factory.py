@@ -1059,7 +1059,6 @@ class ToolFactory:
         failure_code: object = None,
         cause_type: str | None = None,
         status_code: int | None = None,
-        exposed_to_model: bool = True,
     ) -> Tool:
         """Build the shared server-scoped unavailable MCP tool."""
         from ....agent.result import normalize_tool_failure_code
@@ -1076,7 +1075,6 @@ class ToolFactory:
             kwargs["message"] = message
         kwargs["cause_type"] = cause_type
         kwargs["status_code"] = status_code
-        kwargs["exposed_to_model"] = exposed_to_model
         return UnavailableMCPTool(**kwargs)
 
     @staticmethod
@@ -1114,10 +1112,7 @@ class ToolFactory:
         cause, so the setup summary names the exception class whenever the
         loader caught one.
         """
-        from .mcp_adapter import (
-            mcp_load_failure_exposed_to_model,
-            mcp_load_failure_message,
-        )
+        from .mcp_adapter import mcp_load_failure_message
 
         tools: list[Tool] = []
         seen_servers: set[str] = set()
@@ -1138,7 +1133,6 @@ class ToolFactory:
                     message=mcp_load_failure_message(failure.phase),
                     cause_type=failure.cause_type or failure.error_type,
                     status_code=failure.status_code,
-                    exposed_to_model=mcp_load_failure_exposed_to_model(failure.phase),
                 )
             )
         return tools
