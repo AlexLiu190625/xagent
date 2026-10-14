@@ -36,6 +36,7 @@ from xagent.core.tools.adapters.vibe.mcp_adapter import (
     _build_mcp_tool_adapter,
     _compact_json,
     _durable_upload_fields,
+    _excel_failure_code,
     _exception_indicates_http_401,
     _mcp_return_value_as_string,
     _split_url_token,
@@ -72,6 +73,24 @@ def _mcp_tool(name: str = "echo") -> SimpleNamespace:
         description=f"{name} tool",
         inputSchema={"type": "object", "properties": {}},
     )
+
+
+def test_excel_failure_code_is_carried_from_connector_payload() -> None:
+    result = {
+        "content": [
+            {"text": '{"status":"error","failure_code":"excel_workbook_access_denied"}'}
+        ],
+    }
+
+    assert _excel_failure_code(result) == "excel_workbook_access_denied"
+
+
+def test_arbitrary_excel_error_is_not_projected_to_the_client() -> None:
+    result = {
+        "content": [{"text": '{"status":"error","failure_code":"arbitrary"}'}],
+    }
+
+    assert _excel_failure_code(result) is None
 
 
 class _SdkV2CallToolResult(BaseModel):
@@ -1429,6 +1448,49 @@ async def test_execute_mcp_call_forwards_structured_content(monkeypatch):
     result = await adapter._execute_mcp_call(adapter.connection, {}, {})
 
     assert result["structured_content"] == {"status": "completed", "run_id": "abc"}
+
+
+@pytest.mark.asyncio
+async def test_execute_mcp_call_carries_excel_failure_code_from_text_result(
+    monkeypatch,
+):
+    adapter = MCPToolAdapter(
+        mcp_tool=_mcp_tool("excel_list_worksheets"),
+        connection={"transport": "streamable_http", "url": "https://mcp.example.test"},
+        source_server="excel",
+    )
+
+    class _FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            return CallToolResult(
+                content=[
+                    TextContent(
+                        type="text",
+                        text=json.dumps(
+                            {
+                                "status": "error",
+                                "failure_code": "excel_workbook_access_denied",
+                            }
+                        ),
+                    )
+                ],
+                isError=False,
+            )
+
+    @asynccontextmanager
+    async def _fake_create_session(_connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", _fake_create_session)
+
+    result = await adapter._execute_mcp_call(adapter.connection, {}, {})
+
+    assert result["failure_code"] == "excel_workbook_access_denied"
+    assert result["success"] is False
+    assert result["is_error"] is True
 
 
 @pytest.mark.asyncio

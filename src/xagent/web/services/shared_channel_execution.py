@@ -16,6 +16,7 @@ from sqlalchemy.exc import TimeoutError as DatabaseTimeoutError
 from sqlalchemy.orm import Session
 
 from ...config import get_task_reply_wait_timeout_seconds
+from ...core.agent.result import normalize_tool_failure_code
 from ...core.agent.trace import (
     TraceAction,
     TraceCategory,
@@ -752,6 +753,9 @@ async def execute_channel_background(
                 "interactions": projection.interactions,
             },
         }
+        failure_code = normalize_tool_failure_code(result.get("failure_code"))
+        if failure_code is not None:
+            durable_result["failure_code"] = failure_code
 
         report = SettlementReport()
 

@@ -1424,6 +1424,28 @@ def _normalized_mcp_call_result(
     }
 
 
+def _excel_failure_code(result: Mapping[str, Any]) -> str | None:
+    """Carry the Excel connector's allowlisted failure code to the runtime."""
+    from ....agent.result import EXCEL_FAILURE_CODES, normalize_tool_failure_code
+
+    content = result.get("content")
+    if not isinstance(content, list):
+        return None
+    for item in content:
+        if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+            continue
+        try:
+            payload = json.loads(item["text"])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        code = normalize_tool_failure_code(payload.get("failure_code"))
+        if code in EXCEL_FAILURE_CODES:
+            return code
+    return None
+
+
 def _format_unavailable_mcp_tool_name(server_name: str, server_id: Any | None) -> str:
     from .selection_spec import normalize_mcp_server_name
 
@@ -1517,6 +1539,9 @@ class MCPToolAdapter(AbstractBaseTool):
         self._durable_upload_fields = durable_upload_fields
         self._durable_upload_own_file_id = durable_upload_own_file_id
         self._workspace_download_field = workspace_download_field
+        self._is_excel_tool = (
+            self.source_server == "excel" and self.mcp_tool.name.startswith("excel_")
+        )
         self.concurrency_safe = _mcp_tool_is_concurrency_safe(
             self.mcp_tool.name,
             concurrency_safe=concurrency_safe,
@@ -2488,7 +2513,14 @@ class MCPToolAdapter(AbstractBaseTool):
                 meta=dict(tool_meta) or None,
             )
 
-            return _normalized_mcp_call_result(result)
+            normalized = _normalized_mcp_call_result(result)
+            if self._is_excel_tool:
+                failure_code = _excel_failure_code(normalized)
+                if failure_code is not None:
+                    normalized["failure_code"] = failure_code
+                    normalized["success"] = False
+                    normalized["is_error"] = True
+            return normalized
 
     async def _retry_after_authorization_failure(
         self,

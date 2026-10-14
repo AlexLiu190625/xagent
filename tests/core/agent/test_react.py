@@ -76,6 +76,156 @@ class EmptyArgs(BaseModel):
     pass
 
 
+def test_latest_tool_failure_code_is_scoped_to_current_user_turn() -> None:
+    previous = SimpleNamespace(
+        role="tool",
+        metadata={
+            "raw_result": {"success": False, "failure_code": "excel_site_not_found"}
+        },
+    )
+    user = SimpleNamespace(role="user", metadata={})
+    current = SimpleNamespace(
+        role="tool",
+        metadata={
+            "raw_result": {
+                "success": False,
+                "failure_code": "excel_workbook_access_denied",
+            }
+        },
+    )
+    context = SimpleNamespace(messages=[previous, user, current])
+
+    assert (
+        ReActPattern._latest_tool_failure_code(context)
+        == "excel_workbook_access_denied"
+    )
+
+
+def test_latest_tool_failure_code_rejects_unallowlisted_code() -> None:
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(role="user", metadata={}),
+            SimpleNamespace(
+                role="tool",
+                metadata={
+                    "raw_result": {"success": False, "failure_code": "arbitrary"}
+                },
+            ),
+        ]
+    )
+
+    assert ReActPattern._latest_tool_failure_code(context) is None
+
+
+def test_latest_tool_failure_code_rejects_non_string_code() -> None:
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(role="user", metadata={}),
+            SimpleNamespace(
+                role="tool",
+                metadata={
+                    "raw_result": {"success": False, "failure_code": 123},
+                },
+            ),
+        ]
+    )
+
+    assert ReActPattern._latest_tool_failure_code(context) is None
+
+
+def test_latest_tool_failure_code_stops_at_a_later_non_dict_result() -> None:
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(role="user", metadata={}),
+            SimpleNamespace(
+                role="tool",
+                metadata={
+                    "raw_result": {
+                        "success": False,
+                        "failure_code": "excel_site_not_found",
+                    }
+                },
+            ),
+            SimpleNamespace(role="tool", metadata={"raw_result": "completed"}),
+        ]
+    )
+
+    assert ReActPattern._latest_tool_failure_code(context) is None
+
+
+def test_latest_tool_failure_code_does_not_cross_a_failed_current_turn() -> None:
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(
+                role="tool",
+                metadata={
+                    "raw_result": {
+                        "success": False,
+                        "failure_code": "excel_site_not_found",
+                    }
+                },
+            ),
+            SimpleNamespace(role="user", metadata={}),
+            SimpleNamespace(
+                role="tool",
+                metadata={
+                    "raw_result": {"success": False, "failure_code": "arbitrary"}
+                },
+            ),
+        ]
+    )
+
+    assert ReActPattern._latest_tool_failure_code(context) is None
+
+
+def test_latest_tool_failure_code_drops_stale_failure_after_success() -> None:
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(role="user", metadata={}),
+            SimpleNamespace(
+                role="tool",
+                metadata={
+                    "raw_result": {
+                        "success": False,
+                        "failure_code": "excel_site_not_found",
+                    }
+                },
+            ),
+            SimpleNamespace(
+                role="tool",
+                metadata={"raw_result": {"status": "success"}},
+            ),
+        ]
+    )
+
+    assert ReActPattern._latest_tool_failure_code(context) is None
+
+
+def test_latest_tool_failure_code_does_not_reuse_older_code_after_uncoded_failure() -> (
+    None
+):
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(role="user", metadata={}),
+            SimpleNamespace(
+                role="tool",
+                metadata={
+                    "raw_result": {
+                        "success": False,
+                        "failure_code": "excel_site_not_found",
+                    }
+                },
+            ),
+            SimpleNamespace(
+                role="tool",
+                metadata={"raw_result": {"success": False, "error": "other failure"}},
+            ),
+        ]
+    )
+
+    assert ReActPattern._latest_tool_failure_code(context) is None
+
+
 class FakeTool:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
