@@ -1550,33 +1550,35 @@ def _find_command_candidate(
     runner_id = get_runner_id()
     with get_session_local()() as db:
 
-        def first_candidate(*extra: Any) -> Any:
-            return (
-                _claimable_query(db, runner_id=runner_id, command_db_id=command_db_id)
-                .filter(
-                    *extra,
-                    TaskExecutionCommand.task_id.notin_(busy_task_ids),
-                    # A different expired RUNNING owner needs recovery before
-                    # acquisition. Our own owner can still process commands:
-                    # expiry alone does not revoke its immutable lease identity.
-                    or_(
-                        Task.runner_id == runner_id,
-                        task_status_predicate.ne(TaskStatus.RUNNING),
-                        Task.lease_expires_at.is_(None),
-                        Task.lease_expires_at >= _utc_now(),
-                    ),
-                )
-                .first()
+        def first_candidate(kind: TaskCommandKind | None = None) -> Any:
+            query = _claimable_query(
+                db, runner_id=runner_id, command_db_id=command_db_id
             )
+            if kind is not None:
+                query = query.filter(TaskExecutionCommand.kind == kind.value)
+            return query.filter(
+                TaskExecutionCommand.task_id.notin_(busy_task_ids),
+                # A different expired RUNNING owner needs recovery before
+                # acquisition. Our own owner can still process commands:
+                # expiry alone does not revoke its immutable lease identity.
+                or_(
+                    Task.runner_id == runner_id,
+                    task_status_predicate.ne(TaskStatus.RUNNING),
+                    Task.lease_expires_at.is_(None),
+                    Task.lease_expires_at >= _utc_now(),
+                ),
+            ).first()
 
         row = None
         if command_db_id is None:
             # A reply to a waiting task is served before any other claimable
-            # command, oldest first; each task's own order is still enforced
-            # by the shared claimable query.
-            row = first_candidate(
-                TaskExecutionCommand.kind == TaskCommandKind.RESUME_INPUT.value
-            )
+            # command, oldest first. That deliberately includes older pause
+            # and cancel commands of other tasks; each waits behind at most
+            # one reply per waiting task, because the shared claimable query
+            # still enforces each task's own order. This order applies to the
+            # scan only: an admission ticket can still keep a reply behind
+            # older work waiting in the same bucket.
+            row = first_candidate(TaskCommandKind.RESUME_INPUT)
         if row is None:
             row = first_candidate()
         return (

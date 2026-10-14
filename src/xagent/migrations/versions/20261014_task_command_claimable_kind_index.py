@@ -6,7 +6,9 @@ to those statuses keeps it cheap as settled commands accumulate.
 
 On PostgreSQL the index is built ``CONCURRENTLY`` in ``autocommit_block()`` so
 writes are not blocked, and an ``INVALID`` index or one whose columns or
-predicate differ is rebuilt. Other dialects use a plain ``CREATE INDEX``.
+predicate differ is rebuilt. SQLite gets the same partial index through
+``sqlite_where``, built without ``CONCURRENTLY``. Any other dialect gets a
+plain ``CREATE INDEX`` without a predicate.
 
 Accepted cost: every insert, and every status change that leaves a row
 ``pending`` or ``processing``, maintains one more index entry.

@@ -208,6 +208,23 @@ def _run(migration, connection, operation: str) -> None:
             getattr(migration, operation)()
 
 
+def _create_pg_table(connection) -> None:
+    connection.execute(
+        text(
+            f"CREATE TABLE {TABLE} ("
+            "id SERIAL PRIMARY KEY, task_id INTEGER NOT NULL, "
+            "kind VARCHAR(32) NOT NULL, status VARCHAR(16) NOT NULL)"
+        )
+    )
+
+
+def _pg_index_columns(connection) -> tuple[str, ...] | None:
+    for index in inspect(connection).get_indexes(TABLE):
+        if index["name"] == INDEX:
+            return tuple(index["column_names"])
+    return None
+
+
 def _pg_index_state(connection) -> tuple[bool | None, str | None]:
     row = connection.execute(
         text(
@@ -228,20 +245,13 @@ def test_postgresql_upgrade_builds_a_valid_index_with_the_expected_predicate(
     engine = postgresql_engine_factory("upgrade")
 
     with engine.connect() as connection:
-        connection.execute(
-            text(
-                f"CREATE TABLE {TABLE} ("
-                "id SERIAL PRIMARY KEY, task_id INTEGER NOT NULL, "
-                "kind VARCHAR(32) NOT NULL, status VARCHAR(16) NOT NULL)"
-            )
-        )
+        _create_pg_table(connection)
         connection.commit()
 
         _run(migration, connection, "upgrade")
         valid, predicate = _pg_index_state(connection)
         assert valid is True
         assert migration._postgres_predicate_matches_expected(predicate), predicate
-        assert "processing" in predicate and "pending" in predicate
 
         _run(migration, connection, "downgrade")
         assert INDEX not in _index_names(connection)
@@ -257,7 +267,7 @@ def test_postgresql_reply_first_lookup_uses_the_partial_index(
     Base.metadata.create_all(engine)
     factory = sessionmaker(engine, expire_on_commit=False)
     monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
-    monkeypatch.setattr(database_module, "get_session_local", lambda: factory)
+    monkeypatch.setattr(database_module, "_SessionLocal", factory)
     monkeypatch.setattr(transport, "get_runner_id", lambda: "me")
 
     with Session(engine) as session:
@@ -317,8 +327,18 @@ def test_postgresql_reply_first_lookup_uses_the_partial_index(
     assert INDEX in plan, plan
 
 
+# Each defect is a same-named index the upgrade must drop and rebuild:
+# (column list, WHERE clause or None for a non-partial index).
+_DEFECTIVE_INDEXES = {
+    "wrong_predicate": ("kind, id", "status = 'pending'"),
+    "wrong_columns": ("id, kind", "status IN ('pending', 'processing')"),
+    "non_partial": ("kind, id", None),
+    "invalid": ("kind, id", "status IN ('pending', 'processing')"),
+}
+
+
 @pytest.mark.postgresql
-@pytest.mark.parametrize("defect", ["wrong_predicate", "invalid"])
+@pytest.mark.parametrize("defect", list(_DEFECTIVE_INDEXES))
 def test_postgresql_upgrade_rebuilds_an_invalid_or_mismatched_index(
     postgresql_engine_factory, defect
 ) -> None:
@@ -326,29 +346,17 @@ def test_postgresql_upgrade_rebuilds_an_invalid_or_mismatched_index(
         MIGRATION_PATH, f"claimable_kind_index_rebuild_{defect}"
     )
     engine = postgresql_engine_factory(defect)
+    columns, where = _DEFECTIVE_INDEXES[defect]
 
     with engine.connect() as connection:
+        _create_pg_table(connection)
         connection.execute(
             text(
-                f"CREATE TABLE {TABLE} ("
-                "id SERIAL PRIMARY KEY, task_id INTEGER NOT NULL, "
-                "kind VARCHAR(32) NOT NULL, status VARCHAR(16) NOT NULL)"
+                f"CREATE INDEX {INDEX} ON {TABLE} ({columns})"
+                + ("" if where is None else f" WHERE {where}")
             )
         )
-        if defect == "wrong_predicate":
-            connection.execute(
-                text(
-                    f"CREATE INDEX {INDEX} ON {TABLE} (kind, id) "
-                    "WHERE status = 'pending'"
-                )
-            )
-        else:
-            connection.execute(
-                text(
-                    f"CREATE INDEX {INDEX} ON {TABLE} (kind, id) "
-                    "WHERE status IN ('pending', 'processing')"
-                )
-            )
+        if defect == "invalid":
             connection.execute(
                 text(
                     "UPDATE pg_catalog.pg_index SET indisvalid = false "
@@ -365,7 +373,7 @@ def test_postgresql_upgrade_rebuilds_an_invalid_or_mismatched_index(
         valid, predicate = _pg_index_state(connection)
         assert valid is True
         assert migration._postgres_predicate_matches_expected(predicate), predicate
-        assert "processing" in predicate
+        assert _pg_index_columns(connection) == INDEX_COLUMNS
 
 
 def test_offline_sql_rendering_emits_the_partial_index() -> None:
