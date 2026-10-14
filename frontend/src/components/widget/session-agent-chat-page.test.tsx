@@ -486,6 +486,21 @@ describe("SessionAgentChatPage", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument()
   })
 
+  it("does not show a start-message failure stored while established after a reset to the start page", async () => {
+    setBridge("active", activeSession())
+    const { rerender } = render(<SessionAgentChatPage />)
+    app.state.taskId = 71
+    rerender(<SessionAgentChatPage />)
+
+    await failStartMessage(
+      new MessageDeliveryError("diagnostic", "outcome_unknown"),
+    )
+    app.state.taskId = null
+    rerender(<SessionAgentChatPage />)
+
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+  })
+
   it("lets the reload-required notice take priority over the start-message failure", async () => {
     setBridge("active", activeSession())
     const { rerender } = render(<SessionAgentChatPage />)

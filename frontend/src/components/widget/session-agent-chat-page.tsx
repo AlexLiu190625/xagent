@@ -85,10 +85,12 @@ function SessionConversationContent({
     useState<{ code: ClientErrorCode | null } | null>(null)
   const conversationEstablished = state.taskId !== null
 
-  // A conversation that is reset back to the start page must not bring an
-  // earlier failure line back with it.
+  // The failure line belongs to the current start-page visit only: whenever
+  // the conversation becomes established or returns to the start page, the
+  // stored failure is dropped, so a failure that arrived while a conversation
+  // was established never shows on a later start page.
   useEffect(() => {
-    if (conversationEstablished) setStartMessageFailure(null)
+    setStartMessageFailure(null)
   }, [conversationEstablished])
 
   const handleStartMessage = useCallback(async (

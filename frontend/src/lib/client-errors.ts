@@ -42,11 +42,10 @@ export const CLIENT_ERROR_CODES = [
   // "model_error" is left out because it only rides on task_completed and
   // trace_error, never on a task_error frame, "auto_model_unavailable" is not
   // listed either, and the five client-only codes (the upload_* codes,
-  // connection_not_ready and message_not_accepted) are derived by the client.
-  // It stays one table so a code has one wording for every audience. Only codes with a
-  // producer that can
-  // reach that frame today are listed: a listed code nothing produces is an
-  // entry with no expiry date. Which codes those are is a fact about this
+  // connection_not_ready and message_not_accepted) are derived by the
+  // client. It stays one table so a code has one wording for every
+  // audience. Only codes with a producer that can reach that frame today are
+  // listed: a listed code nothing produces is an entry with no expiry date. Which codes those are is a fact about this
   // repository's raise sites, not a property the wire holds -- the field is
   // typed as a bare string and validated against the connector-runtime closed
   // set the server keeps next to its fallback table, and a resolver installed
