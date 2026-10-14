@@ -33,6 +33,7 @@ from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage
 from ..types import PROVIDER_STATE_METADATA_KEY, ChunkType, StreamChunk
 from .base import BaseLLM
+from .tool_choice import supports_forced_tool_choice
 
 logger = logging.getLogger(__name__)
 
@@ -340,6 +341,17 @@ class BedrockLLM(BaseLLM):
     def supports_json_object_response_format(self) -> bool:
         return False
 
+    @property
+    def supports_forced_tool_choice(self) -> bool:
+        """Whether this Bedrock model accepts ``toolChoice.any/tool``.
+
+        Anthropic documents Opus/Sonnet 5.5 as auto-only, and AWS also names
+        Fable 5.1 and Mythos 5.1. The shared matcher accepts bare model ids
+        and the model segment of Bedrock ARNs. Opaque application inference
+        profiles can opt in through the ``auto_tool_choice_only`` ability.
+        """
+        return supports_forced_tool_choice(self._abilities, self._model_name)
+
     def _build_client(self) -> Any:
         import boto3
 
@@ -609,6 +621,7 @@ class BedrockLLM(BaseLLM):
             request["system"] = self._sanitize_unicode_content(system)
         if additional is not None:
             request["additionalModelRequestFields"] = additional
+        tool_choice = self.compatible_tool_choice(tool_choice)
         if tools and tool_choice != "none":
             request["toolConfig"] = {"tools": self._convert_tools(tools)}
             converted_choice = self._convert_tool_choice(tool_choice)

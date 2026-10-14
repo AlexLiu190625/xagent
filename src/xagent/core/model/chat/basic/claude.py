@@ -23,6 +23,7 @@ from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage
 from ..types import ChunkType, StreamChunk
 from .base import BaseLLM
+from .tool_choice import supports_forced_tool_choice
 
 logger = logging.getLogger(__name__)
 
@@ -272,6 +273,10 @@ class ClaudeLLM(BaseLLM):
     def abilities(self) -> List[str]:
         """Get the list of abilities supported by this Claude LLM implementation."""
         return self._abilities
+
+    @property
+    def supports_forced_tool_choice(self) -> bool:
+        return supports_forced_tool_choice(self._abilities, self._model_name)
 
     def _ensure_client(self) -> None:
         """Ensure the Anthropic client is initialized."""
@@ -603,6 +608,8 @@ class ClaudeLLM(BaseLLM):
             if system_message:
                 completion_params["system"] = system_message
 
+            tool_choice = self.compatible_tool_choice(tool_choice)
+
             # Handle tools
             if tools:
                 completion_params["tools"] = self._convert_tools_to_anthropic_format(
@@ -871,6 +878,8 @@ class ClaudeLLM(BaseLLM):
             # Set system message
             if system_message:
                 completion_params["system"] = system_message
+
+            tool_choice = self.compatible_tool_choice(tool_choice)
 
             # Handle tools
             if tools:

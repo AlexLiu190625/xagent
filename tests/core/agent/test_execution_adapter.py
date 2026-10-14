@@ -366,7 +366,22 @@ async def test_execution_adapter_routes_single_call_to_one_tool_then_final_answe
                     }
                 ]
             },
-            {"content": "done", "done": True},
+            {
+                "tool_calls": [
+                    {
+                        "id": "call-final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": json.dumps(
+                                {
+                                    "response_language": "English",
+                                    "answer": "done",
+                                }
+                            ),
+                        },
+                    }
+                ]
+            },
         ]
     )
     tool = FakeTool()
