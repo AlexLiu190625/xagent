@@ -42,6 +42,7 @@ const appControls = vi.hoisted(() => ({
   isConversationResetPending: false,
   isMessageDeliveryPending: false,
   isSessionInteractionLocked: false,
+  connectionNotice: null as "reconnecting" | "lost" | null,
 }))
 const chatInputProps = vi.hoisted(() => ({
   current: null as null | {
@@ -80,6 +81,7 @@ vi.mock("@/contexts/app-context-chat", () => ({
     isConversationResetPending: appControls.isConversationResetPending,
     isMessageDeliveryPending: appControls.isMessageDeliveryPending,
     isSessionInteractionLocked: appControls.isSessionInteractionLocked,
+    connectionNotice: appControls.connectionNotice,
   }),
 }))
 
@@ -289,6 +291,7 @@ describe("TaskConversationPanel", () => {
     appControls.isConversationResetPending = false
     appControls.isMessageDeliveryPending = false
     appControls.isSessionInteractionLocked = false
+    appControls.connectionNotice = null
     appControls.filesDisabled = false
     appControls.voiceInputEnabled = true
     appControls.taskControlsEnabled = true
@@ -672,6 +675,16 @@ describe("TaskConversationPanel", () => {
     appControls.isMessageDeliveryPending = false
     rerender(<TaskConversationPanel mode="page" />)
     expect(chatInputProps.current?.isLoading).toBe(false)
+  })
+
+  it("shows a status banner only once the connection is lost", () => {
+    appControls.connectionNotice = "reconnecting"
+    const { rerender } = render(<TaskConversationPanel mode="page" />)
+    expect(screen.queryByText("clientErrors.connectionLost")).not.toBeInTheDocument()
+
+    appControls.connectionNotice = "lost"
+    rerender(<TaskConversationPanel mode="page" />)
+    expect(screen.getByRole("status")).toHaveTextContent("clientErrors.connectionLost")
   })
 
   it("blocks the established-conversation composer when the Session outcome requires reload", () => {

@@ -115,8 +115,14 @@ export interface ChatMessageProps {
 
 function GeneratingIndicator({ latestTitle, taskStatus }: { latestTitle?: string, taskStatus?: string }) {
   const { t } = useI18n();
+  const { connectionNotice } = useApp();
 
-  const displayTitle = taskStatus === 'paused'
+  // Paused, waiting and completed turns show no activity, so a connection
+  // notice would be misleading there and their own label stays.
+  const showsActivity = !["paused", "waiting_for_user", "completed"].includes(taskStatus || "");
+  const displayTitle = showsActivity && connectionNotice
+    ? t(connectionNotice === "lost" ? "clientErrors.connectionLost" : "clientErrors.connectionReconnecting")
+    : taskStatus === 'paused'
     ? t("common.taskPaused")
     : taskStatus === 'waiting_for_user'
       ? t("common.waitingForUser")
@@ -125,7 +131,7 @@ function GeneratingIndicator({ latestTitle, taskStatus }: { latestTitle?: string
   return (
     <div className="py-3 text-sm leading-relaxed text-muted-foreground flex items-center">
       <span>{displayTitle}</span>
-      {!["paused", "waiting_for_user", "completed"].includes(taskStatus || "") && (
+      {showsActivity && connectionNotice !== "lost" && (
         <span className="ml-1 inline-flex items-end gap-1">
           <span className="dot" />
           <span className="dot" />

@@ -8,6 +8,7 @@ const clipboardWriteTextMock = vi.hoisted(() => vi.fn())
 const appContextMock = vi.hoisted(() => ({
   filesDisabled: false,
   openFilePreview: vi.fn(),
+  connectionNotice: null as "reconnecting" | "lost" | null,
 }))
 const clarificationFormMock = vi.hoisted(() => vi.fn())
 
@@ -88,6 +89,7 @@ import { ChatMessage } from "./ChatMessage"
 describe("ChatMessage Session file capability", () => {
   beforeEach(() => {
     appContextMock.filesDisabled = false
+    appContextMock.connectionNotice = null
     appContextMock.openFilePreview.mockReset()
     clarificationFormMock.mockReset()
     apiRequestMock.mockReset()
@@ -748,5 +750,18 @@ describe("ChatMessage Session file capability", () => {
     )
 
     expect(screen.queryByText(/Which region should I search\?/)).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ["reconnecting", "running", "clientErrors.connectionReconnecting", 3],
+    ["reconnecting", "waiting_for_user", "common.waitingForUser", 0],
+    ["lost", "running", "clientErrors.connectionLost", 0],
+  ] as const)("%s notice while %s shows its text", (notice, taskStatus, text, dots) => {
+    appContextMock.connectionNotice = notice
+    const { container } = render(
+      <ChatMessage role="assistant" content={null} taskStatus={taskStatus} showProcessView={false} />,
+    )
+    expect(screen.getByText(text)).toBeInTheDocument()
+    expect(container.querySelectorAll(".dot")).toHaveLength(dots)
   })
 })

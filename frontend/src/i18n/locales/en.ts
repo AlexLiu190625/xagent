@@ -49,6 +49,8 @@ const en = {
     uploadFailed: "Upload failed. Please try again.",
     connectionNotReady: "Not connected. Your message was not sent.",
     messageNotAccepted: "The message was not accepted.",
+    connectionReconnecting: "Connection lost — reconnecting…",
+    connectionLost: "Connection lost. Reload the page to reconnect.",
     missingRuntimeContext: "This connector needs additional runtime input before it can run.",
     runtimeSecretUnavailable: "This connector needs a runtime credential that is not available.",
     scheduledSecretUnavailable: "A scheduled run needs a runtime credential that is not available.",
