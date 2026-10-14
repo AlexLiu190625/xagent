@@ -1,5 +1,6 @@
 """Gemini LLM implementation using official Google Generative AI SDK."""
 
+import asyncio
 import json
 import logging
 import os
@@ -19,6 +20,7 @@ from ..exceptions import (
     LLMRetryableError,
     LLMTimeoutError,
 )
+from ..stream_deadline import await_before_deadline
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage
 from ..types import ChunkType, StreamChunk
@@ -115,6 +117,17 @@ def _compact_repr(value: Any, limit: int = 500) -> str:
     except Exception:
         text = f"<unrepresentable {type(value).__name__}>"
     return text if len(text) <= limit else text[:limit] + "..."
+
+
+async def _close_stream(stream: Any) -> None:
+    """Close the SDK stream after a deadline expired, best effort."""
+    close = getattr(stream, "aclose", None)
+    if not callable(close):
+        return
+    try:
+        await close()
+    except Exception as exc:  # best effort
+        logger.debug("Closing aborted Gemini stream failed (%s)", type(exc).__name__)
 
 
 def _gemini_candidate_diagnostics(candidate: Any) -> Dict[str, Any]:
@@ -700,12 +713,6 @@ class GeminiLLM(BaseLLM):
         **kwargs: Any,
     ) -> AsyncIterator[StreamChunk]:
         """Stream chat completion using official Google Generative AI SDK."""
-        import time
-
-        first_token = True
-        last_token_time = None
-        start_time = time.time()
-
         current_content = ""
         usage_received = False
 
@@ -777,8 +784,31 @@ class GeminiLLM(BaseLLM):
             if merged_config:
                 api_params["config"] = types.GenerateContentConfig(**merged_config)
 
-            response_stream = await self._client.aio.models.generate_content_stream(
-                **api_params
+            # Both limits are deadlines on the wait itself, not checks made
+            # when a chunk arrives: a check on arrival never runs for a stream
+            # that stays silent, and without a configured ``base_url`` the SDK
+            # client has no HTTP timeout to bound it either (#3058). With tools
+            # (AFC is disabled in ``_build_gemini_tool_config``) the SDK sends
+            # the request and waits for the response headers inside
+            # ``generate_content_stream(...)``; without tools it sends the
+            # request on the first read. The first-token deadline bounds both.
+            loop = asyncio.get_running_loop()
+            first_token_timeout = self.timeout_config.first_token_timeout
+            opened_at = loop.time()
+            first_token_deadline = opened_at + first_token_timeout
+            first_token_message = (
+                f"First token timeout: no chunk within {first_token_timeout}s"
+            )
+            interval_timeout = self.timeout_config.token_interval_timeout
+            interval_message = (
+                f"Token interval timeout: no chunk within {interval_timeout}s "
+                "of the previous one"
+            )
+
+            response_stream = await await_before_deadline(
+                self._client.aio.models.generate_content_stream(**api_params),
+                deadline=first_token_deadline,
+                timeout_message=first_token_message,
             )
 
             # Check if response_stream is None
@@ -793,28 +823,34 @@ class GeminiLLM(BaseLLM):
             tool_call_index = 0
 
             # Process streaming response (async iteration)
-            async for chunk in response_stream:
-                current_time = time.time()
-
-                if first_token:
-                    elapsed = current_time - start_time
-                    if elapsed > self.timeout_config.first_token_timeout:
-                        raise LLMTimeoutError(
-                            f"First token timeout: {elapsed:.2f}s > "
-                            f"{self.timeout_config.first_token_timeout}s"
-                        )
-                    first_token = False
-                    logger.debug(f"First token received after {elapsed:.2f}s")
-
-                if last_token_time is not None:
-                    interval = current_time - last_token_time
-                    if interval > self.timeout_config.token_interval_timeout:
-                        raise LLMTimeoutError(
-                            f"Token interval timeout: {interval:.2f}s > "
-                            f"{self.timeout_config.token_interval_timeout}s"
-                        )
-
-                last_token_time = current_time
+            chunks = aiter(response_stream)
+            first_chunk = True
+            while True:
+                # The interval deadline starts when we begin waiting, so time
+                # the caller spends on the previous chunk is not counted as
+                # provider silence.
+                if first_chunk:
+                    deadline = first_token_deadline
+                    timeout_message = first_token_message
+                else:
+                    deadline = loop.time() + interval_timeout
+                    timeout_message = interval_message
+                try:
+                    chunk = await await_before_deadline(
+                        anext(chunks),
+                        deadline=deadline,
+                        timeout_message=timeout_message,
+                    )
+                except StopAsyncIteration:
+                    break
+                except LLMTimeoutError:
+                    await _close_stream(response_stream)
+                    raise
+                if first_chunk:
+                    first_chunk = False
+                    logger.debug(
+                        "First token received after %.2fs", loop.time() - opened_at
+                    )
 
                 # Check for usage metadata
                 if (
