@@ -3593,3 +3593,160 @@ async def test_supervise_task_command_dispatcher(
         if foreign_loop is not None:
             foreign.cancel()
             foreign_loop.close()
+
+
+@pytest.fixture()
+def shared_dispatch_db(db_session, monkeypatch):
+    """Shared execution enabled, with tasks that any runner may claim from."""
+
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setattr(task_command_transport_module, "get_runner_id", lambda: "me")
+    return db_session
+
+
+def _unowned_task(db, user_id: int, title: str) -> Task:
+    task = Task(
+        user_id=user_id,
+        title=title,
+        description=title,
+        status=TaskStatus.RUNNING,
+        execution_mode="auto",
+        run_id=None,
+        runner_id=None,
+        lease_expires_at=None,
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+def _insert_command(db, task_id: int, kind: TaskCommandKind, identity: str) -> int:
+    row = TaskExecutionCommand(
+        task_id=task_id, command_id=identity, kind=kind.value, payload={}
+    )
+    db.add(row)
+    db.commit()
+    return int(row.id)
+
+
+def _claim_candidate() -> tuple[int, int, TaskCommandKind] | None:
+    return task_command_transport_module._find_command_candidate(None)
+
+
+def test_reply_first_claim_order_prefers_a_newer_reply_over_an_older_start(
+    shared_dispatch_db,
+) -> None:
+    db = shared_dispatch_db
+    user, first_task = _create_running_task(db)
+    second_task = _unowned_task(db, int(user.id), "second")
+    first_task.runner_id = None
+    first_task.lease_expires_at = None
+    db.commit()
+    older_start = _insert_command(
+        db, int(first_task.id), TaskCommandKind.START, "start-a"
+    )
+    newer_reply = _insert_command(
+        db, int(second_task.id), TaskCommandKind.RESUME_INPUT, "reply-b"
+    )
+    assert older_start < newer_reply
+
+    assert _claim_candidate() == (
+        newer_reply,
+        int(second_task.id),
+        TaskCommandKind.RESUME_INPUT,
+    )
+
+
+def test_reply_first_claim_order_keeps_a_tasks_start_ahead_of_its_own_reply(
+    shared_dispatch_db,
+) -> None:
+    db = shared_dispatch_db
+    user, task = _create_running_task(db)
+    task.runner_id = None
+    task.lease_expires_at = None
+    db.commit()
+    start = _insert_command(db, int(task.id), TaskCommandKind.START, "start-same")
+    _insert_command(db, int(task.id), TaskCommandKind.RESUME_INPUT, "reply-same")
+
+    assert _claim_candidate() == (start, int(task.id), TaskCommandKind.START)
+
+
+def test_reply_first_claim_order_takes_the_older_of_two_starts(
+    shared_dispatch_db,
+) -> None:
+    db = shared_dispatch_db
+    user, first_task = _create_running_task(db)
+    first_task.runner_id = None
+    first_task.lease_expires_at = None
+    db.commit()
+    second_task = _unowned_task(db, int(user.id), "second")
+    older = _insert_command(db, int(first_task.id), TaskCommandKind.START, "start-1")
+    _insert_command(db, int(second_task.id), TaskCommandKind.START, "start-2")
+
+    assert _claim_candidate() == (older, int(first_task.id), TaskCommandKind.START)
+
+
+def test_reply_first_claim_order_takes_the_older_of_two_replies(
+    shared_dispatch_db,
+) -> None:
+    db = shared_dispatch_db
+    user, first_task = _create_running_task(db)
+    first_task.runner_id = None
+    first_task.lease_expires_at = None
+    db.commit()
+    second_task = _unowned_task(db, int(user.id), "second")
+    older = _insert_command(
+        db, int(first_task.id), TaskCommandKind.RESUME_INPUT, "reply-1"
+    )
+    _insert_command(db, int(second_task.id), TaskCommandKind.RESUME_INPUT, "reply-2")
+
+    assert _claim_candidate() == (
+        older,
+        int(first_task.id),
+        TaskCommandKind.RESUME_INPUT,
+    )
+
+
+def test_find_command_candidate_with_an_explicit_id_runs_the_single_general_query(
+    shared_dispatch_db,
+) -> None:
+    from sqlalchemy import event, or_
+
+    db = shared_dispatch_db
+    user, task = _create_running_task(db)
+    task.runner_id = None
+    task.lease_expires_at = None
+    db.commit()
+    reply = _insert_command(
+        db, int(task.id), TaskCommandKind.RESUME_INPUT, "reply-explicit"
+    )
+    transport = task_command_transport_module
+    baseline = transport._claimable_query(
+        db, runner_id="me", command_db_id=reply
+    ).filter(
+        TaskExecutionCommand.task_id.notin_(()),
+        or_(
+            Task.runner_id == "me",
+            transport.task_status_predicate.ne(TaskStatus.RUNNING),
+            Task.lease_expires_at.is_(None),
+            Task.lease_expires_at >= transport._utc_now(),
+        ),
+    )
+    selects: list[str] = []
+
+    def record(_conn, _cursor, statement, *_args) -> None:
+        if statement.lstrip().upper().startswith("SELECT"):
+            selects.append(statement)
+
+    engine = get_engine()
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        baseline.first()
+        found = transport._find_command_candidate(reply)
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+    assert found == (reply, int(task.id), TaskCommandKind.RESUME_INPUT)
+    assert len(selects) == 2
+    assert selects[1] == selects[0]

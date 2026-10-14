@@ -1549,22 +1549,36 @@ def _find_command_candidate(
 
     runner_id = get_runner_id()
     with get_session_local()() as db:
-        row = (
-            _claimable_query(db, runner_id=runner_id, command_db_id=command_db_id)
-            .filter(
-                TaskExecutionCommand.task_id.notin_(busy_task_ids),
-                # A different expired RUNNING owner needs recovery before
-                # acquisition. Our own owner can still process commands:
-                # expiry alone does not revoke its immutable lease identity.
-                or_(
-                    Task.runner_id == runner_id,
-                    task_status_predicate.ne(TaskStatus.RUNNING),
-                    Task.lease_expires_at.is_(None),
-                    Task.lease_expires_at >= _utc_now(),
-                ),
+
+        def first_candidate(*extra: Any) -> Any:
+            return (
+                _claimable_query(db, runner_id=runner_id, command_db_id=command_db_id)
+                .filter(
+                    *extra,
+                    TaskExecutionCommand.task_id.notin_(busy_task_ids),
+                    # A different expired RUNNING owner needs recovery before
+                    # acquisition. Our own owner can still process commands:
+                    # expiry alone does not revoke its immutable lease identity.
+                    or_(
+                        Task.runner_id == runner_id,
+                        task_status_predicate.ne(TaskStatus.RUNNING),
+                        Task.lease_expires_at.is_(None),
+                        Task.lease_expires_at >= _utc_now(),
+                    ),
+                )
+                .first()
             )
-            .first()
-        )
+
+        row = None
+        if command_db_id is None:
+            # A reply to a waiting task is served before any other claimable
+            # command, oldest first; each task's own order is still enforced
+            # by the shared claimable query.
+            row = first_candidate(
+                TaskExecutionCommand.kind == TaskCommandKind.RESUME_INPUT.value
+            )
+        if row is None:
+            row = first_candidate()
         return (
             (int(row.id), int(row.task_id), TaskCommandKind(row.kind)) if row else None
         )
