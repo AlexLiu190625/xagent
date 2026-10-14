@@ -11,13 +11,16 @@ import boto3
 import pytest
 from botocore import UNSIGNED
 from botocore.stub import Stubber
+from pydantic import BaseModel
 
+from xagent.core.agent.context.execution import ExecutionContext
 from xagent.core.agent.context.message import Message
+from xagent.core.agent.pattern.react.react import ReActPattern
 from xagent.core.agent.runtime import PatternRuntime
 from xagent.core.model.chat.basic.adapter import create_base_llm
 from xagent.core.model.chat.basic.bedrock import BedrockLLM
 from xagent.core.model.chat.token_context import TokenContextManager
-from xagent.core.model.chat.types import ChunkType
+from xagent.core.model.chat.types import PROVIDER_STATE_METADATA_KEY, ChunkType
 from xagent.core.model.model import ChatModelConfig
 from xagent.core.model.providers import get_supported_provider_metadata
 
@@ -331,6 +334,111 @@ class _FakeClient:
         return {"stream": self.stream}
 
 
+class _SequentialFakeClient:
+    def __init__(self, streams: list[_FakeEventStream]) -> None:
+        self.streams = list(streams)
+        self.requests: list[dict[str, Any]] = []
+
+    def converse_stream(self, **request: Any) -> dict[str, Any]:
+        self.requests.append(request)
+        return {"stream": self.streams.pop(0)}
+
+
+class _FakeConverseClient:
+    def __init__(self, responses: list[dict[str, Any]]) -> None:
+        self.responses = list(responses)
+        self.requests: list[dict[str, Any]] = []
+
+    def converse(self, **request: Any) -> dict[str, Any]:
+        self.requests.append(request)
+        return self.responses.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_converse_reasoning_round_trips_through_context_checkpoint():
+    client = _FakeConverseClient(
+        [
+            {
+                "output": {
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "reasoningContent": {
+                                    "reasoningText": {
+                                        "text": "private reasoning",
+                                        "signature": "signed-value",
+                                    }
+                                }
+                            },
+                            {"reasoningContent": {"redactedContent": b"secret"}},
+                            {
+                                "toolUse": {
+                                    "toolUseId": "call-1",
+                                    "name": "weather",
+                                    "input": {"city": "Paris"},
+                                }
+                            },
+                        ],
+                    }
+                },
+                "stopReason": "tool_use",
+                "usage": {"inputTokens": 5, "outputTokens": 7},
+            },
+            {
+                "output": {
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"text": "It is sunny."}],
+                    }
+                },
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": 9, "outputTokens": 3},
+            },
+        ]
+    )
+    llm = BedrockLLM("model", client=client)
+
+    first = await llm.chat([{"role": "user", "content": "Weather?"}])
+
+    assert first["content"] == ""
+    assert "private reasoning" not in first["content"]
+    json.dumps(first[PROVIDER_STATE_METADATA_KEY])
+    context = ExecutionContext()
+    context.add_user_message("Weather?")
+    context.add_assistant_message(
+        first["content"],
+        tool_calls=first["tool_calls"],
+        metadata={PROVIDER_STATE_METADATA_KEY: first[PROVIDER_STATE_METADATA_KEY]},
+    )
+    context.add_tool_result("weather", {"condition": "sunny"}, "call-1")
+    restored = ExecutionContext.from_dict(context.to_dict())
+
+    second = await llm.chat(restored.get_messages_for_llm(include_system=False))
+
+    assert second["content"] == "It is sunny."
+    replayed = client.requests[1]["messages"]
+    assert replayed[1]["content"] == [
+        {
+            "reasoningContent": {
+                "reasoningText": {
+                    "text": "private reasoning",
+                    "signature": "signed-value",
+                }
+            }
+        },
+        {"reasoningContent": {"redactedContent": b"secret"}},
+        {
+            "toolUse": {
+                "toolUseId": "call-1",
+                "name": "weather",
+                "input": {"city": "Paris"},
+            }
+        },
+    ]
+    assert replayed[2]["content"][0]["toolResult"]["toolUseId"] == "call-1"
+
+
 class _BlockingEventStream:
     def __init__(self) -> None:
         self.closed = False
@@ -471,6 +579,224 @@ async def test_converse_stream_final_tool_snapshot_is_not_appended_twice_by_runt
     assert json.loads(result["tool_calls"][0]["function"]["arguments"]) == {
         "city": "Paris"
     }
+
+
+@pytest.mark.asyncio
+async def test_converse_stream_assembles_fragmented_signed_and_redacted_reasoning():
+    stream = _FakeEventStream(
+        [
+            {"messageStart": {"role": "assistant"}},
+            {
+                "contentBlockDelta": {
+                    "contentBlockIndex": 0,
+                    "delta": {"reasoningContent": {"text": "private "}},
+                }
+            },
+            {
+                "contentBlockDelta": {
+                    "contentBlockIndex": 0,
+                    "delta": {"reasoningContent": {"text": "reasoning"}},
+                }
+            },
+            {
+                "contentBlockDelta": {
+                    "contentBlockIndex": 0,
+                    "delta": {"reasoningContent": {"signature": "signed-"}},
+                }
+            },
+            {
+                "contentBlockDelta": {
+                    "contentBlockIndex": 0,
+                    "delta": {"reasoningContent": {"signature": "value"}},
+                }
+            },
+            {"contentBlockStop": {"contentBlockIndex": 0}},
+            {
+                "contentBlockDelta": {
+                    "contentBlockIndex": 1,
+                    "delta": {"reasoningContent": {"redactedContent": b"sec"}},
+                }
+            },
+            {
+                "contentBlockDelta": {
+                    "contentBlockIndex": 1,
+                    "delta": {"reasoningContent": {"redactedContent": b"ret"}},
+                }
+            },
+            {"contentBlockStop": {"contentBlockIndex": 1}},
+            {
+                "contentBlockStart": {
+                    "contentBlockIndex": 2,
+                    "start": {"toolUse": {"toolUseId": "call-1", "name": "weather"}},
+                }
+            },
+            {
+                "contentBlockDelta": {
+                    "contentBlockIndex": 2,
+                    "delta": {"toolUse": {"input": '{"city":"Paris"}'}},
+                }
+            },
+            {"contentBlockStop": {"contentBlockIndex": 2}},
+            {"messageStop": {"stopReason": "tool_use"}},
+            {"metadata": {"usage": {"inputTokens": 3, "outputTokens": 8}}},
+        ]
+    )
+    client = _FakeClient(stream)
+    llm = BedrockLLM("model", client=client)
+
+    result = await PatternRuntime().run_streaming_llm_call(
+        llm,
+        messages=[{"role": "user", "content": "weather"}],
+        tools=[],
+    )
+
+    assert result["content"] == ""
+    assert "private reasoning" not in result["content"]
+    provider_state = result[PROVIDER_STATE_METADATA_KEY]
+    json.dumps(provider_state)
+    replay = llm._request(
+        [
+            {"role": "user", "content": "weather"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": result["tool_calls"],
+                PROVIDER_STATE_METADATA_KEY: provider_state,
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "sunny"},
+        ],
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        {},
+    )
+    assert replay["messages"][1]["content"] == [
+        {
+            "reasoningContent": {
+                "reasoningText": {
+                    "text": "private reasoning",
+                    "signature": "signed-value",
+                }
+            }
+        },
+        {"reasoningContent": {"redactedContent": b"secret"}},
+        {
+            "toolUse": {
+                "toolUseId": "call-1",
+                "name": "weather",
+                "input": {"city": "Paris"},
+            }
+        },
+    ]
+
+
+class _WeatherArgs(BaseModel):
+    city: str
+
+
+class _WeatherTool:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.metadata = SimpleNamespace(name="weather", description="Get weather")
+
+    def args_type(self) -> type[BaseModel]:
+        return _WeatherArgs
+
+    async def run_json_async(self, args: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append(args)
+        return {"condition": "sunny"}
+
+
+@pytest.mark.asyncio
+async def test_react_round_trips_bedrock_signed_reasoning_with_tool_result():
+    first = _FakeEventStream(
+        [
+            {"messageStart": {"role": "assistant"}},
+            {
+                "contentBlockDelta": {
+                    "contentBlockIndex": 0,
+                    "delta": {"reasoningContent": {"text": "private reasoning"}},
+                }
+            },
+            {
+                "contentBlockDelta": {
+                    "contentBlockIndex": 0,
+                    "delta": {"reasoningContent": {"signature": "signed-value"}},
+                }
+            },
+            {"contentBlockStop": {"contentBlockIndex": 0}},
+            {
+                "contentBlockStart": {
+                    "contentBlockIndex": 1,
+                    "start": {"toolUse": {"toolUseId": "call-1", "name": "weather"}},
+                }
+            },
+            {
+                "contentBlockDelta": {
+                    "contentBlockIndex": 1,
+                    "delta": {"toolUse": {"input": '{"city":"Paris"}'}},
+                }
+            },
+            {"contentBlockStop": {"contentBlockIndex": 1}},
+            {"messageStop": {"stopReason": "tool_use"}},
+            {"metadata": {"usage": {"inputTokens": 3, "outputTokens": 6}}},
+        ]
+    )
+    second = _FakeEventStream(
+        [
+            {"messageStart": {"role": "assistant"}},
+            {
+                "contentBlockDelta": {
+                    "contentBlockIndex": 0,
+                    "delta": {"text": "It is sunny."},
+                }
+            },
+            {"contentBlockStop": {"contentBlockIndex": 0}},
+            {"messageStop": {"stopReason": "end_turn"}},
+            {"metadata": {"usage": {"inputTokens": 8, "outputTokens": 3}}},
+        ]
+    )
+    client = _SequentialFakeClient([first, second])
+    llm = BedrockLLM("model", client=client)
+    tool = _WeatherTool()
+    context = ExecutionContext()
+    context.add_user_message("What is the weather in Paris?")
+
+    result = await ReActPattern(max_iterations=3).run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "It is sunny."
+    assert tool.calls == [{"city": "Paris"}]
+    second_request = client.requests[1]["messages"]
+    assistant = next(
+        message for message in second_request if message["role"] == "assistant"
+    )
+    assert assistant["content"][0] == {
+        "reasoningContent": {
+            "reasoningText": {
+                "text": "private reasoning",
+                "signature": "signed-value",
+            }
+        }
+    }
+    assert assistant["content"][1]["toolUse"]["toolUseId"] == "call-1"
+    tool_result = next(
+        message
+        for message in second_request
+        if message["role"] == "user" and "toolResult" in message["content"][0]
+    )
+    assert tool_result["content"][0]["toolResult"]["toolUseId"] == "call-1"
+    assert all(
+        "private reasoning" not in message.content for message in context.messages
+    )
 
 
 @pytest.mark.asyncio
