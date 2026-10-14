@@ -20,6 +20,46 @@ interface RecentMessage {
   clientMessageId: string
 }
 
+// A connection on which the server confirmed heartbeats is dead once no frame
+// at all has arrived for this long. Mirrors CLIENT_DEAD_AFTER_SECONDS on the
+// server and CLIENT_DEAD_AFTER_MS in public/widget.js.
+export const DEAD_AFTER_MS = 30_000
+const RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000, 15000]
+const RECONNECT_JITTER = 0.2
+const MAX_RECONNECT_ATTEMPTS = RECONNECT_DELAYS_MS.length
+const LIVENESS_QUERY = "liveness=heartbeat"
+
+export type ConnectionPhase = "idle" | "connecting" | "connected" | "reconnecting" | "lost"
+
+export interface ConnectionPhaseFacts {
+  hasDescriptor: boolean
+  autoConnect: boolean
+  stoppedByCaller: boolean
+  ownerOpen: boolean
+  ownerInFlight: boolean
+  retryPending: boolean
+  lifecycleEnded: boolean
+}
+
+/**
+ * The connection phase is a pure function of facts the connection manager
+ * already owns, so it never needs its own transition table. The first rule
+ * that holds wins.
+ */
+export const deriveConnectionPhase = (facts: ConnectionPhaseFacts): ConnectionPhase => {
+  const hasConnectionObject = facts.ownerOpen || facts.ownerInFlight
+  if (
+    !facts.hasDescriptor
+    || facts.stoppedByCaller
+    || (!facts.autoConnect && !hasConnectionObject)
+  ) return "idle"
+  if (facts.ownerOpen) return "connected"
+  if (facts.retryPending || (facts.ownerInFlight && facts.lifecycleEnded)) return "reconnecting"
+  if (facts.ownerInFlight) return "connecting"
+  if (!facts.lifecycleEnded) return "connecting"
+  return "lost"
+}
+
 const MESSAGE_DUPLICATE_THRESHOLD = 2000 // Same message within 2 seconds is considered duplicate
 const HANDSHAKE_TIMEOUT_MS = 10_000
 const MAX_AUTH_REFRESH_RETRIES = 3
@@ -144,6 +184,37 @@ const getInternalSessionId = (
     : null
 }
 
+type LoginKind = "auth" | "external" | "widget-session"
+
+// The Session window is the only connection that omits the task id from chat
+// frames; its reconnects belong to the embedding page, not to this hook.
+const isSessionConnection = (connection: WebSocketConnection): boolean => (
+  connection.chatTaskIdMode === "omit"
+)
+
+const loginKindOf = (connection: WebSocketConnection): LoginKind => {
+  if (isSessionConnection(connection)) return "widget-session"
+  return connection.credentialOwner.kind === "auth-context" ? "auth" : "external"
+}
+
+// Whether two descriptors act for the same login principal. Connection values
+// may carry credentials, so they are compared in memory and never serialized.
+const isSameLoginPrincipal = (
+  previous: WebSocketConnection,
+  next: WebSocketConnection,
+): boolean => {
+  const kind = loginKindOf(previous)
+  if (kind !== loginKindOf(next)) return false
+  if (kind === "widget-session") return true
+  const previousOwner = previous.credentialOwner
+  const nextOwner = next.credentialOwner
+  if (previousOwner.kind === "auth-context" && nextOwner.kind === "auth-context") {
+    return previousOwner.userId === nextOwner.userId
+      && previousOwner.session?.sessionId === nextOwner.session?.sessionId
+  }
+  return previous.url === next.url
+}
+
 export interface WebSocketConnection {
   identity: string
   url: string
@@ -194,6 +265,7 @@ interface PendingDelivery {
   attemptEpoch: number
   deliveryGeneration: number
   socket: WebSocket
+  framesReceivedAtSend: number
 }
 
 interface MessagePreparationClaim {
@@ -265,6 +337,20 @@ interface SocketOwner {
   ) => Promise<boolean>
   disconnectNotified: boolean
   handshakeTimer: ReturnType<typeof setTimeout> | null
+  // `{connection identity}|{login kind}:{login generation}`: which task this
+  // connection serves and for which login principal. Carries no credential.
+  connectionKey: string
+  opened: boolean
+  openedAt: number | null
+  firstFrameAt: number | null
+  lastFrameAt: number | null
+  framesReceived: number
+  // The server confirmed that it pushes heartbeats on this connection.
+  heartbeatEnabled: boolean
+  deadTimer: ReturnType<typeof setTimeout> | null
+  // The reconnect budget was already restored by this connection's traffic.
+  budgetRestored: boolean
+  sharedTaskId: number | undefined
 }
 
 interface OwnerRetirementOptions {
@@ -272,6 +358,10 @@ interface OwnerRetirementOptions {
   preparationError: Error
   close?: { code?: number; reason?: string }
   notifyDisconnect: boolean
+  // Whether this retirement is a connection failure that ends the current
+  // lifecycle. Replacing the descriptor, unmounting and a caller disconnect
+  // are not failures.
+  endsLifecycle: boolean
 }
 
 interface ScheduledRetry {
@@ -352,7 +442,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           taskId,
           token: effectiveToken,
         })
-        : `${baseUrl}/ws/chat/${taskId}${effectiveToken ? `?token=${effectiveToken}` : ""}`,
+        : `${baseUrl}/ws/chat/${taskId}?${effectiveToken ? `token=${effectiveToken}&` : ""}${LIVENESS_QUERY}`,
       taskId,
       chatTaskIdMode: "required",
       credentialOwner: !hasExplicitToken && authToken
@@ -416,7 +506,57 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     onMessage,
   })
   const refreshAccessTokenRef = useRef(refreshAccessToken)
-  const maxReconnectAttempts = 3
+  const openedKeysRef = useRef(new Set<string>())
+  const lastConnectionKeyRef = useRef<string | null>(null)
+  const loginGenerationRef = useRef(0)
+  const loginPrincipalRef = useRef<WebSocketConnection | null>(normalizedConnection)
+  const lifecycleEndedRef = useRef(false)
+  const stoppedByCallerRef = useRef(false)
+  const autoConnectRef = useRef(autoConnect)
+  const connectRef = useRef<() => void>(() => undefined)
+  const [connectionPhase, setConnectionPhase] = useState<ConnectionPhase>(() => (
+    deriveConnectionPhase({
+      hasDescriptor: normalizedConnection !== null,
+      autoConnect,
+      stoppedByCaller: false,
+      ownerOpen: false,
+      ownerInFlight: false,
+      retryPending: false,
+      lifecycleEnded: false,
+    })
+  ))
+
+  // Recomputes the phase from the facts held in refs. Called once at the end
+  // of every entry point (socket callback, timer callback, effect, public
+  // function); internal helpers never call it, and layout effects never do, so
+  // a half-applied state is not rendered.
+  const syncPhase = useCallback(() => {
+    if (!mountedRef.current) return
+    const owner = socketOwnerRef.current
+    setConnectionPhase(deriveConnectionPhase({
+      hasDescriptor: connectionRef.current !== null,
+      autoConnect: autoConnectRef.current,
+      stoppedByCaller: stoppedByCallerRef.current,
+      ownerOpen: owner?.opened === true,
+      ownerInFlight: owner !== null && !owner.opened,
+      retryPending: retryTimersRef.current.size > 0,
+      lifecycleEnded: lifecycleEndedRef.current,
+    }))
+  }, [])
+
+  const withPhaseSync = useCallback(<Args extends unknown[]>(
+    entry: (...args: Args) => void,
+  ) => (...args: Args) => {
+    try {
+      entry(...args)
+    } finally {
+      syncPhase()
+    }
+  }, [syncPhase])
+
+  const connectionKeyFor = useCallback((connection: WebSocketConnection) => (
+    `${connection.identity}|${loginKindOf(connection)}:${loginGenerationRef.current}`
+  ), [])
 
   const rejectPendingDeliveries = useCallback((
     error: Error,
@@ -462,6 +602,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
 
   const invalidateLifecycle = useCallback(() => {
     lifecycleEpochRef.current++
+    lifecycleEndedRef.current = false
     clearRetryTimers()
   }, [clearRetryTimers])
 
@@ -531,6 +672,10 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       clearTimeout(owner.handshakeTimer)
       owner.handshakeTimer = null
     }
+    if (owner.deadTimer) {
+      clearTimeout(owner.deadTimer)
+      owner.deadTimer = null
+    }
     const wasCurrent = (
       socketOwnerRef.current === owner
       && socketRef.current === owner.socket
@@ -544,6 +689,16 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       socketOwnerRef.current = null
       if (mountedRef.current) setIsConnected(false)
       isConnectingRef.current = false
+      // Without heartbeats there is no dead-connection rule, so a connection
+      // that stayed open for a full dead window has shown it is healthy.
+      if (
+        !owner.heartbeatEnabled
+        && owner.openedAt !== null
+        && Date.now() - owner.openedAt >= DEAD_AFTER_MS
+      ) {
+        reconnectAttemptsRef.current = 0
+      }
+      if (options.endsLifecycle) lifecycleEndedRef.current = true
     }
     rejectPendingDeliveries(
       options.pendingError,
@@ -610,14 +765,89 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
   ) => {
     const timer = setTimeout(() => {
       retryTimersRef.current.delete(timer)
+      // A stale timer returns below without doing anything, but its removal
+      // still changes the facts the phase is derived from.
+      syncPhase()
       if (
         !isCurrentLifecycle(lifecycleEpoch)
         || attemptEpochRef.current !== attemptEpoch
       ) return
       callback()
+      syncPhase()
     }, delay)
     retryTimersRef.current.set(timer, { lifecycleEpoch, attemptEpoch })
-  }, [isCurrentLifecycle])
+  }, [isCurrentLifecycle, syncPhase])
+
+  // Schedules the next connection attempt after a retired connection failed.
+  // Only a task that has opened a connection for this login principal during
+  // this mount is retried; the very first connection of a key is not.
+  const scheduleReconnect = useCallback((owner: SocketOwner) => {
+    if (!openedKeysRef.current.has(owner.connectionKey)) return
+    if (isSessionConnection(owner.connection) || !owner.connection.taskId) return
+    if (!canApplyRetiredOwnerPolicy(owner)) return
+    if (reconnectAttemptsRef.current >= MAX_RECONNECT_ATTEMPTS) return
+    const attempt = ++reconnectAttemptsRef.current
+    const jitter = 1 - RECONNECT_JITTER + 2 * RECONNECT_JITTER * Math.random()
+    scheduleRetry(
+      () => connectRef.current(),
+      RECONNECT_DELAYS_MS[attempt - 1] * jitter,
+      owner.lifecycleEpoch,
+      owner.attemptEpoch,
+    )
+  }, [canApplyRetiredOwnerPolicy, scheduleRetry])
+
+  // Retires a connection that stopped delivering frames and hands the failure
+  // to the same recovery path as any other lost connection.
+  const retireDeadOwner = useCallback((
+    owner: SocketOwner,
+    cause: "heartbeat" | "acknowledgement",
+  ) => {
+    if (!isCurrentOwner(owner)) return
+    if (owner.sharedTaskId !== undefined) {
+      owner.callbacks.onMessage?.({
+        type: "stream_unavailable", task_id: owner.sharedTaskId,
+        data: {}, timestamp: new Date().toISOString(),
+      })
+    }
+    const wasCurrent = retireOwner(owner, {
+      pendingError: deliveryError("Connection lost before the message was accepted.", "outcome_unknown"),
+      preparationError: deliveryError("Connection lost before the message was prepared.", "not_sent"),
+      close: { code: 1000, reason: "Connection liveness timeout" },
+      notifyDisconnect: true,
+      endsLifecycle: true,
+    })
+    if (!wasCurrent || socketOwnerRef.current || socketRef.current) return
+    const livenessError = new Error(
+      cause === "heartbeat"
+        ? "WebSocket connection stopped delivering frames."
+        : "WebSocket connection did not answer a sent message.",
+    )
+    setConnectionError(livenessError)
+    reportConnectionFailure(owner.callbacks, {
+      recoverable: true,
+      error: livenessError,
+    }, owner.connection.identity)
+    scheduleReconnect(owner)
+  }, [isCurrentOwner, retireOwner, scheduleReconnect])
+
+  // Starts the dead-connection timer once the server confirmed heartbeats. The
+  // timer is not re-armed per frame: when it fires it measures the time since
+  // the last frame and sleeps for the remainder.
+  const watchLiveness = useCallback((owner: SocketOwner) => {
+    const arm = (delay: number) => {
+      owner.deadTimer = setTimeout(withPhaseSync(() => {
+        owner.deadTimer = null
+        if (!isCurrentOwner(owner)) return
+        const remaining = DEAD_AFTER_MS - (Date.now() - (owner.lastFrameAt ?? 0))
+        if (remaining > 0) {
+          arm(remaining)
+          return
+        }
+        retireDeadOwner(owner, "heartbeat")
+      }), delay)
+    }
+    arm(DEAD_AFTER_MS)
+  }, [isCurrentOwner, retireDeadOwner, withPhaseSync])
 
   useIsomorphicLayoutEffect(() => {
     mountedRef.current = true
@@ -636,6 +866,18 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
 
     if (previousDescriptorKey !== connectionDescriptorIdentity) {
       invalidateLifecycle()
+      if (normalizedConnection !== null) {
+        // The generation moves only here, in the effect that observes the
+        // descriptor change, never during render.
+        const previousPrincipal = loginPrincipalRef.current
+        if (
+          previousPrincipal !== null
+          && !isSameLoginPrincipal(previousPrincipal, normalizedConnection)
+        ) {
+          loginGenerationRef.current++
+        }
+        loginPrincipalRef.current = normalizedConnection
+      }
       if (previousDescriptorKey !== null) {
         rejectPreparations(
           deliveryError("Message not sent: the connection changed before delivery.", "not_sent"),
@@ -681,6 +923,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
 
     descriptorKeyRef.current = connectionDescriptorIdentity
     connectionRef.current = normalizedConnection
+    autoConnectRef.current = autoConnect
     taskIdRef.current = taskId
     deliveryIdentityRef.current = nextIdentity
     deliveryGenerationRef.current = deliveryGeneration
@@ -704,6 +947,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
   }, [token, authToken])
 
   const connect = useCallback(() => {
+    stoppedByCallerRef.current = false
     if (!mountedRef.current) return
     if (
       isConnectingRef.current
@@ -729,6 +973,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           reason: "Connection replaced",
         },
         notifyDisconnect: true,
+        endsLifecycle: true,
       })
       if (socketOwnerRef.current || isConnectingRef.current) return
     } else if (socketRef.current) {
@@ -747,7 +992,6 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       const socket = protocols
         ? new WebSocket(connection.url, protocols)
         : new WebSocket(connection.url)
-      let sharedTaskId: number | undefined
       const owner: SocketOwner = {
         callbacks: callbacksRef.current,
         connection,
@@ -758,11 +1002,21 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         attemptEpoch,
         refreshAccessToken: refreshAccessTokenRef.current,
         socket,
+        connectionKey: connectionKeyFor(connection),
+        opened: false,
+        openedAt: null,
+        firstFrameAt: null,
+        lastFrameAt: null,
+        framesReceived: 0,
+        heartbeatEnabled: false,
+        deadTimer: null,
+        budgetRestored: false,
+        sharedTaskId: undefined,
       }
       socketRef.current = socket
       socketOwnerRef.current = owner
 
-      owner.handshakeTimer = setTimeout(() => {
+      owner.handshakeTimer = setTimeout(withPhaseSync(() => {
         if (!isCurrentOwner(owner)) return
         const handshakeError = new Error("WebSocket connection handshake timed out.")
         const wasCurrent = retireOwner(owner, {
@@ -770,6 +1024,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           preparationError: deliveryError("Connection timed out before the message was prepared.", "not_sent"),
           close: { code: 1000, reason: "Handshake timeout" },
           notifyDisconnect: true,
+          endsLifecycle: true,
         })
         if (!wasCurrent || socketOwnerRef.current || socketRef.current) return
         setConnectionError(handshakeError)
@@ -777,9 +1032,10 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           recoverable: true,
           error: handshakeError,
         }, owner.connection.identity)
-      }, HANDSHAKE_TIMEOUT_MS)
+        scheduleReconnect(owner)
+      }), HANDSHAKE_TIMEOUT_MS)
 
-      socket.onopen = () => {
+      socket.onopen = withPhaseSync(() => {
         if (!isCurrentOwner(owner)) return
         if (owner.handshakeTimer) {
           clearTimeout(owner.handshakeTimer)
@@ -794,6 +1050,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
             preparationError: deliveryError("Connection closed before the message was prepared.", "not_sent"),
             close: { code: 1002, reason: "WebSocket subprotocol mismatch" },
             notifyDisconnect: false,
+            endsLifecycle: true,
           })
           if (!wasCurrent) return
           setConnectionError(protocolError)
@@ -804,17 +1061,20 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           return
         }
 
+        owner.opened = true
+        owner.openedAt = Date.now()
+        openedKeysRef.current.add(owner.connectionKey)
         setIsConnected(true)
         setConnectionError(null)
         isConnectingRef.current = false
         owner.callbacks.onConnect?.()
-      }
+      })
 
-      socket.onclose = (event) => {
+      socket.onclose = withPhaseSync((event: CloseEvent) => {
         if (!isCurrentOwner(owner)) return
-        if (sharedTaskId !== undefined) {
+        if (owner.sharedTaskId !== undefined) {
           owner.callbacks.onMessage?.({
-            type: "stream_unavailable", task_id: sharedTaskId,
+            type: "stream_unavailable", task_id: owner.sharedTaskId,
             data: {}, timestamp: new Date().toISOString(),
           })
         }
@@ -823,6 +1083,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           pendingError: deliveryError("Connection closed before the message was accepted.", "outcome_unknown"),
           preparationError: deliveryError("Connection closed before the message was prepared.", "not_sent"),
           notifyDisconnect: false,
+          endsLifecycle: true,
         })
         if (!wasCurrent) return
 
@@ -883,6 +1144,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
                     new Error("Authentication failed and token refresh failed"),
                   )
                 }
+                syncPhase()
               })
               .catch(() => {
                 if (!canApplyRetiredOwnerPolicy(owner)) return
@@ -891,6 +1153,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
                   owner,
                   new Error("Authentication failed and token refresh error"),
                 )
+                syncPhase()
               })
           } catch {
             if (!canApplyRetiredOwnerPolicy(owner)) return
@@ -908,30 +1171,16 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           return
         }
 
-        // Don't reconnect if it's a 404 error or abnormal closure (1006)
-        if (event.code === 1006) {
-          return
-        }
-
-        // Don't reconnect if it's a clean close (might be intentional)
+        // A clean close is intentional. Every other code, including an
+        // abnormal closure (1006), is a lost connection.
         if (event.code === 1000) {
           return
         }
 
-        // Only attempt to reconnect if under max attempts and the connection is task-bound
-        if (reconnectAttemptsRef.current < maxReconnectAttempts && connection.taskId) {
-          reconnectAttemptsRef.current++
-          const delay = Math.min(1000 * reconnectAttemptsRef.current, 5000)
-          scheduleRetry(
-            connect,
-            delay,
-            owner.lifecycleEpoch,
-            owner.attemptEpoch,
-          )
-        }
-      }
+        scheduleReconnect(owner)
+      })
 
-      socket.onerror = () => {
+      socket.onerror = withPhaseSync(() => {
         if (!isCurrentOwner(owner)) return
         console.error("WebSocket error")
         const connectionError = new Error("WebSocket connection failed. The backend WebSocket endpoint may not be available.")
@@ -940,6 +1189,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           preparationError: deliveryError("Connection failed before the message was prepared.", "not_sent"),
           close: { code: 1000, reason: "WebSocket transport error" },
           notifyDisconnect: true,
+          endsLifecycle: true,
         })
         if (!wasCurrent || socketOwnerRef.current || socketRef.current) return
         setConnectionError(connectionError)
@@ -947,15 +1197,44 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           recoverable: true,
           error: connectionError,
         }, owner.connection.identity)
-
-      }
+        scheduleReconnect(owner)
+      })
 
       socket.onmessage = (event) => {
         if (!isCurrentOwner(owner)) return
+        // Every frame counts as proof of life, including frames that fail to
+        // parse and the liveness frames intercepted below.
+        const receivedAt = Date.now()
+        owner.lastFrameAt = receivedAt
+        owner.framesReceived += 1
+        if (owner.firstFrameAt === null) {
+          owner.firstFrameAt = receivedAt
+        } else if (
+          owner.heartbeatEnabled
+          && !owner.budgetRestored
+          && receivedAt - owner.firstFrameAt >= DEAD_AFTER_MS
+        ) {
+          // The connection carried traffic for a full dead window, so it is
+          // healthy enough to start the reconnect budget over.
+          owner.budgetRestored = true
+          reconnectAttemptsRef.current = 0
+        }
         try {
           const data = JSON.parse(event.data)
+          if (data.type === "connection_capabilities") {
+            if (
+              Array.isArray(data.capabilities)
+              && data.capabilities.includes("heartbeat")
+              && !owner.heartbeatEnabled
+            ) {
+              owner.heartbeatEnabled = true
+              watchLiveness(owner)
+            }
+            return
+          }
+          if (data.type === "heartbeat") return
           if (data.type === "task_stream_snapshot" || data.stream_run_id !== undefined) {
-            sharedTaskId = data.task_id
+            owner.sharedTaskId = data.task_id
           }
 
           if (data.type === 'message_accepted' || data.type === 'message_rejected') {
@@ -1181,6 +1460,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       console.error("Failed to create WebSocket connection")
       const connectionError = new Error("Failed to create WebSocket connection.")
       isConnectingRef.current = false
+      lifecycleEndedRef.current = true
       setConnectionError(connectionError)
       reportConnectionFailure(callbacksRef.current, {
         recoverable: false,
@@ -1189,17 +1469,34 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     }
   }, [
     canApplyRetiredOwnerPolicy,
+    connectionKeyFor,
     isCurrentOwner,
     notifyDisconnect,
     reportPermanentFailure,
     retireOwner,
     retireOwnerCore,
+    scheduleReconnect,
     scheduleRetry,
+    syncPhase,
+    watchLiveness,
+    withPhaseSync,
   ])
+
+  useIsomorphicLayoutEffect(() => {
+    connectRef.current = connect
+  }, [connect])
+
+  // Public entry: the internal `connect` is also run by timers and effects,
+  // which recompute the phase themselves.
+  const connectFromCaller = useCallback(() => {
+    connect()
+    syncPhase()
+  }, [connect, syncPhase])
 
   const disconnect = useCallback(() => {
     const owner = socketOwnerRef.current
     invalidateLifecycle()
+    stoppedByCallerRef.current = true
     reconnectAttemptsRef.current = 0
     if (owner) {
       retireOwner(owner, {
@@ -1207,6 +1504,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         preparationError: deliveryError("Disconnected before the message was prepared.", "not_sent"),
         close: {},
         notifyDisconnect: true,
+        endsLifecycle: false,
       })
     } else {
       rejectPendingDeliveries(
@@ -1218,11 +1516,13 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     }
     setIsConnected(false)
     isConnectingRef.current = false
+    syncPhase()
   }, [
     invalidateLifecycle,
     rejectPendingDeliveries,
     rejectPreparations,
     retireOwner,
+    syncPhase,
   ])
 
   const sendMessage = useCallback((
@@ -1469,8 +1769,19 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           reject,
           timeout: setTimeout(() => {
             if (pendingDeliveriesRef.current.get(clientMessageId) !== pendingDelivery) return
-            pendingDeliveriesRef.current.delete(clientMessageId)
-            reject(deliveryError("Message delivery was not acknowledged. Your draft was kept.", "outcome_unknown"))
+            if (
+              isCurrentOwner(owner)
+              && owner.framesReceived === pendingDelivery.framesReceivedAtSend
+            ) {
+              // Nothing at all arrived since the send: the link is dead, not
+              // merely slow to acknowledge. Retiring the connection rejects
+              // this delivery together with every other one waiting on it.
+              retireDeadOwner(owner, "acknowledgement")
+            } else {
+              pendingDeliveriesRef.current.delete(clientMessageId)
+              reject(deliveryError("Message delivery was not acknowledged. Your draft was kept.", "outcome_unknown"))
+            }
+            syncPhase()
           }, 30000),
           connectionIdentity: connection.identity,
           descriptorKey: currentDescriptorKey,
@@ -1478,6 +1789,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           attemptEpoch: currentAttemptEpoch,
           deliveryGeneration: currentDeliveryGeneration,
           socket,
+          framesReceivedAtSend: owner.framesReceived,
         }
         pendingDeliveriesRef.current.set(clientMessageId, pendingDelivery)
       })
@@ -1559,7 +1871,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         preparationsRef.current.delete(clientMessageId)
       }
     }
-  }, [isCurrentOwner, uploadFiles])
+  }, [isCurrentOwner, retireDeadOwner, syncPhase, uploadFiles])
 
   const getCurrentTaskConnection = useCallback(() => {
     const connection = connectionRef.current
@@ -1623,10 +1935,28 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
   useEffect(() => {
     const ownedDescriptorKey = connectionDescriptorIdentity
     setConnectionError(null)
-    reconnectAttemptsRef.current = 0
+    const connectionKey = connectionRef.current
+      ? connectionKeyFor(connectionRef.current)
+      : null
+    // The reconnect budget belongs to the connection key: it restarts for a
+    // different task or login principal, and survives a credential refresh
+    // that replaces the descriptor under the same key.
+    if (connectionKey !== lastConnectionKeyRef.current) {
+      reconnectAttemptsRef.current = 0
+      lastConnectionKeyRef.current = connectionKey
+    }
     if (autoConnect && ownedDescriptorKey !== null && !isConnectingRef.current) {
+      if (
+        connectionKey !== null
+        && openedKeysRef.current.has(connectionKey)
+        && reconnectAttemptsRef.current < MAX_RECONNECT_ATTEMPTS
+      ) {
+        // Replacing an already-opened connection spends one reconnect slot.
+        reconnectAttemptsRef.current++
+      }
       connect()
     }
+    syncPhase()
 
     return () => {
       invalidateLifecycle()
@@ -1644,6 +1974,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
             reason: "Component unmounting",
           },
           notifyDisconnect: true,
+          endsLifecycle: false,
         })
       }
       if (ownedDescriptorKey !== null) {
@@ -1661,30 +1992,27 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       }
       if (mountedRef.current) setIsConnected(false)
       isConnectingRef.current = false
+      syncPhase()
     }
   }, [
     autoConnect,
     clearRecentMessages,
     connect,
     connectionDescriptorIdentity,
+    connectionKeyFor,
     invalidateLifecycle,
     rejectPendingDeliveries,
     rejectPreparations,
     retireOwner,
+    syncPhase,
   ])
-
-  // Separate effect to handle connection state changes
-  useEffect(() => {
-    if (isConnected) {
-      reconnectAttemptsRef.current = 0 // Reset attempts on successful connection
-    }
-  }, [isConnected])
 
   return {
     isConnected,
+    connectionPhase,
     lastMessage,
     connectionError,
-    connect,
+    connect: connectFromCaller,
     disconnect,
     sendMessage,
     sendChatMessage,

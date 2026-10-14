@@ -12,6 +12,12 @@
   };
   var SESSION_RETRY_AFTER_FALLBACK_MS = 1000;
   var SESSION_REFRESH_THRESHOLD_MS = 60000;
+  // Mirrors the iframe's dead-connection threshold (use-websocket DEAD_AFTER_MS).
+  var CLIENT_DEAD_AFTER_MS = 30000;
+  // A connection counts as stable only after carrying traffic for one full
+  // dead window, the same span the main chat requires before resetting its budget.
+  var STABLE_TRAFFIC_SPAN_MS = 30000;
+  var SESSION_STABLE_CONNECTION_MS = CLIENT_DEAD_AFTER_MS + STABLE_TRAFFIC_SPAN_MS; // 60 s
   var SESSION_ERROR_CODES = {
     grant_malformed: true,
     signature_invalid: true,
@@ -1397,7 +1403,7 @@
         state.awaitedDeliveryId = null;
         state.stableDeliveryId = deliveryId;
         state.rapidRecoveries = 0;
-      }, 15000);
+      }, SESSION_STABLE_CONNECTION_MS);
       state.stabilityTimer = timer;
     }
 
