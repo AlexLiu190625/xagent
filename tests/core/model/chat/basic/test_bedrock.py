@@ -816,6 +816,12 @@ async def test_stream_cancellation_closes_blocking_botocore_event_stream():
     with pytest.raises(asyncio.CancelledError):
         await pending
 
+    # A stream with no socket to shut down is closed in the background, since
+    # close() would otherwise wait for a read still blocked in its worker.
+    for _ in range(500):
+        if stream.closed:
+            break
+        await asyncio.sleep(0.01)
     assert stream.closed is True
 
 
