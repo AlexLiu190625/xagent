@@ -61,7 +61,10 @@ const webSocketOptions = vi.hoisted(() => ({
 }))
 const sendChatMessageMock = vi.hoisted(() => vi.fn())
 const sendRawMessageMock = vi.hoisted(() => vi.fn())
-const wsHarness = vi.hoisted(() => ({ isConnected: true }))
+const wsHarness = vi.hoisted(() => ({
+  isConnected: true,
+  connectionPhase: "connected" as string,
+}))
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const routerPushMock = vi.hoisted(() => vi.fn())
 // Mutable so connector-runtime dialog tests (which render the real
@@ -132,6 +135,7 @@ vi.mock("@/hooks/use-websocket", async (importOriginal) => ({
     webSocketOptions.all.push(options)
     return {
       isConnected: wsHarness.isConnected,
+      connectionPhase: wsHarness.connectionPhase,
       connectionError: null,
       sendMessage: sendRawMessageMock,
       sendChatMessage: sendChatMessageMock,
@@ -648,6 +652,7 @@ describe("AppProvider websocket message routing", () => {
     webSocketOptions.all = []
     sessionControls = null
     wsHarness.isConnected = true
+    wsHarness.connectionPhase = "connected"
     apiRequestMock.mockReset()
     routerPushMock.mockReset()
     sendRawMessageMock.mockReset()
@@ -2065,6 +2070,27 @@ describe("AppProvider websocket message routing", () => {
       screen.getByTestId("messages").textContent || "[]"
     ) as Array<{ content: string }>
     expect(messages).toEqual([])
+  })
+
+  it("shows the reconnecting notice for a task the socket opened earlier in this mount", () => {
+    let setTask: ((id: number) => void) | undefined
+    function NoticeProbe() {
+      const { connectionNotice, setTaskId } = useApp()
+      setTask = (id) => setTaskId(id, { navigate: false })
+      return <span data-testid="notice">{connectionNotice ?? "none"}</span>
+    }
+    render(
+      <AppProvider token="token">
+        <NoticeProbe />
+      </AppProvider>
+    )
+    for (const id of [1, 2]) {
+      act(() => setTask?.(id))
+      act(() => webSocketOptions.current?.onConnect?.())
+    }
+    wsHarness.connectionPhase = "reconnecting"
+    act(() => setTask?.(1))
+    expect(screen.getByTestId("notice").textContent).toBe("reconnecting")
   })
 
   it("does not retarget a different task's status when a failed-retry ack arrives after switching away", async () => {

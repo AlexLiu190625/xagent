@@ -2809,11 +2809,11 @@ export function AppProvider({
     }
   }, [dispatchSessionConversation, releaseStopControl, requireSessionReload, sessionConnectionIdentity])
 
-  // Task the socket last opened for; undefined until the first open.
-  const openedTaskIdRef = useRef<typeof state.taskId | undefined>(undefined)
+  // Tasks the socket has opened for since this provider mounted.
+  const openedTaskIdsRef = useRef(new Set<typeof state.taskId>())
 
   const onConnect = useCallback(() => {
-    openedTaskIdRef.current = stateRef.current.taskId
+    openedTaskIdsRef.current.add(stateRef.current.taskId)
     if (sessionTransport?.history === "none") {
       const connectionIdentity = sessionConnectionIdentityRef.current
       if (connectionIdentity && connectionIdentity === sessionConnectionIdentity) {
@@ -2967,8 +2967,8 @@ export function AppProvider({
   const connectionNotice = deriveConnectionNotice({
     isSessionTransport: sessionTransport !== undefined,
     hadOpen: sessionTransport
-      ? openedTaskIdRef.current !== undefined
-      : openedTaskIdRef.current === state.taskId,
+      ? openedTaskIdsRef.current.size > 0
+      : openedTaskIdsRef.current.has(state.taskId),
     phase: connectionPhase,
     isConnected,
   })
