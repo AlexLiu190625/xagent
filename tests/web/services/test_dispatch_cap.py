@@ -557,7 +557,12 @@ async def test_dispatch_reservation_released_after_real_handler(
     async def execute_background(**_kwargs: Any) -> None:
         await release.wait()
 
-    def stage_task(**fields: Any) -> int:
+    monkeypatch.setattr(task_execution, "execute_task_background", execute_background)
+    monkeypatch.setattr(task_execution, "execute_resume_background", execute_background)
+
+    def stage(
+        command_kind: TaskCommandKind | None, payload: dict, **task_fields: Any
+    ) -> int:
         with get_session_local()() as db:
             task = Task(
                 user_id=real_host.user_id,
@@ -567,33 +572,23 @@ async def test_dispatch_reservation_released_after_real_handler(
                 source="sdk",
                 run_id="run-a",
                 execution_mode="balanced",
-                **fields,
+                **task_fields,
             )
             db.add(task)
             db.commit()
+            if command_kind is not None:
+                transport.enqueue_task_command(
+                    db,
+                    task_id=int(task.id),
+                    actor_user_id=real_host.user_id,
+                    command_id=f"{kind}-1",
+                    kind=command_kind,
+                    payload=payload,
+                )
             return int(task.id)
 
-    def stage_command(
-        task_id: int, command_kind: TaskCommandKind, payload: dict
-    ) -> None:
-        with get_session_local()() as db:
-            transport.enqueue_task_command(
-                db,
-                task_id=task_id,
-                actor_user_id=real_host.user_id,
-                command_id=f"{kind}-1",
-                kind=command_kind,
-                payload=payload,
-            )
-
-    connections = MagicMock()
-    connections.connections_for_task.return_value = []
-    connections.send_personal_message = AsyncMock()
-    connections.broadcast_to_task = AsyncMock()
-
-    if kind == "start":
-        from xagent.web.services import task_start
-
+    if kind in ("start", "message"):
+        # The turn is scheduled by the real orchestrator; only its runner is stubbed.
         monkeypatch.setattr(
             task_orchestrator,
             "load_task_setup_snapshot_sync",
@@ -603,9 +598,21 @@ async def test_dispatch_reservation_released_after_real_handler(
             task_orchestrator, "resolve_execution_scope", lambda *a: object()
         )
         monkeypatch.setattr(task_orchestrator, "_get_agent_manager", Mock())
-        monkeypatch.setattr(
-            task_execution, "execute_task_background", execute_background
+    if kind in ("message", "resume"):
+        connections = MagicMock()
+        connections.connections_for_task.return_value = []
+        connections.send_personal_message = AsyncMock()
+        connections.broadcast_to_task = AsyncMock()
+        stack.enter_context(patch.object(websocket_api, "manager", connections))
+        stack.enter_context(
+            patch.object(
+                websocket_api._command_origins, "resolve", return_value=MagicMock()
+            )
         )
+
+    if kind == "start":
+        from xagent.web.services import task_start
+
         created = await task_start.create_sdk_task(
             agent_id=real_host.agent,
             task_owner_user_id=real_host.user_id,
@@ -617,24 +624,8 @@ async def test_dispatch_reservation_released_after_real_handler(
         )
         target = int(created.task_id)
     elif kind == "message":
-        monkeypatch.setattr(
-            task_orchestrator,
-            "load_task_setup_snapshot_sync",
-            lambda *a, **kw: object(),
-        )
-        monkeypatch.setattr(
-            task_orchestrator, "resolve_execution_scope", lambda *a: object()
-        )
-        monkeypatch.setattr(task_orchestrator, "_get_agent_manager", Mock())
-        monkeypatch.setattr(
-            task_execution, "execute_task_background", execute_background
-        )
         # The previous run ended, so the message opens a new turn.
-        target = stage_task(
-            status=TaskStatus.COMPLETED, control_state="completed", state_version=3
-        )
-        stage_command(
-            target,
+        target = stage(
             TaskCommandKind.MESSAGE,
             {
                 "type": "chat_message",
@@ -642,35 +633,27 @@ async def test_dispatch_reservation_released_after_real_handler(
                 "client_message_id": "message-1",
                 "files": [],
             },
-        )
-        stack.enter_context(patch.object(websocket_api, "manager", connections))
-        stack.enter_context(
-            patch.object(
-                websocket_api._command_origins, "resolve", return_value=MagicMock()
-            )
+            status=TaskStatus.COMPLETED,
+            control_state="completed",
+            state_version=3,
         )
     elif kind == "resume":
         from xagent.web.services.task_execution_controller import TaskControlState
 
-        target = stage_task(
+        target = stage(
+            TaskCommandKind.RESUME,
+            {"type": "resume_task"},
             status=TaskStatus.PAUSED,
             control_state=TaskControlState.RESUME_REQUESTED.value,
         )
-        stage_command(target, TaskCommandKind.RESUME, {"type": "resume_task"})
         agent = MagicMock()
         agent.supports_live_control.return_value = True
-        agent_manager = MagicMock()
-        agent_manager.get_agent_for_task = AsyncMock(return_value=agent)
         stack.enter_context(
             patch(
                 "xagent.web.services.agent_service_manager.get_agent_manager",
-                return_value=agent_manager,
-            )
-        )
-        stack.enter_context(patch.object(websocket_api, "manager", connections))
-        stack.enter_context(
-            patch.object(
-                websocket_api._command_origins, "resolve", return_value=MagicMock()
+                return_value=MagicMock(
+                    get_agent_for_task=AsyncMock(return_value=agent)
+                ),
             )
         )
         stack.enter_context(
@@ -691,27 +674,21 @@ async def test_dispatch_reservation_released_after_real_handler(
                 ),
             )
         )
-        stack.enter_context(
-            patch.object(
-                task_execution,
-                "execute_resume_background",
-                side_effect=execute_background,
-            )
-        )
     else:
         from xagent.core.agent.context import ContextManager
         from xagent.core.agent.registry import ExecutionRegistry
         from xagent.core.agent.runner import AgentRunner
         from xagent.web.services import task_resume, task_resume_command
 
-        target = stage_task(
+        target = stage(
+            None,
+            {},
             status=TaskStatus.WAITING_FOR_USER,
             control_state="waiting_for_user",
             state_version=2,
         )
-        execution_id = str(target)
         contexts = ContextManager()
-        contexts.create_context(execution_id).add_user_message("original")
+        contexts.create_context(str(target)).add_user_message("original")
         tracer = SimpleNamespace(
             load_latest_checkpoint=AsyncMock(return_value=None), checkpoint=AsyncMock()
         )
@@ -719,7 +696,7 @@ async def test_dispatch_reservation_released_after_real_handler(
             SimpleNamespace(llm=None), tracer=tracer, context_manager=contexts
         )
         registry = ExecutionRegistry()
-        registry.register(execution_id, runner)
+        registry.register(str(target), runner)
         subscription = registry.subscribe(lambda _: registry.unsubscribe(subscription))
 
         async def inject(execution_id: str, **kwargs: Any) -> Any:
@@ -735,9 +712,6 @@ async def test_dispatch_reservation_released_after_real_handler(
                     )
                 )
             ),
-        )
-        monkeypatch.setattr(
-            task_execution, "execute_resume_background", execute_background
         )
         task_resume_command._admit_reply(
             task_resume.TaskReplyInput(
@@ -823,11 +797,21 @@ async def test_resume_counted_until_promotion(
     await eventually(lambda: target not in manager._active_task_ids())
 
 
-@pytest.fixture
-def ensure_spy(cap_host: CapHost) -> AsyncMock:
-    spy = AsyncMock(wraps=cap_host.registry.ensure)
-    cap_host.registry.ensure = spy  # type: ignore[method-assign]
-    return spy
+def take_last_slot_after_snapshot(
+    host: CapHost, monkeypatch: pytest.MonkeyPatch, other_task_id: int
+) -> None:
+    """Make the first reservation find the cap full although its snapshot was open."""
+
+    real_reserve = host.manager.reserve_dispatch_slot
+    calls: list[int] = []
+
+    def reserve(task_id: int, *, limit: int) -> Any:
+        if not calls:
+            calls.append(task_id)
+            assert real_reserve(other_task_id, limit=limit) is not None
+        return real_reserve(task_id, limit=limit)
+
+    monkeypatch.setattr(host.manager, "reserve_dispatch_slot", reserve)
 
 
 # --- closed cap --------------------------------------------------------------
@@ -852,26 +836,17 @@ def assert_untouched(host: CapHost, command_id: int, task_id: int) -> None:
 async def test_closed_cap_holds_execution_command_without_side_effects(
     cap_host: CapHost,
     monkeypatch: pytest.MonkeyPatch,
-    ensure_spy: AsyncMock,
     kind: str,
 ) -> None:
     host = cap_host
+    ensure_spy = AsyncMock(wraps=host.registry.ensure)
+    host.registry.ensure = ensure_spy  # type: ignore[method-assign]
     set_limit(monkeypatch, 1)
     unrelated = host.new_task()
     target = host.new_task()
     if kind == "snapshot_open_but_full":
         command_id = host.enqueue(target, "start")
-        real_reserve = host.manager.reserve_dispatch_slot
-        calls: list[int] = []
-
-        def reserve(task_id: int, *, limit: int) -> Any:
-            if not calls:
-                # Another attempt takes the last slot after the snapshot was built.
-                calls.append(task_id)
-                assert real_reserve(unrelated, limit=limit) is not None
-            return real_reserve(task_id, limit=limit)
-
-        monkeypatch.setattr(host.manager, "reserve_dispatch_slot", reserve)
+        take_last_slot_after_snapshot(host, monkeypatch, unrelated)
     else:
         host.live(unrelated)
         command_id = host.enqueue(target, kind)
@@ -1101,16 +1076,7 @@ async def test_prompt_dispatch_honours_cap(
     unrelated = host.new_task()
     if row == "start_after_snapshot":
         command_id = host.enqueue(target, "start")
-        real_reserve = host.manager.reserve_dispatch_slot
-        calls: list[int] = []
-
-        def reserve(task_id: int, *, limit: int) -> Any:
-            if not calls:
-                calls.append(task_id)
-                assert real_reserve(unrelated, limit=limit) is not None
-            return real_reserve(task_id, limit=limit)
-
-        monkeypatch.setattr(host.manager, "reserve_dispatch_slot", reserve)
+        take_last_slot_after_snapshot(host, monkeypatch, unrelated)
     else:
         host.live(unrelated)
         command_id = host.enqueue(target, row)

@@ -3717,55 +3717,30 @@ def test_reply_first_claim_order_puts_a_reply_ahead_of_an_older_control_command(
     )
 
 
+@pytest.mark.parametrize("reply_task_is_active", [False, True])
 def test_reply_first_claim_order_is_not_used_while_the_cap_is_closed(
-    shared_dispatch_db,
+    shared_dispatch_db, reply_task_is_active: bool
 ) -> None:
     from xagent.web.services.task_dispatch_cap import DispatchCapSnapshot
 
     db = shared_dispatch_db
-    user, active_task = _create_running_task(db)
-    active_task.runner_id = None
-    active_task.lease_expires_at = None
+    user, start_task = _create_running_task(db)
+    start_task.runner_id = None
+    start_task.lease_expires_at = None
     db.commit()
-    waiting_task = _unowned_task(db, int(user.id), "waiting")
+    reply_task = _unowned_task(db, int(user.id), "waiting")
     older_start = _insert_command(
-        db, int(active_task.id), TaskCommandKind.START, "start-active"
+        db, int(start_task.id), TaskCommandKind.START, "start-active"
     )
-    _insert_command(db, int(waiting_task.id), TaskCommandKind.RESUME_INPUT, "reply-b")
-    closed = DispatchCapSnapshot(1, frozenset({int(active_task.id)}))
+    _insert_command(db, int(reply_task.id), TaskCommandKind.RESUME_INPUT, "reply")
+    active = {int(start_task.id)} | (
+        {int(reply_task.id)} if reply_task_is_active else set()
+    )
+    closed = DispatchCapSnapshot(len(active), frozenset(active))
 
     assert task_command_transport_module._find_command_candidate(None, (), closed) == (
         older_start,
-        int(active_task.id),
-        TaskCommandKind.START,
-    )
-
-
-def test_reply_first_claim_order_is_not_used_while_the_cap_is_closed_for_active_tasks(
-    shared_dispatch_db,
-) -> None:
-    from xagent.web.services.task_dispatch_cap import DispatchCapSnapshot
-
-    db = shared_dispatch_db
-    user, first_task = _create_running_task(db)
-    first_task.runner_id = None
-    first_task.lease_expires_at = None
-    db.commit()
-    second_task = _unowned_task(db, int(user.id), "second")
-    older_start = _insert_command(
-        db, int(first_task.id), TaskCommandKind.START, "start-first"
-    )
-    _insert_command(
-        db, int(second_task.id), TaskCommandKind.RESUME_INPUT, "reply-second"
-    )
-    closed = DispatchCapSnapshot(
-        2, frozenset({int(first_task.id), int(second_task.id)})
-    )
-    assert closed.closed
-
-    assert task_command_transport_module._find_command_candidate(None, (), closed) == (
-        older_start,
-        int(first_task.id),
+        int(start_task.id),
         TaskCommandKind.START,
     )
 
