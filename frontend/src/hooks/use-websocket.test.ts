@@ -3700,8 +3700,10 @@ describe("useWebSocket normalized connections", () => {
       const [first] = MockWebSocket.instances
       act(() => first.open())
       const lost = hook.result.current.sendChatMessage("hi", files, false, "retry-id").catch(() => undefined)
-      await waitFor(() => expect(first.send).toHaveBeenCalledOnce(), { timeout: 4000 })
-      act(() => first.triggerClose(1006))
+      await waitFor(() => expect(first.send).toHaveBeenCalledOnce())
+      // A clean close schedules no automatic reconnect, so only the explicit
+      // connect or descriptor change below creates the second socket.
+      act(() => first.triggerClose(1000))
       await lost
 
       if (retryTaskId === 1 && retryToken === "t1") act(() => hook.result.current.connect())
@@ -3709,7 +3711,7 @@ describe("useWebSocket normalized connections", () => {
       const second = MockWebSocket.instances[1]
       act(() => second.open())
       void hook.result.current.sendChatMessage("hi", files, false, "retry-id").catch(() => undefined)
-      await waitFor(() => expect(second.send).toHaveBeenCalledOnce(), { timeout: 4000 })
+      await waitFor(() => expect(second.send).toHaveBeenCalledOnce())
 
       expect(uploadFiles).toHaveBeenCalledTimes(uploads)
       expect(second.send.mock.calls[0][0]).toBe(first.send.mock.calls[0][0].replace('"task_id":1', `"task_id":${retryTaskId}`))
