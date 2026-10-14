@@ -83,21 +83,89 @@ def _flatten_json_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _sanitize_schema_for_gemini(schema: Any) -> Any:
-    """Remove JSON Schema keywords that Gemini function declarations reject."""
+    """Normalize JSON Schema fragments accepted by Gemini function declarations."""
     unsupported_keys = {
         # Pydantic/JSON Schema uses this for closed objects or dict value schemas.
         # google-genai converts it to additional_properties, which Gemini rejects
         # in function declaration schemas.
         "additionalProperties",
         "additional_properties",
+        "const",
+        "allOf",
     }
 
     if isinstance(schema, dict):
-        return {
-            key: _sanitize_schema_for_gemini(value)
-            for key, value in schema.items()
-            if key not in unsupported_keys
-        }
+        sanitized: Dict[str, Any] = {}
+        for key, value in schema.items():
+            if key in unsupported_keys:
+                continue
+            if key in {"properties", "patternProperties", "$defs", "definitions"}:
+                if isinstance(value, dict):
+                    sanitized[key] = {
+                        name: _sanitize_schema_for_gemini(child)
+                        for name, child in value.items()
+                    }
+                else:
+                    sanitized[key] = value
+            else:
+                sanitized[key] = _sanitize_schema_for_gemini(value)
+        # Gemini's Schema model accepts one type string and string enum
+        # members. JSON Schema permits a type list and arbitrary JSON enum
+        # values, so normalize or drop those provider-incompatible forms.
+        schema_type = sanitized.get("type")
+        if isinstance(schema_type, list):
+            valid_types = list(
+                dict.fromkeys(
+                    item
+                    for item in schema_type
+                    if isinstance(item, str)
+                    and item
+                    in {
+                        "array",
+                        "boolean",
+                        "integer",
+                        "null",
+                        "number",
+                        "object",
+                        "string",
+                    }
+                )
+            )
+            if len(valid_types) == 1:
+                sanitized["type"] = valid_types[0]
+            elif "null" in valid_types and len(valid_types) == 2:
+                non_null_type = next(item for item in valid_types if item != "null")
+                sanitized["type"] = non_null_type
+                sanitized["nullable"] = True
+            elif valid_types:
+                sanitized.pop("type", None)
+                existing_any_of = sanitized.get("anyOf")
+                type_options = [{"type": item} for item in valid_types]
+                if isinstance(existing_any_of, list):
+                    type_options.extend(existing_any_of)
+                sanitized["anyOf"] = type_options
+            else:
+                sanitized.pop("type", None)
+        enum = sanitized.get("enum")
+        if isinstance(enum, list):
+            string_members = [item for item in enum if isinstance(item, str)]
+            has_null = any(item is None for item in enum)
+            if string_members and len(string_members) + int(has_null) == len(enum):
+                sanitized["enum"] = string_members
+                if has_null:
+                    sanitized["nullable"] = True
+            else:
+                sanitized.pop("enum", None)
+        else:
+            sanitized.pop("enum", None)
+        one_of = sanitized.pop("oneOf", None)
+        if isinstance(one_of, list):
+            existing_any_of = sanitized.get("anyOf")
+            if isinstance(existing_any_of, list):
+                sanitized["anyOf"] = existing_any_of + one_of
+            else:
+                sanitized["anyOf"] = one_of
+        return sanitized
     if isinstance(schema, list):
         return [_sanitize_schema_for_gemini(item) for item in schema]
     return schema

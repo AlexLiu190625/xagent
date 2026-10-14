@@ -578,6 +578,28 @@ class FakeLLM:
         return self.responses.pop(0)
 
 
+def final_answer_response(
+    answer: str, response_language: str = "English"
+) -> dict[str, Any]:
+    return {
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "call_final",
+                "function": {
+                    "name": "final_answer",
+                    "arguments": json.dumps(
+                        {
+                            "response_language": response_language,
+                            "answer": answer,
+                        }
+                    ),
+                },
+            }
+        ],
+    }
+
+
 class FakeNamedLLM(FakeLLM):
     """FakeLLM carrying a ``model_name``, for tests that assert on it in logs."""
 
@@ -1727,10 +1749,10 @@ async def test_react_retries_provider_tool_protocol_error_with_work_tools() -> N
     assert llm_end_events[1]["data"]["success"] is True
 
 
-def test_react_accepts_null_tool_calls_in_forced_final_response() -> None:
+def test_react_rejects_null_tool_calls_in_forced_final_response() -> None:
     pattern = ReActPattern()
 
-    assert not pattern._response_requires_tool_protocol_retry(
+    assert pattern._response_requires_tool_protocol_retry(
         {"content": "Done.", "tool_calls": None},
         force_final_answer=True,
     )
@@ -3324,7 +3346,7 @@ async def test_react_pattern_finalizes_with_completion_evidence() -> None:
                 ],
                 "done": False,
             },
-            {"content": "Created output/en_poster.html."},
+            final_answer_response("Created output/en_poster.html."),
         ]
     )
     pattern = ReActPattern(max_iterations=3, finalize_after_tool_result=True)
@@ -3398,7 +3420,7 @@ async def test_react_pattern_uses_decision_for_repeated_tools() -> None:
                     }
                 ],
             },
-            "可以基于已有搜索结果回答。",
+            final_answer_response("可以基于已有搜索结果回答。", "Simplified Chinese"),
         ]
     )
     pattern = ReActPattern(
@@ -3503,7 +3525,7 @@ async def test_react_repeated_decision_drains_current_tool_call_batch() -> None:
                     }
                 ],
             },
-            "Both pending searches were executed.",
+            final_answer_response("Both pending searches were executed."),
         ]
     )
     pattern = ReActPattern(
@@ -3590,7 +3612,7 @@ async def test_react_pattern_uses_decision_after_cross_tool_attempts() -> None:
                     }
                 ],
             },
-            "已有跨工具结果，直接回答。",
+            final_answer_response("已有跨工具结果，直接回答。", "Simplified Chinese"),
         ]
     )
     pattern = ReActPattern(
@@ -3679,7 +3701,7 @@ async def test_react_pattern_uses_decision_after_tool_group_successes() -> None:
                     }
                 ],
             },
-            "AirPods 4 uses USB-C.",
+            final_answer_response("AirPods 4 uses USB-C."),
         ]
     )
     pattern = ReActPattern(
@@ -3759,7 +3781,7 @@ async def test_react_pattern_accepts_legacy_auto_reroute_kwarg() -> None:
                     }
                 ],
             },
-            "可以基于已有搜索结果回答。",
+            final_answer_response("可以基于已有搜索结果回答。", "Simplified Chinese"),
         ]
     )
     pattern = ReActPattern(
@@ -3980,7 +4002,7 @@ async def test_react_pattern_repeated_guard_can_fire_twice_in_single_run() -> No
                     }
                 ],
             },
-            "第三次搜索后信息足够。",
+            final_answer_response("第三次搜索后信息足够。", "Simplified Chinese"),
         ]
     )
     pattern = ReActPattern(

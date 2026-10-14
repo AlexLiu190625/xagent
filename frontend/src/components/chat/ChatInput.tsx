@@ -37,6 +37,7 @@ import {
 
 interface ChatInputProps {
   onSend: (message: string, config?: AgentConfig) => void | Promise<void>;
+  placeholder?: string;
   isLoading?: boolean;
   files?: File[];
   onFilesChange?: (files: File[]) => void;
@@ -108,6 +109,7 @@ interface DefaultModelRecord {
 
 export function ChatInput({
   onSend,
+  placeholder,
   isLoading,
   files = [],
   onFilesChange,
@@ -1173,7 +1175,7 @@ export function ChatInput({
             />
             {!message && (
               <div className="pointer-events-none absolute left-4 top-3 text-[14px] text-muted-foreground/60">
-                {t("chatPage.input.placeholder")}
+                {placeholder ?? t("chatPage.input.placeholder")}
               </div>
             )}
           </div>

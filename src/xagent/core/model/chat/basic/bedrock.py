@@ -9,7 +9,7 @@ import copy
 import json
 import logging
 import threading
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from typing import Any
 
 from botocore import UNSIGNED
@@ -28,9 +28,12 @@ from ....utils.security import redact_sensitive_text
 from ...providers import validate_bedrock_endpoint
 from ..error import matches_context_length_error
 from ..exceptions import LLMContextLengthError, LLMRetryableError
+from ..stream_deadline import await_before_deadline
+from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage
 from ..types import PROVIDER_STATE_METADATA_KEY, ChunkType, StreamChunk
 from .base import BaseLLM
+from .tool_choice import supports_forced_tool_choice
 
 logger = logging.getLogger(__name__)
 
@@ -228,6 +231,44 @@ def _insert_reasoning_blocks(
         blocks.insert(min(max(index, 0), len(blocks)), block)
 
 
+def _shutdown_event_stream(event_stream: Any) -> bool:
+    """Make a worker blocked reading ``event_stream`` return; report success.
+
+    botocore's ``EventStream`` wraps the urllib3 response. Its ``shutdown()``
+    (urllib3 >= 2.3) shuts the socket down for reading, which wakes a read
+    blocked in another thread. ``EventStream.close()`` cannot: it waits for the
+    lock that blocked read holds, so it returns only when the read does.
+    """
+    raw_stream = getattr(event_stream, "_raw_stream", None)
+    shutdown = getattr(raw_stream, "shutdown", None)
+    if not callable(shutdown):
+        return False
+    try:
+        shutdown()
+    except (OSError, RuntimeError, ValueError) as exc:
+        logger.debug("Shutting down Bedrock stream failed (%s)", type(exc).__name__)
+        return False
+    return True
+
+
+def _close_in_background(close: Callable[[], Any]) -> None:
+    """Close without waiting, for a stream whose read may still be blocked."""
+
+    def run() -> None:
+        try:
+            close()
+        except Exception as exc:  # best effort
+            logger.debug("Closing Bedrock stream failed (%s)", type(exc).__name__)
+
+    try:
+        threading.Thread(target=run, name="bedrock-stream-close", daemon=True).start()
+    except RuntimeError as exc:
+        # No thread to spare (or the interpreter is shutting down): leave the
+        # response to be closed when collected rather than mask the error the
+        # caller is about to see.
+        logger.debug("Closing Bedrock stream failed (%s)", type(exc).__name__)
+
+
 class BedrockLLM(BaseLLM):
     """Call Bedrock's provider-neutral Converse APIs through boto3.
 
@@ -250,6 +291,7 @@ class BedrockLLM(BaseLLM):
         timeout: float = 180.0,
         abilities: list[str] | None = None,
         client: Any = None,
+        timeout_config: TimeoutConfig | None = None,
     ) -> None:
         self._model_name = model_name
         self.region_name = region_name or None
@@ -270,6 +312,7 @@ class BedrockLLM(BaseLLM):
         self.default_temperature = default_temperature
         self.default_max_tokens = default_max_tokens
         self.timeout = timeout
+        self.timeout_config = timeout_config or TimeoutConfig()
         self._abilities = list(abilities or ["chat", "tool_calling", "vision"])
         self._client = client
         self._client_lock = threading.Lock()
@@ -297,6 +340,17 @@ class BedrockLLM(BaseLLM):
     @property
     def supports_json_object_response_format(self) -> bool:
         return False
+
+    @property
+    def supports_forced_tool_choice(self) -> bool:
+        """Whether this Bedrock model accepts ``toolChoice.any/tool``.
+
+        Anthropic documents Opus/Sonnet 5.5 as auto-only, and AWS also names
+        Fable 5.1 and Mythos 5.1. The shared matcher accepts bare model ids
+        and the model segment of Bedrock ARNs. Opaque application inference
+        profiles can opt in through the ``auto_tool_choice_only`` ability.
+        """
+        return supports_forced_tool_choice(self._abilities, self._model_name)
 
     def _build_client(self) -> Any:
         import boto3
@@ -567,6 +621,7 @@ class BedrockLLM(BaseLLM):
             request["system"] = self._sanitize_unicode_content(system)
         if additional is not None:
             request["additionalModelRequestFields"] = additional
+        tool_choice = self.compatible_tool_choice(tool_choice)
         if tools and tool_choice != "none":
             request["toolConfig"] = {"tools": self._convert_tools(tools)}
             converted_choice = self._convert_tool_choice(tool_choice)
@@ -788,6 +843,7 @@ class BedrockLLM(BaseLLM):
         )
         client = await self._get_client()
         event_stream = None
+        read_in_flight = False
         current_text = ""
         tool_calls: dict[int, dict[str, Any]] = {}
         reasoning_deltas: dict[int, dict[str, Any]] = {}
@@ -807,17 +863,58 @@ class BedrockLLM(BaseLLM):
             return raw
 
         try:
-            response = await run_in_thread_with_telemetry(
-                "bedrock.converse_stream", client.converse_stream, **request
+            # Both limits are deadlines on the wait itself (#3059). Each event
+            # is read in a worker thread, and botocore's per-socket-read timeout
+            # is the only other bound. The first-token deadline also covers
+            # opening the stream. Expiry while ``converse_stream`` is still
+            # waiting leaves no response to shut down: that worker runs on
+            # until the headers arrive or botocore's connect/read timeout
+            # (``self.timeout``) fires, and a stream it opens after expiry is
+            # dropped and closed only when collected.
+            loop = asyncio.get_running_loop()
+            first_token_timeout = self.timeout_config.first_token_timeout
+            first_token_deadline = loop.time() + first_token_timeout
+            first_token_message = (
+                f"First token timeout: no chunk within {first_token_timeout}s"
+            )
+            interval_timeout = self.timeout_config.token_interval_timeout
+            interval_message = (
+                f"Token interval timeout: no chunk within {interval_timeout}s "
+                "of the previous one"
+            )
+
+            response = await await_before_deadline(
+                run_in_thread_with_telemetry(
+                    "bedrock.converse_stream", client.converse_stream, **request
+                ),
+                deadline=first_token_deadline,
+                timeout_message=first_token_message,
             )
             event_stream = response["stream"]
             iterator = iter(event_stream)
+            first_event = True
             while True:
-                present, event = await run_in_thread_with_telemetry(
-                    "bedrock.stream_next", self._next_event, iterator
+                # The interval deadline starts when we begin waiting, so time
+                # the caller spends on the previous chunk is not counted as
+                # provider silence.
+                if first_event:
+                    deadline = first_token_deadline
+                    timeout_message = first_token_message
+                else:
+                    deadline = loop.time() + interval_timeout
+                    timeout_message = interval_message
+                read_in_flight = True
+                present, event = await await_before_deadline(
+                    run_in_thread_with_telemetry(
+                        "bedrock.stream_next", self._next_event, iterator
+                    ),
+                    deadline=deadline,
+                    timeout_message=timeout_message,
                 )
+                read_in_flight = False
                 if not present:
                     break
+                first_event = False
                 if "contentBlockStart" in event:
                     start_event = event["contentBlockStart"]
                     index = int(start_event.get("contentBlockIndex", 0))
@@ -1019,7 +1116,28 @@ class BedrockLLM(BaseLLM):
         finally:
             close = getattr(event_stream, "close", None)
             if callable(close):
-                await run_in_thread_with_telemetry("bedrock.stream_close", close)
+                # Only a read still pending in a worker (a deadline,
+                # cancellation, or an error out of the await) needs the socket
+                # shut down first: neither cancelling its wait nor close()
+                # interrupts it. Without a shutdown, close() would wait for
+                # that read, so it is left to run in the background instead.
+                if not read_in_flight:
+                    await run_in_thread_with_telemetry("bedrock.stream_close", close)
+                elif _shutdown_event_stream(event_stream):
+                    try:
+                        await run_in_thread_with_telemetry(
+                            "bedrock.stream_close", close
+                        )
+                    except Exception as exc:
+                        # The woken worker's urllib3 cleanup can race this
+                        # close (release_conn() clears _connection while
+                        # close() checks it unlocked), and a close error must
+                        # not replace the error already in flight.
+                        logger.debug(
+                            "Closing Bedrock stream failed (%s)", type(exc).__name__
+                        )
+                else:
+                    _close_in_background(close)
 
     async def close(self) -> None:
         client = self._client

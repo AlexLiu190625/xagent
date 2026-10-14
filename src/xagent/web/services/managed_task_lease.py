@@ -72,8 +72,8 @@ def finalize_managed_task_lease_result(
     an interruption is decided as the other result paths decide it: a
     recoverable run rests PAUSED with no failure transcript, error or result,
     and its channel result says it was interrupted (as lease recovery's does).
-    It needs ``XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED`` (off by default), as
-    on the other paths. A database connectivity failure while deciding raises
+    It follows ``settlement_pause_enabled``, as on the other paths. A
+    database connectivity failure while deciding raises
     ``InterruptionSettlementDeferred`` after rolling back, keeping the lease
     for TTL recovery; any other decision fault settles as before. Every
     decided interruption is recorded in ``task_auto_recovery``.

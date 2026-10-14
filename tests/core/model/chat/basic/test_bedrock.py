@@ -67,6 +67,99 @@ def test_factory_and_metadata_preserve_native_bedrock_settings():
     assert metadata["credential_fields"][0]["required"] is False
 
 
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "anthropic.claude-opus-5-5-v1:0",
+        "au.anthropic.claude-opus-5-5",
+        "eu.anthropic.claude-sonnet-5-5-v1:0",
+        "us.anthropic.claude-fable-5-1-20261001-v1:0",
+        "global.anthropic.claude-mythos-5-1-v1:0",
+        "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-opus-5-5-v1:0",
+        "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-5-5-v1:0",
+    ],
+)
+def test_auto_only_bedrock_models_separate_tools_from_forced_choice(model_name):
+    llm = BedrockLLM(model_name)
+
+    assert llm.has_ability("tool_calling") is True
+    assert llm.supports_forced_tool_choice is False
+    assert llm.compatible_tool_choice("required") == "auto"
+    assert (
+        llm.compatible_tool_choice({"type": "function", "function": {"name": "lookup"}})
+        == "auto"
+    )
+
+
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "us.anthropic.claude-haiku-5-5-v1:0",
+        "us.anthropic.claude-opus-5-v1:0",
+        "anthropic.claude-fable-5-v1:0",
+        "custom.vendor.anthropic.claude-opus-5-5-v1:0",
+        "amazon.nova-pro-v1:0",
+    ],
+)
+def test_other_bedrock_models_keep_forced_tool_choice(model_name):
+    llm = BedrockLLM(model_name)
+
+    assert llm.supports_forced_tool_choice is True
+    assert llm.compatible_tool_choice("required") == "required"
+
+
+def test_retry_wrapper_preserves_bedrock_forced_choice_capability():
+    llm = create_base_llm(
+        ChatModelConfig(
+            id="bedrock-opus-55",
+            model_name="au.anthropic.claude-opus-5-5-v1:0",
+            model_provider="bedrock",
+            api_key="br-key",
+            bedrock_region="ap-southeast-2",
+            bedrock_auth_mode="api_key",
+        )
+    )
+
+    assert llm.supports_forced_tool_choice is False
+    assert llm.compatible_tool_choice("required") == "auto"
+
+
+def test_auto_only_ability_overrides_opaque_bedrock_model_id():
+    llm = BedrockLLM(
+        "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/opaque-id",
+        abilities=["chat", "tool_calling", "auto_tool_choice_only"],
+    )
+
+    assert llm.supports_forced_tool_choice is False
+    assert llm.compatible_tool_choice("required") == "auto"
+
+
+def test_auto_only_bedrock_request_normalizes_raw_required_choice():
+    llm = BedrockLLM("anthropic.claude-opus-5-5-v1:0")
+    request = llm._request(
+        [{"role": "user", "content": "hello"}],
+        None,
+        None,
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "Look up a value",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        "required",
+        None,
+        None,
+        None,
+        {},
+    )
+
+    assert request["toolConfig"]["toolChoice"] == {"auto": {}}
+
+
 @pytest.mark.asyncio
 async def test_converse_translates_system_history_image_and_usage():
     client = _runtime_client()
@@ -816,6 +909,12 @@ async def test_stream_cancellation_closes_blocking_botocore_event_stream():
     with pytest.raises(asyncio.CancelledError):
         await pending
 
+    # A stream with no socket to shut down is closed in the background, since
+    # close() would otherwise wait for a read still blocked in its worker.
+    for _ in range(500):
+        if stream.closed:
+            break
+        await asyncio.sleep(0.01)
     assert stream.closed is True
 
 

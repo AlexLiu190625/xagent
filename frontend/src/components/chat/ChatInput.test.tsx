@@ -2223,4 +2223,16 @@ describe("ChatInput", () => {
       await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1))
     }
   )
+
+  it("uses the provided placeholder and keeps the default without one", () => {
+    const onSend = vi.fn()
+    const { rerender } = render(<ChatInput hideConfig hideFileUpload onSend={onSend} />)
+
+    expect(screen.getByText("chatPage.input.placeholder")).toBeInTheDocument()
+
+    rerender(<ChatInput hideConfig hideFileUpload onSend={onSend} placeholder="custom.placeholder" />)
+
+    expect(screen.getByText("custom.placeholder")).toBeInTheDocument()
+    expect(screen.queryByText("chatPage.input.placeholder")).not.toBeInTheDocument()
+  })
 })

@@ -67,9 +67,9 @@ engine = engine_fixture
 def factory(engine, monkeypatch) -> sessionmaker:
     Base.metadata.create_all(engine)
     result = sessionmaker(engine)
-    monkeypatch.setattr("xagent.web.models.database.get_session_local", lambda: result)
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", result)
     # Selects the PostgreSQL row-lock path or the SQLite CAS path.
-    monkeypatch.setattr("xagent.web.models.database.get_engine", lambda: engine)
+    monkeypatch.setattr("xagent.web.models.database._engine", engine)
     monkeypatch.setattr(
         task_lease_recovery, "invalidate_task_cache_best_effort", lambda _id: None
     )
