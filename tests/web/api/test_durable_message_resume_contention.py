@@ -37,6 +37,7 @@ from xagent.web.services.task_command_transport import (
     get_runner_id,
     max_command_defers,
 )
+from xagent.web.services.task_dispatch_cap import DispatchCapSnapshot
 from xagent.web.services.task_execution import ResumeReservationOutcome
 
 live_task_lease = live_task_lease_fixture
@@ -127,6 +128,10 @@ def _live_control_environment(
         background_manager.try_reserve_resume.return_value = outcome
         background_manager.resume_holder_age_seconds.return_value = None
         background_manager.running_tasks.get.return_value = None
+        # An open cap: the dispatcher reads the snapshot and takes a slot.
+        background_manager.dispatch_cap_snapshot.return_value = DispatchCapSnapshot(
+            80, frozenset()
+        )
 
     with (
         patch(
