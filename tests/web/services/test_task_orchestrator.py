@@ -2496,12 +2496,22 @@ async def test_schedule_bg_resolves_scope_off_loop_before_execution(
     assert resolver_threads and resolver_threads[0] != loop_thread
 
 
-@pytest.mark.parametrize("failure_point", ["missing_snapshot", "execute_error"])
+@pytest.mark.parametrize(
+    ("failure_point", "expect_flag"),
+    [
+        ("missing_snapshot", True),
+        ("execute_error", True),
+        ("success", False),
+        ("paused", False),
+    ],
+)
 @pytest.mark.asyncio
-async def test_schedule_bg_persists_setup_failures_off_loop(
+async def test_schedule_bg_settles_off_loop_and_registers_failure_flag(
     db_session,
     failure_point,
+    expect_flag,
 ) -> None:
+    from xagent.core.agent.interruption import InterruptionReason
     from xagent.web.services.task_execution import background_task_manager
 
     user = _create_user(db_session)
@@ -2516,13 +2526,18 @@ async def test_schedule_bg_persists_setup_failures_off_loop(
     execute = AsyncMock(
         side_effect=(
             RuntimeError("simulated execute failure")
-            if failure_point == "execute_error"
+            if failure_point in ("execute_error", "paused")
             else None
         )
     )
 
-    def record_failure(*_args, **_kwargs) -> None:
+    def record_failure(*_args, **settle_kwargs) -> bool | None:
         marker_threads.append(get_ident())
+        if failure_point == "paused":
+            # The settlement reports the handled failure as a pause.
+            settle_kwargs["report"].paused_for = InterruptionReason.PERSISTENCE_FAILURE
+            return True
+        return None
 
     with (
         patch(
@@ -2551,7 +2566,11 @@ async def test_schedule_bg_persists_setup_failures_off_loop(
             "xagent.web.services.task_orchestrator.settle_task_lease_isolated",
             side_effect=record_failure,
         ),
-        patch.object(background_task_manager, "register_task"),
+        patch.object(background_task_manager, "register_task") as register,
+        patch(
+            "xagent.web.services.task_orchestrator.publish_settlement_pause",
+            new=AsyncMock(),
+        ) as publish_pause,
         patch(
             "xagent.web.services.task_orchestrator._get_agent_manager",
             return_value=MagicMock(),
@@ -2565,8 +2584,16 @@ async def test_schedule_bg_persists_setup_failures_off_loop(
             force_fresh=False,
             context=None,
         )
+        (_, bg_task), kwargs = register.call_args
+        await bg_task
 
     assert marker_threads and marker_threads[0] != loop_thread
+    # The runner settles every outcome and returns normally; the registration's
+    # failure flag is what reports a handled failure to the per-process
+    # execution counts, and a pause is not a failure.
+    assert bg_task.exception() is None
+    assert kwargs["failure_flag"]() is expect_flag
+    assert publish_pause.await_count == int(failure_point == "paused")
 
 
 @pytest.mark.asyncio

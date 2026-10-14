@@ -38,6 +38,7 @@ import shutil
 import time
 import uuid
 import weakref
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -4675,6 +4676,18 @@ class BackgroundTaskManager:
         self._explicitly_cancelled: weakref.WeakSet[asyncio.Task] = weakref.WeakSet()
         self._shutting_down = False
         self._shutdown_lock = asyncio.Lock()
+        # Every execution task this process started, by identity: one object
+        # counts once as started and once as finished however many times it
+        # is registered. Live members are the in-flight executions.
+        self._counted_tasks: weakref.WeakSet[asyncio.Task] = weakref.WeakSet()
+        # Window counts for the per-process diagnostics line. Written by
+        # registration and by done callbacks, zeroed by ``drain_window_counts``
+        # and when ``start_accepting`` opens a new lifespan. ``shutdown`` keeps
+        # them so cancellations during shutdown are still reported.
+        self._window_started = 0
+        self._window_finished_ok = 0
+        self._window_finished_failed = 0
+        self._window_finished_cancelled = 0
 
     def start_accepting(self) -> None:
         """Reopen admission for a new application lifespan."""
@@ -4693,6 +4706,7 @@ class BackgroundTaskManager:
         # so an idle manager must not retain the previous lifespan's lock.
         self._shutdown_lock = asyncio.Lock()
         self._shutting_down = False
+        self.drain_window_counts()
 
     async def wait_for_previous(self, task_id: int) -> None:
         """Wait for previous background task of this task to complete"""
@@ -4713,8 +4727,23 @@ class BackgroundTaskManager:
                         f"Previous background task {task_id} ended with error: {e}"
                     )
 
-    def register_task(self, task_id: int, task: asyncio.Task) -> None:
-        """Register new background task"""
+    def register_task(
+        self,
+        task_id: int,
+        task: asyncio.Task,
+        *,
+        failure_flag: Callable[[], bool] | None = None,
+    ) -> None:
+        """Register new background task and count it as a started execution.
+
+        ``failure_flag`` reports a failure the task handled itself and then
+        returned from normally; it is read once, when the task finishes, and
+        must be a cheap read of state the task already holds. Without it only
+        an exception escaping the task counts as a failure. The manager logs
+        that exception exactly once, with its traceback, and asyncio adds no
+        second report; a path that also awaits the handle may log it again
+        there.
+        """
         if self._shutting_down:
             task.cancel()
             raise RuntimeError("Background task manager is shutting down")
@@ -4731,6 +4760,7 @@ class BackgroundTaskManager:
         task.add_done_callback(
             lambda finished: self.cleanup_task(task_id, expected_task=finished)
         )
+        self._count_execution_start(task_id, task, failure_flag)
         logger.info(f"Registered background task for task {task_id}")
 
     def resume_admission_state(
@@ -4850,6 +4880,13 @@ class BackgroundTaskManager:
         self._resume_owner_started_at.pop(task_id, None)
 
     def promote_resume_task(self, task_id: int, task: asyncio.Task) -> None:
+        """Make a resume coordinator the task's execution and count it as started.
+
+        It is counted without a failure flag: only an exception escaping the
+        coordinator counts as failed, and that exception is logged as for
+        ``register_task``.
+        """
+
         if self._shutting_down:
             raise RuntimeError("Background task manager is shutting down")
         existing = self.resume_tasks.get(task_id)
@@ -4858,7 +4895,95 @@ class BackgroundTaskManager:
                 f"Task {task_id} resume coordinator is not registered or no longer current"
             )
         self.running_tasks[task_id] = task
+        self._count_execution_start(task_id, task, None)
         logger.info("Promoted resume coordinator for task %s", task_id)
+
+    def _count_execution_start(
+        self,
+        task_id: int,
+        task: asyncio.Task,
+        failure_flag: Callable[[], bool] | None,
+    ) -> None:
+        if task in self._counted_tasks:
+            return
+        self._counted_tasks.add(task)
+        self._window_started += 1
+        task.add_done_callback(
+            lambda finished: self._count_execution_finish(
+                task_id, finished, failure_flag
+            )
+        )
+
+    def _count_execution_finish(
+        self,
+        task_id: int,
+        task: asyncio.Task,
+        failure_flag: Callable[[], bool] | None,
+    ) -> None:
+        # Deliberately independent of ``cleanup_task`` and ``_shutting_down``:
+        # tasks cancelled by ``shutdown`` are still counted.
+        if task.cancelled():
+            self._window_finished_cancelled += 1
+            return
+        exc = task.exception()
+        if exc is not None:
+            # Reading the exception marks it retrieved, which silences
+            # asyncio's "Task exception was never retrieved" report for a
+            # handle nobody awaits. Report it here instead; this callback is
+            # attached once per task object, so it is reported once.
+            logger.error(
+                "Background execution for task %s raised", task_id, exc_info=exc
+            )
+        failed = exc is not None
+        if not failed and failure_flag is not None:
+            try:
+                failed = bool(failure_flag())
+            except Exception:
+                logger.exception("Execution failure flag raised; counting as failed")
+                failed = True
+        if failed:
+            self._window_finished_failed += 1
+        else:
+            self._window_finished_ok += 1
+
+    def inflight_counts(self) -> tuple[int, int]:
+        """Return (executions in flight, resume coordinators not yet executing).
+
+        The two numbers are disjoint: a promoted coordinator is an execution.
+        Counts objects, not task ids, so an older execution still finishing
+        after its task id was registered again is included.
+        """
+
+        inflight = sum(1 for task in list(self._counted_tasks) if not task.done())
+        resuming = sum(
+            1
+            for task in list(self.resume_tasks.values())
+            if not task.done() and task not in self._counted_tasks
+        )
+        return inflight, resuming
+
+    def drain_window_counts(self) -> tuple[int, int, int, int]:
+        """Return and zero (started, finished ok, failed, cancelled) since the last drain.
+
+        "failed" means the task raised, or reported through its failure flag
+        that it handled a failure. "ok" is every other non-cancelled finish,
+        which includes runs that paused, lost their lease, or whose agent
+        reported an unsuccessful result without raising. A resume coordinator
+        is counted without a failure flag, so a resume run that handles its
+        own failure and returns normally counts as "ok".
+        """
+
+        counts = (
+            self._window_started,
+            self._window_finished_ok,
+            self._window_finished_failed,
+            self._window_finished_cancelled,
+        )
+        self._window_started = 0
+        self._window_finished_ok = 0
+        self._window_finished_failed = 0
+        self._window_finished_cancelled = 0
+        return counts
 
     def cleanup_task(
         self,

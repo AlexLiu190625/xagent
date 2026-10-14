@@ -2854,7 +2854,9 @@ def _schedule_bg(
                 raise cleanup_cancellation
 
     bg_task = asyncio.create_task(_runner())
-    background_task_manager.register_task(task_id, bg_task)
+    background_task_manager.register_task(
+        task_id, bg_task, failure_flag=lambda: execution_failed
+    )
     if task_source == "trigger":
         from ...core.utils.setup_metrics import trigger_execution
 
