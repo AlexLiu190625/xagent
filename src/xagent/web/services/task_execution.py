@@ -38,6 +38,7 @@ import shutil
 import time
 import uuid
 import weakref
+from collections import Counter
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -98,6 +99,7 @@ from .task_auto_recovery import (
     settlement_interruption_for_failure,
     settlement_interruption_for_result,
 )
+from .task_dispatch_cap import DispatchCapSnapshot
 from .task_events import DeliveryNotifier, publish_task_event
 from .task_execution_event_writer import (
     FactWitness,
@@ -4659,6 +4661,14 @@ class AnyResumeRun:
 ANY_RESUME_RUN = AnyResumeRun()
 
 
+class DispatchReservation:
+    __slots__ = ("task_id", "released")
+
+    def __init__(self, task_id: int) -> None:
+        self.task_id = task_id
+        self.released = False
+
+
 class BackgroundTaskManager:
     """Manages background task execution, ensuring only one background process per task at a time"""
 
@@ -4694,6 +4704,57 @@ class BackgroundTaskManager:
         self._window_finished_ok = 0
         self._window_finished_failed = 0
         self._window_finished_cancelled = 0
+        # Every live execution handle by task id, whatever registry table it
+        # sits in. A handle leaves only through its own done callback, so an
+        # execution counts until it has finished unwinding, not merely until it
+        # called ``cleanup_task``. Kept apart from ``_counted_tasks``, which is
+        # not keyed by task id and so cannot answer whether a task is active.
+        self._live_executions: dict[int, set[asyncio.Task]] = {}
+        # One entry per in-flight dispatch attempt that took a slot for a task
+        # and has not yet seen its execution registered or the attempt end.
+        self._dispatch_reservations: Counter[int] = Counter()
+
+    def _drop_live_execution(self, task_id: int, task: asyncio.Task) -> None:
+        handles = self._live_executions.get(task_id)
+        if handles is None:
+            return
+        handles.discard(task)
+        if not handles:
+            del self._live_executions[task_id]
+
+    def _active_task_ids(self) -> frozenset[int]:
+        return (
+            frozenset(self._live_executions)
+            | frozenset(self.resume_tasks)
+            | frozenset(self._dispatch_reservations)
+        )
+
+    def dispatch_cap_snapshot(self, limit: int) -> DispatchCapSnapshot:
+        return DispatchCapSnapshot(limit, self._active_task_ids())
+
+    def reserve_dispatch_slot(
+        self, task_id: int, *, limit: int
+    ) -> DispatchReservation | None:
+        """Take a slot for ``task_id`` unless the cap is full for it.
+
+        Reads the active set and adds the token with no await in between, so
+        concurrent dispatch attempts cannot both take the last slot.
+        """
+
+        if not self.dispatch_cap_snapshot(limit).admits(task_id):
+            return None
+        self._dispatch_reservations[task_id] += 1
+        return DispatchReservation(task_id)
+
+    def release_dispatch_slot(self, token: DispatchReservation | None) -> None:
+        if token is None or token.released:
+            return
+        token.released = True
+        remaining = self._dispatch_reservations.get(token.task_id, 0) - 1
+        if remaining > 0:
+            self._dispatch_reservations[token.task_id] = remaining
+        else:
+            self._dispatch_reservations.pop(token.task_id, None)
 
     def start_accepting(self) -> None:
         """Reopen admission for a new application lifespan."""
@@ -4705,6 +4766,8 @@ class BackgroundTaskManager:
             or self._resume_run_ids
             or self._resume_reservations
             or self._resume_owner_started_at
+            or self._live_executions
+            or self._dispatch_reservations
         ):
             raise RuntimeError("Background task manager still owns background work")
         # asyncio synchronization primitives are bound to the event loop that
@@ -4753,6 +4816,14 @@ class BackgroundTaskManager:
         if self._shutting_down:
             task.cancel()
             raise RuntimeError("Background task manager is shutting down")
+        # Counted from here, so a handle that track_execution cancels still
+        # leaves the table through its own done callback.
+        self._live_executions.setdefault(task_id, set()).add(task)
+        # Registered before the cleanup callback, so the handle has left the
+        # table by the time cleanup signals a freed slot.
+        task.add_done_callback(
+            lambda finished: self._drop_live_execution(task_id, finished)
+        )
         from .task_coordinator_runtime import current_task_coordinator
 
         coordinator = current_task_coordinator(task_id)
@@ -4862,6 +4933,14 @@ class BackgroundTaskManager:
             raise RuntimeError("Background task manager is shutting down")
         if task_id not in self._resume_reservations:
             raise RuntimeError(f"Task {task_id} has no reserved resume slot")
+        # Counted from here, so a handle that track_execution cancels still
+        # leaves the table through its own done callback.
+        self._live_executions.setdefault(task_id, set()).add(task)
+        # Registered before the cleanup callback, so the handle has left the
+        # table by the time cleanup signals a freed slot.
+        task.add_done_callback(
+            lambda finished: self._drop_live_execution(task_id, finished)
+        )
         from .task_coordinator_runtime import current_task_coordinator
 
         coordinator = current_task_coordinator(task_id)
@@ -5017,6 +5096,9 @@ class BackgroundTaskManager:
             self._resume_run_ids.pop(task_id, None)
             self._resume_owner_started_at.pop(task_id, None)
             logger.info("Cleaned up resume coordinator for task %s", task_id)
+        from .task_command_transport import notify_dispatcher_slot_freed
+
+        notify_dispatcher_slot_freed()
 
     async def cancel_task(
         self,
@@ -5038,6 +5120,10 @@ class BackgroundTaskManager:
             self._resume_reservations.discard(task_id)
             self._resume_owner_started_at.pop(task_id, None)
         if not tasks:
+            if not self._shutting_down:
+                from .task_command_transport import notify_dispatcher_slot_freed
+
+                notify_dispatcher_slot_freed()
             return BackgroundTaskCancelOutcome(requested=False)
 
         requested = False
@@ -5068,6 +5154,9 @@ class BackgroundTaskManager:
             self.resume_tasks.pop(task_id, None)
             self._resume_run_ids.pop(task_id, None)
             self._resume_owner_started_at.pop(task_id, None)
+            from .task_command_transport import notify_dispatcher_slot_freed
+
+            notify_dispatcher_slot_freed()
         return BackgroundTaskCancelOutcome(requested=requested)
 
     def cancel_was_requested(self, task: asyncio.Task | None) -> bool:
@@ -5105,6 +5194,8 @@ class BackgroundTaskManager:
                 self._resume_run_ids.clear()
                 self._resume_reservations.clear()
                 self._resume_owner_started_at.clear()
+                self._live_executions.clear()
+                self._dispatch_reservations.clear()
 
 
 background_task_manager = BackgroundTaskManager()

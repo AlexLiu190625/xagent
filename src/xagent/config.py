@@ -59,6 +59,7 @@ TASK_AUTO_RESUME_ENABLED = "XAGENT_TASK_AUTO_RESUME_ENABLED"
 TASK_AUTO_RESUME_POLL_SECONDS = "XAGENT_TASK_AUTO_RESUME_POLL_SECONDS"
 TASK_AUTO_RESUME_MAX_PER_TICK = "XAGENT_TASK_AUTO_RESUME_MAX_PER_TICK"
 TASK_AUTO_RESUME_MAX_INFLIGHT = "XAGENT_TASK_AUTO_RESUME_MAX_INFLIGHT"
+DISPATCHER_MAX_INFLIGHT_PER_PROCESS = "XAGENT_DISPATCHER_MAX_INFLIGHT_PER_PROCESS"
 TASK_AUTO_RESUME_WINDOW_SECONDS = "XAGENT_TASK_AUTO_RESUME_WINDOW_SECONDS"
 TASK_AUTO_RESUME_CHANNEL_WINDOW_SECONDS = (
     "XAGENT_TASK_AUTO_RESUME_CHANNEL_WINDOW_SECONDS"
@@ -565,6 +566,12 @@ def get_task_auto_resume_max_inflight() -> int:
     """Get the global cap on auto-resumed runs in flight (default 50)."""
 
     return _get_positive_int_env(TASK_AUTO_RESUME_MAX_INFLIGHT, 50)
+
+
+def get_dispatcher_max_inflight_per_process() -> int:
+    """Get the per-process cap on dispatcher-claimed executions (default 80)."""
+
+    return _get_positive_int_env(DISPATCHER_MAX_INFLIGHT_PER_PROCESS, 80)
 
 
 def get_task_auto_resume_window_seconds() -> int:
