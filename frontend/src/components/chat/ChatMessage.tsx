@@ -85,6 +85,10 @@ export interface ChatMessageProps {
   rawContent?: string;
   traceEvents?: TraceEvent[];
   showProcessView?: boolean;
+  // Whether an interrupted process draws its own "Interrupted" line. A caller
+  // whose turn already shows the interruption elsewhere passes false; the
+  // process is then treated like any other trace-only message.
+  showInterruptedStatus?: boolean;
   isVirtual?: boolean;
   taskStatus?: string;
   processStatus?: string;
@@ -317,6 +321,7 @@ export function ChatMessage({
   // Default matches TaskConversationPanelProps: an unwired caller gets the
   // internal-page behavior; public surfaces opt out explicitly.
   showProcessView = true,
+  showInterruptedStatus = true,
   taskStatus,
   processStatus,
   timestamp,
@@ -451,9 +456,11 @@ export function ChatMessage({
   // was rendered (internal pages) or suppressed (embedded chat) — keying this
   // off the events themselves rather than off shouldShowProcess. Stopped
   // unanswered turns are the exception once the trace is hidden (see above).
+  // An interrupted process is another exception, unless the caller has turned
+  // its own "Interrupted" line off: that line is the message's content.
   const isProcessOnlyMessage =
     hasTraceEvents &&
-    resolvedProcessStatus !== "interrupted" &&
+    !(resolvedProcessStatus === "interrupted" && showInterruptedStatus) &&
     !isUser &&
     !content &&
     showEmptyStatus === false &&
@@ -624,7 +631,7 @@ export function ChatMessage({
                   />
                 </div>
               )}
-              {resolvedProcessStatus === "interrupted" && (
+              {resolvedProcessStatus === "interrupted" && showInterruptedStatus && (
                 <div className="py-3 text-sm text-muted-foreground">{t("agent.layout.status.interrupted")}</div>
               )}
             </div>

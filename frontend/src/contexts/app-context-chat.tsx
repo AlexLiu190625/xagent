@@ -1308,6 +1308,11 @@ const normalizeDagExecutionPayload = (raw: Record<string, unknown>): DAGExecutio
 export interface AppState {
   streamRecoveryTaskId?: number | null
   messages: Message[]
+  // Ids of the user messages that opened a turn the visitor stopped. Kept
+  // here rather than on a bubble because a terminal frame that names a
+  // message_id adds no bubble. The conversation panel reads it to draw that
+  // turn's process as stopped. Live only: a reload does not rebuild it.
+  stoppedTurnAnchorIds: string[]
   currentTask: Task | null
   taskRuntimeExtensions: TaskRuntimeExtensions
   dagExecution: DAGExecution | null
@@ -1360,6 +1365,7 @@ type AppAction =
   | { type: "SET_TASK_ID"; payload: number | null }
   | { type: "ADOPT_SESSION_TASK"; payload: { taskId: number; task: Task } }
   | { type: "RESET_SESSION_CONVERSATION" }
+  | { type: "MARK_TURN_STOPPED"; payload: { anchorMessageId: string } }
   | { type: "ADD_MESSAGE"; payload: Message }
   | { type: "UPSERT_STREAMING_FINAL_ANSWER"; payload: { messageId: string; executionSequence?: number; delta?: string; content?: string; status?: Message["status"]; timestamp: string } }
   | { type: "SET_CURRENT_TASK"; payload: Task | null }
@@ -1407,6 +1413,7 @@ type AppAction =
 
 const createInitialState = (): AppState => ({
   messages: [],
+  stoppedTurnAnchorIds: [],
   currentTask: null,
   taskRuntimeExtensions: {},
   dagExecution: null,
@@ -1473,6 +1480,7 @@ function projectAppState(state: AppState, action: AppAction): AppState {
       // Clear messages if task ID changes
       const taskChanged = state.taskId !== action.payload
       const messages = taskChanged ? [] : state.messages
+      const stoppedTurnAnchorIds = taskChanged ? [] : state.stoppedTurnAnchorIds
       const contextUsage = taskChanged ? null : state.contextUsage
       const taskRuntimeExtensions = taskChanged ? {} : state.taskRuntimeExtensions
       // Also clear the previous task's DAG plan/phase here - otherwise
@@ -1485,6 +1493,7 @@ function projectAppState(state: AppState, action: AppAction): AppState {
         ...state,
         taskId: action.payload,
         messages,
+        stoppedTurnAnchorIds,
         contextUsage,
         taskRuntimeExtensions,
         dagExecution,
@@ -1504,7 +1513,19 @@ function projectAppState(state: AppState, action: AppAction): AppState {
         taskId: action.payload.taskId,
         currentTask: clearStaleAutoRecovery(withDagTerminatedAt(action.payload.task)),
         taskRuntimeExtensions: {},
+        stoppedTurnAnchorIds: [],
       }
+
+    case "MARK_TURN_STOPPED":
+      return state.stoppedTurnAnchorIds.includes(action.payload.anchorMessageId)
+        ? state
+        : {
+            ...state,
+            stoppedTurnAnchorIds: [
+              ...state.stoppedTurnAnchorIds,
+              action.payload.anchorMessageId,
+            ],
+          }
 
     case "RESET_SESSION_CONVERSATION":
       return {
@@ -2024,9 +2045,9 @@ function projectAppState(state: AppState, action: AppAction): AppState {
             isStreamingFinalAnswerMessage(message)
           )
         })
-        return { ...state, messages: messagesToKeep }
+        return { ...state, messages: messagesToKeep, stoppedTurnAnchorIds: [] }
       }
-      return { ...state, messages: [] }
+      return { ...state, messages: [], stoppedTurnAnchorIds: [] }
 
     case "RESET_STATE":
       return {
@@ -6589,6 +6610,22 @@ export function AppProvider({
         const isVisitorStoppedTurn =
           endsStopIntent
           && errorFrame.terminalErrorCode === "external_turn_interrupted"
+        // The stopped mark is recorded before, and independent of, the bubble
+        // check below: a frame that names a message_id adds no bubble, yet its
+        // turn is still the stopped one. The turn is identified by the user
+        // message that opened it; with no user message there is nothing to
+        // anchor to and the turn keeps the failed rendering.
+        if (isVisitorStoppedTurn) {
+          const anchorMessage = [...currentState.messages]
+            .reverse()
+            .find((candidate) => candidate.role === "user")
+          if (anchorMessage) {
+            dispatch({
+              type: "MARK_TURN_STOPPED",
+              payload: { anchorMessageId: anchorMessage.id },
+            })
+          }
+        }
         // A frame that names a message_id adds no bubble below: that message
         // is drawn from its own display event. It still ends the intent.
         if (

@@ -4,9 +4,9 @@ export type TimelineAnchor = {
 };
 
 /** User messages delimit execution turns; assistant result messages should not split trace groups. */
-export function getUserTimelineAnchors(
-  sortedMessages: TimelineAnchor[],
-): TimelineAnchor[] {
+export function getUserTimelineAnchors<T extends TimelineAnchor>(
+  sortedMessages: T[],
+): T[] {
   return sortedMessages.filter((message) => message.role === "user");
 }
 
