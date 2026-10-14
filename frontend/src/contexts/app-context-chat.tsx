@@ -2543,6 +2543,13 @@ export function AppProvider({
       stopTimeoutRef.current = null
     }
   }, [])
+  // Returns the button to pressable and disarms its window. It deliberately
+  // leaves stopIntentTaskIdRef alone: the intent is per task and outlives the
+  // button (a reconnect, a waiting turn), so each caller decides it itself.
+  const releaseStopControl = useCallback(() => {
+    clearStopTimeout()
+    setStopState("idle")
+  }, [clearStopTimeout])
   const { t } = useI18n()
   const router = useRouter()
   const lastConnectedTaskId = useRef<number | null>(null)
@@ -2763,9 +2770,12 @@ export function AppProvider({
     // The task this connection is bound to changed. It had to pass through an
     // unbound or replacement phase to get here — SESSION_TASK_INFO leaves the
     // bound id alone when a task_info names a different task — so whatever the
-    // visitor asked to stop, this connection no longer follows it.
+    // visitor asked to stop, this connection no longer follows it. The control
+    // was already released on the way through that phase (canStopTask is false
+    // there); releasing it here too keeps every clear site the same shape.
     stopIntentTaskIdRef.current = null
-  }, [boundSessionTaskId])
+    releaseStopControl()
+  }, [boundSessionTaskId, releaseStopControl])
 
   useEffect(() => clearStopTimeout, [clearStopTimeout])
 
@@ -2778,8 +2788,7 @@ export function AppProvider({
     // deliberately survives this: the session token is re-issued 60s before
     // expiry, which changes the connection identity mid-cancel, and the turn's
     // terminal frame must still render as a stopped turn afterwards.
-    clearStopTimeout()
-    setStopState("idle")
+    releaseStopControl()
 
     if (sessionConversationRef.current.phase === "bound") {
       if (sessionConnectionIdentity) {
@@ -2795,7 +2804,7 @@ export function AppProvider({
         new Error("Conversation outcome is unknown after a connection refresh; reload required.")
       )
     }
-  }, [clearStopTimeout, dispatchSessionConversation, requireSessionReload, sessionConnectionIdentity])
+  }, [dispatchSessionConversation, releaseStopControl, requireSessionReload, sessionConnectionIdentity])
 
   const onConnect = useCallback(() => {
     if (sessionTransport?.history === "none") {
@@ -6514,8 +6523,7 @@ export function AppProvider({
           && stopIntentTaskIdRef.current !== null
           && controlEnvelope.taskId === stopIntentTaskIdRef.current
         ) {
-          clearStopTimeout()
-          setStopState("idle")
+          releaseStopControl()
         }
         break
 
