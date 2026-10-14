@@ -1,3 +1,4 @@
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -17,6 +18,53 @@ from .base import (
     resolve_requested_size,
 )
 from .usage import record_image_usage, record_unusable_response
+
+logger = logging.getLogger(__name__)
+
+
+def _serializable_openai_usage(usage: Any) -> dict[str, Any]:
+    """Return SDK usage as plain data safe for the tool-result boundary.
+
+    OpenAI's generated ``Usage`` model is built lazily. Pydantic can serialize
+    it directly, but embedding the untouched object in ``RootModel[dict]`` --
+    what :class:`FunctionTool` does to image results -- can traverse its
+    ``MockValSer`` and raise instead. At that point the image endpoint has
+    already returned, usage has been metered, and the image may already be in
+    the workspace, so propagating the serialization failure misreports success
+    as a retryable generation failure and can buy the same image again.
+
+    This conversion is intentionally after :func:`record_image_usage`: a broken
+    presentation serializer must never erase the provider's billing record.
+    If the SDK cannot dump its optional response metadata, omit that metadata
+    from the outward result while preserving the successful image.
+    """
+    if not usage:
+        return {}
+    if isinstance(usage, dict):
+        return dict(usage)
+
+    model_dump = getattr(usage, "model_dump", None)
+    if callable(model_dump):
+        try:
+            dumped = model_dump(mode="json")
+        except Exception as error:  # noqa: BLE001 - result metadata is best effort
+            logger.warning(
+                "OpenAI image usage could not be serialized after metering: %s",
+                error,
+            )
+        else:
+            if isinstance(dumped, dict):
+                return dumped
+            logger.warning(
+                "OpenAI image usage serializer returned %s instead of a dict",
+                type(dumped).__name__,
+            )
+    else:
+        logger.warning(
+            "OpenAI image usage has no model_dump method (type %s)",
+            type(usage).__name__,
+        )
+    return {}
 
 
 def _openai_image_url(response: Any) -> Optional[str]:
@@ -191,9 +239,6 @@ class OpenAIImageModel(BaseImageModel):
         if aspect_ratio:
             # OpenAI doesn't support aspect_ratio parameter directly
             # Log a warning but continue with the base size
-            import logging
-
-            logger = logging.getLogger(__name__)
             logger.warning(
                 f"aspect_ratio parameter '{aspect_ratio}' is not directly supported by OpenAI API, using size '{size}' instead"
             )
@@ -277,6 +322,7 @@ class OpenAIImageModel(BaseImageModel):
             image_count=image_count,
             resolution=str(normalized_size or ""),
         )
+        result["usage"] = _serializable_openai_usage(result["usage"])
 
         try:
             result["image_url"] = _openai_image_url(response)
@@ -386,6 +432,7 @@ class OpenAIImageModel(BaseImageModel):
             image_count=image_count,
             resolution=str(size or ""),
         )
+        result["usage"] = _serializable_openai_usage(result["usage"])
 
         try:
             result["image_url"] = _openai_image_url(response)
