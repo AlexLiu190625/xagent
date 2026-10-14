@@ -8,6 +8,8 @@ accepts and the exact message it raises with.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
@@ -20,7 +22,6 @@ from tests.web.services.interaction_marker_shared import (
 from tests.web.services.task_interaction_schema_shared import (
     make_row,
     make_trace_event,
-    seed_active_row,
     seed_task_with_run,
 )
 from xagent.web.models.database import Base
@@ -28,13 +29,15 @@ from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_interaction import TaskInteractionRequest
 
 
-@pytest.fixture()
-def db(tmp_path) -> Iterator[Session]:
-    engine = sa.create_engine(f"sqlite:///{tmp_path / 'marker_assertions.db'}")
+@contextmanager
+def _sqlite_session(path: Path, *, check_constraints: bool) -> Iterator[Session]:
+    engine = sa.create_engine(f"sqlite:///{path}")
 
     @sa.event.listens_for(engine, "connect")
-    def enable_foreign_keys(connection, _record):
+    def configure(connection, _record):
         connection.execute("PRAGMA foreign_keys=ON")
+        if not check_constraints:
+            connection.execute("PRAGMA ignore_check_constraints=ON")
 
     Base.metadata.create_all(engine)
     session = sessionmaker(bind=engine)()
@@ -45,6 +48,24 @@ def db(tmp_path) -> Iterator[Session]:
         engine.dispose()
 
 
+@pytest.fixture()
+def db(tmp_path) -> Iterator[Session]:
+    with _sqlite_session(
+        tmp_path / "marker_assertions.db", check_constraints=True
+    ) as session:
+        yield session
+
+
+@pytest.fixture()
+def unchecked_db(tmp_path) -> Iterator[Session]:
+    """A database whose CHECK constraints are not enforced, for the one
+    case today's constraints cannot hold: a protocol version other than 1."""
+    with _sqlite_session(
+        tmp_path / "marker_assertions.db", check_constraints=False
+    ) as session:
+        yield session
+
+
 def _seed(
     db: Session,
     *,
@@ -52,6 +73,7 @@ def _seed(
     row: tuple[str, str] | None,
     status: TaskStatus,
     task_run_id: str = "run-a",
+    protocol_version: int = 1,
 ) -> tuple[int, int | None]:
     """Seed one task and at most one interaction row ``(run_id, status)``;
     return the task id and the row id."""
@@ -61,14 +83,13 @@ def _seed(
     if row is None:
         return task_id, None
     row_run_id, row_status = row
-    if row_status == "active":
-        return task_id, seed_active_row(db, task_id=task_id, run_id=row_run_id)
     seeded = TaskInteractionRequest(
         **make_row(
             task_id=task_id,
             resume_trace_event_id=make_trace_event(db, task_id=task_id),
             status=row_status,
             run_id=row_run_id,
+            protocol_version=protocol_version,
         )
     )
     db.add(seeded)
@@ -159,8 +180,8 @@ def test_marker_residue_refuses_a_run_the_task_is_not_on(db: Session) -> None:
             TaskStatus.WAITING_FOR_USER,
             None,
             ("run-a", "active"),
-            "task {t} is waiting_for_user with one active interaction row on "
-            "run 'run-a' and interaction_protocol_version=None",
+            "task {t} is waiting_for_user with active interaction row {r} on "
+            "run 'run-a' at protocol_version=1 and interaction_protocol_version=None",
             id="waiting_row_without_marker",
         ),
         pytest.param(
@@ -178,7 +199,7 @@ def test_interaction_marker_invariant_judges_only_a_waiting_task(
     """``running_marker_without_row`` passes: this assertion checks nothing
     when the task is not WAITING_FOR_USER, so it cannot be used to guard a
     close path, which runs while the task is RUNNING."""
-    task_id, _row_id = _seed(db, marker=marker, row=row, status=status)
+    task_id, row_id = _seed(db, marker=marker, row=row, status=status)
 
     if expected is None:
         assert assert_interaction_marker_invariant(db, task_id=task_id) is None
@@ -186,4 +207,52 @@ def test_interaction_marker_invariant_judges_only_a_waiting_task(
     with pytest.raises(AssertionError) as excinfo:
         assert_interaction_marker_invariant(db, task_id=task_id)
 
-    assert str(excinfo.value) == expected.format(t=task_id)
+    assert str(excinfo.value) == expected.format(t=task_id, r=row_id)
+
+
+@pytest.mark.parametrize(
+    ("marker", "row", "expected"),
+    [
+        pytest.param(2, ("run-a", "active"), None, id="marker_equals_the_row_version"),
+        pytest.param(
+            1,
+            ("run-a", "active"),
+            "task {t} is waiting_for_user with active interaction row {r} on "
+            "run 'run-a' at protocol_version=2 and interaction_protocol_version=1",
+            id="marker_differs_from_the_row_version",
+        ),
+        pytest.param(
+            2,
+            None,
+            "task {t} is waiting_for_user with interaction_protocol_version=2 "
+            "and 0 active interaction rows on run 'run-a'",
+            id="later_version_marker_without_row",
+        ),
+    ],
+)
+def test_interaction_marker_invariant_compares_with_the_row_protocol_version(
+    unchecked_db: Session,
+    marker: int,
+    row: tuple[str, str] | None,
+    expected: str | None,
+) -> None:
+    """The pairing contract sets the marker to the active row's
+    ``protocol_version``, not to a literal 1; with only version 1 allowed by
+    today's constraints, version 2 is the only way to tell the two apart."""
+    task_id, row_id = _seed(
+        unchecked_db,
+        marker=marker,
+        row=row,
+        status=TaskStatus.WAITING_FOR_USER,
+        protocol_version=2,
+    )
+
+    if expected is None:
+        assert (
+            assert_interaction_marker_invariant(unchecked_db, task_id=task_id) is None
+        )
+        return
+    with pytest.raises(AssertionError) as excinfo:
+        assert_interaction_marker_invariant(unchecked_db, task_id=task_id)
+
+    assert str(excinfo.value) == expected.format(t=task_id, r=row_id)

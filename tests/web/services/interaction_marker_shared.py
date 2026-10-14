@@ -21,8 +21,9 @@ the close paths run while the task is RUNNING, where a check gated on
 WAITING_FOR_USER has nothing to say.
 
 ``assert_interaction_marker_invariant`` states the invariant for a task that
-is waiting for the user: marker 1 if and only if exactly one active row for
-the task's current run. In any other status it checks nothing, so it cannot
+is waiting for the user: the marker is set if and only if exactly one active
+row exists for the task's current run, and it then equals that row's
+``protocol_version``. In any other status it checks nothing, so it cannot
 stand in for ``assert_marker_residue``.
 
 Both read with their own Core selects and share no predicate with production
@@ -92,8 +93,9 @@ def assert_marker_residue(db: Session, *, task_id: int, run_id: str) -> None:
 
 
 def assert_interaction_marker_invariant(db: Session, *, task_id: int) -> None:
-    """Assert, for a task waiting for the user, that the marker is 1 exactly
-    when one active row exists for the task's current run.
+    """Assert, for a task waiting for the user, that the marker is set
+    exactly when one active row exists for the task's current run, and that
+    it equals that row's ``protocol_version``.
 
     Checks nothing when the task is not WAITING_FOR_USER.
     """
@@ -105,14 +107,16 @@ def assert_interaction_marker_invariant(db: Session, *, task_id: int) -> None:
     if status != TaskStatus.WAITING_FOR_USER:
         return
     rows = _active_rows(db, task_id=task_id, run_id=run_id)
-    if marker == 1 and len(rows) != 1:
+    if marker is not None and len(rows) != 1:
         raise AssertionError(
             f"task {task_id} is waiting_for_user with "
-            f"interaction_protocol_version=1 and {len(rows)} active "
+            f"interaction_protocol_version={marker!r} and {len(rows)} active "
             f"interaction rows on run {run_id!r}"
         )
-    if len(rows) == 1 and marker != 1:
+    if len(rows) == 1 and marker != rows[0][1]:
+        row_id, protocol_version = rows[0]
         raise AssertionError(
-            f"task {task_id} is waiting_for_user with one active interaction "
-            f"row on run {run_id!r} and interaction_protocol_version={marker!r}"
+            f"task {task_id} is waiting_for_user with active interaction row "
+            f"{row_id} on run {run_id!r} at protocol_version={protocol_version!r} "
+            f"and interaction_protocol_version={marker!r}"
         )
