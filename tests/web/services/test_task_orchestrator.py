@@ -1055,11 +1055,7 @@ def test_begin_turn_retires_failed_session_before_reconciliation(
         def close(self) -> None:
             events.append("close")
 
-    monkeypatch.setattr(
-        database_module,
-        "get_session_local",
-        lambda: lambda: FailedSession(),
-    )
+    monkeypatch.setattr(database_module, "_SessionLocal", lambda: FailedSession())
     monkeypatch.setattr(
         task_orchestrator_module,
         "_claim_turn_no_commit",
@@ -1117,11 +1113,7 @@ def test_commit_reconciliation_accepts_a_late_visible_graph(
         created_sessions.append(session)
         return session
 
-    monkeypatch.setattr(
-        database_module,
-        "get_session_local",
-        lambda: session_factory,
-    )
+    monkeypatch.setattr(database_module, "_SessionLocal", session_factory)
     monkeypatch.setattr(task_orchestrator_module.time, "sleep", MagicMock())
 
     assert (
@@ -1167,11 +1159,7 @@ def test_successful_commit_is_not_rejected_when_session_close_fails(
         def invalidate(self) -> None:
             events.append("invalidate")
 
-    monkeypatch.setattr(
-        database_module,
-        "get_session_local",
-        lambda: lambda: CloseFailingSession(),
-    )
+    monkeypatch.setattr(database_module, "_SessionLocal", lambda: CloseFailingSession())
     monkeypatch.setattr(
         task_orchestrator_module,
         "_claim_turn_no_commit",
@@ -1230,11 +1218,7 @@ def test_reconciliation_read_failure_remains_commit_outcome_unknown(
             return FailedCommitSession()
         raise RuntimeError("reconciliation database unavailable")
 
-    monkeypatch.setattr(
-        database_module,
-        "get_session_local",
-        lambda: session_factory,
-    )
+    monkeypatch.setattr(database_module, "_SessionLocal", session_factory)
     monkeypatch.setattr(
         task_orchestrator_module,
         "_claim_turn_no_commit",
@@ -2915,7 +2899,7 @@ async def test_schedule_bg_releases_lease_without_blocking_pool_checkout(
         task.run_id = "run-a"
         seed_db.commit()
 
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     held_connection = engine.connect()
     ticker_stop = asyncio.Event()
     ticks = 0

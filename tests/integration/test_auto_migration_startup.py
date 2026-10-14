@@ -1411,9 +1411,7 @@ async def test_failed_startup_leaves_no_unsignaled_temp_file_cleanup(
         "xagent.web.services.kb_file_service.reconcile_uploaded_files",
         lambda *args, **kwargs: {},
     )
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local", lambda: _FakeSession
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", _FakeSession)
 
     def _blocking_cleanup(*, stop_event=None) -> int:
         # Stand in for a real sweep of a large tree: an executor walk that only

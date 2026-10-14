@@ -28,7 +28,7 @@ def a2a_task(engine, task_id, monkeypatch):
     monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "false")
     factory = sessionmaker(engine)
     monkeypatch.setattr(a2a_task_cancel, "get_session_local", lambda: factory)
-    monkeypatch.setattr("xagent.web.models.database.get_session_local", lambda: factory)
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", factory)
     manager = task_execution.BackgroundTaskManager()
     monkeypatch.setattr(task_execution, "background_task_manager", manager)
     with factory() as db:
