@@ -170,6 +170,7 @@ async def test_delayed_shutdown_callbacks_cannot_remove_new_lifespan_owner(monke
     assert manager.resume_tasks == {}
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("live", "resume", "tokens", "closed", "active"),
     [
@@ -189,7 +190,9 @@ async def test_delayed_shutdown_callbacks_cannot_remove_new_lifespan_owner(monke
         "empty",
     ],
 )
-def test_cap_snapshot_counts_union_of_task_ids(live, resume, tokens, closed, active):
+async def test_cap_snapshot_counts_union_of_task_ids(
+    live, resume, tokens, closed, active
+):
     manager = BackgroundTaskManager()
     handle = object()
     for task_id in live:

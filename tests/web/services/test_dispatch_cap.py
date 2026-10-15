@@ -213,6 +213,20 @@ async def dispatch(host: CapHost) -> bool:
     )
 
 
+async def test_dispatcher_snapshot_feeds_gate_held_seconds(
+    cap_host: CapHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = cap_host
+    set_limit(monkeypatch, 1)
+    clock = SimpleNamespace(now=0.0)
+    host.manager._cap_clock = lambda: clock.now
+    host.manager._live_executions[999] = {object()}  # type: ignore[assignment]
+
+    assert await dispatch(host) is False
+
+    assert host.manager.drain_gate_held_seconds(5.0) == 5.0
+
+
 # --- tail and reservation accounting -----------------------------------------
 
 

@@ -3914,7 +3914,13 @@ def test_dispatcher_max_inflight_env_parsing(monkeypatch, caplog, raw, expected,
     with caplog.at_level(logging.WARNING, logger="xagent.config"):
         assert config.get_dispatcher_max_inflight_per_process() == expected
 
-    assert (env_var in caplog.text) is warns
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name == "xagent.config" and record.levelno == logging.WARNING
+    ]
+    assert len(warnings) == int(warns)
+    assert all(env_var in record.getMessage() for record in warnings)
 
 
 @pytest.mark.parametrize(

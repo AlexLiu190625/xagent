@@ -4669,6 +4669,10 @@ class DispatchReservation:
         self.released = False
 
 
+def _running_loop_time() -> float:
+    return asyncio.get_running_loop().time()
+
+
 class BackgroundTaskManager:
     """Manages background task execution, ensuring only one background process per task at a time"""
 
@@ -4713,6 +4717,15 @@ class BackgroundTaskManager:
         # One entry per in-flight dispatch attempt that took a slot for a task
         # and has not yet seen its execution registered or the attempt end.
         self._dispatch_reservations: Counter[int] = Counter()
+        # Time this process spent at its dispatch cap, for the diagnostics
+        # line's ``gate_held_s``. Observed at every cap snapshot and at each
+        # drain; between two observations the earlier one's state is assumed.
+        # Zeroed by ``drain_gate_held_seconds`` and by ``start_accepting``;
+        # ``shutdown`` keeps the total for the final line.
+        self._cap_clock: Callable[[], float] = _running_loop_time
+        self._cap_last_limit: int | None = None
+        self._cap_closed_since: float | None = None
+        self._cap_closed_total = 0.0
 
     def _track_live_execution(self, task_id: int, task: asyncio.Task) -> None:
         self._live_executions.setdefault(task_id, set()).add(task)
@@ -4737,8 +4750,28 @@ class BackgroundTaskManager:
             | frozenset(self._dispatch_reservations)
         )
 
+    def _record_cap_state(self, closed: bool, now: float) -> None:
+        since = self._cap_closed_since
+        if closed:
+            if since is None:
+                self._cap_closed_since = now
+        elif since is not None:
+            self._cap_closed_total += max(0.0, now - since)
+            self._cap_closed_since = None
+
+    def _observe_current_cap_state(self, now: float) -> None:
+        limit = self._cap_last_limit
+        if limit is None:
+            return
+        self._record_cap_state(
+            DispatchCapSnapshot(limit, self._active_task_ids()).closed, now
+        )
+
     def dispatch_cap_snapshot(self, limit: int) -> DispatchCapSnapshot:
-        return DispatchCapSnapshot(limit, self._active_task_ids())
+        snapshot = DispatchCapSnapshot(limit, self._active_task_ids())
+        self._cap_last_limit = limit
+        self._record_cap_state(snapshot.closed, self._cap_clock())
+        return snapshot
 
     def reserve_dispatch_slot(
         self, task_id: int, *, limit: int
@@ -4784,6 +4817,9 @@ class BackgroundTaskManager:
         self._shutdown_lock = asyncio.Lock()
         self._shutting_down = False
         self.drain_window_counts()
+        self._cap_last_limit = None
+        self._cap_closed_since = None
+        self._cap_closed_total = 0.0
 
     async def wait_for_previous(self, task_id: int) -> None:
         """Wait for previous background task of this task to complete"""
@@ -5068,6 +5104,23 @@ class BackgroundTaskManager:
         self._window_finished_cancelled = 0
         return counts
 
+    def drain_gate_held_seconds(self, now: float) -> float:
+        """Return and zero the seconds at the dispatch cap since the last drain.
+
+        Observes the cap once more at ``now``. A closed interval still open is
+        split: the part up to ``now`` is returned and the rest counts towards
+        the next drain. ``0.0`` in a process that never built a cap snapshot.
+        """
+
+        self._observe_current_cap_state(now)
+        held = self._cap_closed_total
+        since = self._cap_closed_since
+        if since is not None:
+            held += max(0.0, now - since)
+            self._cap_closed_since = now
+        self._cap_closed_total = 0.0
+        return held
+
     def cleanup_task(
         self,
         task_id: int,
@@ -5194,6 +5247,10 @@ class BackgroundTaskManager:
                 self._resume_owner_started_at.clear()
                 self._live_executions.clear()
                 self._dispatch_reservations.clear()
+                # The tables are empty now; close any cap interval here so
+                # the final diagnostics line does not count later shutdown
+                # steps as time at the cap.
+                self._observe_current_cap_state(self._cap_clock())
 
 
 background_task_manager = BackgroundTaskManager()
