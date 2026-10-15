@@ -8,7 +8,11 @@ from uuid import uuid4
 
 from pydantic import TypeAdapter, ValidationError
 
-from ..tools.core.browser_use import BrowserSessionManager, get_browser_manager
+from ..tools.core.browser_use import (
+    BrowserSessionManager,
+    _validate_browser_target,
+    get_browser_manager,
+)
 from .environment import (
     ComputerEnvironment,
     ComputerFrameMismatchError,
@@ -170,10 +174,18 @@ class BrowserComputerEnvironment(ComputerEnvironment):
         self._browser_session: Any | None = None
 
     async def _get_page(self, *, reject_recreated_session: bool) -> Any:
+        workspace_dir = getattr(self.workspace, "workspace_dir", None)
+        workspace_roots = self._authorized_workspace_roots()
+        session_kwargs: dict[str, Any] = {
+            "headless": self.headless,
+            "locale": self.locale,
+        }
+        if workspace_dir is not None:
+            session_kwargs["workspace_root"] = str(workspace_dir)
+        if workspace_roots:
+            session_kwargs["workspace_roots"] = workspace_roots
         session = await self.manager.get_or_create(
-            self._manager_session_id,
-            headless=self.headless,
-            locale=self.locale,
+            self._manager_session_id, **session_kwargs
         )
         recreated = (
             self._browser_session is not None and session is not self._browser_session
@@ -194,6 +206,17 @@ class BrowserComputerEnvironment(ComputerEnvironment):
         if page.viewport_size != requested:
             await page.set_viewport_size(cast(Any, requested))
         return page
+
+    def _authorized_workspace_roots(self) -> tuple[str, ...]:
+        """Return trusted workspace roots for local browser navigation."""
+        roots: list[str] = []
+        workspace_dir = getattr(self.workspace, "workspace_dir", None)
+        if workspace_dir is not None:
+            roots.append(str(workspace_dir))
+        roots.extend(
+            str(path) for path in getattr(self.workspace, "allowed_external_dirs", ())
+        )
+        return tuple(dict.fromkeys(root for root in roots if root))
 
     async def _close(self) -> None:
         await self.manager.close(self._manager_session_id)
@@ -339,8 +362,22 @@ class BrowserComputerEnvironment(ComputerEnvironment):
         if action.type is ComputerActionType.NAVIGATE:
             if action.url is None:
                 raise ValueError("navigate action requires a URL")
+            target_url = self._resolve_navigation_url(action.url)
+            try:
+                workspace_dir = getattr(self.workspace, "workspace_dir", None)
+                await _validate_browser_target(
+                    target_url,
+                    workspace_root=(
+                        str(workspace_dir) if workspace_dir is not None else None
+                    ),
+                    workspace_roots=self._authorized_workspace_roots(),
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "Only public HTTP(S) URLs or authorized workspace files are allowed"
+                ) from exc
             await page.goto(
-                self._resolve_navigation_url(action.url),
+                target_url,
                 wait_until="domcontentloaded",
                 timeout=30_000,
             )
@@ -439,8 +476,10 @@ class BrowserComputerEnvironment(ComputerEnvironment):
     def _resolve_navigation_url(raw_url: str) -> str:
         url = raw_url.strip()
         parsed = urlsplit(url)
+        if parsed.scheme == "file" and not parsed.netloc:
+            return url
         if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
-            raise ValueError("navigate URL must use absolute HTTP or HTTPS")
+            raise ValueError("navigate URL must use absolute HTTP(S) or file URL")
         return url
 
     @staticmethod

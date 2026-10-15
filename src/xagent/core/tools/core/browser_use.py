@@ -8,13 +8,21 @@ automatically cleaned up after a timeout period.
 
 import asyncio
 import json
+import logging
+import re
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Sequence, cast
+from urllib.parse import unquote, urlsplit
 
 from ....config import (
+    get_browser_allow_unsandboxed,
     get_browser_tool_default_locale,
     get_browser_tool_default_timezone,
 )
+from ...utils.security import validate_public_http_url
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from playwright.async_api import Browser, BrowserContext, Page, async_playwright
@@ -58,6 +66,490 @@ def _format_error_with_traceback(error: Exception, context: str = "") -> str:
         return f"Error: {str(error)}\n\nTraceback:\n{tb_str}"
 
 
+def _workspace_file_path(
+    url: str,
+    workspace_root: str | None = None,
+    workspace_roots: Sequence[str] | None = None,
+    workspace_file_paths: Sequence[str] | None = None,
+) -> Path | None:
+    """Return a file contained by an authorized root, or ``None`` if unsafe."""
+    roots = [workspace_root] if workspace_root else []
+    roots.extend(workspace_roots or ())
+    if not roots and not workspace_file_paths:
+        return None
+    try:
+        parsed = urlsplit(url)
+        if parsed.scheme.lower() != "file" or parsed.netloc:
+            return None
+        candidate = Path(unquote(parsed.path)).expanduser().resolve()
+    except (OSError, ValueError):
+        return None
+    if not candidate.is_file():
+        return None
+    for file_path in workspace_file_paths or ():
+        if not isinstance(file_path, str) or not file_path:
+            continue
+        try:
+            if candidate == Path(file_path).expanduser().resolve():
+                return candidate
+        except (OSError, ValueError):
+            continue
+    for root_value in roots:
+        if not isinstance(root_value, str) or not root_value:
+            continue
+        try:
+            candidate.relative_to(Path(root_value).expanduser().resolve())
+        except (OSError, ValueError):
+            continue
+        return candidate
+    return None
+
+
+async def _validate_browser_target(
+    url: str,
+    *,
+    workspace_root: str | None = None,
+    workspace_roots: Sequence[str] | None = None,
+    workspace_file_paths: Sequence[str] | None = None,
+) -> None:
+    """Validate a browser target and every request made by its page."""
+    try:
+        parsed = urlsplit(url)
+    except ValueError as exc:
+        raise ValueError("Malformed browser URL") from exc
+
+    scheme = parsed.scheme.lower()
+    if scheme in {"about", "data", "blob"}:
+        # These URLs do not perform a network connection by themselves. Any
+        # HTTP(S) fetches initiated by their document still pass through the
+        # CDP guard and the browser-wide egress proxy.
+        return
+    if scheme == "file":
+        if (
+            _workspace_file_path(
+                url,
+                workspace_root=workspace_root,
+                workspace_roots=workspace_roots,
+                workspace_file_paths=workspace_file_paths,
+            )
+            is None
+        ):
+            raise ValueError("Only workspace files are allowed")
+        return
+    if scheme not in {"http", "https"}:
+        raise ValueError("Only HTTP(S) URLs are allowed")
+    try:
+        await validate_public_http_url(url)
+    except OSError as exc:
+        raise ValueError("Browser target could not be resolved") from exc
+
+
+_PROXY_HEADER_LIMIT = 64 * 1024
+_PROXY_CONNECT_TIMEOUT = 10.0
+_PROXY_RESPONSE_TIMEOUT = 10.0
+_PROXY_MAX_REQUEST_BODY = 64 * 1024 * 1024
+_BROWSER_WORKSPACE_AUTH = object()
+
+_HTTP_FETCH_PATTERNS = [
+    {"urlPattern": "http://*", "requestStage": "Request"},
+    {"urlPattern": "https://*", "requestStage": "Request"},
+    {"urlPattern": "ws://*", "requestStage": "Request"},
+    {"urlPattern": "wss://*", "requestStage": "Request"},
+]
+
+
+class _BrowserEgressProxy:
+    """Small loopback proxy that pins each connection to validated DNS IPs.
+
+    Chromium resolves hosts independently of Python.  A browser-wide CONNECT
+    proxy closes that TOCTOU gap: the proxy validates the hostname, connects
+    directly to one of the validated public IPs, and then tunnels the original
+    TLS/WebSocket handshake without changing its Host header or SNI.
+    """
+
+    def __init__(self) -> None:
+        self._server: asyncio.AbstractServer | None = None
+        self._client_tasks: set[asyncio.Task[Any]] = set()
+
+    async def start(self) -> str:
+        self._server = await asyncio.start_server(
+            self._handle_client,
+            host="127.0.0.1",
+            port=0,
+            limit=_PROXY_HEADER_LIMIT,
+        )
+        socket = self._server.sockets[0]
+        port = socket.getsockname()[1]
+        return f"http://127.0.0.1:{port}"
+
+    async def close(self) -> None:
+        tasks = list(self._client_tasks)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._client_tasks.clear()
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
+            self._server = None
+
+    async def _handle_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            self._client_tasks.add(task)
+        try:
+            header = await asyncio.wait_for(
+                reader.readuntil(b"\r\n\r\n"), _PROXY_CONNECT_TIMEOUT
+            )
+            method, target, version, headers = self._parse_request(header)
+            if method.upper() == "CONNECT":
+                await self._handle_connect(reader, writer, target)
+            else:
+                await self._handle_forward(
+                    reader, writer, method, target, version, headers
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("Browser egress proxy rejected request: %s", exc)
+            await self._send_error(writer, 502, "Bad Gateway")
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            if task is not None:
+                self._client_tasks.discard(task)
+
+    @staticmethod
+    def _parse_request(
+        header: bytes,
+    ) -> tuple[str, str, str, dict[str, str]]:
+        lines = header[:-4].split(b"\r\n")
+        method, target, version = lines[0].decode("latin-1").split(" ", 2)
+        headers: dict[str, str] = {}
+        for line in lines[1:]:
+            name, value = line.decode("latin-1").split(":", 1)
+            headers[name.lower().strip()] = value.strip()
+        return method, target, version, headers
+
+    async def _handle_connect(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        target: str,
+    ) -> None:
+        parsed = urlsplit(f"//{target}")
+        if (
+            parsed.username
+            or parsed.password
+            or parsed.hostname is None
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("invalid CONNECT authority")
+        port = parsed.port or 443
+        resolved = await validate_public_http_url(f"https://{target}")
+        remote_reader, remote_writer = await self._open_validated(resolved, port)
+        try:
+            writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            await writer.drain()
+            await self._bridge(reader, writer, remote_reader, remote_writer)
+        finally:
+            if not remote_writer.is_closing():
+                remote_writer.close()
+            try:
+                await remote_writer.wait_closed()
+            except Exception:
+                pass
+
+    async def _handle_forward(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        method: str,
+        target: str,
+        version: str,
+        headers: dict[str, str],
+    ) -> None:
+        if target.startswith("/"):
+            host = headers.get("host")
+            if not host:
+                raise ValueError("origin-form request has no Host header")
+            logical_url = f"http://{host}{target}"
+        else:
+            logical_url = target
+        parsed = urlsplit(logical_url)
+        scheme = parsed.scheme.lower()
+        websocket = scheme == "ws"
+        if scheme == "ws":
+            scheme = "http"
+        elif scheme == "wss":
+            scheme = "https"
+        if scheme not in {"http", "https"} or parsed.hostname is None:
+            raise ValueError("proxy only accepts HTTP(S) targets")
+        if scheme == "https":
+            raise ValueError("HTTPS requests must use CONNECT")
+        port = parsed.port or 80
+        resolved = await validate_public_http_url(
+            parsed._replace(scheme=scheme).geturl()
+        )
+        body = await self._read_forward_body(reader, headers)
+        remote_reader, remote_writer = await self._open_validated(resolved, port)
+        try:
+            path = parsed.path or "/"
+            if parsed.query:
+                path = f"{path}?{parsed.query}"
+            output_headers = []
+            saw_host = False
+            chunked = headers.get("transfer-encoding", "").lower() == "chunked"
+            for name, value in headers.items():
+                if (
+                    name == "proxy-connection"
+                    or name == "expect"
+                    or (not websocket and name == "connection")
+                    or (chunked and name == "content-length")
+                ):
+                    continue
+                if name == "host":
+                    value = parsed.netloc
+                    saw_host = True
+                output_headers.append(f"{name}: {value}")
+            if not saw_host:
+                output_headers.append(f"Host: {parsed.netloc}")
+            if not websocket:
+                output_headers.append("Connection: close")
+            request = (
+                f"{method} {path} {version}\r\n"
+                + "\r\n".join(output_headers)
+                + "\r\n\r\n"
+            ).encode("latin-1")
+            remote_writer.write(request + body)
+            await remote_writer.drain()
+            if websocket:
+                # A WebSocket stays on this one validated origin after the
+                # HTTP upgrade, so it needs the normal bidirectional bridge.
+                await self._bridge(reader, writer, remote_reader, remote_writer)
+            else:
+                # Do not bridge client_reader here. Once this request has been
+                # sent, any additional bytes on Chromium's keep-alive socket
+                # must never reach this origin's upstream connection.
+                await self._relay_response(remote_reader, writer)
+        finally:
+            remote_writer.close()
+            try:
+                await remote_writer.wait_closed()
+            except Exception:
+                pass
+
+    @staticmethod
+    async def _read_forward_body(
+        reader: asyncio.StreamReader, headers: dict[str, str]
+    ) -> bytes:
+        """Read exactly one bounded HTTP request body before opening upstream."""
+        transfer_encoding = headers.get("transfer-encoding", "").lower()
+        if transfer_encoding not in {"", "identity", "chunked"}:
+            raise ValueError("unsupported proxy request transfer encoding")
+        if transfer_encoding == "chunked":
+            body = bytearray()
+            total = 0
+            while True:
+                size_line = await asyncio.wait_for(
+                    reader.readuntil(b"\r\n"), _PROXY_CONNECT_TIMEOUT
+                )
+                try:
+                    size_text = size_line[:-2].split(b";", 1)[0].strip()
+                    chunk_size = int(size_text, 16)
+                except ValueError as exc:
+                    raise ValueError("invalid chunked proxy request body") from exc
+                body.extend(size_line)
+                if chunk_size == 0:
+                    while True:
+                        trailer = await asyncio.wait_for(
+                            reader.readuntil(b"\r\n"), _PROXY_CONNECT_TIMEOUT
+                        )
+                        body.extend(trailer)
+                        if trailer == b"\r\n":
+                            return bytes(body)
+                total += chunk_size
+                if total > _PROXY_MAX_REQUEST_BODY:
+                    raise ValueError("proxy request body is too large")
+                chunk = await asyncio.wait_for(
+                    reader.readexactly(chunk_size + 2), _PROXY_CONNECT_TIMEOUT
+                )
+                if not chunk.endswith(b"\r\n"):
+                    raise ValueError("invalid chunked proxy request body")
+                body.extend(chunk)
+        raw_length = headers.get("content-length", "0")
+        try:
+            content_length = int(raw_length)
+        except ValueError as exc:
+            raise ValueError("invalid Content-Length") from exc
+        if content_length < 0 or content_length > _PROXY_MAX_REQUEST_BODY:
+            raise ValueError("proxy request body is too large")
+        if content_length == 0:
+            return b""
+        try:
+            return await asyncio.wait_for(
+                reader.readexactly(content_length), _PROXY_CONNECT_TIMEOUT
+            )
+        except asyncio.IncompleteReadError as exc:
+            raise ValueError("proxy request body ended early") from exc
+
+    @staticmethod
+    async def _relay_response(
+        remote_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter
+    ) -> None:
+        header = await asyncio.wait_for(
+            remote_reader.readuntil(b"\r\n\r\n"), _PROXY_RESPONSE_TIMEOUT
+        )
+        lines = header[:-4].split(b"\r\n")
+        response_headers: list[bytes] = []
+        content_length: int | None = None
+        chunked = False
+        for line in lines[1:]:
+            name, _, value = line.partition(b":")
+            normalized_name = name.lower().strip()
+            if normalized_name in {b"connection", b"proxy-connection", b"keep-alive"}:
+                continue
+            if normalized_name == b"content-length":
+                try:
+                    content_length = int(value.strip())
+                except ValueError as exc:
+                    raise ValueError("invalid upstream Content-Length") from exc
+                if content_length < 0:
+                    raise ValueError("invalid upstream Content-Length")
+            elif normalized_name == b"transfer-encoding":
+                chunked = value.strip().lower() == b"chunked"
+            response_headers.append(line)
+        response_headers.append(b"Connection: close")
+        client_writer.write(b"\r\n".join([lines[0], *response_headers, b"", b""]))
+        await client_writer.drain()
+
+        if content_length is not None:
+            remaining = content_length
+            while remaining:
+                data = await asyncio.wait_for(
+                    remote_reader.read(min(64 * 1024, remaining)),
+                    _PROXY_RESPONSE_TIMEOUT,
+                )
+                if not data:
+                    break
+                client_writer.write(data)
+                await client_writer.drain()
+                remaining -= len(data)
+            return
+
+        if chunked:
+            while True:
+                size_line = await asyncio.wait_for(
+                    remote_reader.readuntil(b"\r\n"), _PROXY_RESPONSE_TIMEOUT
+                )
+                client_writer.write(size_line)
+                await client_writer.drain()
+                try:
+                    chunk_size = int(size_line[:-2].split(b";", 1)[0].strip(), 16)
+                except ValueError as exc:
+                    raise ValueError("invalid upstream chunked response") from exc
+                chunk = await asyncio.wait_for(
+                    remote_reader.readexactly(chunk_size + 2),
+                    _PROXY_RESPONSE_TIMEOUT,
+                )
+                client_writer.write(chunk)
+                await client_writer.drain()
+                if chunk_size == 0:
+                    while True:
+                        trailer = await asyncio.wait_for(
+                            remote_reader.readuntil(b"\r\n"),
+                            _PROXY_RESPONSE_TIMEOUT,
+                        )
+                        client_writer.write(trailer)
+                        await client_writer.drain()
+                        if trailer == b"\r\n":
+                            return
+
+        try:
+            while data := await asyncio.wait_for(
+                remote_reader.read(64 * 1024), _PROXY_RESPONSE_TIMEOUT
+            ):
+                client_writer.write(data)
+                await client_writer.drain()
+        except (ConnectionError, asyncio.IncompleteReadError, asyncio.TimeoutError):
+            pass
+
+    @staticmethod
+    async def _open_validated(
+        addresses: list[str], port: int
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        last_error: OSError | None = None
+        for address in addresses:
+            try:
+                return await asyncio.wait_for(
+                    asyncio.open_connection(address, port), _PROXY_CONNECT_TIMEOUT
+                )
+            except (OSError, asyncio.TimeoutError) as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise OSError("validated host did not provide any addresses")
+
+    @staticmethod
+    async def _send_error(
+        writer: asyncio.StreamWriter, status: int, reason: str
+    ) -> None:
+        if writer.is_closing():
+            return
+        writer.write(
+            f"HTTP/1.1 {status} {reason}\r\n"
+            "Connection: close\r\n"
+            "Content-Length: 0\r\n\r\n".encode("ascii")
+        )
+        try:
+            await writer.drain()
+        except Exception:
+            pass
+
+    @staticmethod
+    async def _bridge(
+        client_reader: asyncio.StreamReader,
+        client_writer: asyncio.StreamWriter,
+        remote_reader: asyncio.StreamReader,
+        remote_writer: asyncio.StreamWriter,
+    ) -> None:
+        async def copy_stream(
+            source: asyncio.StreamReader, destination: asyncio.StreamWriter
+        ) -> None:
+            try:
+                while data := await source.read(64 * 1024):
+                    destination.write(data)
+                    await destination.drain()
+            except (ConnectionError, asyncio.IncompleteReadError):
+                pass
+
+        tasks = {
+            asyncio.create_task(copy_stream(client_reader, remote_writer)),
+            asyncio.create_task(copy_stream(remote_reader, client_writer)),
+        }
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            remote_writer.close()
+            try:
+                await remote_writer.wait_closed()
+            except Exception:
+                pass
+
+
 class BrowserSession:
     """Browser session with lazy initialization."""
 
@@ -66,6 +558,9 @@ class BrowserSession:
         session_id: str,
         headless: bool = True,
         locale: Optional[str] = None,
+        workspace_root: str | None = None,
+        workspace_roots: Sequence[str] | None = None,
+        workspace_file_paths: Sequence[str] | None = None,
     ):
         """
         Initialize a browser session.
@@ -80,6 +575,22 @@ class BrowserSession:
         self.session_id = session_id
         self.headless = headless
         self.locale = locale or get_browser_tool_default_locale()
+        self.workspace_root = workspace_root
+        self.workspace_roots = tuple(
+            dict.fromkeys(
+                root
+                for root in ((workspace_root,) if workspace_root else ())
+                + tuple(workspace_roots or ())
+                if isinstance(root, str) and root
+            )
+        )
+        self.workspace_file_paths = tuple(
+            dict.fromkeys(
+                file_path
+                for file_path in (workspace_file_paths or ())
+                if isinstance(file_path, str) and file_path
+            )
+        )
         # No caller ever supplies a per-request timezone (no tool schema
         # exposes it, and _with_default_session only injects locale) -- this
         # is deployment-configured only, unlike locale.
@@ -88,9 +599,209 @@ class BrowserSession:
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
         self._playwright: Any = None
+        self._cdp_sessions: list[Any] = []
+        self._cdp_tasks: set[asyncio.Task[Any]] = set()
+        self._guarded_pages: set[int] = set()
+        self._page_guard_futures: dict[int, asyncio.Future[None]] = {}
+        self._cdp_sessions_by_page: dict[int, Any] = {}
+        self._egress_proxy: _BrowserEgressProxy | None = None
         self._created_at = datetime.now()
         self._last_used = datetime.now()
         self._initialized = False
+
+    async def _guard_page_requests(self, page: Page) -> None:
+        """Validate network requests, including HTTP redirect hops.
+
+        Playwright's route API invokes a handler only for the first request in
+        a redirect chain. The Chromium Fetch domain emits a pause for each HTTP
+        hop, so using it here keeps Chromium's cookie and redirect semantics
+        while applying the URL policy to network subresources and redirects.
+        Local-file requests are gated by the context route installed before
+        the first page exists.
+        """
+        page_key = id(page)
+        if self._context is None:
+            return
+        existing = self._page_guard_futures.get(page_key)
+        if existing is not None:
+            await asyncio.shield(existing)
+            return
+        if page_key in self._guarded_pages:
+            return
+        loop = asyncio.get_running_loop()
+        ready = loop.create_future()
+        ready.add_done_callback(
+            lambda future: (
+                future.exception() if not future.cancelled() and future.done() else None
+            )
+        )
+        self._page_guard_futures[page_key] = ready
+        self._guarded_pages.add(page_key)
+        cdp = None
+        try:
+            cdp = await self._context.new_cdp_session(page)
+        except BaseException as exc:
+            self._guarded_pages.discard(page_key)
+            self._page_guard_futures.pop(page_key, None)
+            if isinstance(exc, asyncio.CancelledError):
+                ready.cancel()
+            elif not ready.done():
+                ready.set_exception(exc)
+            raise
+
+        async def handle_paused(params: dict[str, Any]) -> None:
+            request_id = params.get("requestId")
+            request = params.get("request") or {}
+            request_url = request.get("url", "")
+            try:
+                await _validate_browser_target(
+                    request_url,
+                    workspace_root=self.workspace_root,
+                    workspace_roots=self.workspace_roots,
+                    workspace_file_paths=self.workspace_file_paths,
+                )
+            except Exception:
+                # Fail closed if validation or DNS resolution fails. Leaving
+                # a paused request unresolved would stall the whole page.
+                await cdp.send(
+                    "Fetch.failRequest",
+                    {"requestId": request_id, "errorReason": "BlockedByClient"},
+                )
+                return
+            await cdp.send("Fetch.continueRequest", {"requestId": request_id})
+
+        def on_paused(params: dict[str, Any]) -> None:
+            task = asyncio.create_task(handle_paused(params))
+            self._cdp_tasks.add(task)
+
+            def finish_request(completed: asyncio.Task[Any]) -> None:
+                self._cdp_tasks.discard(completed)
+                if completed.cancelled():
+                    return
+                error = completed.exception()
+                if error is not None:
+                    logger.debug(
+                        "Browser CDP request guard failed",
+                        exc_info=(type(error), error, error.__traceback__),
+                    )
+
+            task.add_done_callback(finish_request)
+
+        cdp.on("Fetch.requestPaused", on_paused)
+        try:
+            await cdp.send(
+                "Fetch.enable",
+                {"patterns": _HTTP_FETCH_PATTERNS},
+            )
+        except BaseException as exc:
+            self._guarded_pages.discard(page_key)
+            self._page_guard_futures.pop(page_key, None)
+            try:
+                await cdp.detach()
+            except Exception:
+                pass
+            if isinstance(exc, asyncio.CancelledError):
+                ready.cancel()
+            elif not ready.done():
+                ready.set_exception(exc)
+            raise
+        self._cdp_sessions.append(cdp)
+        self._cdp_sessions_by_page[page_key] = cdp
+
+        def forget_page(*_args: Any) -> None:
+            self._guarded_pages.discard(page_key)
+            ready = self._page_guard_futures.pop(page_key, None)
+            if ready is not None and not ready.done():
+                ready.cancel()
+            page_cdp = self._cdp_sessions_by_page.pop(page_key, None)
+            if page_cdp is None:
+                return
+            try:
+                self._cdp_sessions.remove(page_cdp)
+            except ValueError:
+                pass
+
+            async def detach_page_cdp() -> None:
+                try:
+                    await page_cdp.send("Fetch.disable")
+                except Exception:
+                    pass
+                try:
+                    await page_cdp.detach()
+                except Exception:
+                    pass
+
+            cleanup = asyncio.create_task(detach_page_cdp())
+            self._cdp_tasks.add(cleanup)
+
+            def finish_cleanup(done: asyncio.Task[Any]) -> None:
+                self._cdp_tasks.discard(done)
+                if not done.cancelled():
+                    done.exception()
+
+            cleanup.add_done_callback(finish_cleanup)
+
+        page.on("close", forget_page)
+        if not ready.done():
+            ready.set_result(None)
+
+    async def _guard_context_route(self, route: Any) -> None:
+        """Gate local-file requests before popup or frame navigation starts.
+
+        A page-level CDP session is installed asynchronously after Chromium
+        creates a popup target.  BrowserContext routing is registered before
+        the first page exists, so it also covers a popup's first request and
+        requests from out-of-process iframes.  HTTP(S)/WebSocket traffic is
+        intentionally left to the browser-wide pinned egress proxy and the
+        CDP redirect guard; this route is the synchronous local-file boundary
+        that the proxy cannot enforce.
+        """
+        request_url = route.request.url
+        try:
+            scheme = urlsplit(request_url).scheme.lower()
+        except ValueError:
+            scheme = ""
+        if scheme != "file":
+            await route.fallback()
+            return
+        try:
+            await _validate_browser_target(
+                request_url,
+                workspace_root=self.workspace_root,
+                workspace_roots=self.workspace_roots,
+                workspace_file_paths=self.workspace_file_paths,
+            )
+        except Exception:
+            logger.info("Blocked browser local-file request: %s", request_url)
+            await route.abort("blockedbyclient")
+            return
+        await route.fallback()
+
+    def _schedule_page_guard(self, page: Page) -> None:
+        task = asyncio.create_task(self._guard_page_requests(page))
+        self._cdp_tasks.add(task)
+
+        def finish(completed: asyncio.Task[Any]) -> None:
+            self._cdp_tasks.discard(completed)
+            if completed.cancelled():
+                return
+            error = completed.exception()
+            if error is not None:
+                logger.error(
+                    "Failed to guard popup page requests",
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+                close_task = asyncio.create_task(page.close())
+                self._cdp_tasks.add(close_task)
+
+                def finish_close(done: asyncio.Task[Any]) -> None:
+                    self._cdp_tasks.discard(done)
+                    if not done.cancelled():
+                        done.exception()
+
+                close_task.add_done_callback(finish_close)
+
+        task.add_done_callback(finish)
 
     async def _ensure_initialized(self) -> None:
         """Lazy initialization: create browser on first use."""
@@ -105,23 +816,34 @@ class BrowserSession:
             self._playwright = await async_playwright().start()
 
             # Launch browser with anti-detection settings
-            self._browser = await self._playwright.chromium.launch(
-                headless=self.headless,
-                args=[
-                    # Disable WebDriver detection
-                    "--disable-blink-features=AutomationControlled",
-                    # Other anti-detection flags
-                    "--disable-infobars",
-                    "--window-size=1920,1080",
-                    # Allow local file access
-                    "--allow-file-access-from-files",
-                    "--allow-file-access",
-                    # No sandbox for local file access in some environments
-                    "--no-sandbox",
-                    # Disable web security for file:// URLs (required for local files)
-                    "--disable-web-security",
-                ],
-            )
+            browser_args = [
+                # Disable WebDriver detection
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                "--window-size=1920,1080",
+                # Prevent browser-managed transports from bypassing the
+                # request guard. Browser tasks do not require WebRTC/QUIC.
+                "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+                "--disable-quic",
+            ]
+            allow_unsandboxed = get_browser_allow_unsandboxed()
+            if allow_unsandboxed:
+                browser_args.append("--no-sandbox")
+            try:
+                self._egress_proxy = _BrowserEgressProxy()
+                proxy_server = await self._egress_proxy.start()
+                self._browser = await self._playwright.chromium.launch(
+                    headless=self.headless,
+                    args=browser_args,
+                    chromium_sandbox=not allow_unsandboxed,
+                    # Chromium otherwise has an implicit loopback bypass on
+                    # some versions.  Make the proxy boundary explicit so
+                    # loopback/private destinations cannot skip validation.
+                    proxy={"server": proxy_server, "bypass": "<-loopback>"},
+                )
+            except Exception:
+                await self.close()
+                raise
 
             # Create context with realistic settings. locale comes from the
             # caller (ultimately the requesting user/task's own language);
@@ -129,15 +851,32 @@ class BrowserSession:
             # the deployment default -- previously hardcoded to
             # zh-CN/Asia/Shanghai, which forced every automated session to
             # request Chinese-localized pages regardless of who asked.
-            self._context = await self._browser.new_context(
-                viewport={"width": 1920, "height": 1080},
-                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                locale=self.locale,
-                timezone_id=self.timezone_id,
-            )
+            try:
+                self._context = await self._browser.new_context(
+                    viewport={"width": 1920, "height": 1080},
+                    user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    locale=self.locale,
+                    timezone_id=self.timezone_id,
+                    # Service workers can own requests without going through
+                    # Playwright routing. Browser security checks must see every
+                    # page request, so keep them disabled for this context.
+                    service_workers="block",
+                )
+            except Exception:
+                await self.close()
+                raise
 
-            self._page = await self._context.new_page()
+            try:
+                await self._context.route(
+                    re.compile(r"^file:"), self._guard_context_route
+                )
+                self._context.on("page", self._schedule_page_guard)
+                self._page = await self._context.new_page()
+                await self._guard_page_requests(self._page)
+            except Exception:
+                await self.close()
+                raise
 
             # Languages mirror the context's own locale instead of a fixed
             # list, so the spoofed navigator.languages stays consistent with
@@ -179,8 +918,21 @@ class BrowserSession:
                 Object.defineProperty(navigator, 'languages', {
                     get: () => __XAGENT_LANGUAGES__
                 });
+
+                // These APIs can open sockets outside page request routing.
+                // Browser tasks do not need them, so keep them unavailable.
+                Object.defineProperty(globalThis, 'SharedWorker', {
+                    value: undefined,
+                    configurable: false,
+                    writable: false
+                });
+                Object.defineProperty(globalThis, 'RTCPeerConnection', {
+                    value: undefined,
+                    configurable: false,
+                    writable: false
+                });
             """.replace("__XAGENT_LANGUAGES__", spoofed_languages)
-            await self._page.add_init_script(init_script)
+            await self._context.add_init_script(init_script)
 
             self._initialized = True
 
@@ -197,6 +949,27 @@ class BrowserSession:
 
     async def close(self) -> None:
         """Close the browser and cleanup resources."""
+        while self._cdp_tasks:
+            tasks = list(self._cdp_tasks)
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._cdp_tasks.clear()
+        for cdp in self._cdp_sessions:
+            try:
+                await cdp.send("Fetch.disable")
+            except Exception:
+                pass
+            try:
+                await cdp.detach()
+            except Exception:
+                pass
+        self._cdp_sessions.clear()
+        self._cdp_sessions_by_page.clear()
+        self._guarded_pages.clear()
+        self._page_guard_futures.clear()
+
         try:
             # Close page first
             if self._page:
@@ -229,6 +1002,13 @@ class BrowserSession:
         except Exception:
             pass  # Ignore playwright stop errors
 
+        if self._egress_proxy is not None:
+            try:
+                await self._egress_proxy.close()
+            except Exception:
+                pass
+            self._egress_proxy = None
+
         self._initialized = False
 
 
@@ -254,6 +1034,9 @@ class BrowserSessionManager:
         session_id: str,
         headless: bool = False,
         locale: Optional[str] = None,
+        workspace_root: str | None = None,
+        workspace_roots: Sequence[str] | None = None,
+        workspace_file_paths: Sequence[str] | None = None,
     ) -> BrowserSession:
         """
         Get or create a browser session (async-safe).
@@ -283,6 +1066,16 @@ class BrowserSessionManager:
                         f"{existing.locale!r}; requested locale {locale!r} ignored "
                         "(a session's locale is frozen at creation)"
                     )
+                if workspace_root and not existing.workspace_root:
+                    existing.workspace_root = workspace_root
+                if workspace_roots and not existing.workspace_roots:
+                    existing.workspace_roots = tuple(workspace_roots)
+                if workspace_file_paths:
+                    existing.workspace_file_paths = tuple(
+                        dict.fromkeys(
+                            (*existing.workspace_file_paths, *workspace_file_paths)
+                        )
+                    )
                 existing._last_used = datetime.now()
                 return existing
 
@@ -291,7 +1084,14 @@ class BrowserSessionManager:
                 self._cleanup_task = asyncio.create_task(self._cleanup_loop())
 
             # Create new session with specified settings
-            new_session = BrowserSession(session_id, headless, locale=locale)
+            new_session = BrowserSession(
+                session_id,
+                headless,
+                locale=locale,
+                workspace_root=workspace_root,
+                workspace_roots=workspace_roots,
+                workspace_file_paths=workspace_file_paths,
+            )
             self._sessions[session_id] = new_session
             new_session._last_used = datetime.now()
             # Log the resolved locale (falls back to the deployment default
@@ -408,8 +1208,41 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
             "message": "",
             "error": "Missing required parameters: session_id and url are required",
         }
+    trusted_call = kwargs.get("_workspace_auth") is _BROWSER_WORKSPACE_AUTH
+    workspace_root = kwargs.get("_workspace_root") if trusted_call else None
+    workspace_roots = kwargs.get("_workspace_roots") if trusted_call else None
+    workspace_file_paths = kwargs.get("_workspace_file_paths") if trusted_call else None
+    trusted_workspace_roots = (
+        tuple(root for root in workspace_roots if isinstance(root, str) and root)
+        if isinstance(workspace_roots, (list, tuple))
+        else None
+    )
+    trusted_workspace_file_paths = (
+        tuple(path for path in workspace_file_paths if isinstance(path, str) and path)
+        if isinstance(workspace_file_paths, (list, tuple))
+        else None
+    )
+    try:
+        await _validate_browser_target(
+            str(url),
+            workspace_root=workspace_root if isinstance(workspace_root, str) else None,
+            workspace_roots=trusted_workspace_roots,
+            workspace_file_paths=trusted_workspace_file_paths,
+        )
+    except (TypeError, ValueError):
+        return {
+            "success": False,
+            "session_id": session_id,
+            "url": url,
+            "title": "",
+            "message": "",
+            "error": "Browser target is not allowed",
+        }
     headless = kwargs.get("headless", False)
-    wait_until = kwargs.get("wait_until", "networkidle")
+    wait_until = cast(
+        Literal["commit", "domcontentloaded", "load", "networkidle"],
+        kwargs.get("wait_until", "networkidle"),
+    )
     locale = kwargs.get("locale")
 
     if not PLAYWRIGHT_AVAILABLE:
@@ -423,19 +1256,24 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
         }
 
     manager = get_browser_manager()
-    session = await manager.get_or_create(session_id, headless, locale=locale)
+    session = await manager.get_or_create(
+        session_id,
+        headless,
+        locale=locale,
+        workspace_root=workspace_root if isinstance(workspace_root, str) else None,
+        workspace_roots=trusted_workspace_roots,
+        workspace_file_paths=trusted_workspace_file_paths,
+    )
     page = await session.get_page()
 
     try:
-        # For local files, use 'domcontentloaded' or 'load' instead of 'networkidle'
-        # because local files don't have network activity
-        if url.startswith("file://"):
-            # Override wait_until for local files
-            wait_until_local = (
-                wait_until if wait_until != "networkidle" else "domcontentloaded"
-            )
-        else:
-            wait_until_local = wait_until
+        wait_until_local: Literal[
+            "commit", "domcontentloaded", "load", "networkidle"
+        ] = (
+            "domcontentloaded"
+            if url.startswith("file://") and wait_until == "networkidle"
+            else wait_until
+        )
 
         # Log navigation attempt for debugging
         import logging
@@ -448,7 +1286,7 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
         # Add timeout to prevent hanging (default 30 seconds)
         # Using wait_until parameter (default: 'networkidle', but can be 'domcontentloaded' or 'load')
         # networkidle can hang on pages with continuous background requests
-        await page.goto(url, wait_until=wait_until_local, timeout=30000)  # type: ignore[arg-type]
+        await page.goto(url, wait_until=wait_until_local, timeout=30000)
         # Get title (no timeout parameter available for title())
         title = await page.title()
 

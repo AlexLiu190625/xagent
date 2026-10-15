@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from ....file_ref import build_workspace_file_ref
 from ....tools.core.browser_use import (
+    _BROWSER_WORKSPACE_AUTH,
     browser_click,
     browser_close,
     browser_evaluate,
@@ -396,6 +397,25 @@ class BrowserNavigateTool(BrowserTaskSessionMixin, AbstractBaseTool):
 
         # Convert workspace-relative paths to file:// URLs
         url = args.get("url", "")
+        # This is an internal trust boundary: callers may not choose the
+        # directories used to authorize file:// navigation. Always discard
+        # model-supplied values, then inject the task workspace's authorized
+        # roots when one exists.
+        args = dict(args)
+        args.pop("_workspace_root", None)
+        args.pop("_workspace_roots", None)
+        args.pop("_workspace_file_paths", None)
+        args.pop("_workspace_auth", None)
+        if self._workspace is not None:
+            args["_workspace_auth"] = _BROWSER_WORKSPACE_AUTH
+            args["_workspace_root"] = str(self._workspace.workspace_dir)
+            args["_workspace_roots"] = [
+                str(self._workspace.workspace_dir),
+                *(
+                    str(path)
+                    for path in getattr(self._workspace, "allowed_external_dirs", ())
+                ),
+            ]
 
         # Debug logging
         import logging
@@ -434,8 +454,8 @@ class BrowserNavigateTool(BrowserTaskSessionMixin, AbstractBaseTool):
                 )
 
                 if resolved_path.exists():
-                    args = dict(args)  # Make a mutable copy
                     args["url"] = resolved_path.as_uri()
+                    args["_workspace_file_paths"] = [str(resolved_path)]
                     logger.info(
                         f"[BrowserNavigateTool] Converted to file:// URL: {args['url']}"
                     )
