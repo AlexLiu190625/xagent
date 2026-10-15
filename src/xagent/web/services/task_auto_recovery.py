@@ -133,10 +133,11 @@ def interruption_pause_result() -> dict[str, Any]:
 _INELIGIBLE_SOURCES = frozenset({"a2a", "external", "widget", "shared_link"})
 
 # Callers that only ever read a task's status. A settlement interruption of
-# one of their runs is never paused: the caller could not tell a retry from a
-# stall, and a FAILED settlement keeps the provider error it would be shown.
-# Eligible for automatic resume all the same (lease expiry and the user's own
-# resume are not settlement interruptions).
+# one of their runs ends FAILED with the provider's error, as it always has;
+# pausing it would leave the task PAUSED for good once automatic resume gives
+# up, which is worse for a caller that sees nothing but the status. Lease
+# expiry is not a settlement interruption and is paused (and resumed) for
+# them as for any other task.
 _STATUS_ONLY_SOURCES = frozenset({"sdk"})
 
 

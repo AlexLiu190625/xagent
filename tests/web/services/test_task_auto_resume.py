@@ -1162,8 +1162,10 @@ def _team_admission(
     monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
 
     def classify(db, command):
-        owner = db.get(Task, command.task_id).user_id
-        return AdmissionPolicy(bucket=f"team:{owner}", capacity=1, max_pending=1)
+        task = db.get(Task, command.task_id)
+        if task.source != "sdk":
+            return None
+        return AdmissionPolicy(bucket=f"team:{task.user_id}", capacity=1, max_pending=1)
 
     task_execution_admission.set_task_admission_hook(classify)
     request.addfinalizer(lambda: task_execution_admission.set_task_admission_hook(None))
@@ -1193,8 +1195,9 @@ def _team_admission(
         db.commit()
 
 
+@pytest.mark.parametrize("team_a_rows", [1, 200])
 def test_admission_full_in_one_team_does_not_block_another(
-    factory, notified, monkeypatch, request
+    factory, notified, monkeypatch, request, team_a_rows
 ):
     now = utc_now()
     with factory() as db:
@@ -1204,51 +1207,37 @@ def test_admission_full_in_one_team_does_not_block_another(
     with factory() as db:
         team_a, team_b = db.get(User, team_a_id), db.get(User, team_b_id)
         _team_admission(factory, monkeypatch, request, full_for=team_a)
-        # Team A's row is due first, then team B's, then an unhooked one.
-        a_row = _seed(db, now, user=team_a, due_in=-30)
-        b_row = _seed(db, now, user=team_b, due_in=-20)
-        db.commit()
-
-    report = run_auto_resume_tick(now=now)
-
-    assert report.admission_full
-    assert report.dispatched == 1
-    row = _row(factory, a_row)
-    assert (row.state, _aware(row.next_attempt_at)) == (
-        "scheduled",
-        now + timedelta(seconds=30),
-    )
-    assert _commands(factory, a_row) == []
-    assert _row(factory, b_row).state == "dispatched"
-    assert len(_commands(factory, b_row)) == 1
-
-
-def test_a_team_with_many_due_rows_delays_another_for_a_bounded_number_of_ticks(
-    factory, notified, monkeypatch, request
-):
-    now = utc_now()
-    with factory() as db:
-        team_a, team_b = _user(db), _user(db)
-        db.commit()
-        team_a_id, team_b_id = team_a.id, team_b.id
-    with factory() as db:
-        team_a, team_b = db.get(User, team_a_id), db.get(User, team_b_id)
-        _team_admission(factory, monkeypatch, request, full_for=team_a)
+        # Team A's rows are due first; team B's row and an internal row the
+        # host's hook does not classify come after them.
         a_rows = [
-            _seed(db, now, user=team_a, due_in=-1000 + index) for index in range(200)
+            _seed(db, now, user=team_a, source="sdk", due_in=-1000 + index)
+            for index in range(team_a_rows)
         ]
-        b_row = _seed(db, now, user=team_b, due_in=-1)
+        b_row = _seed(db, now, user=team_b, source="sdk", due_in=-1)
+        unhooked = _seed(db, now, user=team_b, due_in=-1)
         db.commit()
-    scan_limit = 4 * 20
-    ticks_bound = -(-len(a_rows) // scan_limit) + 1
+    # Each scan handles ``4 * max_per_tick`` rows, so a team ahead of everyone
+    # else delays another team by at most ceil(rows / 80) scans, plus the one
+    # that dispatches it.
+    ticks_bound = -(-team_a_rows // (4 * 20)) + 1
 
     for tick in range(ticks_bound):
-        run_auto_resume_tick(now=now + timedelta(seconds=5 * tick))
+        report = run_auto_resume_tick(now=now + timedelta(seconds=5 * tick))
+        if tick == 0:
+            assert report.admission_full
         if _row(factory, b_row).state == "dispatched":
             break
 
     assert _row(factory, b_row).state == "dispatched"
-    assert tick + 1 <= ticks_bound == 4
+    assert _row(factory, unhooked).state == "dispatched"
+    assert len(_commands(factory, b_row)) == 1
+    if team_a_rows == 1:
+        assert tick == 0
+        row = _row(factory, a_rows[0])
+        assert (row.state, _aware(row.next_attempt_at)) == (
+            "scheduled",
+            now + timedelta(seconds=30),
+        )
     # Team A never got through its full bucket.
     assert all(_commands(factory, task_id) == [] for task_id in a_rows[:5])
 
@@ -2360,6 +2349,10 @@ def test_failure_while_postponing_is_logged_and_the_scan_continues(
     assert _row(factory, healthy).state == "dispatched"
 
 
+class _HostHookRefusal(Exception):
+    """A host admission hook's own error type: directly an ``Exception``."""
+
+
 def _raising_stage(exc: BaseException, task_id_box: list[int]):
     """``stage_task_command`` that raises ``exc`` for the first seeded task."""
     real = task_auto_resume.stage_task_command
@@ -2376,6 +2369,7 @@ def _raising_stage(exc: BaseException, task_id_box: list[int]):
     "exc",
     [
         RuntimeError("Execution admission requires shared task execution"),
+        _HostHookRefusal("team membership required"),
         TaskCommandOwnerStateError("pending writes failed to flush"),
         ValueError("Drain the admission bucket before changing its policy"),
         IntegrityError("INSERT", {}, Exception("duplicate")),
@@ -2384,6 +2378,7 @@ def _raising_stage(exc: BaseException, task_id_box: list[int]):
     ],
     ids=[
         "hook_runtime_error",
+        "host_hook_error",
         "owner_state_error",
         "value_error",
         "integrity_error",

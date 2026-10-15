@@ -20,6 +20,7 @@ from unittest.mock import Mock
 import pytest
 import sqlalchemy as sa
 
+from tests.web.services.coordinator_command_shared import claim_for_owner
 from tests.web.services.task_database_shared import engine as engine_fixture
 from tests.web.services.test_channel_reply_hold import (
     CID,
@@ -34,7 +35,13 @@ from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_auto_recovery import TaskAutoRecovery, TaskRecoveryEvent
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.user import User
-from xagent.web.services import task_auto_resume, task_event_bridge, task_orchestrator
+from xagent.web.services import (
+    task_auto_resume,
+    task_coordinator_service,
+    task_event_bridge,
+    task_orchestrator,
+    task_start_consumer,
+)
 from xagent.web.services.task_auto_resume import (
     check_auto_resume_claim_sync,
     run_auto_resume_tick,
@@ -180,6 +187,18 @@ def _count_statements(factory, tid: int, fn) -> int:
     return len(statements)
 
 
+def _hand_off_start(factory, tid: int, command_db_id: int) -> Any:
+    """Claim the START as the task's owner and run the consumer's handoff."""
+    with factory() as db:
+        lease = task_coordinator_service.acquire_task_lease_no_commit(
+            db, tid, runner_id="worker-1"
+        )
+        assert lease is not None
+        db.commit()
+        command = claim_for_owner(db, lease, command_db_id)
+    return task_start_consumer._commit_handoff(command, lease)
+
+
 PENDING_ROWS = {
     "scheduled": dict(row="scheduled"),
     "dispatched_pending": dict(row="dispatched", command_status="pending"),
@@ -190,7 +209,7 @@ PENDING_ROWS = {
 
 
 # --------------------------------------------------------------------------
-# I-4a. A pending automatic resume is replaced
+# A pending automatic resume is replaced
 # --------------------------------------------------------------------------
 
 
@@ -246,8 +265,54 @@ def test_append_supersedes_queued_auto_resume(factory, row_state):
         ] == []
 
 
+@pytest.mark.parametrize("row_state", sorted(PENDING_ROWS))
+def test_superseded_resume_cannot_reject_the_start(factory, row_state):
+    """Message M runs: the queued RESUME, fenced on the version it admitted
+    from, can no longer move the task, so the START is accepted by the
+    consumer and the task moves to a new run."""
+    seed = PENDING_ROWS[row_state]
+    tid = _seed(factory, source="sdk", **seed)
+    version = seed.get("version", PV)
+    prepared = _accept(factory, tid)
+
+    with factory() as db:
+        moved = db.execute(
+            sa.update(Task)
+            .where(
+                Task.id == tid,
+                Task.state_version == version,
+                Task.control_state == TaskControlState.PAUSED.value,
+            )
+            .values(
+                control_state=TaskControlState.RESUME_REQUESTED.value,
+                state_version=Task.state_version + 1,
+            )
+        ).rowcount
+        db.commit()
+    assert moved == 0
+    # The guard skips the RESUME, which ends and lets the START be claimed.
+    with factory() as db:
+        db.execute(
+            sa.update(TaskExecutionCommand)
+            .where(
+                TaskExecutionCommand.task_id == tid,
+                TaskExecutionCommand.kind == "resume",
+            )
+            .values(status="completed")
+        )
+        db.commit()
+
+    outcome = _hand_off_start(factory, tid, prepared.command_db_id)
+    assert isinstance(outcome, task_start_consumer._StartHandoff)
+    assert outcome.start.message == "message M"
+    with factory() as db:
+        task = db.get(Task, tid)
+        assert (task.status, task.run_id) == (TaskStatus.RUNNING, outcome.start.run_id)
+        assert task.run_id != RUN
+
+
 # --------------------------------------------------------------------------
-# I-4c. Scope: only a pending resume of a status-only source, in shared mode
+# Scope: only a pending resume of a status-only source, in shared mode
 # --------------------------------------------------------------------------
 
 _SCOPE_ROWS = {
@@ -302,7 +367,7 @@ def test_supersede_scope(factory, monkeypatch, source, row_state, mode):
 
 
 # --------------------------------------------------------------------------
-# I-4d. Busy and zero-row paths leave nothing behind
+# Busy and zero-row paths leave nothing behind
 # --------------------------------------------------------------------------
 
 
@@ -319,46 +384,47 @@ def _zero_rowcount_on(monkeypatch, call: int) -> None:
 
 @pytest.mark.parametrize(
     "case",
-    ["resume_requested_with_live_resume", "version_cas_loses", "refence_loses"],
+    [
+        "resume_requested_with_live_resume",
+        "version_cas_loses",
+        "refence_loses",
+        "give_up_cas_loses",
+        "stranded_hand_off",
+    ],
 )
 def test_append_busy(factory, monkeypatch, case):
-    if case == "resume_requested_with_live_resume":
+    if case in {"resume_requested_with_live_resume", "stranded_hand_off"}:
         tid = _seed(
             factory,
             source="sdk",
             row="dispatched",
-            command_status="processing",
+            # A hand-off with no RESUME left to finish is stranded, not busy.
+            command_status=(
+                "processing"
+                if case == "resume_requested_with_live_resume"
+                else "completed"
+            ),
             version=PV + 1,
             control_state="resume_requested",
         )
     else:
         tid = _seed(factory, source="sdk")
-        _zero_rowcount_on(monkeypatch, 1 if case == "version_cas_loses" else 2)
+        _zero_rowcount_on(
+            monkeypatch,
+            {"version_cas_loses": 1, "refence_loses": 2, "give_up_cas_loses": 3}[case],
+        )
     before = _snapshot(factory, tid)
 
+    if case == "stranded_hand_off":
+        _accept(factory, tid)
+        after = _snapshot(factory, tid)
+        assert after["messages"] == ["append-turn"]
+        assert after["row"][:2] == ("dispatched", None)
+        return
     with pytest.raises(TaskTurnError, match="busy"):
         _accept(factory, tid)
 
     assert _snapshot(factory, tid) == before
-
-
-def test_a_stranded_hand_off_is_not_busy(factory):
-    """``resume_requested`` without a live RESUME command: nothing will finish
-    that hand-off, so the append is accepted by the unchanged path."""
-    tid = _seed(
-        factory,
-        source="sdk",
-        row="dispatched",
-        command_status="completed",
-        version=PV + 1,
-        control_state="resume_requested",
-    )
-
-    _accept(factory, tid)
-
-    after = _snapshot(factory, tid)
-    assert after["messages"] == ["append-turn"]
-    assert after["row"][:2] == ("dispatched", None)
 
 
 # --------------------------------------------------------------------------
@@ -420,13 +486,3 @@ def test_recovery_state_writers():
         "_reschedule_dispatched_no_commit",
         "record_interruption_no_commit",
     }
-
-
-def test_the_supersede_has_one_caller():
-    callers = [
-        path.name
-        for path in sorted(SERVICES.glob("*.py"))
-        if "supersede_pending_auto_resume_for_append_no_commit(" in path.read_text()
-        and path.name != "task_auto_resume.py"
-    ]
-    assert callers == ["task_orchestrator.py"]

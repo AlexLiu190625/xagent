@@ -848,15 +848,13 @@ _RAISED_BY_REASON = {
 async def _settle_status_only(path: str, factory, ids, lease, reason: str) -> None:
     if path == "exception":
         await _schedule_failing_turn(factory, ids, lease, _RAISED_BY_REASON[reason]())
-    elif path == "result":
-        _settle_result("result", factory, ids, lease, RESULTS[reason])
     else:
-        _settle_result("channel", factory, ids, lease, RESULTS[reason])
+        _settle_result(path, factory, ids, lease, RESULTS[reason])
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("db", ["ok", "unavailable_during_eligibility"])
-@pytest.mark.parametrize("path", ["result", "channel", "exception"])
+@pytest.mark.parametrize("path", ["result", "resumed_result", "channel", "exception"])
 @pytest.mark.parametrize("reason", sorted(RESULTS))
 @pytest.mark.parametrize("infra", ["unset", "true", "false"])
 @pytest.mark.parametrize("auto", ["on", "off"])
