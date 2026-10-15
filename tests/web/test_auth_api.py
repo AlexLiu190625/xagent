@@ -17,7 +17,12 @@ from sqlalchemy.orm import sessionmaker
 from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.shared.auth_database import auth_db_override
 from xagent.web.api import auth as auth_api
-from xagent.web.api.auth import RefreshTokenResponse, auth_router, hash_password
+from xagent.web.api.auth import (
+    RefreshTokenResponse,
+    auth_router,
+    hash_password,
+    verify_password,
+)
 from xagent.web.models import database as database_module
 from xagent.web.models.auth_database import get_auth_db
 from xagent.web.models.database import Base, configure_db, get_db, get_engine
@@ -1387,13 +1392,71 @@ class TestAuthAPI:
         )
         response = client.patch(
             "/api/auth/email",
-            json={"email": "updated@example.com"},
+            json={
+                "email": "updated@example.com",
+                "current_password": test_user_data["password"],
+            },
             headers={"Authorization": f"Bearer {token}"},
         )
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
         assert data["user"]["email"] == "updated@example.com"
+
+    def test_logout_revokes_the_refresh_token_supplied_by_the_client(
+        self, test_db, test_user_data
+    ):
+        setup_first_admin()
+        assert client.post("/api/auth/register", json=test_user_data).status_code == 200
+        login = client.post(
+            "/api/auth/login",
+            json={
+                "username": test_user_data["username"],
+                "password": test_user_data["password"],
+            },
+        )
+        assert login.status_code == 200
+        tokens = login.json()
+
+        response = client.post(
+            "/api/auth/logout",
+            json={"refresh_token": tokens["refresh_token"]},
+            headers={"Authorization": f"Bearer {tokens['access_token']}"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+        refresh = client.post(
+            "/api/auth/refresh", json={"refresh_token": tokens["refresh_token"]}
+        )
+        assert refresh.status_code == 401
+
+    def test_oidc_user_email_update_does_not_require_local_password(self, test_db):
+        db = TestingSessionLocal()
+        try:
+            user = User(
+                username="oidc-user",
+                email="oidc@example.com",
+                password_hash="!oidc-google",
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            result = asyncio.run(
+                auth_api.update_current_user_email(
+                    request=auth_api.UpdateEmailRequest(email="new@example.com"),
+                    db=db,
+                    user=user,
+                )
+            )
+
+            assert result.success is True
+            assert result.user is not None
+            assert result.user["email"] == "new@example.com"
+            assert result.user["has_password"] is False
+        finally:
+            db.close()
 
     def test_update_current_user_email_rejects_duplicate(self, test_db):
         setup_first_admin()
@@ -1420,7 +1483,7 @@ class TestAuthAPI:
         token = login_and_get_token("seconduser", "password123")
         response = client.patch(
             "/api/auth/email",
-            json={"email": "first@example.com"},
+            json={"email": "first@example.com", "current_password": "password123"},
             headers={"Authorization": f"Bearer {token}"},
         )
         assert response.status_code == 200
@@ -1624,7 +1687,8 @@ class TestAuthAPI:
         )
         assert user is not None
         assert user.password_hash != test_user_data["password"]  # Should be hashed
-        assert len(str(user.password_hash)) == 64
+        assert str(user.password_hash).startswith("$2b$")
+        assert verify_password(test_user_data["password"], str(user.password_hash))
 
         db.close()
 
@@ -1928,7 +1992,10 @@ class TestAuthAPI:
         token = login_and_get_token("updater", "password123")
         conflict_response = client.patch(
             "/api/auth/email",
-            json={"email": "legacy@example.com"},
+            json={
+                "email": "legacy@example.com",
+                "current_password": "password123",
+            },
             headers={"Authorization": f"Bearer {token}"},
         )
         assert conflict_response.status_code == 200
