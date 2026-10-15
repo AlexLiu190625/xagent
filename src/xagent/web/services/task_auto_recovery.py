@@ -138,6 +138,14 @@ _INELIGIBLE_SOURCES = frozenset({"a2a", "external", "widget", "shared_link"})
 # Eligible for automatic resume all the same (lease expiry and the user's own
 # resume are not settlement interruptions).
 _STATUS_ONLY_SOURCES = frozenset({"sdk"})
+
+
+def is_status_only_source(source: Any) -> bool:
+    """Whether a task of ``source`` has a caller that only reads its status."""
+
+    return str(source or "internal") in _STATUS_ONLY_SOURCES
+
+
 _TRIGGER_TYPES = frozenset(member.value for member in TriggerType)
 
 # TriggerRun error for a run a settling path paused after an interruption
@@ -788,7 +796,7 @@ def _pausable_with_infra_switch(
     is unreachable and kept as the seam). Otherwise it fails as before.
     """
 
-    if reason in SETTLEMENT_PAUSE_DEFERRED_REASONS or source in _STATUS_ONLY_SOURCES:
+    if reason in SETTLEMENT_PAUSE_DEFERRED_REASONS or is_status_only_source(source):
         return False
     if reason is InterruptionReason.MODEL_OUTPUT_INVALID:
         return get_task_auto_resume_enabled() and (
@@ -945,7 +953,7 @@ def decide_interruption(
         return legacy_interruption_decision(reason)
     # Attribute-only, before any database read: a connectivity failure
     # reading eligibility must not defer a run that was never going to pause.
-    if str(task.source or "internal") in _STATUS_ONLY_SOURCES:
+    if is_status_only_source(task.source):
         return legacy_interruption_decision(reason)
     try:
         eligibility = auto_recovery_eligibility(db, task)

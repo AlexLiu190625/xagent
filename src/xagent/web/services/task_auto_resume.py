@@ -2266,6 +2266,117 @@ def _auto_resume_pending(db: Session, task: Task, row: TaskAutoRecovery | None) 
     )
 
 
+def resume_command_in_flight(db: Session, task_id: int) -> bool:
+    """Whether a RESUME command of the task (automatic or a person's) is still
+    queued or running."""
+
+    return bool(
+        db.execute(
+            select(
+                select(TaskExecutionCommand.id)
+                .where(
+                    TaskExecutionCommand.task_id == task_id,
+                    TaskExecutionCommand.kind == TaskCommandKind.RESUME.value,
+                    TaskExecutionCommand.status.in_(
+                        (COMMAND_PENDING, COMMAND_PROCESSING)
+                    ),
+                )
+                .exists()
+            )
+        ).scalar()
+    )
+
+
+def supersede_pending_auto_resume_for_append_no_commit(db: Session, task: Task) -> bool:
+    """A status-only caller's append, accepted on ``task``, replaces the
+    automatic resume its paused run waits for; no commit.
+
+    Caller: ``_accept_turn_no_commit`` for a status-only source in shared
+    execution, holding the ``tasks`` row lock, with ``task`` re-read after it
+    and the START already reserved in this transaction, before reading the
+    version the START is staged at. Lock order is the module's: ``tasks``,
+    then the recovery row.
+
+    Acts only while :func:`_auto_resume_pending` says an automatic resume of
+    the run may still start; otherwise nothing is written and ``False`` is
+    returned. It moves ``state_version`` and the row's fence to the new version
+    in one step, as :func:`cancel_pending_auto_resume_no_commit` does, so an
+    automatic RESUME already queued or claimed (fenced on the version it
+    admitted from) defers and its claim guard skips it. The row rests in
+    ``manual(new_turn)`` at the new fence: unlike a person's cancel this is no
+    user intent, and nothing schedules a ``manual`` row again at its fence.
+
+    Under the caller's lock a compare-and-swap that misses means the rows moved
+    in a way the lock should have prevented; it raises
+    ``TaskTurnError("busy")`` so the whole acceptance rolls back and nothing is
+    accepted.
+    """
+
+    from .task_orchestrator import TaskTurnError
+
+    row = db.get(
+        TaskAutoRecovery, int(task.id), with_for_update=True, populate_existing=True
+    )
+    if not _auto_resume_pending(db, task, row):
+        return False
+    assert row is not None
+    from_state = TaskAutoRecoveryState(row.state)
+    task_version = int(task.state_version or 0)
+    row_as_read = select(TaskAutoRecovery.task_id).where(
+        *_row_cas(row, from_state, fenced=False)
+    )
+    bumped = _rowcount(
+        db.execute(
+            update(Task)
+            .where(
+                Task.id == task.id,
+                Task.run_id == task.run_id,
+                Task.state_version == task.state_version,
+                task_status_predicate.eq(TaskStatus.PAUSED),
+                Task.control_state == TaskControlState.PAUSED.value,
+                row_as_read.exists(),
+            )
+            .values(state_version=func.coalesce(Task.state_version, 0) + 1)
+            .execution_options(synchronize_session=False)
+        )
+    )
+    if bumped != 1:
+        raise TaskTurnError("busy")
+    moved = _rowcount(
+        db.execute(
+            update(TaskAutoRecovery)
+            .where(*_row_cas(row, from_state, fenced=False))
+            .values(paused_state_version=task_version + 1)
+            .execution_options(synchronize_session=False)
+        )
+    )
+    if moved != 1:
+        raise TaskTurnError("busy")
+    db.refresh(task)
+    db.refresh(row)
+    result = _give_up_no_commit(
+        db,
+        task,
+        row,
+        TaskAutoRecoveryState.MANUAL,
+        from_state=from_state,
+        at="sdk_append",
+        state_detail="new_turn",
+        # The event type is ``stale``, like the channel supersede's, so one
+        # timeline query (``stale`` with ``mismatch = new_turn``) covers both;
+        # the row's own state says why it rests in ``manual``. The event's
+        # detail already carries the row's state and state_detail.
+        event_detail={"mismatch": "new_turn"},
+        stop=(TaskRecoveryEventType.STALE, None),
+        fenced=True,
+        log_level=logging.INFO,
+        counter="xagent.task.auto_resume.superseded_by_turn",
+    )
+    if result.outcome is not _Outcome.GAVE_UP:
+        raise TaskTurnError("busy")
+    return True
+
+
 def cancel_pending_auto_resume_no_commit(
     db: Session, task: Task, *, at: str
 ) -> AutoResumeCancel:

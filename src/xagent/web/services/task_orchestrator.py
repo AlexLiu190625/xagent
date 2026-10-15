@@ -105,6 +105,7 @@ from .task_auto_recovery import (
     apply_interruption_outcome_no_commit,
     decide_owned_run_interruption,
     interruption_pause_result,
+    is_status_only_source,
     settlement_interruption_for_failure,
 )
 from .task_command_transport import ClaimedTaskCommand
@@ -1209,6 +1210,39 @@ def reserve_task_start_no_commit(
     )
 
 
+def _lock_status_only_append_no_commit(db: Session, task_id: int) -> Task | None:
+    """Lock the task of a status-only caller's append; ``None`` for any other.
+
+    A status-only caller has no way to observe a START that an automatic
+    RESUME queued for the same paused run would reject, so its acceptance
+    replaces that resume (see
+    ``supersede_pending_auto_resume_for_append_no_commit``). The source never
+    changes after creation, so the object the caller already loaded decides
+    first, before any lock or re-read. Then the row is locked and re-read:
+    only the START reservation would otherwise take the lock, after the state
+    this must decide on was read. A RESUME handing off is about to run the
+    paused turn again, so the append is busy; a hand-off no RESUME is left to
+    finish is stranded, not busy.
+    """
+    from sqlalchemy import select
+
+    from .task_auto_resume import resume_command_in_flight
+
+    loaded = db.get(Task, task_id)
+    if loaded is None or not is_status_only_source(loaded.source):
+        return None
+    db.execute(select(Task.id).where(Task.id == task_id).with_for_update())
+    locked = db.get(Task, task_id, populate_existing=True)
+    if locked is None:
+        raise TaskTurnNotFoundError(task_id)
+    if (
+        locked.control_state == TaskControlState.RESUME_REQUESTED.value
+        and resume_command_in_flight(db, task_id)
+    ):
+        raise TaskTurnError("busy")
+    return locked
+
+
 def _accept_turn_no_commit(
     db: Session,
     task_id: int,
@@ -1235,6 +1269,14 @@ def _accept_turn_no_commit(
 
     run_id = str(uuid4())
     queued = enqueues_task_turns()
+    # Only an append in shared execution can lose its START to a queued
+    # automatic RESUME; every other turn issues exactly the statements it
+    # always has.
+    locked = (
+        _lock_status_only_append_no_commit(db, task_id)
+        if queued and kind == TurnKind.APPEND
+        else None
+    )
     if queued:
         claimed: int = reserve_task_start_no_commit(
             db,
@@ -1294,6 +1336,15 @@ def _accept_turn_no_commit(
         if owned.status == TaskStatus.WAITING_FOR_USER:
             raise TaskTurnError("interaction_response_required")
         raise TaskTurnError("busy")
+    if locked is not None:
+        from .task_auto_resume import (
+            supersede_pending_auto_resume_for_append_no_commit,
+        )
+
+        # The START is staged at the version this may move: the version
+        # snapshot below is read after it.
+        supersede_pending_auto_resume_for_append_no_commit(db, locked)
+        db.refresh(locked)
 
     if not queued:
         from .task_admission_execution import require_execution_admission
