@@ -1,7 +1,8 @@
 import React from "react"
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { AppProviderTransportConfig } from "@/contexts/app-context-chat"
+import { MessageDeliveryError } from "@/hooks/use-websocket"
 import type { WidgetSession } from "./use-widget-session"
 
 const bridge = vi.hoisted(() => ({
@@ -16,6 +17,8 @@ const bridge = vi.hoisted(() => ({
     handleConnectionFailure: vi.fn(),
   },
 }))
+
+const i18n = vi.hoisted(() => ({ locale: "en" }))
 
 const app = vi.hoisted(() => ({
   provider: null as null | {
@@ -112,7 +115,9 @@ vi.mock("@/components/task/task-conversation-panel", () => ({
 }))
 
 vi.mock("@/contexts/i18n-context", () => ({
-  useI18n: () => ({ t: (key: string) => key }),
+  useI18n: () => ({
+    t: (key: string) => (i18n.locale === "en" ? key : `${i18n.locale}:${key}`),
+  }),
 }))
 
 import { SessionAgentChatPage } from "./session-agent-chat-page"
@@ -177,6 +182,7 @@ describe("SessionAgentChatPage", () => {
   })
 
   afterEach(() => {
+    i18n.locale = "en"
     cleanup()
     vi.unstubAllGlobals()
     vi.restoreAllMocks()
@@ -401,6 +407,164 @@ describe("SessionAgentChatPage", () => {
     await waitFor(() => {
       expect(screen.getByRole("alert")).toHaveTextContent("widgetSession.startMessageFailed")
     })
+  })
+
+  async function failStartMessage(error: unknown): Promise<unknown> {
+    app.sendMessage.mockRejectedValueOnce(error)
+    const onSend = app.startProps?.onSend as (
+      message: string,
+      files: File[],
+      config?: Record<string, unknown>,
+    ) => Promise<void>
+    let thrown: unknown
+    await act(async () => {
+      thrown = await onSend("hi", [], {}).then(() => null, (caught: unknown) => caught)
+    })
+    return thrown
+  }
+
+  it.each([
+    [
+      "a coded delivery error",
+      new MessageDeliveryError("diagnostic", "not_sent", { errorCode: "connection_not_ready" }),
+      "clientErrors.connectionNotReady",
+    ],
+    [
+      "an error carrying an unrecognised code",
+      Object.assign(new Error("x"), { errorCode: "not_a_code" }),
+      "widgetSession.startMessageFailed",
+    ],
+  ])("shows the start-message failure for %s", async (_label, error, expectedText) => {
+    setBridge("active", activeSession())
+    render(<SessionAgentChatPage />)
+
+    const thrown = await failStartMessage(error)
+
+    expect(screen.getByRole("alert")).toHaveTextContent(expectedText)
+    expect(thrown).toBe(error)
+    expect((thrown as { notificationHandled?: unknown }).notificationHandled).toBeUndefined()
+  })
+
+  it("re-renders the start-message failure in the new locale", async () => {
+    setBridge("active", activeSession())
+    const { rerender } = render(<SessionAgentChatPage />)
+
+    await failStartMessage(
+      new MessageDeliveryError("diagnostic", "not_sent", { errorCode: "connection_not_ready" }),
+    )
+    expect(screen.getByRole("alert")).toHaveTextContent("clientErrors.connectionNotReady")
+    expect(screen.getByRole("alert")).not.toHaveTextContent("zh:")
+
+    i18n.locale = "zh"
+    rerender(<SessionAgentChatPage />)
+
+    expect(screen.getByRole("alert")).toHaveTextContent("zh:clientErrors.connectionNotReady")
+  })
+
+  it("does not show a start-message failure that arrives after the conversation is established", async () => {
+    setBridge("active", activeSession())
+    const { rerender } = render(<SessionAgentChatPage />)
+    app.state.taskId = 71
+    rerender(<SessionAgentChatPage />)
+
+    await failStartMessage(new Error("late rejection"))
+
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+  })
+
+  it("does not bring an old start-message failure back when the conversation returns to the start page", async () => {
+    setBridge("active", activeSession())
+    const { rerender } = render(<SessionAgentChatPage />)
+    await failStartMessage(new Error("early rejection"))
+    expect(screen.getByRole("alert")).toBeInTheDocument()
+
+    app.state.taskId = 71
+    rerender(<SessionAgentChatPage />)
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+
+    app.state.taskId = null
+    rerender(<SessionAgentChatPage />)
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+  })
+
+  it("does not show a start-message failure stored while established after a reset to the start page", async () => {
+    setBridge("active", activeSession())
+    const { rerender } = render(<SessionAgentChatPage />)
+    app.state.taskId = 71
+    rerender(<SessionAgentChatPage />)
+
+    await failStartMessage(
+      new MessageDeliveryError("diagnostic", "outcome_unknown"),
+    )
+    app.state.taskId = null
+    rerender(<SessionAgentChatPage />)
+
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+  })
+
+  it("never inserts a stale start-message failure while returning to the start page", async () => {
+    setBridge("active", activeSession())
+    const { rerender } = render(<SessionAgentChatPage />)
+    app.state.taskId = 71
+    rerender(<SessionAgentChatPage />)
+    await failStartMessage(
+      new MessageDeliveryError("diagnostic", "outcome_unknown"),
+    )
+
+    // rerender flushes effects before it returns, so the final DOM cannot show
+    // a line that was committed and then cleared; the observer records every
+    // node inserted on the way.
+    const inserted: Element[] = []
+    const collect = (records: MutationRecord[]) => {
+      for (const record of records) {
+        record.addedNodes.forEach((node) => {
+          if (node instanceof Element) inserted.push(node)
+        })
+      }
+    }
+    const observer = new MutationObserver(collect)
+    observer.observe(document.body, { childList: true, subtree: true })
+    app.state.taskId = null
+    rerender(<SessionAgentChatPage />)
+    collect(observer.takeRecords())
+    observer.disconnect()
+
+    expect(inserted.some((node) => node.textContent?.includes("start:Support Agent"))).toBe(true)
+    expect(inserted.filter((node) => (
+      node.matches('[role="alert"]') || node.querySelector('[role="alert"]') !== null
+    ))).toEqual([])
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+  })
+
+  it("clears the previous start-message failure while a resend is pending", async () => {
+    setBridge("active", activeSession())
+    render(<SessionAgentChatPage />)
+    await failStartMessage(new Error("first failure"))
+    expect(screen.getByRole("alert")).toHaveTextContent("widgetSession.startMessageFailed")
+
+    app.sendMessage.mockReturnValueOnce(new Promise<void>(() => undefined))
+    const onSend = app.startProps?.onSend as (
+      message: string,
+      files: File[],
+      config?: Record<string, unknown>,
+    ) => Promise<void>
+    act(() => {
+      void onSend("hi again", [], {})
+    })
+
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+  })
+
+  it("lets the reload-required notice take priority over the start-message failure", async () => {
+    setBridge("active", activeSession())
+    const { rerender } = render(<SessionAgentChatPage />)
+    await failStartMessage(new Error("early rejection"))
+
+    app.isSessionInteractionLocked = true
+    rerender(<SessionAgentChatPage />)
+
+    expect(screen.getAllByRole("alert")).toHaveLength(1)
+    expect(screen.getByRole("alert")).toHaveTextContent("widgetSession.reloadRequired")
   })
 
   it("preserves validated Agent metadata and the conversation while refreshing", () => {

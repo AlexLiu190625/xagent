@@ -162,6 +162,7 @@ import {
   useApp,
 } from "./app-context-chat"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
+import { MessageDeliveryError } from "@/hooks/use-websocket"
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer"
 import { TASK_ERROR_EVENT, type TaskErrorEventDetail } from "@/lib/task-error-events"
 import type { Translate } from "@/contexts/i18n-context"
@@ -5636,6 +5637,31 @@ describe("AppProvider websocket message routing", () => {
     expect(screen.getByTestId("messages").textContent).not.toContain(
       "Stale socket answer"
     )
+  })
+
+  it("rejects a Session send without a connection as connection_not_ready", async () => {
+    render(
+      <AppProvider token="token" transport={makeSessionTransport(null)}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    sendChatMessageMock.mockClear()
+    sendRawMessageMock.mockClear()
+
+    const rejection = await getSessionControls()
+      .sendMessage("Before the connection exists", { clientMessageId: "no-connection" })
+      .then(() => null, (error: unknown) => error)
+
+    expect(rejection).toBeInstanceOf(MessageDeliveryError)
+    expect(rejection).toMatchObject({
+      disposition: "not_sent",
+      errorCode: "connection_not_ready",
+      retryWithNewId: false,
+      message: "Message not sent: the Session connection is not ready.",
+    })
+    expect(sendChatMessageMock).not.toHaveBeenCalled()
+    expect(sendRawMessageMock).not.toHaveBeenCalled()
   })
 
   it("rebinds a bound Session to a refreshed connection before a later reset", async () => {

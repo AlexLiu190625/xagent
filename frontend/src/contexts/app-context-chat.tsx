@@ -7086,8 +7086,10 @@ export function AppProvider({
 
     if (sessionTransport?.allowTasklessChat) {
       if (!sessionDeliveryOwner) {
-        throw new Error(
-          "Message not sent: the Session connection is not ready."
+        throw new MessageDeliveryError(
+          "Message not sent: the Session connection is not ready.",
+          "not_sent",
+          { errorCode: "connection_not_ready" },
         )
       }
 

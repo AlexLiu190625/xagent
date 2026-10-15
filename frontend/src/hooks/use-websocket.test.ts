@@ -3,6 +3,7 @@ import { act, renderHook, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import {
+  MessageDeliveryError,
   type WebSocketConnection,
   useWebSocket,
 } from "./use-websocket"
@@ -161,6 +162,7 @@ describe("useWebSocket message delivery", () => {
     await expect(result.current.sendChatMessage("keep this draft")).rejects.toMatchObject({
       message: "Message not sent: the connection is not ready.",
       disposition: "not_sent",
+      errorCode: "connection_not_ready",
     })
   })
 
@@ -439,7 +441,7 @@ describe("useWebSocket message delivery", () => {
       message: "Message was rejected.",
       disposition: "rejected",
       userFacing: false,
-      errorCode: null,
+      errorCode: "message_not_accepted",
     })
   })
 
@@ -471,7 +473,7 @@ describe("useWebSocket message delivery", () => {
       message: "Message was rejected.",
       disposition: "rejected",
       userFacing: false,
-      errorCode: null,
+      errorCode: "message_not_accepted",
     })
   })
 
@@ -506,7 +508,7 @@ describe("useWebSocket message delivery", () => {
       message: "Message was rejected.",
       disposition: "rejected",
       userFacing: false,
-      errorCode: null,
+      errorCode: "message_not_accepted",
     })
   })
 
@@ -547,7 +549,116 @@ describe("useWebSocket message delivery", () => {
       message: "Message was rejected.",
       disposition: "rejected",
       userFacing: false,
-      errorCode: null,
+      errorCode: "message_not_accepted",
+    })
+  })
+
+  it("gives a trusted rejection with blank prose and no code the not-accepted code", async () => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+      legacyErrorProse: "trusted",
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    const delivery = result.current.sendChatMessage(
+      "answer",
+      undefined,
+      false,
+      "rejected-blank-prose",
+    )
+    act(() => {
+      socket.receive({
+        type: "message_rejected",
+        client_message_id: "rejected-blank-prose",
+        message: "   ",
+        rejection_outcome: "not_accepted",
+      })
+    })
+
+    await expect(delivery).rejects.toMatchObject({
+      message: "Message was rejected.",
+      disposition: "rejected",
+      userFacing: false,
+      errorCode: "message_not_accepted",
+    })
+  })
+
+  it.each([
+    "upload_failed",
+    "connection_not_ready",
+  ])("gives a definitive rejection naming the client-only code %s the not-accepted code", async (clientOnlyCode) => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+      legacyErrorProse: "trusted",
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    const delivery = result.current.sendChatMessage(
+      "answer",
+      undefined,
+      false,
+      "rejected-client-only-code",
+    )
+    act(() => {
+      socket.receive({
+        type: "message_rejected",
+        client_message_id: "rejected-client-only-code",
+        error_code: clientOnlyCode,
+        message: "token=secret",
+        rejection_outcome: "not_accepted",
+      })
+    })
+
+    await expect(delivery).rejects.toMatchObject({
+      message: "Message was rejected.",
+      disposition: "rejected",
+      userFacing: false,
+      errorCode: "message_not_accepted",
+    })
+  })
+
+  it.each([
+    ["an unrecognised code with an explicit outcome_unknown outcome", { error_code: "provider_secret", rejection_outcome: "outcome_unknown" }],
+    ["an unrecognised code with no outcome field", { error_code: "provider_secret" }],
+    ["a client-only code with an outcome_unknown outcome", { error_code: "connection_not_ready", rejection_outcome: "outcome_unknown" }],
+  ])("shows the outcome-unknown code for %s", async (_label, frame) => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    const delivery = result.current.sendChatMessage(
+      "answer",
+      undefined,
+      false,
+      "rejected-outcome-unknown",
+    )
+    act(() => {
+      socket.receive({
+        type: "message_rejected",
+        client_message_id: "rejected-outcome-unknown",
+        message: "token=secret",
+        ...frame,
+      })
+    })
+
+    await expect(delivery).rejects.toMatchObject({
+      message: "Message was rejected.",
+      disposition: "outcome_unknown",
+      userFacing: false,
+      errorCode: "message_outcome_unknown",
     })
   })
 
@@ -689,6 +800,7 @@ describe("useWebSocket message delivery", () => {
     await expect(delivery).rejects.toMatchObject({
       message: "Connection closed before the message was accepted.",
       disposition: "outcome_unknown",
+      errorCode: "message_outcome_unknown",
     })
   })
 
@@ -708,6 +820,7 @@ describe("useWebSocket message delivery", () => {
       const rejection = expect(delivery).rejects.toMatchObject({
         message: "Message delivery was not acknowledged. Your draft was kept.",
         disposition: "outcome_unknown",
+        errorCode: "message_outcome_unknown",
       })
       await act(async () => {
         vi.advanceTimersByTime(30000)
@@ -744,6 +857,28 @@ describe("useWebSocket message delivery", () => {
       message: "ambiguous delivery",
       disposition,
     })
+  })
+})
+
+describe("MessageDeliveryError display code", () => {
+  it.each([
+    ["an unknown outcome with no code", "outcome_unknown", false, undefined, "message_outcome_unknown"],
+    ["an unknown outcome with an explicit null code", "outcome_unknown", false, null, "message_outcome_unknown"],
+    ["a user-facing unknown outcome with no code", "outcome_unknown", true, undefined, null],
+    ["an unknown outcome with an explicit code", "outcome_unknown", false, "task_busy", "task_busy"],
+    ["a not-sent failure with no code", "not_sent", false, undefined, null],
+    ["a rejection with no code", "rejected", false, undefined, null],
+  ] as const)("derives the code for %s", (_label, disposition, userFacing, errorCode, expected) => {
+    const error = new MessageDeliveryError("diagnostic text", disposition, {
+      userFacing,
+      ...(errorCode === undefined ? {} : { errorCode }),
+    })
+
+    expect(error.errorCode).toBe(expected)
+    // Only the code is derived; every other field keeps its input.
+    expect(error.retryWithNewId).toBe(false)
+    expect(error.userFacing).toBe(userFacing)
+    expect(error.message).toBe("diagnostic text")
   })
 })
 

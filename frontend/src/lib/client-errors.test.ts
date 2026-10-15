@@ -6,7 +6,20 @@ import {
   clientErrorFallback,
   clientErrorTranslationKey,
   readClientErrorCode,
+  readServerRejectionCode,
+  type ClientErrorCode,
 } from "@/lib/client-errors"
+
+// The codes this client derives itself. A server rejection frame never
+// legitimately names one, so readServerRejectionCode drops it; every other
+// listed code is a server code and passes through unchanged.
+const CLIENT_ONLY_CODES = new Set<ClientErrorCode>([
+  "upload_too_large",
+  "upload_proxy_error",
+  "upload_failed",
+  "connection_not_ready",
+  "message_not_accepted",
+])
 
 describe("client error wire contract", () => {
   it.each([
@@ -36,6 +49,8 @@ describe("client error wire contract", () => {
     ["upload_too_large", "clientErrors.uploadTooLarge", "File is too large. Please reduce the upload size and try again."],
     ["upload_proxy_error", "clientErrors.uploadProxyError", "Upload failed before reaching the application. Please check the server upload limit."],
     ["upload_failed", "clientErrors.uploadFailed", "Upload failed. Please try again."],
+    ["connection_not_ready", "clientErrors.connectionNotReady", "Not connected. Your message was not sent."],
+    ["message_not_accepted", "clientErrors.messageNotAccepted", "The message was not accepted."],
     ["missing_runtime_context", "clientErrors.missingRuntimeContext", "This connector needs additional runtime input before it can run."],
     ["runtime_secret_unavailable", "clientErrors.runtimeSecretUnavailable", "This connector needs a runtime credential that is not available."],
     ["scheduled_secret_unavailable", "clientErrors.scheduledSecretUnavailable", "A scheduled run needs a runtime credential that is not available."],
@@ -50,6 +65,12 @@ describe("client error wire contract", () => {
   it("rejects unknown and non-string codes", () => {
     expect(readClientErrorCode("provider_secret")).toBeNull()
     expect(readClientErrorCode({ error_code: "upload_failed" })).toBeNull()
+  })
+
+  it.each(
+    CLIENT_ERROR_CODES.map((code) => [code, CLIENT_ONLY_CODES.has(code) ? null : code] as const),
+  )("readServerRejectionCode reads %s as %s", (code, expected) => {
+    expect(readServerRejectionCode(code)).toBe(expected)
   })
 
   it("keeps the fallback strings identical to the English locale", () => {
