@@ -5,7 +5,8 @@ attempt reserves a slot for it until its last live execution handle ends, so
 one task never occupies two slots. Executions registered outside the
 dispatcher count as well, but the cap never holds them. ``BackgroundTaskManager``
 owns the counted state; this module owns the limit, the command-kind
-classification and the immutable view one dispatch attempt works from.
+classification and the immutable view a dispatch attempt or an idle-release
+check works from.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ CONTROL_KINDS = frozenset({"pause", "cancel"})
 
 @dataclass(frozen=True)
 class DispatchCapSnapshot:
-    """The active task ids one dispatch attempt saw, against the limit."""
+    """The active task ids one dispatch attempt or idle check saw, against the limit."""
 
     limit: int
     active_ids: frozenset[int]

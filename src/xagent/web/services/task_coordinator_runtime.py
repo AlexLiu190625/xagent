@@ -8,12 +8,13 @@ Run-scoped execution fences never acquire, renew or release task ownership.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 from contextvars import ContextVar
 from enum import Enum
 from typing import Any, Awaitable, Callable, TypeVar
 
-from sqlalchemy import select
+from sqlalchemy import and_, func, select
 from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.orm import Session
 
@@ -40,6 +41,11 @@ from .task_coordinator_service import (
     recover_expired_idle_task_lease_no_commit,
     release_task_lease_no_commit,
     renew_task_leases_no_commit,
+)
+from .task_dispatch_cap import (
+    EXECUTION_OPENING_KINDS,
+    DispatchCapSnapshot,
+    build_dispatch_cap_snapshot,
 )
 from .task_lease_service import TaskLease as ExecutionLease
 from .task_lease_service import TaskLeaseHeartbeatOutcome, get_runner_id
@@ -627,7 +633,17 @@ class TaskCoordinator:
                 if task is not None and task.status != TaskStatus.RUNNING:
                     release_task_admissions(db, self.lease)
 
-    def _release_if_idle(self) -> str:
+    def _release_if_idle(
+        self, *, held_by_cap: DispatchCapSnapshot | None = None
+    ) -> str:
+        """Release the lease unless the task still has work for this owner.
+
+        ``held_by_cap`` is the snapshot of a process at its dispatch cap that
+        holds no slot for this task. Its pending execution-opening commands
+        would wait here for a free slot, so they do not keep the lease and any
+        process with room may claim them. Not applied to a RUNNING task, whose
+        orphaned row keeps the busy/recover handling.
+        """
         assert self.lease is not None
         with self._registry.session_factory() as db, db.begin():
             if not lock_task_lease_no_commit(db, self.lease):
@@ -637,27 +653,53 @@ class TaskCoordinator:
                 from .task_execution_admission import release_task_admissions
 
                 release_task_admissions(db, self.lease)
-            pending = db.execute(
-                select(TaskExecutionCommand.id)
-                .where(
-                    TaskExecutionCommand.task_id == self.task_id,
-                    TaskExecutionCommand.status.in_(("pending", "processing")),
-                )
-                .limit(1)
-            ).first()
+            unfinished = select(TaskExecutionCommand.id).where(
+                TaskExecutionCommand.task_id == self.task_id,
+                TaskExecutionCommand.status.in_(("pending", "processing")),
+            )
+            held_execution = and_(
+                TaskExecutionCommand.status == "pending",
+                TaskExecutionCommand.kind.in_(sorted(EXECUTION_OPENING_KINDS)),
+            )
+            exclude_held = (
+                held_by_cap is not None
+                and task is not None
+                and task.status != TaskStatus.RUNNING
+            )
+            if exclude_held:
+                unfinished = unfinished.where(~held_execution)
+            pending = db.execute(unfinished.limit(1)).first()
             if pending is not None:
                 return "busy"
+            held = (
+                db.scalar(
+                    select(func.count())
+                    .select_from(TaskExecutionCommand)
+                    .where(TaskExecutionCommand.task_id == self.task_id, held_execution)
+                )
+                if exclude_held
+                else 0
+            )
             task = db.get(Task, self.task_id)
             assert task is not None
             if task.status == TaskStatus.RUNNING:
                 # Admission may have committed before the process could register
                 # an execution. Stop renewal and preserve the token for recovery.
                 return "recover"
-            return (
-                "released"
-                if release_task_lease_no_commit(db, self.lease)
-                else "recover"
+            if not release_task_lease_no_commit(db, self.lease):
+                return "recover"
+        if held and held_by_cap is not None:
+            logger.info(
+                "Task %s lease released by runner %s at its dispatch cap "
+                "(limit=%s, active=%s); %s queued execution command(s) left "
+                "for a process with a free slot",
+                self.task_id,
+                self.lease.runner_id,
+                held_by_cap.limit,
+                len(held_by_cap.active_ids),
+                held,
             )
+        return "released"
 
     async def _check_idle(self) -> None:
         try:
@@ -670,8 +712,14 @@ class TaskCoordinator:
                         and not self._command_tasks
                         and self._execution_task is None
                     ):
+                        # Built on the loop: the snapshot reads the execution
+                        # registry and records the cap state for gate_held_s.
+                        cap = build_dispatch_cap_snapshot()
+                        held_by_cap = None if cap.admits(self.task_id) else cap
                         outcome = await run_db_io_cancellation_safe(
-                            self._release_if_idle
+                            functools.partial(
+                                self._release_if_idle, held_by_cap=held_by_cap
+                            )
                         )
                         if outcome != "busy":
                             self._recovery_required = outcome == "recover"
