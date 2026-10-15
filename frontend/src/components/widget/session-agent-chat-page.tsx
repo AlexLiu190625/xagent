@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useCallback, useEffect, useMemo, useState } from "react"
+import React, { useCallback, useMemo, useState } from "react"
 import { Loader2 } from "lucide-react"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
@@ -88,10 +88,16 @@ function SessionConversationContent({
   // The failure line belongs to the current start-page visit only: whenever
   // the conversation becomes established or returns to the start page, the
   // stored failure is dropped, so a failure that arrived while a conversation
-  // was established never shows on a later start page.
-  useEffect(() => {
+  // was established never shows on a later start page. The drop happens while
+  // rendering rather than in an effect: React re-runs this component with the
+  // cleared failure before committing, so the stale line under role="alert"
+  // never reaches the DOM, not even for a single commit.
+  const [lastSeenConversationEstablished, setLastSeenConversationEstablished] =
+    useState(conversationEstablished)
+  if (lastSeenConversationEstablished !== conversationEstablished) {
+    setLastSeenConversationEstablished(conversationEstablished)
     setStartMessageFailure(null)
-  }, [conversationEstablished])
+  }
 
   const handleStartMessage = useCallback(async (
     message: string,

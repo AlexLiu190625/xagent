@@ -3,12 +3,23 @@ import { describe, expect, it } from "vitest"
 import en from "@/i18n/locales/en"
 import {
   CLIENT_ERROR_CODES,
-  CLIENT_ONLY_ERROR_CODES,
   clientErrorFallback,
   clientErrorTranslationKey,
   readClientErrorCode,
   readServerRejectionCode,
+  type ClientErrorCode,
 } from "@/lib/client-errors"
+
+// The codes this client derives itself. A server rejection frame never
+// legitimately names one, so readServerRejectionCode drops it; every other
+// listed code is a server code and passes through unchanged.
+const CLIENT_ONLY_CODES = new Set<ClientErrorCode>([
+  "upload_too_large",
+  "upload_proxy_error",
+  "upload_failed",
+  "connection_not_ready",
+  "message_not_accepted",
+])
 
 describe("client error wire contract", () => {
   it.each([
@@ -56,28 +67,10 @@ describe("client error wire contract", () => {
     expect(readClientErrorCode({ error_code: "upload_failed" })).toBeNull()
   })
 
-  it.each([
-    "upload_too_large",
-    "upload_proxy_error",
-    "upload_failed",
-    "connection_not_ready",
-    "message_not_accepted",
-  ] as const)("readServerRejectionCode treats %s as unrecognised", (code) => {
-    expect(readServerRejectionCode(code)).toBeNull()
-  })
-
-  it("readServerRejectionCode passes a server code through", () => {
-    expect(readServerRejectionCode("task_busy")).toBe("task_busy")
-  })
-
-  it("keeps the client-only code set to exactly the codes the client derives itself", () => {
-    expect([...CLIENT_ONLY_ERROR_CODES].sort()).toEqual([
-      "connection_not_ready",
-      "message_not_accepted",
-      "upload_failed",
-      "upload_proxy_error",
-      "upload_too_large",
-    ])
+  it.each(
+    CLIENT_ERROR_CODES.map((code) => [code, CLIENT_ONLY_CODES.has(code) ? null : code] as const),
+  )("readServerRejectionCode reads %s as %s", (code, expected) => {
+    expect(readServerRejectionCode(code)).toBe(expected)
   })
 
   it("keeps the fallback strings identical to the English locale", () => {

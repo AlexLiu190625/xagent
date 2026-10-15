@@ -501,6 +501,40 @@ describe("SessionAgentChatPage", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument()
   })
 
+  it("never inserts a stale start-message failure while returning to the start page", async () => {
+    setBridge("active", activeSession())
+    const { rerender } = render(<SessionAgentChatPage />)
+    app.state.taskId = 71
+    rerender(<SessionAgentChatPage />)
+    await failStartMessage(
+      new MessageDeliveryError("diagnostic", "outcome_unknown"),
+    )
+
+    // rerender flushes effects before it returns, so the final DOM cannot show
+    // a line that was committed and then cleared; the observer records every
+    // node inserted on the way.
+    const inserted: Element[] = []
+    const collect = (records: MutationRecord[]) => {
+      for (const record of records) {
+        record.addedNodes.forEach((node) => {
+          if (node instanceof Element) inserted.push(node)
+        })
+      }
+    }
+    const observer = new MutationObserver(collect)
+    observer.observe(document.body, { childList: true, subtree: true })
+    app.state.taskId = null
+    rerender(<SessionAgentChatPage />)
+    collect(observer.takeRecords())
+    observer.disconnect()
+
+    expect(inserted.some((node) => node.textContent?.includes("start:Support Agent"))).toBe(true)
+    expect(inserted.filter((node) => (
+      node.matches('[role="alert"]') || node.querySelector('[role="alert"]') !== null
+    ))).toEqual([])
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+  })
+
   it("clears the previous start-message failure while a resend is pending", async () => {
     setBridge("active", activeSession())
     render(<SessionAgentChatPage />)

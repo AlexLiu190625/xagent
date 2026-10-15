@@ -33,7 +33,8 @@ export const CLIENT_ERROR_CODES = [
   "upload_too_large",
   "upload_proxy_error",
   "upload_failed",
-  // Client-only codes: also add each one to CLIENT_ONLY_ERROR_CODES below.
+  // Client-only codes, like the three upload_* codes above: also add each one
+  // to CLIENT_ONLY_ERROR_CODES below.
   "connection_not_ready",
   "message_not_accepted",
   // Connector-runtime codes that reach the client on a terminal task_error
@@ -152,7 +153,7 @@ export function readClientErrorCode(value: unknown): ClientErrorCode | null {
 // Codes this client derives itself. A message_rejected frame that names one
 // is treated as naming an unrecognised code: the server has no business
 // telling the client that it is "not connected".
-export const CLIENT_ONLY_ERROR_CODES: ReadonlySet<ClientErrorCode> = new Set([
+const CLIENT_ONLY_ERROR_CODES: ReadonlySet<ClientErrorCode> = new Set([
   "upload_too_large",
   "upload_proxy_error",
   "upload_failed",

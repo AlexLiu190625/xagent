@@ -588,6 +588,44 @@ describe("useWebSocket message delivery", () => {
   })
 
   it.each([
+    "upload_failed",
+    "connection_not_ready",
+  ])("gives a definitive rejection naming the client-only code %s the not-accepted code", async (clientOnlyCode) => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+      legacyErrorProse: "trusted",
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    const delivery = result.current.sendChatMessage(
+      "answer",
+      undefined,
+      false,
+      "rejected-client-only-code",
+    )
+    act(() => {
+      socket.receive({
+        type: "message_rejected",
+        client_message_id: "rejected-client-only-code",
+        error_code: clientOnlyCode,
+        message: "token=secret",
+        rejection_outcome: "not_accepted",
+      })
+    })
+
+    await expect(delivery).rejects.toMatchObject({
+      message: "Message was rejected.",
+      disposition: "rejected",
+      userFacing: false,
+      errorCode: "message_not_accepted",
+    })
+  })
+
+  it.each([
     ["an unrecognised code with an explicit outcome_unknown outcome", { error_code: "provider_secret", rejection_outcome: "outcome_unknown" }],
     ["an unrecognised code with no outcome field", { error_code: "provider_secret" }],
     ["a client-only code with an outcome_unknown outcome", { error_code: "connection_not_ready", rejection_outcome: "outcome_unknown" }],
@@ -830,17 +868,17 @@ describe("MessageDeliveryError display code", () => {
     ["an unknown outcome with an explicit code", "outcome_unknown", false, "task_busy", "task_busy"],
     ["a not-sent failure with no code", "not_sent", false, undefined, null],
     ["a rejection with no code", "rejected", false, undefined, null],
-  ] as const)("derives the code for %s", (label, disposition, userFacing, errorCode, expected) => {
+  ] as const)("derives the code for %s", (_label, disposition, userFacing, errorCode, expected) => {
     const error = new MessageDeliveryError("diagnostic text", disposition, {
       userFacing,
       ...(errorCode === undefined ? {} : { errorCode }),
     })
 
     expect(error.errorCode).toBe(expected)
-    if (label === "an unknown outcome with no code") {
-      expect(error.retryWithNewId).toBe(false)
-      expect(error.message).toBe("diagnostic text")
-    }
+    // Only the code is derived; every other field keeps its input.
+    expect(error.retryWithNewId).toBe(false)
+    expect(error.userFacing).toBe(userFacing)
+    expect(error.message).toBe("diagnostic text")
   })
 })
 
