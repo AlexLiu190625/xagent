@@ -159,11 +159,7 @@ async def test_history_and_rest_read_same_outcome(
 
     factory = sessionmaker(engine)
 
-    def get_db():
-        with factory() as db:
-            yield db
-
-    monkeypatch.setattr(database, "get_db", get_db)
+    monkeypatch.setattr(database, "_SessionLocal", factory)
     # No cross-test response cache; the production cache is keyed by updated_at.
     monkeypatch.setattr(chat, "cache_get", lambda key: None)
     monkeypatch.setattr(websocket, "cache_get", lambda key: None)

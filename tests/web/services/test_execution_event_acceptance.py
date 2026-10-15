@@ -227,7 +227,7 @@ async def test_all_v2_readers_share_facts_with_legacy_content_blocked(
         )
         db.commit()
     monkeypatch.setattr(setup, "get_session_local", lambda: factory)
-    monkeypatch.setattr("xagent.web.models.database.get_db", lambda: iter([factory()]))
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", factory)
     monkeypatch.setattr(websocket, "cache_get", lambda *_: None)
     monkeypatch.setattr(websocket, "cache_set", lambda *_a, **_k: None)
     monkeypatch.setattr(tasks, "get_session_local", lambda: factory)
