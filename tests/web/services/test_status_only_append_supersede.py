@@ -50,6 +50,7 @@ from xagent.web.services import (
 from xagent.web.services.task_auto_resume import (
     check_auto_resume_claim_sync,
     run_auto_resume_tick,
+    status_only_terminal_view,
 )
 from xagent.web.services.task_command_execution import ResumeCommandOutcome
 from xagent.web.services.task_command_transport import SettledTaskCommand
@@ -378,6 +379,42 @@ def test_rejected_start_after_supersede_leaves_the_task_paused(factory, monkeypa
     assert delivery == ["failed"]
     assert run_auto_resume_tick().dispatched == 0
     assert [c for c in _snapshot(factory, tid)["commands"] if c[0] == "resume"] == []
+
+
+@pytest.mark.parametrize("outcome", ["start_pending", "start_runs", "start_rejected"])
+def test_append_outcomes_project(factory, monkeypatch, outcome):
+    """What a status-only caller reads after its append replaced a pending
+    automatic resume: ``paused`` while the START is queued, the turn's own
+    status once it runs, and ``failed`` if the START is rejected (nothing
+    will resume the task and the message was not delivered)."""
+    tid = _seed(factory, source="sdk", row="scheduled")
+    prepared = _accept(factory, tid)
+
+    def read():
+        with factory() as db:
+            return status_only_terminal_view(db, tid)
+
+    if outcome == "start_pending":
+        assert read() is None
+        assert _snapshot(factory, tid)["task"][0] == TaskStatus.PAUSED
+        return
+    if outcome == "start_runs":
+        _hand_off_start(factory, tid, prepared.command_db_id)
+        assert read() is None
+        assert _snapshot(factory, tid)["task"][0] == TaskStatus.RUNNING
+        return
+    monkeypatch.setattr(
+        task_start_consumer, "command_identity_matches_task", lambda *_a: False
+    )
+    _hand_off_start(factory, tid, prepared.command_db_id)
+
+    view = read()
+    assert view is not None
+    assert (view.state, view.error) == (
+        "manual",
+        "Task failed: the new message could not be started.",
+    )
+    assert _snapshot(factory, tid)["task"][0] == TaskStatus.PAUSED
 
 
 # --------------------------------------------------------------------------

@@ -1358,7 +1358,8 @@ def _accept_turn_no_commit(
         # rejected (for example ``start_identity_changed``) leaves the task
         # PAUSED with automatic resume stopped (``manual`` / ``new_turn``):
         # the message is marked delivery-failed and the paused run is not
-        # resumed. No terminal status is reported to the caller in that case.
+        # resumed. The ``/v1`` read of such a task reports ``failed`` (see
+        # ``status_only_terminal_view``).
         #
         # The START is staged at the version this may move: the version
         # snapshot below is read after it.

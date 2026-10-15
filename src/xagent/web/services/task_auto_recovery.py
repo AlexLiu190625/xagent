@@ -129,7 +129,9 @@ def interruption_pause_result() -> dict[str, Any]:
 # Callers that own their own protocol for a stopped run: A2A clients, external
 # cancellation, and anonymous visitors of a widget or shared link. SDK tasks
 # are eligible: an SDK ``wait()`` keeps waiting on a PAUSED task, so a client
-# still waiting on it receives the resumed run's result.
+# still waiting on it receives the resumed run's result. Once automatic resume
+# stops, the ``/v1`` read of such a task reports ``failed`` (see
+# ``task_auto_resume.status_only_terminal_view``), so that wait returns.
 _INELIGIBLE_SOURCES = frozenset({"a2a", "external", "widget", "shared_link"})
 
 # Callers that only ever read a task's status. A settlement interruption of

@@ -616,7 +616,10 @@ class TaskInfoResponse(BaseModel):
         ...,
         description=(
             "One of: pending / running / paused / waiting_for_user / "
-            "completed / failed."
+            "completed / failed. A task whose automatic resume gave up is "
+            "reported as failed even though it is stored as paused; that "
+            "failed can change later if the task is resumed by hand or a "
+            "message is appended."
         ),
     )
     run_id: Optional[str] = Field(None, description="Current execution run identity.")
