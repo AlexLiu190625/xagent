@@ -30,8 +30,10 @@ from tests.e2e.shared_execution_harness import (
     receive_event,
     recovery_state,
     restart_hosts,
+    start_task,
     task_state,
     wait_for,
+    ws_url,
 )
 
 pytestmark = pytest.mark.e2e
@@ -43,36 +45,7 @@ def _fast_auto_resume(monkeypatch):
     monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_SHORT_INITIAL_BACKOFF_SECONDS", "1")
     monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_POLL_SECONDS", "1")
     monkeypatch.delenv("XAGENT_TASK_AUTO_RESUME_ENABLED", raising=False)
-
-
-def _ws_url(app, task_id: int) -> str:
-    return (
-        str(app.client.base_url).replace("http://", "ws://").rstrip("/")
-        + f"/ws/chat/{task_id}?token={app.token}"
-    )
-
-
-def _start_gated_task(app) -> int:
-    """An owner's internal task whose first model call waits for release."""
-    from websockets.sync.client import connect
-
-    response = app.client.post(
-        "/api/chat/task/create",
-        headers=app.headers,
-        json={
-            "title": "Auto resume",
-            "description": "e2e:gate",
-            "execution_mode": "balanced",
-        },
-    )
-    assert response.status_code == 200, response.text
-    task_id = response.json()["task_id"]
-    with connect(_ws_url(app, task_id)) as ws:
-        receive_event(ws, "historical_data_complete")
-        ws.send(json.dumps({"type": "execute_task"}))
-        receive_event(ws, "execution_started")
-    wait_for(lambda: (app.root / "model-entered").exists(), app, "model call")
-    return task_id
+    monkeypatch.delenv("XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED", raising=False)
 
 
 def _assert_crash_is_resumed(app, task_id: int, run_id: str) -> None:
@@ -99,7 +72,7 @@ def _assert_crash_is_resumed(app, task_id: int, run_id: str) -> None:
 
 def test_killed_worker_run_resumes_automatically(shared_app):
     app = shared_app
-    task_id = _start_gated_task(app)
+    task_id = start_task(app)
     run_id = task_state(task_id)["run_id"]
 
     kill_host(app, app.processes[1])
@@ -114,7 +87,7 @@ def test_killed_worker_run_resumes_automatically(shared_app):
 def test_killed_combined_host_run_resumes_automatically(shared_app):
     app = shared_app
     restart_hosts(app, "combined")
-    task_id = _start_gated_task(app)
+    task_id = start_task(app)
     run_id = task_state(task_id)["run_id"]
 
     kill_host(app, app.processes[0])
@@ -135,7 +108,7 @@ def test_run_killed_while_pause_requested_stays_paused(shared_app):
     from xagent.web.models.task import Task
 
     app = shared_app
-    task_id = _start_gated_task(app)
+    task_id = start_task(app)
     worker = app.processes[1]
     # Freeze the owner so the pause cannot complete, then record the user's
     # request as the pause command would: the run dies PAUSE_REQUESTED.
@@ -179,7 +152,7 @@ def test_message_while_scheduled_makes_the_resume_stale(shared_app):
         "worker",
         XAGENT_TASK_AUTO_RESUME_SHORT_INITIAL_BACKOFF_SECONDS="20",
     )
-    task_id = _start_gated_task(app)
+    task_id = start_task(app)
     killed_run_id = task_state(task_id)["run_id"]
     kill_host(app, app.processes[1])
     (app.root / "model-release").touch()
@@ -190,7 +163,7 @@ def test_message_while_scheduled_makes_the_resume_stale(shared_app):
         app,
         "the scheduled resume",
     )
-    with connect(_ws_url(app, task_id)) as ws:
+    with connect(ws_url(app, task_id)) as ws:
         receive_event(ws, "historical_data_complete")
         ws.send(
             json.dumps(
@@ -326,10 +299,20 @@ def test_later_scheduled_tick_supersedes_the_killed_one(shared_app):
 # --------------------------------------------------------------------------
 
 
-def test_switch_off_leaves_a_killed_run_paused(shared_app):
+@pytest.mark.parametrize(
+    "infra_pause", [None, "true"], ids=["infra-default", "infra-on"]
+)
+def test_switch_off_leaves_a_killed_run_paused(shared_app, infra_pause):
+    # Unset, the infrastructure-failure pause switch follows automatic resume
+    # (off). Explicitly on, it changes nothing here (E10b-ii): lease expiry
+    # is recorded either way, and with automatic resume off it waits for the
+    # user.
     app = shared_app
-    restart_hosts(app, "web", "worker", XAGENT_TASK_AUTO_RESUME_ENABLED="false")
-    task_id = _start_gated_task(app)
+    switches = {"XAGENT_TASK_AUTO_RESUME_ENABLED": "false"}
+    if infra_pause is not None:
+        switches["XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED"] = infra_pause
+    restart_hosts(app, "web", "worker", **switches)
+    task_id = start_task(app)
     kill_host(app, app.processes[1])
     (app.root / "model-release").touch()
     app.start("worker")

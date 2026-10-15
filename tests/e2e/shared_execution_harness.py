@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import fcntl
 import json
 import multiprocessing
 import os
@@ -19,8 +20,41 @@ import pytest
 
 from tests.e2e.app_harness import build_access_token
 
+# A provider fault the hosts' model boundary injects: ``{"kind": "unavailable"
+# | "invalid_output", "remaining": int | null}``. ``remaining`` counts provider
+# attempts (each tier-1 retry is one); ``null`` keeps the fault until the file
+# is removed. Counting attempts rather than time makes the moment the provider
+# "recovers" deterministic.
+MODEL_FAULT_FILE = "model-fault.json"
+
+
+def _take_model_fault(root: Path, tool_names: set[str]) -> str | None:
+    """Consume one attempt of the current fault, if it applies to this call."""
+    try:
+        handle = (root / MODEL_FAULT_FILE).open("r+")
+    except FileNotFoundError:
+        return None
+    with handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        spec = json.load(handle)
+        kind = spec["kind"]
+        # Unusable output only matters where the model must answer.
+        if kind == "invalid_output" and "final_answer" not in tool_names:
+            return None
+        remaining = spec.get("remaining")
+        if remaining is not None:
+            if remaining <= 0:
+                return None
+            spec["remaining"] = remaining - 1
+            handle.seek(0)
+            handle.truncate()
+            json.dump(spec, handle)
+        return kind
+
 
 def _install_model_boundary(root: Path, role: str) -> None:
+    import openai
+
     from tests.e2e.scripted_llm import ScriptedLLM
     from xagent.web.api import chat
     from xagent.web.services import agent_service_manager
@@ -30,6 +64,8 @@ def _install_model_boundary(root: Path, role: str) -> None:
             super().__init__([])
 
         async def chat(self, messages, **kwargs):
+            tool_names = {t["function"]["name"] for t in kwargs.get("tools", []) or []}
+            fault = _take_model_fault(root, tool_names)
             with (root / f"model-{os.getpid()}.jsonl").open("a") as log:
                 log.write(
                     json.dumps(
@@ -40,12 +76,37 @@ def _install_model_boundary(root: Path, role: str) -> None:
                                 t["function"]["name"]
                                 for t in kwargs.get("tools", []) or []
                             ],
+                            "fault": fault,
                         }
                     )
                     + "\n"
                 )
+            if fault == "unavailable":
+                # A real provider 5xx; the text must not read as a capacity,
+                # quota or credential refusal, which are classified apart.
+                request = httpx.Request(
+                    "POST", "http://scripted-provider.invalid/v1/chat/completions"
+                )
+                raise openai.InternalServerError(
+                    "Service Unavailable",
+                    response=httpx.Response(503, request=request),
+                    body=None,
+                )
+            if fault == "invalid_output":
+                return {
+                    "tool_calls": [
+                        {
+                            "id": "e2e-empty-final",
+                            "function": {
+                                "name": "final_answer",
+                                "arguments": json.dumps(
+                                    {"response_language": "English", "answer": ""}
+                                ),
+                            },
+                        }
+                    ]
+                }
             text = json.dumps(messages)
-            tool_names = {t["function"]["name"] for t in kwargs.get("tools", []) or []}
             if "generate_execution_plan" in tool_names:
                 return {
                     "tool_calls": [
@@ -230,8 +291,19 @@ def _install_model_boundary(root: Path, role: str) -> None:
                 }
             return "Shared E2E answer"
 
-    agent_service_manager.create_default_llm = RecordingLLM
-    chat.resolve_llms_from_names = lambda *a, **kw: (RecordingLLM(), None, None, None)
+    def boundary_llm():
+        # Test-only knob: put the production tier-1 retry layer in front of
+        # the scripted provider, so a fault is retried as a real one would be.
+        llm = RecordingLLM()
+        attempts = os.environ.get("E2E_MODEL_RETRY_ATTEMPTS")
+        if not attempts:
+            return llm
+        from xagent.core.model.chat.basic.adapter import attach_chat_retry_wrapper
+
+        return attach_chat_retry_wrapper(llm, max_retries=int(attempts))
+
+    agent_service_manager.create_default_llm = boundary_llm
+    chat.resolve_llms_from_names = lambda *a, **kw: (boundary_llm(), None, None, None)
 
 
 def _host(pipe, environment: dict[str, str], role: str, root: str) -> None:
@@ -588,6 +660,7 @@ def recovery_state(task_id: int) -> tuple[dict[str, Any] | None, list[str]]:
             "reason": row.reason,
             "run_id": row.run_id,
             "total_resumes": row.total_resumes,
+            "no_progress_resumes": row.no_progress_resumes,
         }, events
 
 
@@ -602,4 +675,120 @@ def auto_resume_commands(task_id: int) -> list[str]:
             .filter(TaskExecutionCommand.task_id == task_id)
             .order_by(TaskExecutionCommand.id)
             if command.command_id.startswith("auto-resume:")
+        ]
+
+
+def ws_url(app, task_id: int) -> str:
+    return (
+        str(app.client.base_url).replace("http://", "ws://").rstrip("/")
+        + f"/ws/chat/{task_id}?token={app.token}"
+    )
+
+
+def create_task(app, title: str, description: str) -> int:
+    """An owner's internal balanced task, not yet executed."""
+    response = app.client.post(
+        "/api/chat/task/create",
+        headers=app.headers,
+        json={
+            "title": title,
+            "description": description,
+            "execution_mode": "balanced",
+        },
+    )
+    assert response.status_code == 200, response.text
+    return response.json()["task_id"]
+
+
+def start_task(app, description: str = "e2e:gate") -> int:
+    """An owner's internal balanced task, executed over the WebSocket.
+
+    A gated description (``e2e:gate``) makes the first model call wait for
+    ``model-release``; this then returns once that call has started.
+    """
+    from websockets.sync.client import connect
+
+    task_id = create_task(app, "Auto resume", description)
+    with connect(ws_url(app, task_id)) as ws:
+        receive_event(ws, "historical_data_complete")
+        ws.send(json.dumps({"type": "execute_task"}))
+        receive_event(ws, "execution_started")
+    if "e2e:gate" in description:
+        wait_for(lambda: (app.root / "model-entered").exists(), app, "model call")
+    return task_id
+
+
+# Long enough for several automatic resumes with their backoff and jitter.
+COLLECT_EVENTS_TIMEOUT = 45
+
+
+def collect_events(app, ws, until) -> list[dict[str, Any]]:
+    """Events up to and including the first one ``until`` accepts.
+
+    Unlike :func:`receive_event` this tolerates ``error`` events: a failed
+    model call may surface one before the run pauses.
+    """
+    events: list[dict[str, Any]] = []
+    deadline = time.monotonic() + COLLECT_EVENTS_TIMEOUT
+    while (remaining := deadline - time.monotonic()) > 0:
+        try:
+            event = json.loads(ws.recv(timeout=remaining))
+        except TimeoutError:
+            break
+        events.append(event)
+        if until(event):
+            return events
+    pytest.fail(f"Timed out collecting events: {events}\n{app.diagnostics()}")
+
+
+# ---------------------------------------------------------------- model faults
+
+
+def set_model_fault(app, kind: str, *, count: int | None) -> None:
+    """Fail the next ``count`` provider attempts (``None``: until cleared).
+
+    Change it only while no model call is in flight.
+    """
+    path = app.root / MODEL_FAULT_FILE
+    staged = path.with_suffix(".tmp")
+    staged.write_text(json.dumps({"kind": kind, "remaining": count}))
+    os.replace(staged, path)
+
+
+def clear_model_fault(app) -> None:
+    (app.root / MODEL_FAULT_FILE).unlink(missing_ok=True)
+
+
+def model_faults(app, kind: str | None = None) -> list[dict[str, Any]]:
+    return [
+        call
+        for call in model_calls(app)
+        if call.get("fault") is not None and kind in (None, call["fault"])
+    ]
+
+
+def answered_model_calls(app) -> list[dict[str, Any]]:
+    return [call for call in model_calls(app) if call.get("fault") is None]
+
+
+def task_detail(app, task_id: int) -> dict[str, Any]:
+    response = app.client.get(f"/api/chat/task/{task_id}", headers=app.headers)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def assistant_messages(task_id: int) -> list[tuple[str, str]]:
+    """``(message_type, content)`` of the task's persisted assistant messages."""
+    from xagent.web.models.chat_message import TaskChatMessage
+    from xagent.web.models.database import get_session_local
+
+    with get_session_local()() as db:
+        return [
+            (message.message_type, message.content)
+            for message in db.query(TaskChatMessage)
+            .filter(
+                TaskChatMessage.task_id == task_id,
+                TaskChatMessage.role == "assistant",
+            )
+            .order_by(TaskChatMessage.id)
         ]

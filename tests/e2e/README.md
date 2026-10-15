@@ -40,8 +40,19 @@ pytest's automatic startup skips.
 | `test_shared_channels.py` | Slack, Feishu, and Telegram callbacks through real SharedChannelTurn execution and forwarded traces; Telegram attachment download, worker transformation, and returned bytes; queued pause and channel deactivation before worker consumption. |
 | `test_shared_happy_paths.py` | Agent public chat/reply/follow-up and file transfer; A2A blocking/context continuation; all execution modes and auto branches; combined host; legacy webhook. |
 | `test_shared_gmail.py` | Agent and workforce Gmail callback through actual signature verification, mail ingestion, and worker completion. |
-| `test_shared_auto_resume.py` | Automatic resume after SIGKILL: a killed worker's or combined host's run is recovered, scheduled, dispatched by the sweeper and finished by a replacement host on the same run; a run killed while PAUSE_REQUESTED, a user message while the resume is scheduled, and the switch turned off each leave it to the user; a later tick of the same scheduled trigger supersedes the killed tick, whose TriggerRun fails, while the later tick completes. |
+| `test_shared_auto_resume.py` | Automatic resume after SIGKILL: a killed worker's or combined host's run is recovered, scheduled, dispatched by the sweeper and finished by a replacement host on the same run; a run killed while PAUSE_REQUESTED, a user message while the resume is scheduled, and the switch turned off each leave it to the user; a later tick of the same scheduled trigger supersedes the killed tick, whose TriggerRun fails, while the later tick completes; with automatic resume off the killed run waits for its user whether the infrastructure-failure pause switch is left to follow it or turned on. |
+| `test_shared_provider_outage.py` | Automatic resume after model provider faults: a 503 outage pauses the run after tier-1 retries and the same run finishes once the provider recovers; an outage that outlasts the resume limit stops, and a manual resume then finishes it; unusable output (an empty final answer) is resampled until the no-progress limit stops it, or finishes once a resample answers; with both switches off an outage still fails the task. |
 | `test_shared_network_recovery.py` | A controllable TCP link interrupts only the test hosts' Redis connections. An in-flight task still persists its result, an unaccepted START leaves no task behind, and clients recover after reconnection. |
+
+The hosts' scripted provider can fail on demand: `set_model_fault(app, kind,
+count=...)` writes `model-fault.json` in the hosts' root, and each provider
+attempt it applies to consumes one count (`None` keeps it until `clear_model_fault`).
+`unavailable` applies to every attempt and raises a real
+`openai.InternalServerError` (503); `invalid_output` applies to, and consumes
+counts on, only attempts that offer `final_answer`, and returns an empty one.
+Setting `E2E_MODEL_RETRY_ATTEMPTS` before the hosts start puts the production
+tier-1 retry layer, with that many attempts, in front of the provider; other
+modules leave it unset and see single attempts.
 
 In `test_shared_channels.py`, the bot callbacks and their event bridge run in
 pytest's process. Spawned web/worker hosts have channel ingress disabled, so
