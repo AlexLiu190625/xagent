@@ -7,12 +7,14 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from xagent.web.channels import batch_control
 from xagent.web.channels.feishu import bot as module
 from xagent.web.services.channel_input_acceptance import AcceptedChannelInput
 from xagent.web.services.channel_runtime import (
     ChannelAuthorizationError,
     SelectedChannelTask,
 )
+from xagent.web.services.channel_stop import ChannelStopOutcome, ChannelStopResult
 from xagent.web.services.shared_channel_execution import SharedChannelTurn
 
 
@@ -51,6 +53,16 @@ def bot(monkeypatch, tmp_path):
     monkeypatch.setattr(module, "authorize_channel_sender", AsyncMock())
     monkeypatch.setattr(module, "discard_channel_task_results", AsyncMock())
     monkeypatch.setattr(module, "get_shared_task_execution_enabled", lambda: True)
+    monkeypatch.setattr(
+        batch_control, "get_shared_task_execution_enabled", lambda: True
+    )
+    # The database leaves /stop to the in-memory stop unless a test says so.
+    monkeypatch.setattr(
+        batch_control,
+        "stop_channel_task",
+        AsyncMock(return_value=ChannelStopResult(ChannelStopOutcome.ACTIVE)),
+    )
+    monkeypatch.setattr(batch_control, "deliver_channel_result", AsyncMock())
     return instance
 
 
@@ -646,3 +658,64 @@ async def test_startup_filter_preserves_controls_but_allows_shared_retries(
     assert not bot.control_tasks
     assert bot.active_tasks["sender"] == "45"
     assert bot._process_messages_batch.await_count == int(shared)
+
+
+# --------------------------------------------------------------------------
+# /stop wiring (the outcome matrix: tests/web/test_channel_stop_control.py)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "held", "reply"),
+    [
+        pytest.param(
+            ChannelStopOutcome.CANCELLED,
+            11,
+            "Stopped. The interrupted run will not resume automatically. Send "
+            "another message to continue here, or /new for a fresh task.",
+            id="cancelled",
+        ),
+        pytest.param(
+            ChannelStopOutcome.PAUSE_QUEUED,
+            None,
+            "Stopped the current run. Send another message to continue here, "
+            "or /new for a fresh task.",
+            id="pause_queued",
+        ),
+        pytest.param(
+            ChannelStopOutcome.IDLE, None, "No active run to stop.", id="idle"
+        ),
+    ],
+)
+@pytest.mark.parametrize("command", ["/stop", "/pause"])
+async def test_stop_replies_then_delivers_the_released_reply(
+    bot, monkeypatch, command, outcome, held, reply
+):
+    stop = AsyncMock(return_value=ChannelStopResult(outcome, held))
+    monkeypatch.setattr(batch_control, "stop_channel_task", stop)
+    events = []
+    bot._send_text.side_effect = lambda chat, text: events.append(("reply", text))
+    batch_control.deliver_channel_result.side_effect = lambda *args: events.append(
+        ("deliver", args)
+    )
+
+    await control(bot, command)
+
+    stop.assert_awaited_once_with(
+        channel_id=7, external_user_id="sender", task_id=45, pause_awaited_run=True
+    )
+    assert events[0] == ("reply", reply)
+    assert events[1:] == (
+        [("deliver", (held, bot._deliver_shared_result))] if held else []
+    )
+
+
+@pytest.mark.asyncio
+async def test_stop_in_a_new_conversation_skips_the_database(bot):
+    bot.active_tasks["sender"] = "-1"
+
+    await control(bot, "/stop")
+
+    batch_control.stop_channel_task.assert_not_awaited()
+    assert bot._send_text.await_args.args[1] == "No active run to stop."

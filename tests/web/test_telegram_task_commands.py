@@ -1248,3 +1248,114 @@ def test_stop_signals_new_preparation_despite_retained_shared_turn() -> None:
     previous.request_stop.assert_called_once()
     assert bot._consume_user_stop_request(101)
     assert not bot.user_message_queues
+
+
+# --------------------------------------------------------------------------
+# /stop wiring, from every entry point (the outcome matrix:
+# tests/web/test_channel_stop_control.py)
+# --------------------------------------------------------------------------
+
+_STOP_ENTRIES = [
+    pytest.param("cmd_stop", "/stop", id="command_stop"),
+    pytest.param("cmd_stop", "/pause", id="command_pause"),
+    pytest.param("handle_message", "stop", id="text_stop"),
+    pytest.param("handle_message", "停止", id="text_chinese"),
+]
+
+
+@pytest.fixture
+def stop_bot(monkeypatch):
+    from unittest.mock import AsyncMock, Mock
+
+    from aiogram import Dispatcher, types
+
+    from xagent.web.channels import batch_control
+    from xagent.web.services.channel_stop import ChannelStopOutcome, ChannelStopResult
+
+    bot = _bot(9)
+    bot.instance_id = "test"
+    bot._started_at = None
+    bot._menu_generation = "current"
+    bot.bot = Mock()
+    bot.dp = Dispatcher()
+    bot._register_handlers()
+    bot.active_tasks = {123: 45}
+    events: list[tuple[str, object]] = []
+
+    async def answer(self, text, **kwargs):
+        events.append(("reply", text))
+
+    monkeypatch.setattr(types.Message, "answer", answer)
+    monkeypatch.setattr(
+        batch_control, "get_shared_task_execution_enabled", lambda: True
+    )
+    stop = AsyncMock(return_value=ChannelStopResult(ChannelStopOutcome.ACTIVE))
+    monkeypatch.setattr(batch_control, "stop_channel_task", stop)
+    deliver = AsyncMock(side_effect=lambda *args: events.append(("deliver", args)))
+    monkeypatch.setattr(batch_control, "deliver_channel_result", deliver)
+    handlers = {h.callback.__name__: h.callback for h in bot.dp.message.handlers}
+    return SimpleNamespace(bot=bot, stop=stop, events=events, handlers=handlers)
+
+
+async def _send_stop(stop_bot, handler: str, text: str) -> None:
+    from aiogram import types
+
+    message = types.Message(
+        message_id=1,
+        date=datetime.now(timezone.utc),
+        chat=types.Chat(id=123, type="private"),
+        from_user=types.User(id=123, is_bot=False, first_name="Sender"),
+        text=text,
+    )
+    await stop_bot.handlers[handler](message)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("handler", "text"), _STOP_ENTRIES)
+@pytest.mark.parametrize(
+    ("outcome", "held", "reply"),
+    [
+        pytest.param(
+            "cancelled",
+            11,
+            "Stopped. The interrupted run will not resume automatically. Send "
+            "another message to continue here, or use /new for a fresh task.",
+            id="cancelled",
+        ),
+        pytest.param(
+            "pause_queued",
+            None,
+            "Stopped the current run. Send another message to continue here, "
+            "or use /new for a fresh task.",
+            id="pause_queued",
+        ),
+        pytest.param("idle", None, "No active run to stop.", id="idle"),
+    ],
+)
+async def test_stop_replies_then_delivers_the_released_reply(
+    stop_bot, handler, text, outcome, held, reply
+):
+    from xagent.web.services.channel_stop import ChannelStopOutcome, ChannelStopResult
+
+    stop_bot.stop.return_value = ChannelStopResult(ChannelStopOutcome(outcome), held)
+
+    await _send_stop(stop_bot, handler, text)
+
+    stop_bot.stop.assert_awaited_once_with(
+        channel_id=9, external_user_id="123", task_id=45, pause_awaited_run=True
+    )
+    expected: list[tuple[str, object]] = [("reply", reply)]
+    if held:
+        expected.append(("deliver", (held, stop_bot.bot._deliver_shared_result)))
+    assert stop_bot.events == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("handler", "text"), _STOP_ENTRIES)
+async def test_stop_in_a_new_conversation_skips_the_database(stop_bot, handler, text):
+    stop_bot.bot.active_tasks[123] = -1
+
+    await _send_stop(stop_bot, handler, text)
+
+    stop_bot.stop.assert_not_awaited()
+    assert stop_bot.events == [("reply", "No active run to stop.")]

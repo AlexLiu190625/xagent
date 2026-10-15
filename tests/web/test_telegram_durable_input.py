@@ -25,6 +25,7 @@ from xagent.web.services import (
 from xagent.web.services import channel_input_acceptance as inputs
 from xagent.web.services import (
     channel_runtime,
+    channel_stop,
     shared_channel_execution,
     task_event_bridge,
     uploaded_file_store,
@@ -59,6 +60,7 @@ def ingress(engine, monkeypatch, tmp_path):
         shared_channel_execution,
         uploaded_file_store,
         channel_runtime,
+        channel_stop,
     ):
         monkeypatch.setattr(service, "get_session_local", lambda: sessions)
     monkeypatch.setattr(task_event_bridge, "_bridge", Mock(host_id="ingress"))
@@ -908,3 +910,38 @@ async def test_failed_shared_result_carries_delivery_task_id():
     )
     texts = [getattr(call.args[0], "text", None) for call in bot.bot.await_args_list]
     assert "Task execution failed. (Task ID: 77)" in texts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending", ["queued", "preparing"])
+async def test_stop_with_only_pending_input_pauses_the_awaited_run(
+    ingress, monkeypatch, pending
+):
+    make, sessions, _ = ingress
+    monkeypatch.setattr(channel_stop, "notify_task_command_dispatcher", Mock())
+    bot = make()
+    await run(bot, message())
+    assert not bot.user_active_executions
+    # The run runs again (e.g. resumed automatically); its reply is pending.
+    with sessions() as db:
+        start = db.query(TaskExecutionCommand).filter_by(kind="start").one()
+        task = db.get(Task, start.task_id)
+        task.status, task.control_state = TaskStatus.RUNNING, "running"
+        task.run_id = run_id = start.target_run_id
+        db.get(TaskChannelDelivery, start.id).status = "pending"
+        db.commit()
+    if pending == "queued":
+        bot.user_message_queues[123] = ["later"]
+    else:
+        bot.user_preparing_executions.add(123)
+    handlers = {h.callback.__name__: h.callback for h in bot.dp.message.handlers}
+
+    await handlers["cmd_stop"](message("/stop", identity=5))
+
+    with sessions() as db:
+        (pause,) = db.query(TaskExecutionCommand).filter_by(kind="pause").all()
+        assert (pause.target_run_id, pause.status) == (run_id, "pending")
+    assert 123 not in bot.user_message_queues
+    if pending == "preparing":
+        assert bot._consume_user_stop_request(123)
+    assert make.sent[-1][2].startswith("Stopped the current run.")

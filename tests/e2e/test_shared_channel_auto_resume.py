@@ -363,3 +363,67 @@ async def test_channel_reply_past_the_window_is_interrupted(
     assert (start["run_id"], start["delivery"]) == (run_id, "delivered")
     assert _count(ingress.sent, INTERRUPTED_USER_MESSAGE) == 1
     assert _count(ingress.sent, ANSWER) == 0
+
+
+# --------------------------------------------------------------------------
+# E10: /stop cancels the waiting resume
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_channel_stop_while_scheduled_cancels_the_resume(shared_app, ingress):
+    from xagent.web.models.database import get_session_local
+    from xagent.web.models.task_auto_recovery import TaskAutoRecovery
+
+    app = shared_app
+    # A wide window between recording and dispatch.
+    await asyncio.to_thread(
+        restart_hosts,
+        app,
+        "web",
+        "worker",
+        XAGENT_TASK_AUTO_RESUME_SHORT_INITIAL_BACKOFF_SECONDS="20",
+    )
+    task_id, run_id = await _gated_turn_killed(app, ingress)
+    await asyncio.to_thread(
+        wait_for,
+        lambda: (recovery_state(task_id)[0] or {}).get("state") == "scheduled",
+        app,
+        "the scheduled resume",
+    )
+    await _deliver_round(ingress)
+    assert _starts(task_id)[0]["delivery"] == "pending"
+    calls_before = len(model_calls(app))
+    with get_session_local()() as db:
+        row = db.get(TaskAutoRecovery, task_id)
+        due, recorded_version = row.next_attempt_at, int(row.paused_state_version)
+
+    stop = SimpleNamespace(
+        event=SimpleNamespace(message=SimpleNamespace(chat_id="chat"))
+    )
+    await asyncio.wait_for(ingress.bot._handle_control("sender", stop, "/stop"), 30)
+
+    # The /stop reply and M1's "stopped" reply, once each (their order is
+    # best effort: the recovery loop may deliver M1 first).
+    assert _count(ingress.sent, "will not resume automatically") == 1
+    assert _count(ingress.sent, INTERRUPTED_USER_MESSAGE) == 1
+    (start,) = _starts(task_id)
+    assert (start["run_id"], start["delivery"]) == (run_id, "delivered")
+    row, events = recovery_state(task_id)
+    assert row is not None
+    assert (row["state"], row["state_detail"]) == ("manual", "user_cancelled")
+    assert "skipped_user_intent" in events and "auto_resumed" not in events
+    state = task_state(task_id)
+    assert (state["status"], state["run_id"]) == ("paused", run_id)
+    assert state["state_version"] == recorded_version + 1
+    # Past the dispatch time and two sweeper polls: nothing resumed the run.
+    if due is None:
+        await asyncio.sleep(35)
+    else:
+        remaining = _utc(due) + timedelta(seconds=2) - datetime.now(timezone.utc)
+        await asyncio.sleep(max(remaining.total_seconds(), 0))
+    await _deliver_round(ingress)
+    assert auto_resume_commands(task_id) == []
+    assert len(model_calls(app)) == calls_before
+    assert _count(ingress.sent, INTERRUPTED_USER_MESSAGE) == 1
+    assert task_state(task_id)["status"] == "paused"

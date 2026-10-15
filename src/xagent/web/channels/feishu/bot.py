@@ -76,7 +76,11 @@ from ...services.uploaded_file_store import (
     compensate_staged_uploaded_files,
     stage_uploaded_file_from_local_path,
 )
-from ..batch_control import BatchChannelControl
+from ..batch_control import (
+    BatchChannelControl,
+    selected_task_id,
+    stop_reply_text,
+)
 from .trace_handler import FeishuTraceHandler
 
 logger = logging.getLogger(__name__)
@@ -165,6 +169,7 @@ class FeishuBotInstance(BatchChannelControl[str]):
     async def _handle_control(self, open_id: str, data: Any, command: str) -> None:
         chat_id = data.event.message.chat_id
         lock = self.control_locks.setdefault(open_id, asyncio.Lock())
+        held: int | None = None
         try:
             async with lock:
                 await authorize_channel_sender(
@@ -210,13 +215,14 @@ class FeishuBotInstance(BatchChannelControl[str]):
                                 return
                         reply = "Started a new task. Please describe your request."
                 else:
-                    stopped = self._stop_current_conversation(open_id)
-                    reply = (
-                        "Stopped the current run. Send another message to continue here, or /new for a fresh task."
-                        if stopped
-                        else "No active run to stop."
+                    stop, held = await self._handle_stop_request(
+                        open_id,
+                        external_user_id=open_id,
+                        task_id=selected_task_id(self.active_tasks.get(open_id)),
                     )
+                    reply = stop_reply_text(stop, new_hint="/new")
             await self._send_text(chat_id, reply)
+            await self._deliver_released_reply(held)
         except ChannelAuthorizationError:
             await self._send_text(chat_id, "🚫 You are not authorized to use this bot.")
         except ChannelConfigurationError:

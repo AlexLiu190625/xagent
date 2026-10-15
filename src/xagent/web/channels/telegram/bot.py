@@ -104,7 +104,11 @@ from ...services.uploaded_file_store import (
     compensate_staged_uploaded_files,
     stage_uploaded_file_from_local_path,
 )
-from ..batch_control import BatchChannelControl
+from ..batch_control import (
+    BatchChannelControl,
+    selected_task_id,
+    stop_reply_text,
+)
 from .handler import TelegramTraceHandler
 from .utils import (
     CancelledDelivery,
@@ -591,13 +595,7 @@ class TelegramBotInstance(BatchChannelControl[int]):
             logger.info(
                 f"Received stop command from {message.from_user.id} on bot {self.instance_id}"
             )
-            stopped = self._stop_current_conversation(message.from_user.id)
-            if stopped:
-                await message.answer(
-                    "Stopped the current run. Send another message to continue here, or use /new for a fresh task."
-                )
-            else:
-                await message.answer("No active run to stop.")
+            await self._answer_stop(message)
 
         @self.dp.message()
         async def handle_message(message: types.Message) -> None:
@@ -627,16 +625,20 @@ class TelegramBotInstance(BatchChannelControl[int]):
                 logger.info(
                     f"Received stop text from {user_id} on bot {self.instance_id}: {msg_content}"
                 )
-                stopped = self._stop_current_conversation(user_id)
-                if stopped:
-                    await message.answer(
-                        "Stopped the current run. Send another message to continue here, or use /new for a fresh task."
-                    )
-                else:
-                    await message.answer("No active run to stop.")
+                await self._answer_stop(message)
                 return
 
             self._enqueue_user_message(user_id, message)
+
+    async def _answer_stop(self, message: types.Message) -> None:
+        user_id = cast(types.User, message.from_user).id
+        stop, held = await self._handle_stop_request(
+            user_id,
+            external_user_id=str(user_id),
+            task_id=selected_task_id(self.active_tasks.get(user_id)),
+        )
+        await message.answer(stop_reply_text(stop, new_hint="use /new"))
+        await self._deliver_released_reply(held)
 
     def _switch_lock_for_user(self, user_id: int) -> asyncio.Lock:
         lock = self.user_switch_locks.get(user_id)

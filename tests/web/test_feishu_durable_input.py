@@ -24,6 +24,7 @@ from xagent.web.services import (
 from xagent.web.services import channel_input_acceptance as inputs
 from xagent.web.services import (
     channel_runtime,
+    channel_stop,
     shared_channel_execution,
     task_event_bridge,
     uploaded_file_store,
@@ -60,6 +61,7 @@ def ingress(engine, monkeypatch, tmp_path):
         shared_channel_execution,
         uploaded_file_store,
         channel_runtime,
+        channel_stop,
     ):
         monkeypatch.setattr(service, "get_session_local", lambda: sessions)
     monkeypatch.setattr(task_event_bridge, "_bridge", Mock(host_id="ingress"))
@@ -862,3 +864,43 @@ async def test_failed_shared_result_carries_delivery_task_id(ingress):
         delivery, {"success": False, "status": "error", "error": "boom"}
     )
     assert bot._update_text.await_args.args[2] == "Task execution failed. (Task ID: 77)"
+
+
+def _awaited_run_running(sessions) -> str:
+    """The accepted turn's run runs again (e.g. resumed automatically) and
+    its reply is still pending; the ingress tracks no turn of it."""
+    with sessions() as db:
+        start = db.query(TaskExecutionCommand).filter_by(kind="start").one()
+        task = db.get(Task, start.task_id)
+        task.status, task.control_state = TaskStatus.RUNNING, "running"
+        task.run_id = start.target_run_id
+        db.get(TaskChannelDelivery, start.id).status = "pending"
+        db.commit()
+        return str(start.target_run_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending", ["queued", "preparing"])
+async def test_stop_with_only_pending_input_pauses_the_awaited_run(
+    ingress, monkeypatch, pending
+):
+    make, sessions, _ = ingress
+    monkeypatch.setattr(channel_stop, "notify_task_command_dispatcher", Mock())
+    bot = make()
+    await run(bot, message())
+    assert not bot.user_active_executions
+    run_id = _awaited_run_running(sessions)
+    if pending == "queued":
+        bot.user_message_queues["sender"] = [message("later", "later")]
+    else:
+        bot.user_preparing_executions.add("sender")
+
+    await bot._handle_control("sender", message("/stop"), "/stop")
+
+    with sessions() as db:
+        (pause,) = db.query(TaskExecutionCommand).filter_by(kind="pause").all()
+        assert (pause.target_run_id, pause.status) == (run_id, "pending")
+    assert "sender" not in bot.user_message_queues
+    if pending == "preparing":
+        assert bot._consume_user_stop_request("sender")
+    assert bot._send_text.await_args.args[1].startswith("Stopped the current run.")
