@@ -12,6 +12,7 @@ from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_admission import TaskAdmissionBucket, TaskAdmissionTicket
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.services import task_command_transport as transport
+from xagent.web.services import task_coordinator_runtime as runtime
 
 engine = engine_fixture
 task_id = task_id_fixture
@@ -22,7 +23,7 @@ RUNNER = "worker"
 @pytest.fixture
 def factory(engine, monkeypatch):
     result = sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(database, "get_session_local", lambda: result)
+    monkeypatch.setattr(database, "_SessionLocal", result)
     monkeypatch.setattr(transport, "get_runner_id", lambda: RUNNER)
     return result
 
@@ -167,8 +168,21 @@ def test_count_ignores_process_local_busy_tasks(factory, task_id, monkeypatch):
     ids = seed(factory, task_id)
     with factory() as db:
         busy = db.get(TaskExecutionCommand, ids["idle_head"]).task_id
-        before = transport.count_claimable_task_commands(db, runner_id=RUNNER)
-    # The dispatcher skips its own busy tasks; the count reports cluster state.
+
+    class BusyRegistry:
+        def busy_command_tasks(self):
+            return (busy,)
+
+    # The dispatcher's busy list comes from this process's coordinator
+    # registry. Make it report the idle task as busy through both ways of
+    # reaching the registry, so a count that consulted it would drop it.
+    registry = BusyRegistry()
+    monkeypatch.setattr(runtime, "get_task_coordinator_registry", lambda: registry)
+    monkeypatch.setattr(runtime, "_registry", registry)
+
+    # The dispatcher skips its own busy tasks.
     assert transport._find_command_candidate(ids["idle_head"], (busy,)) is None
+    # The count still reports every shared-mode selection in the seed,
+    # idle_head included: idle_head, own_expired_owner, start, admission_head.
     with factory() as db:
-        assert transport.count_claimable_task_commands(db, runner_id=RUNNER) == before
+        assert transport.count_claimable_task_commands(db, runner_id=RUNNER) == 4

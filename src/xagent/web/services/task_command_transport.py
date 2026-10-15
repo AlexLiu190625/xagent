@@ -1556,6 +1556,25 @@ def _owner_lease_recovery_settled(runner_id: str, now: datetime) -> Any:
     )
 
 
+def _dispatcher_candidate_query(
+    db: Session, *, runner_id: str, command_db_id: int | None, shared: bool
+) -> Query[Any]:
+    """The database part of the dispatcher's candidate selection.
+
+    ``_claimable_query``, plus the owner lease-recovery filter when
+    ``shared``. The shared dispatcher's scan and
+    ``count_claimable_task_commands`` both build on this, so a database
+    predicate added here reaches both. Process-local filters (the busy-task
+    list) and the scan's reply-first kind order stay with the caller.
+    Without shared execution ``claim_task_command`` looks up with
+    ``_claimable_query`` alone, so a predicate for both modes belongs there.
+    """
+    query = _claimable_query(db, runner_id=runner_id, command_db_id=command_db_id)
+    if shared:
+        query = query.filter(_owner_lease_recovery_settled(runner_id, _utc_now()))
+    return query
+
+
 def _find_command_candidate(
     command_db_id: int | None,
     busy_task_ids: tuple[int, ...] = (),
@@ -1566,14 +1585,14 @@ def _find_command_candidate(
     with get_session_local()() as db:
 
         def first_candidate(kind: TaskCommandKind | None = None) -> Any:
-            query = _claimable_query(
-                db, runner_id=runner_id, command_db_id=command_db_id
+            # This scan serves only shared execution (dispatch_one_task_command).
+            query = _dispatcher_candidate_query(
+                db, runner_id=runner_id, command_db_id=command_db_id, shared=True
             )
             if kind is not None:
                 query = query.filter(TaskExecutionCommand.kind == kind.value)
             return query.filter(
-                TaskExecutionCommand.task_id.notin_(busy_task_ids),
-                _owner_lease_recovery_settled(runner_id, _utc_now()),
+                TaskExecutionCommand.task_id.notin_(busy_task_ids)
             ).first()
 
         row = None
@@ -1594,27 +1613,54 @@ def _find_command_candidate(
 
 
 def count_claimable_task_commands(db: Session, *, runner_id: str) -> int:
-    """Count the commands the dispatcher could claim, seen from ``runner_id``.
+    """Count the commands that pass the dispatcher's database checks.
 
-    Uses the dispatcher's own readiness predicates: claim availability, team
-    admission, the earlier-unfinished-command gate and runner routing, plus,
-    with shared execution, the owner lease-recovery filter. Process-local
-    state such as the dispatcher's busy-task list is not applied, so the
-    result describes database state only.
+    Builds on the same query as the dispatcher's candidate scan
+    (``_dispatcher_candidate_query``), seen from ``runner_id``: claim
+    availability, team admission, the earlier-unfinished-command gate and
+    runner routing, plus the START/RESUME_INPUT exclusion without shared
+    execution and the owner lease-recovery filter with it. Whether shared
+    execution is on, and so which variant of each predicate applies, comes
+    from the calling process's ``get_shared_task_execution_enabled()``, not
+    from the worker that would claim. Without shared execution the
+    dispatcher claims through ``claim_task_command``, whose lookup is
+    ``_claimable_query`` alone, which is what this applies in that mode.
 
-    This is not a backlog depth. Only the first unfinished command of each
-    task passes the filter, and with team admission only the head ticket of
-    each bucket does.
+    The result is an upper bound on what a dispatcher in ``runner_id`` could
+    claim now. Checks made after a candidate is picked are not applied:
+    whether the process consumes commands at all
+    (``consumes_task_commands()``), the busy-task list, task owner
+    acquisition and lease checks, and the admission reservation that
+    rechecks capacity under lock. Each of them can only turn a counted
+    command away.
+
+    This is not a backlog depth either. Only the first unfinished command of
+    each task passes, except that a cancel or pause may pass an earlier
+    command that still waits for admission. Under team admission a ticketed
+    command passes when its ticket already holds a slot under the task's
+    current owner, or when no older ticket of its bucket waits for the next
+    slot, the bucket has a free slot and startup pacing allows it. An older
+    ticket queued behind its own task's earlier command, or guidance joining
+    a running execution, does not wait for a slot (``_older_waiter``). A
+    command without a ticket is not gated by admission, and a guidance
+    message that joins its task's running execution passes whatever its
+    ticket says.
 
     The query runs in ``db``. Unlike the dispatcher's ``first()`` lookup, a
     count evaluates the correlated admission and earlier-command subqueries
     for every candidate row, so callers that need a bound should set a
     statement timeout on that session.
     """
-    query = _claimable_query(db, runner_id=runner_id, command_db_id=None)
-    if get_shared_task_execution_enabled():
-        query = query.filter(_owner_lease_recovery_settled(runner_id, _utc_now()))
-    return query.order_by(None).count()
+    return (
+        _dispatcher_candidate_query(
+            db,
+            runner_id=runner_id,
+            command_db_id=None,
+            shared=get_shared_task_execution_enabled(),
+        )
+        .order_by(None)
+        .count()
+    )
 
 
 async def dispatch_one_task_command(
