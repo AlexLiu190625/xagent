@@ -64,6 +64,7 @@ from ...config import (
     get_task_auto_resume_max_inflight,
     get_task_auto_resume_max_per_tick,
 )
+from ...core.agent.interruption import is_database_unavailable
 from ...core.runtime_performance import (
     increment_counter,
     observe_value,
@@ -122,6 +123,15 @@ logger = logging.getLogger(__name__)
 DISPATCH_CHECK_GRACE_SECONDS = 60
 # A full admission queue pushes the candidate this far out.
 ADMISSION_FULL_DELAY_SECONDS = 30
+# So does a refused staging that is neither a full queue nor a race nor a
+# database outage: a configuration or programming fault repeats on every
+# attempt, so retrying it on every tick only adds load. Only ``ValueError``
+# and ``RuntimeError`` (``_EXPECTED_STAGING_REFUSALS``) count as refused; any
+# other class still postpones the row but counts as a failed candidate.
+STAGING_REFUSED_DELAY_SECONDS = 60
+# The classes of ``stage_task_command`` failure that are a refusal, not a bug:
+# a rejected command, an owner or task that moved, an admission wait.
+_EXPECTED_STAGING_REFUSALS = (ValueError, RuntimeError)
 _COMMAND_ID_MAX_CHARS = 64
 # Consecutive failed ticks before TASK_AUTO_RESUME_UNAVAILABLE is raised.
 _UNAVAILABLE_AFTER_FAILURES = 3
@@ -727,13 +737,30 @@ def _limit_state(
 # --------------------------------------------------------------------------
 
 
-class _AdmissionFull(Exception):
-    """``AdmissionQueueFull`` carrying the fence the candidate was seen at."""
+class _DispatchRefused(Exception):
+    """A dispatch whose staging was refused, carrying the fence the candidate
+    was seen at. The scan postpones that one row and goes on."""
+
+    delay_seconds: int
 
     def __init__(self, task_id: int, paused_state_version: int) -> None:
         super().__init__(task_id, paused_state_version)
         self.task_id = task_id
         self.paused_state_version = paused_state_version
+
+
+class _AdmissionFull(_DispatchRefused):
+    """``AdmissionQueueFull``: the candidate's admission bucket is full."""
+
+    delay_seconds = ADMISSION_FULL_DELAY_SECONDS
+
+
+class _StagingRefused(_DispatchRefused):
+    """``stage_task_command`` raised something other than a full queue, a race
+    or a database outage (chained as ``__cause__``). The row is postponed
+    either way; ``scan_due`` counts it as refused or as failed by the class."""
+
+    delay_seconds = STAGING_REFUSED_DELAY_SECONDS
 
 
 def _process_due_candidate_no_commit(
@@ -859,6 +886,13 @@ def _process_due_candidate_no_commit(
         )
     except AdmissionQueueFull as exc:
         raise _AdmissionFull(task_id, paused_state_version) from exc
+    except IntegrityError:
+        # A race on the command row: ``_settle_candidate`` counts it.
+        raise
+    except Exception as exc:
+        if is_database_unavailable(exc) or is_database_pool_timeout(exc):
+            raise
+        raise _StagingRefused(task_id, paused_state_version) from exc
     if not staged.created:
         # Only a race that dispatched this exact (fence, attempt) gets here.
         # Commit ``dispatched`` only if that command is this dispatch and is
@@ -905,10 +939,18 @@ def _process_due_candidate_no_commit(
     )
 
 
-def _postpone_after_admission_full(
-    task_id: int, paused_state_version: int, now: datetime
+def _postpone_candidate(
+    task_id: int,
+    *,
+    paused_state_version: int,
+    now: datetime,
+    delay_seconds: int,
 ) -> None:
-    """Push a candidate the admission queue refused; a single-row CAS."""
+    """Push a candidate its dispatch was refused for; a single-row CAS.
+
+    Fresh session: the candidate's own transaction was rolled back. Matches
+    only a row still ``scheduled`` at ``paused_state_version``.
+    """
 
     from ..models.database import get_session_local
 
@@ -921,10 +963,7 @@ def _postpone_after_admission_full(
                     TaskAutoRecovery.state == _SCHEDULED.value,
                     TaskAutoRecovery.paused_state_version == paused_state_version,
                 )
-                .values(
-                    next_attempt_at=now
-                    + timedelta(seconds=ADMISSION_FULL_DELAY_SECONDS)
-                )
+                .values(next_attempt_at=now + timedelta(seconds=delay_seconds))
                 .execution_options(synchronize_session=False)
             )
             db.commit()
@@ -1355,7 +1394,7 @@ def _settle_candidate(
 
     A failure is logged and skipped so one bad row cannot stall the rest,
     except a pool timeout, which ends the tick as lease recovery does.
-    ``_AdmissionFull`` propagates for the dispatch path to handle.
+    ``_DispatchRefused`` propagates for the dispatch path to handle.
     """
 
     try:
@@ -1364,7 +1403,7 @@ def _settle_candidate(
             db.commit()
         else:
             db.rollback()
-    except _AdmissionFull:
+    except _DispatchRefused:
         db.rollback()
         raise
     except IntegrityError:
@@ -1523,8 +1562,17 @@ def scan_due(
 
     Once the budget is spent, a row that needs a dispatch is left unwritten
     and the scan goes on, so rows behind it can still expire, go stale or be
-    superseded. Only a full admission queue stops it early (its buckets are
-    shared, so the next dispatch would be refused too).
+    superseded. A row whose staging is refused is postponed on its own
+    (``_DispatchRefused``) and the scan goes on too: a host may bucket
+    admission per team, so one full bucket says nothing about the next row.
+    A team with more due rows than ``scan_limit`` ahead of everyone else still
+    uses up the scan, so another team's row waits at most
+    ``ceil(rows / scan_limit)`` ticks plus the one that dispatches it; each
+    further due row of a full bucket costs one refused staging. A refusal
+    that is not ``ValueError`` or ``RuntimeError`` counts as a failed
+    candidate (ERROR, ``candidate_failed``) while the row is still postponed.
+    A postpone that fails on a database outage or pool timeout ends the tick;
+    any other postpone failure is logged and the scan goes on.
     """
 
     for db, task_id in _candidates(_SCHEDULED, now=now, limit=scan_limit):
@@ -1538,20 +1586,57 @@ def scan_due(
                     db, task_id, now=now, can_dispatch=can_dispatch
                 ),
             )
-        except _AdmissionFull as full:
-            report.admission_full = True
-            increment_counter(
-                "xagent.task.auto_resume.skipped",
-                attributes={"outcome": "admission_full"},
-            )
-            _postpone_after_admission_full(full.task_id, full.paused_state_version, now)
-            logger.info(
-                "component=auto-resume task_id=%s admission queue is full; "
-                "postponed %ss",
-                full.task_id,
-                ADMISSION_FULL_DELAY_SECONDS,
-            )
-            return
+        except _DispatchRefused as refused:
+            if isinstance(refused, _AdmissionFull):
+                report.admission_full = True
+                increment_counter(
+                    "xagent.task.auto_resume.skipped",
+                    attributes={"outcome": "admission_full"},
+                )
+                logger.info(
+                    "component=auto-resume task_id=%s admission queue is full; "
+                    "postponing %ss",
+                    refused.task_id,
+                    refused.delay_seconds,
+                )
+            elif isinstance(refused.__cause__, _EXPECTED_STAGING_REFUSALS):
+                increment_counter(
+                    "xagent.task.auto_resume.skipped",
+                    attributes={"outcome": "staging_refused"},
+                )
+                logger.warning(
+                    "component=auto-resume task_id=%s staging the resume was "
+                    "refused; postponing %ss",
+                    refused.task_id,
+                    refused.delay_seconds,
+                    exc_info=refused.__cause__,
+                )
+            else:
+                report.failed += 1
+                increment_counter("xagent.task.auto_resume.candidate_failed")
+                logger.error(
+                    "component=auto-resume task_id=%s candidate failed; postponing %ss",
+                    refused.task_id,
+                    refused.delay_seconds,
+                    exc_info=refused.__cause__,
+                )
+            try:
+                _postpone_candidate(
+                    refused.task_id,
+                    paused_state_version=refused.paused_state_version,
+                    now=now,
+                    delay_seconds=refused.delay_seconds,
+                )
+            except Exception as exc:
+                if is_database_pool_timeout(exc) or is_database_unavailable(exc):
+                    raise
+                logger.warning(
+                    "component=auto-resume task_id=%s postponing the refused "
+                    "candidate failed; it is retried next tick",
+                    refused.task_id,
+                    exc_info=True,
+                )
+            continue
         if result is not None and result.dispatch_delay_seconds is not None:
             observe_value(
                 "xagent.task.auto_resume.dispatch_delay_seconds",
@@ -2054,14 +2139,15 @@ def channel_reply_waits_for_auto_resume(
 
 def resume_hand_off_can_complete(db: Session, task: Task, *, now: datetime) -> bool:
     """Whether the resume ``task`` is handing off (PAUSED, ``resume_requested``)
-    can still start its run, so a new channel turn should wait (busy).
+    can still start its run, so a new channel turn or a status-only append
+    should wait (busy).
 
     True while a RESUME command of the task (automatic or a person's) is still
     queued or running, or while an automatic resume of its run still holds
     the channel reply (``_auto_resume_holds``: within the channel window and
     its grace). Otherwise the hand-off is stranded -- its command ended but
     the resumed run never took the lease -- and refusing every turn would
-    strand the channel with it. One read, no locks; the caller holds the task
+    strand the channel or the status-only caller with it. One read, no locks; the caller holds the task
     row lock.
     """
 
@@ -2198,6 +2284,96 @@ def _auto_resume_pending(db: Session, task: Task, row: TaskAutoRecovery | None) 
     return status in (COMMAND_PENDING, COMMAND_PROCESSING) and (
         _rolled_back_by_this_claim(db, task, row, str(row.last_command_id))
     )
+
+
+def supersede_pending_auto_resume_for_append_no_commit(db: Session, task: Task) -> bool:
+    """A status-only caller's append, accepted on ``task``, replaces the
+    automatic resume its paused run waits for; no commit.
+
+    Caller: ``_accept_turn_no_commit`` for a status-only source in shared
+    execution, holding the ``tasks`` row lock, with ``task`` re-read after it
+    and the START already reserved in this transaction, before reading the
+    version the START is staged at. Lock order is the module's: ``tasks``,
+    then the recovery row.
+
+    Acts only while :func:`_auto_resume_pending` says an automatic resume of
+    the run may still start; otherwise nothing is written and ``False`` is
+    returned. It moves ``state_version`` and the row's fence to the new version
+    in one step, as :func:`cancel_pending_auto_resume_no_commit` does, so an
+    automatic RESUME already queued or claimed (fenced on the version it
+    admitted from) defers and its claim guard skips it. The row rests in
+    ``manual(new_turn)`` at the new fence: unlike a person's cancel this is no
+    user intent, and nothing schedules a ``manual`` row again at its fence.
+
+    A compare-and-swap that misses means the task or the row moved since it was
+    read (the caller's lock prevents that on PostgreSQL; SQLite ignores row
+    locks); it raises ``TaskTurnError("busy")`` so the whole acceptance rolls
+    back and nothing is accepted.
+    """
+
+    from .task_orchestrator import TaskTurnError
+
+    row = db.get(
+        TaskAutoRecovery, int(task.id), with_for_update=True, populate_existing=True
+    )
+    if not _auto_resume_pending(db, task, row):
+        return False
+    assert row is not None
+    from_state = TaskAutoRecoveryState(row.state)
+    task_version = int(task.state_version or 0)
+    row_as_read = select(TaskAutoRecovery.task_id).where(
+        *_row_cas(row, from_state, fenced=False)
+    )
+    bumped = _rowcount(
+        db.execute(
+            update(Task)
+            .where(
+                Task.id == task.id,
+                Task.run_id == task.run_id,
+                Task.state_version == task.state_version,
+                task_status_predicate.eq(TaskStatus.PAUSED),
+                Task.control_state == TaskControlState.PAUSED.value,
+                row_as_read.exists(),
+            )
+            .values(state_version=func.coalesce(Task.state_version, 0) + 1)
+            .execution_options(synchronize_session=False)
+        )
+    )
+    if bumped != 1:
+        raise TaskTurnError("busy")
+    moved = _rowcount(
+        db.execute(
+            update(TaskAutoRecovery)
+            .where(*_row_cas(row, from_state, fenced=False))
+            .values(paused_state_version=task_version + 1)
+            .execution_options(synchronize_session=False)
+        )
+    )
+    if moved != 1:
+        raise TaskTurnError("busy")
+    db.refresh(task)
+    db.refresh(row)
+    result = _give_up_no_commit(
+        db,
+        task,
+        row,
+        TaskAutoRecoveryState.MANUAL,
+        from_state=from_state,
+        at="sdk_append",
+        state_detail="new_turn",
+        # The event type is ``stale``, like the channel supersede's, so one
+        # timeline query (``stale`` with ``mismatch = new_turn``) covers both;
+        # the row's own state says why it rests in ``manual``. The event's
+        # detail already carries the row's state and state_detail.
+        event_detail={"mismatch": "new_turn"},
+        stop=(TaskRecoveryEventType.STALE, None),
+        fenced=True,
+        log_level=logging.INFO,
+        counter="xagent.task.auto_resume.superseded_by_turn",
+    )
+    if result.outcome is not _Outcome.GAVE_UP:
+        raise TaskTurnError("busy")
+    return True
 
 
 def cancel_pending_auto_resume_no_commit(

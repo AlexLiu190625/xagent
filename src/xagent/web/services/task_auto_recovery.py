@@ -126,9 +126,27 @@ def interruption_pause_result() -> dict[str, Any]:
     return {"error": None}
 
 
-# Callers that own their own protocol for a stopped run: SDK and A2A clients,
-# external cancellation, and anonymous visitors of a widget or shared link.
-_INELIGIBLE_SOURCES = frozenset({"sdk", "a2a", "external", "widget", "shared_link"})
+# Callers that own their own protocol for a stopped run: A2A clients, external
+# cancellation, and anonymous visitors of a widget or shared link. SDK tasks
+# are eligible: an SDK ``wait()`` keeps waiting on a PAUSED task, so a client
+# still waiting on it receives the resumed run's result.
+_INELIGIBLE_SOURCES = frozenset({"a2a", "external", "widget", "shared_link"})
+
+# Callers that only ever read a task's status. A settlement interruption of
+# one of their runs ends FAILED with the provider's error, as it always has;
+# pausing it would leave the task PAUSED for good once automatic resume gives
+# up, which is worse for a caller that sees nothing but the status. Lease
+# expiry is not a settlement interruption and is paused (and resumed) for
+# them as for any other task.
+_STATUS_ONLY_SOURCES = frozenset({"sdk"})
+
+
+def is_status_only_source(source: Any) -> bool:
+    """Whether a task of ``source`` has a caller that only reads its status."""
+
+    return str(source or "internal") in _STATUS_ONLY_SOURCES
+
+
 _TRIGGER_TYPES = frozenset(member.value for member in TriggerType)
 
 # TriggerRun error for a run a settling path paused after an interruption
@@ -160,7 +178,7 @@ def auto_recovery_eligibility(db: Session, task: Task) -> AutoRecoveryEligibilit
 
     Rules apply in order and the first match wins:
 
-    1. SDK, A2A, external, widget and shared-link tasks are ineligible.
+    1. A2A, external, widget and shared-link tasks are ineligible.
     2. Workforce tasks are eligible unless their run is a preview (or the
        run row is gone, so it cannot be shown not to be one).
     3. Trigger tasks are eligible.
@@ -292,7 +310,7 @@ def record_interruption_no_commit(
         state, state_detail = TaskAutoRecoveryState.INELIGIBLE, eligibility.detail
     elif (
         gated_by_settlement_switches
-        and _pausable_with_infra_switch(reason, eligibility.kind)
+        and _pausable_with_infra_switch(reason, eligibility.kind, task.source)
         and not get_task_infra_failure_pause_enabled()
     ):
         state, state_detail = TaskAutoRecoveryState.DISABLED, None
@@ -761,11 +779,15 @@ SETTLEMENT_PAUSE_DEFERRED_REASONS: frozenset[InterruptionReason] = frozenset()
 
 
 def _pausable_with_infra_switch(
-    reason: InterruptionReason, kind: str | None = None
+    reason: InterruptionReason,
+    kind: str | None = None,
+    source: Any = None,
 ) -> bool:
     """Whether ``XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED`` decides ``reason``.
 
-    False for a deferred reason. ``model_output_invalid`` is not an
+    False for a deferred reason and for a status-only ``source``
+    (:data:`_STATUS_ONLY_SOURCES`): settlement never pauses their runs, so the
+    switch does not decide them. ``model_output_invalid`` is not an
     infrastructure failure: a run paused for it is worth stopping only when
     an automatic resume will resample it, so it also needs automatic resume
     on and, when ``kind`` is known, a task kind it schedules
@@ -773,7 +795,7 @@ def _pausable_with_infra_switch(
     is unreachable and kept as the seam). Otherwise it fails as before.
     """
 
-    if reason in SETTLEMENT_PAUSE_DEFERRED_REASONS:
+    if reason in SETTLEMENT_PAUSE_DEFERRED_REASONS or is_status_only_source(source):
         return False
     if reason is InterruptionReason.MODEL_OUTPUT_INVALID:
         return get_task_auto_resume_enabled() and (
@@ -906,7 +928,9 @@ def decide_interruption(
 
     1. Settlement does not pause for ``reason`` (:func:`settlement_pause_enabled`:
        the switch is off, the reason is deferred, or it is
-       ``model_output_invalid`` with automatic resume off), an ineligible task, or
+       ``model_output_invalid`` with automatic resume off), a task of a
+       status-only source (:data:`_STATUS_ONLY_SOURCES`, decided from the row
+       alone before anything is read), an ineligible task, or
        ``model_output_invalid`` on a task kind automatic resume does not
        schedule (:func:`auto_resume_schedulable`; nothing would resample it;
        unreachable today, every eligible kind is scheduled): ``LEGACY``.
@@ -925,6 +949,10 @@ def decide_interruption(
     """
 
     if not settlement_pause_enabled(reason):
+        return legacy_interruption_decision(reason)
+    # Attribute-only, before any database read: a connectivity failure
+    # reading eligibility must not defer a run that was never going to pause.
+    if is_status_only_source(task.source):
         return legacy_interruption_decision(reason)
     try:
         eligibility = auto_recovery_eligibility(db, task)

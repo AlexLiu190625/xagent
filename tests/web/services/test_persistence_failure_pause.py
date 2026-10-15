@@ -1091,7 +1091,7 @@ async def test_pause_projects_like_lease_recovery(canonical, monkeypatch, auto_r
     [
         ("trigger", "disabled", None, "interrupted"),
         # Ineligibility wins over the switch.
-        ("sdk", "ineligible", "ineligible:source_sdk", "ineligible"),
+        ("a2a", "ineligible", "ineligible:source_a2a", "ineligible"),
     ],
 )
 async def test_switch_off_settles_exactly_as_before(
@@ -1133,8 +1133,8 @@ async def test_switch_off_settles_exactly_as_before(
 @pytest.mark.asyncio
 async def test_ineligible_task_settles_exactly_as_before(canonical, monkeypatch):
     factory, _tid = canonical
-    gated = _projected_task(factory, source="sdk")
-    baseline = _projected_task(factory, source="sdk")
+    gated = _projected_task(factory, source="a2a")
+    baseline = _projected_task(factory, source="a2a")
     gated_lease = _prepare_run(factory, gated)
     baseline_lease = _prepare_run(factory, baseline)
 
@@ -1149,7 +1149,7 @@ async def test_ineligible_task_settles_exactly_as_before(canonical, monkeypatch)
         factory, baseline, baseline_lease
     )
     _task, row, events = _state(factory, gated["task"])
-    assert (row.state, row.state_detail) == ("ineligible", "ineligible:source_sdk")
+    assert (row.state, row.state_detail) == ("ineligible", "ineligible:source_a2a")
     assert [e.event for e in events] == ["ineligible"]
 
 
@@ -1516,7 +1516,7 @@ def test_result_paths_decide_every_verdict(canonical, monkeypatch, path, case):
 def test_result_paths_settle_exactly_as_before(canonical, monkeypatch, path, case):
     if case == "switch_off":
         monkeypatch.setenv(PAUSE_SWITCH, "false")
-    source = "sdk" if case == "ineligible" else "trigger"
+    source = "a2a" if case == "ineligible" else "trigger"
     factory, _tid = canonical
     plain = {k: v for k, v in PERSISTENCE_RESULT.items() if k != "interruption_reason"}
     gated = _projected_task(factory, source=source)
@@ -1822,7 +1822,7 @@ def test_result_pause_reports_the_scheduled_resume(canonical, monkeypatch, path)
         ),
         ("manual", "auto_resume_disabled", [("task_paused", None)]),
         ("manual", "supersede_check_failed", [("task_paused", None)]),
-        ("ineligible", "ineligible:source_sdk", [("task_paused", None)]),
+        ("ineligible", "ineligible:source_a2a", [("task_paused", None)]),
     ],
 )
 async def test_pause_broadcast_announces_only_a_planned_resume(state, detail, expected):

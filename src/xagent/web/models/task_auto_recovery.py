@@ -86,7 +86,7 @@ class TaskAutoRecovery(Base):  # type: ignore
     reason: Mapped[str] = mapped_column(String(32), nullable=False)
     # A TaskAutoRecoveryState value.
     state: Mapped[str] = mapped_column(String(24), nullable=False)
-    # e.g. ``ineligible:source_sdk``.
+    # e.g. ``ineligible:source_a2a``.
     state_detail: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # ``tasks.state_version`` after the settling write; for a PAUSED row it
     # fences dispatch (a FAILED row's value is recorded but never read).

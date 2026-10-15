@@ -178,7 +178,7 @@ def _k(auto_resume: dict[str, Any]) -> tuple[int, int]:
             {"state": "manual", "state_detail": "user_cancelled", "total_resumes": 2},
             ("stopped", "cancelled", 2, None),
         ),
-        ({"state": "ineligible", "state_detail": "ineligible:source_sdk"}, None),
+        ({"state": "ineligible", "state_detail": "ineligible:source_a2a"}, None),
         ({"state": "ineligible", "state_detail": "ineligible:preview"}, None),
         ({"state": "stale", "state_detail": "dispatch:run_id"}, None),
         ({"state": "disabled"}, None),
@@ -513,7 +513,7 @@ def test_switched_off_manual_reads_none_whether_recorded_or_drained(
 def test_dispatch_time_ineligible_reads_none(factory):
     task_id, _recorded, now = _record(factory)
     with factory() as db:
-        db.get(Task, task_id).source = "sdk"
+        db.get(Task, task_id).source = "a2a"
         db.commit()
 
     stopped = _tick(factory, task_id, _due(factory, task_id))

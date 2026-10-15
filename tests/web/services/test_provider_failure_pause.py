@@ -88,6 +88,7 @@ from xagent.core.agent import (
 from xagent.core.agent.checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
     CHECKPOINT_TYPE,
+    ExecutionEventPersistenceError,
     TraceCheckpointStore,
 )
 from xagent.core.agent.execution_adapter import INTERRUPTED_USER_MESSAGE
@@ -834,7 +835,66 @@ def _switch_case(m: pytest.MonkeyPatch, case: str) -> str:
     elif case in {"infra_default", "pause_requested"}:
         if case == "infra_default":
             m.delenv(PAUSE_SWITCH)
-    return "sdk" if case == "ineligible" else "trigger"
+    return "a2a" if case == "ineligible" else "trigger"
+
+
+_RAISED_BY_REASON = {
+    "llm_unavailable": lambda: LLMTimeoutError("provider timed out"),
+    "model_output_invalid": lambda: LLMEmptyContentError("empty response"),
+    "persistence_failure": lambda: ExecutionEventPersistenceError("event write failed"),
+}
+
+
+async def _settle_status_only(path: str, factory, ids, lease, reason: str) -> None:
+    if path == "exception":
+        await _schedule_failing_turn(factory, ids, lease, _RAISED_BY_REASON[reason]())
+    else:
+        _settle_result(path, factory, ids, lease, RESULTS[reason])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("db", ["ok", "unavailable_during_eligibility"])
+@pytest.mark.parametrize("path", ["result", "resumed_result", "channel", "exception"])
+@pytest.mark.parametrize("reason", sorted(RESULTS))
+@pytest.mark.parametrize("infra", ["unset", "true", "false"])
+@pytest.mark.parametrize("auto", ["on", "off"])
+async def test_status_only_settlement(
+    canonical, monkeypatch, auto, infra, reason, path, db
+):
+    """An SDK task's interruption settles FAILED with its own error, whatever
+    the switches, exactly like an A2A task, and the verdict never reads the
+    database (so a connectivity failure cannot defer it)."""
+
+    monkeypatch.setenv(AUTO_RESUME_SWITCH, "true" if auto == "on" else "false")
+    if infra == "unset":
+        monkeypatch.delenv(PAUSE_SWITCH)
+    else:
+        monkeypatch.setenv(PAUSE_SWITCH, infra)
+    factory, _tid = canonical
+    sdk, baseline = (
+        _projected_task(factory, source="sdk"),
+        _projected_task(factory, source="a2a"),
+    )
+    sdk_lease = _prepare_run(factory, sdk)
+    baseline_lease = _prepare_run(factory, baseline)
+
+    with monkeypatch.context() as m:
+        if db != "ok":
+            _break_decision(m, "eligibility", _connection_reset())
+        await _settle_status_only(path, factory, sdk, sdk_lease, reason)
+    await _settle_status_only(path, factory, baseline, baseline_lease, reason)
+
+    projection = _full_projection(factory, sdk, sdk_lease)
+    assert projection == _full_projection(factory, baseline, baseline_lease)
+    assert projection["status"] == TaskStatus.FAILED
+    assert projection["runner_id"] is None
+    _task, row, _events = _state(factory, sdk["task"])
+    if db == "ok":
+        assert (row.reason, row.state) == (reason, "manual")
+    else:
+        # The recorder reads eligibility inside its own SAVEPOINT; a
+        # connectivity failure there skips the row, never the settlement.
+        assert row is None
 
 
 @pytest.mark.parametrize(

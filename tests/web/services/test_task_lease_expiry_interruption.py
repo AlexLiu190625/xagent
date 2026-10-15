@@ -384,8 +384,12 @@ def test_infra_failure_pause_switch_does_not_gate_lease_expiry(factory, monkeypa
         (None, "false", ("disabled", None, "interrupted")),
         (None, "true", ("manual", None, "interrupted")),
         # Ineligibility is permanent, so it wins over the temporary switch.
-        ("sdk", "false", ("ineligible", "ineligible:source_sdk", "ineligible")),
-        ("sdk", "true", ("ineligible", "ineligible:source_sdk", "ineligible")),
+        ("a2a", "false", ("ineligible", "ineligible:source_a2a", "ineligible")),
+        ("a2a", "true", ("ineligible", "ineligible:source_a2a", "ineligible")),
+        # A status-only source is never paused for a settlement failure, so
+        # the switch is not what kept it from pausing.
+        ("sdk", "false", ("manual", None, "interrupted")),
+        ("sdk", "true", ("manual", None, "interrupted")),
     ],
 )
 def test_gated_settlement_state_precedence(
@@ -450,7 +454,6 @@ def _workforce_run(db: Session, user: User, *, is_preview: bool) -> int:
 @pytest.mark.parametrize(
     ("case", "expected"),
     [
-        ("sdk", "ineligible:source_sdk"),
         ("a2a", "ineligible:source_a2a"),
         ("external", "ineligible:source_external"),
         ("widget", "ineligible:source_widget"),
@@ -471,7 +474,7 @@ def test_ineligible_tasks_recover_unchanged_and_record_why(
     with factory() as db:
         user = _user(db)
         fields: dict[str, Any] = {}
-        if case in {"sdk", "a2a", "external", "widget", "shared_link"}:
+        if case in {"a2a", "external", "widget", "shared_link"}:
             fields["source"] = case
         elif case == "workforce_preview":
             fields["agent_config"] = {
@@ -504,6 +507,10 @@ def test_ineligible_tasks_recover_unchanged_and_record_why(
     ("case", "kind"),
     [
         ("normal", "normal"),
+        # An SDK wait() keeps waiting on a PAUSED task, so the resumed run's
+        # result still reaches it.
+        ("sdk", "normal"),
+        ("sdk_workforce", "workforce"),
         ("trigger", "trigger_webhook"),
         ("trigger_no_type", "trigger"),
         ("trigger_unknown_type", "trigger"),
@@ -531,6 +538,13 @@ def test_eligible_tasks_record_their_kind(factory, monkeypatch, case, kind):
                     "workforce_run_id": _workforce_run(db, user, is_preview=False),
                 },
             }[case]
+        elif case == "sdk":
+            fields["source"] = "sdk"
+        elif case == "sdk_workforce":
+            fields["source"] = "sdk"
+            fields["agent_config"] = {
+                "workforce_run_id": _workforce_run(db, user, is_preview=False)
+            }
         elif case == "workforce":
             fields["agent_config"] = {
                 "workforce_run_id": _workforce_run(db, user, is_preview=False)
@@ -1256,7 +1270,7 @@ def test_the_window_counts_from_the_lease_lapse_not_the_recovery(factory, ago, s
 def test_ineligible_and_failed_recoveries_announce_no_resume(factory):
     with factory() as db:
         user = _user(db)
-        ineligible = int(_task(db, user, source="sdk").id)
+        ineligible = int(_task(db, user, source="a2a").id)
         _task(db, user, checkpoint=None)
 
     batch = recover_expired_task_leases_batch_isolated(
