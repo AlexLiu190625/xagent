@@ -448,3 +448,108 @@ async def test_app_shutdown_stops_diagnostics_after_the_drain(
 
     stops = [name for name in order if name != "other"]
     assert stops == ["drain", "diagnostics"]
+
+
+def _gate_probe(manager, monkeypatch, *, window_started_at: float = 0.0):
+    """Return (clock, close, open_, drain) helpers around one manager.
+
+    ``close`` / ``open_`` make the process full / empty at a clock reading and
+    build a cap snapshot with limit 1; ``drain`` is the diagnostics drain.
+    """
+
+    monkeypatch.setenv("XAGENT_TASK_EXECUTION_ROLE", "combined")
+    monkeypatch.setattr(process_diagnostics._window, "started_at", window_started_at)
+    clock = _FakeClock()
+    manager._cap_clock = clock
+
+    def close(at: float) -> None:
+        clock.now = at
+        manager._live_executions[1] = {object()}  # type: ignore[assignment]
+        manager.dispatch_cap_snapshot(1)
+
+    def open_(at: float) -> None:
+        clock.now = at
+        manager._live_executions.pop(1, None)
+        manager.dispatch_cap_snapshot(1)
+
+    def drain(at: float) -> float:
+        return process_diagnostics.drain_execution_counters(now=at).gate_held_s
+
+    return clock, close, open_, drain
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "row",
+    ["never_closed", "closed_within_window", "split_across_drain"]
+    + ["bounded_by_window", "drain_observes", "zeroed_after_drain"],
+)
+async def test_gate_held_seconds_measures_closed_time(manager, monkeypatch, row):
+    started_at = 100.0 if row == "bounded_by_window" else 0.0
+    _, close, open_, drain = _gate_probe(
+        manager, monkeypatch, window_started_at=started_at
+    )
+
+    if row == "never_closed":
+        open_(1)
+        open_(5)
+        assert drain(10) == 0.0
+    elif row == "closed_within_window":
+        open_(1)
+        close(3)
+        open_(5)
+        assert drain(10) == 2.0
+    elif row == "split_across_drain":
+        close(8)
+        assert drain(10) == 2.0
+        open_(11)
+        assert drain(13) == 1.0
+    elif row == "bounded_by_window":
+        close(90)
+        assert drain(110) == 10.0
+    elif row == "drain_observes":
+        open_(0)
+        manager._live_executions[1] = {object()}  # type: ignore[assignment]
+        assert drain(10) == 0.0
+        assert drain(15) == 5.0
+    else:
+        close(3)
+        open_(5)
+        assert drain(10) == 2.0
+        assert drain(20) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_gate_held_counts_a_full_process_with_nothing_queued(
+    manager, monkeypatch
+):
+    clock, _, _, drain = _gate_probe(manager, monkeypatch)
+    running = asyncio.create_task(asyncio.sleep(3600))
+    try:
+        manager.register_task(1, running)
+        clock.now = 0.0
+        manager.dispatch_cap_snapshot(1)
+        assert drain(60) == 60.0
+    finally:
+        running.cancel()
+        await asyncio.gather(running, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("row", ["shutdown_closes_interval", "new_lifespan_resets"])
+async def test_gate_held_after_shutdown_and_new_lifespan(manager, monkeypatch, row):
+    clock, _, _, drain = _gate_probe(manager, monkeypatch)
+    clock.now = 0.0
+    # A reservation outlives cancellation, so only the observation that
+    # follows shutdown's clearing of the tables can end the interval at 4.0.
+    assert manager.reserve_dispatch_slot(1, limit=1) is not None
+    manager.dispatch_cap_snapshot(1)
+    clock.now = 4.0
+    await manager.shutdown()
+
+    if row == "shutdown_closes_interval":
+        assert drain(10) == 4.0
+    else:
+        clock.now = 6.0
+        manager.start_accepting()
+        assert drain(10) == 0.0

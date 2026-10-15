@@ -76,9 +76,12 @@ def local_execution_unless_selected(monkeypatch):
 
 
 _DATABASE_MODULE = "xagent.web.models.database"
-_DATABASE_ACCESSORS = ("get_session_local", "get_optional_session_local", "get_engine")
-# ``get_db`` reads ``_SessionLocal`` too but is not checked yet: tests still
-# patch it directly, so adding it here waits on converting those tests.
+_DATABASE_ACCESSORS = (
+    "get_session_local",
+    "get_optional_session_local",
+    "get_engine",
+    "get_db",
+)
 # A leaked binding stays leaked for the rest of the process; report it once,
 # against the test that leaked it, instead of failing every later test too.
 _reported_stale_database_accessors: set[str] = set()

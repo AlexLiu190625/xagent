@@ -246,7 +246,7 @@ def test_websocket_reads_v2_without_legacy_queries_and_enforces_access(
     from xagent.web.api import websocket
 
     factory, task_id = canonical
-    monkeypatch.setattr("xagent.web.models.database.get_db", lambda: iter([factory()]))
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", factory)
     monkeypatch.setattr(websocket, "cache_get", lambda *_: None)
     monkeypatch.setattr(websocket, "cache_set", lambda *_a, **_k: None)
     with factory() as db:

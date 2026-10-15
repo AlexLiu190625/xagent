@@ -9,6 +9,11 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from xagent.core.memory.in_memory import InMemoryMemoryStore
 from xagent.web import dynamic_memory_store as dynamic_memory_store_module
+
+# Imported up front so ``chat`` binds the real ``get_db``: the preview tests
+# patch ``database.get_db`` before ``patch("xagent.web.api.chat....")`` would
+# otherwise import ``chat`` for the first time and freeze the mock into it.
+from xagent.web.api import chat as _chat_api  # noqa: F401
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api.websocket import (
     ConnectionManager,

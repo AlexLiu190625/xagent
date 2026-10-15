@@ -37,8 +37,14 @@ Field meanings:
   process, not the task's stored status.
 - ``window_s``: actual seconds covered; longer than 60 when the loop was
   blocked at flush time.
-- ``gate_held_s``: seconds claim loops waited on a per-process in-flight cap.
-  No such cap exists, so it is always ``0.0``.
+- ``gate_held_s``: seconds in the window this process was at its cap
+  (``XAGENT_DISPATCHER_MAX_INFLIGHT_PER_PROCESS``): its active task ids
+  numbered at least the limit, so its dispatcher did not claim commands that
+  would start a new execution here. It is time at the cap, not time work waited:
+  a process running exactly the limit with nothing queued reports the whole
+  window. Checked at each dispatch attempt and at the flush, so each change
+  is late by at most the gap between attempts (0.5 s while the dispatcher is
+  idle). Always ``0.0`` in a process that does not dispatch task commands.
 - ``loop_lag_max_ms`` / ``loop_lag_samples``: largest event-loop scheduling
   delay seen by a 1-second sampler, and the number of samples delayed by at
   least 500 ms.
@@ -139,6 +145,7 @@ def drain_execution_counters(now: float | None = None) -> ExecutionCounters:
     window_s = 0.0 if started_at is None else max(0.0, now - started_at)
     inflight, resume_inflight = background_task_manager.inflight_counts()
     started, ok, failed, cancelled = background_task_manager.drain_window_counts()
+    gate_held_s = min(background_task_manager.drain_gate_held_seconds(now), window_s)
     counters = ExecutionCounters(
         role=_resolve_role(),
         pid=os.getpid(),
@@ -149,7 +156,7 @@ def drain_execution_counters(now: float | None = None) -> ExecutionCounters:
         finished_ok=ok,
         finished_failed=failed,
         finished_cancelled=cancelled,
-        gate_held_s=0.0,
+        gate_held_s=gate_held_s,
         loop_lag_max_ms=_window.lag_max_ms,
         loop_lag_samples=_window.lag_samples,
     )

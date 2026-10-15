@@ -109,7 +109,7 @@ async def _replay(
     async def send_personal_message(event: dict, websocket: object) -> None:
         sent.append(event)
 
-    monkeypatch.setattr("xagent.web.models.database.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", SessionLocal)
     monkeypatch.setattr("xagent.web.api.websocket.get_db", get_test_db)
     monkeypatch.setattr(
         "xagent.web.api.websocket.get_session_local", lambda: SessionLocal
@@ -167,7 +167,7 @@ async def test_one_question_replays_once_and_keeps_the_trace_event_identity(
     # written exactly the way production writes them. ``task_execution`` binds
     # ``get_db`` at import time, so the module attribute is the one to patch.
     monkeypatch.setattr("xagent.web.services.task_execution.get_db", get_test_db)
-    monkeypatch.setattr("xagent.web.models.database.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", SessionLocal)
     _persist_agent_outbound_event(
         task_id,
         {

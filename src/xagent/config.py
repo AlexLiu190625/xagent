@@ -81,6 +81,8 @@ TASK_AUTO_RESUME_LLM_MAX_ELAPSED_SECONDS = (
 TASK_AUTO_RESUME_MODEL_OUTPUT_MAX_NO_PROGRESS = (
     "XAGENT_TASK_AUTO_RESUME_MODEL_OUTPUT_MAX_NO_PROGRESS"
 )
+# Shared task command dispatcher.
+DISPATCHER_MAX_INFLIGHT_PER_PROCESS = "XAGENT_DISPATCHER_MAX_INFLIGHT_PER_PROCESS"
 UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS = (
     "XAGENT_UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS"
 )
@@ -627,6 +629,12 @@ def get_task_auto_resume_model_output_max_no_progress() -> int:
     """Get the run-level retry limit for model_output_invalid (default 2)."""
 
     return _get_positive_int_env(TASK_AUTO_RESUME_MODEL_OUTPUT_MAX_NO_PROGRESS, 2)
+
+
+def get_dispatcher_max_inflight_per_process() -> int:
+    """Get the per-process cap on executions the dispatcher admits (default 80)."""
+
+    return _get_positive_int_env(DISPATCHER_MAX_INFLIGHT_PER_PROCESS, 80)
 
 
 def get_uploaded_file_recovery_interval_seconds() -> int:

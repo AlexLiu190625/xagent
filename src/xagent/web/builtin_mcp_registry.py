@@ -1840,13 +1840,20 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "accounting.payments",
                 "accounting.banktransactions",
                 "accounting.manualjournals",
+                "accounting.reports.aged.read",
+                "accounting.reports.profitandloss.read",
+                "accounting.reports.balancesheet.read",
+                "accounting.reports.trialbalance.read",
                 "offline_access",
             ],
             "is_visible_in_connector": True,
-            # Match SG's database-configured launcher; inject only the actor's token.
+            # In-repo server (xagent.web.tools.mcp.xero). It replaced the
+            # third-party @xeroapi/xero-mcp-server package, whose lists could
+            # not report totals or filter overdue invoices. The actor's token
+            # still arrives as XERO_CLIENT_BEARER_TOKEN.
             "launch_config": {
-                "command": "npx",
-                "args": ["-y", "@xeroapi/xero-mcp-server@latest"],
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.xero"],
                 "env_mapping": {"XERO_CLIENT_BEARER_TOKEN": "access_token"},
             },
         },

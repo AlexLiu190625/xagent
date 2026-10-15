@@ -13,6 +13,7 @@ from xagent.web.models.task_admission import TaskAdmissionBucket, TaskAdmissionT
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.services import task_command_transport as transport
 from xagent.web.services import task_coordinator_runtime as runtime
+from xagent.web.services.task_dispatch_cap import DispatchCapSnapshot
 
 engine = engine_fixture
 task_id = task_id_fixture
@@ -184,5 +185,21 @@ def test_count_ignores_process_local_busy_tasks(factory, task_id, monkeypatch):
     assert transport._find_command_candidate(ids["idle_head"], (busy,)) is None
     # The count still reports every shared-mode selection in the seed,
     # idle_head included: idle_head, own_expired_owner, start, admission_head.
+    with factory() as db:
+        assert transport.count_claimable_task_commands(db, runner_id=RUNNER) == 4
+
+
+def test_count_ignores_the_process_dispatch_cap(factory, task_id, monkeypatch):
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    ids = seed(factory, task_id)
+    # A closed cap: this process already runs as many executions as it may,
+    # none of them for a seeded task.
+    closed = DispatchCapSnapshot(limit=1, active_ids=frozenset({-1}))
+    assert closed.closed
+    monkeypatch.setattr(transport, "build_dispatch_cap_snapshot", lambda: closed)
+
+    # The dispatcher's scan skips a command that would open an execution.
+    assert transport._find_command_candidate(ids["idle_head"], (), closed) is None
+    # The count still reports every shared-mode selection in the seed.
     with factory() as db:
         assert transport.count_claimable_task_commands(db, runner_id=RUNNER) == 4

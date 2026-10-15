@@ -3946,6 +3946,42 @@ class TestTaskAutoRecoveryConfig:
 
 
 @pytest.mark.parametrize(
+    ("raw", "expected", "warns"),
+    [
+        (None, 80, False),
+        ("7", 7, False),
+        ("1", 1, False),
+        (" 7 ", 7, False),
+        ("100000", 100000, False),
+        ("0", 80, True),
+        ("-1", 80, True),
+        ("abc", 80, True),
+        ("", 80, True),
+        ("7.5", 80, True),
+    ],
+)
+def test_dispatcher_max_inflight_env_parsing(monkeypatch, caplog, raw, expected, warns):
+    env_var = config.DISPATCHER_MAX_INFLIGHT_PER_PROCESS
+    assert env_var == "XAGENT_DISPATCHER_MAX_INFLIGHT_PER_PROCESS"
+    if raw is None:
+        monkeypatch.delenv(env_var, raising=False)
+    else:
+        monkeypatch.setenv(env_var, raw)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="xagent.config"):
+        assert config.get_dispatcher_max_inflight_per_process() == expected
+
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name == "xagent.config" and record.levelno == logging.WARNING
+    ]
+    assert len(warnings) == int(warns)
+    assert all(env_var in record.getMessage() for record in warnings)
+
+
+@pytest.mark.parametrize(
     "name,value",
     [
         ("XAGENT_EXECUTION_BUDGET_DEFAULT_TOKENS", "-1"),
