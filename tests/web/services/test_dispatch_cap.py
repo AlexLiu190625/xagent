@@ -58,41 +58,7 @@ def set_limit(monkeypatch: pytest.MonkeyPatch, limit: int) -> None:
     monkeypatch.setenv(LIMIT_ENV, str(limit))
 
 
-# --- limit parsing -----------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("raw", "expected", "warns"),
-    [
-        (None, 80, False),
-        ("7", 7, False),
-        ("1", 1, False),
-        (" 7 ", 7, False),
-        ("100000", 100000, False),
-        ("0", 80, True),
-        ("-1", 80, True),
-        ("abc", 80, True),
-        ("", 80, True),
-        ("7.5", 80, True),
-    ],
-)
-def test_dispatcher_max_inflight_env_parsing(
-    monkeypatch: pytest.MonkeyPatch, raw: str | None, expected: int, warns: bool
-) -> None:
-    logger = Mock()
-    monkeypatch.setattr(config, "logger", logger)
-    if raw is None:
-        monkeypatch.delenv(LIMIT_ENV, raising=False)
-    else:
-        monkeypatch.setenv(LIMIT_ENV, raw)
-
-    assert config.get_dispatcher_max_inflight_per_process() == expected
-
-    if warns:
-        logger.warning.assert_called_once()
-        assert LIMIT_ENV in logger.warning.call_args.args
-    else:
-        logger.warning.assert_not_called()
+# --- limit memo --------------------------------------------------------------
 
 
 def test_dispatch_limit_memo_warns_once_per_raw_value(

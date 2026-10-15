@@ -2,9 +2,10 @@
 
 The cap counts task ids, not handles: a task counts from the moment a dispatch
 attempt reserves a slot for it until its last live execution handle ends, so
-one task never occupies two slots. ``BackgroundTaskManager`` owns the counted
-state; this module owns the limit, the command-kind classification and the
-immutable view one dispatch attempt works from.
+one task never occupies two slots. Executions registered outside the
+dispatcher count as well, but the cap never holds them. ``BackgroundTaskManager``
+owns the counted state; this module owns the limit, the command-kind
+classification and the immutable view one dispatch attempt works from.
 """
 
 from __future__ import annotations

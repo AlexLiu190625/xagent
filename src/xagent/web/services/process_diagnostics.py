@@ -38,7 +38,8 @@ Field meanings:
 - ``window_s``: actual seconds covered; longer than 60 when the loop was
   blocked at flush time.
 - ``gate_held_s``: seconds claim loops waited on a per-process in-flight cap.
-  No such cap exists, so it is always ``0.0``.
+  The dispatcher cap (``XAGENT_DISPATCHER_MAX_INFLIGHT_PER_PROCESS``) does not
+  report into it yet, so it is always ``0.0``.
 - ``loop_lag_max_ms`` / ``loop_lag_samples``: largest event-loop scheduling
   delay seen by a 1-second sampler, and the number of samples delayed by at
   least 500 ms.

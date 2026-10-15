@@ -1678,7 +1678,10 @@ async def dispatch_one_task_command(
             )
             if reservation is None:
                 # The cap filled after the snapshot. An execution end signals
-                # the dispatcher, which retries then.
+                # the dispatcher, which retries then. Releasing another
+                # attempt's reservation signals nothing, so when the slot was
+                # held by an attempt that ends without starting an execution,
+                # the retry waits for the idle interval or the next notify.
                 return False
         try:
             coordinator = await registry.ensure(task_id)

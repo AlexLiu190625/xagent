@@ -4714,6 +4714,14 @@ class BackgroundTaskManager:
         # and has not yet seen its execution registered or the attempt end.
         self._dispatch_reservations: Counter[int] = Counter()
 
+    def _track_live_execution(self, task_id: int, task: asyncio.Task) -> None:
+        self._live_executions.setdefault(task_id, set()).add(task)
+        # Both callers run this before they register the cleanup callback, so
+        # the handle has left the table by the time cleanup signals a freed slot.
+        task.add_done_callback(
+            lambda finished: self._drop_live_execution(task_id, finished)
+        )
+
     def _drop_live_execution(self, task_id: int, task: asyncio.Task) -> None:
         handles = self._live_executions.get(task_id)
         if handles is None:
@@ -4818,12 +4826,7 @@ class BackgroundTaskManager:
             raise RuntimeError("Background task manager is shutting down")
         # Counted from here, so a handle that track_execution cancels still
         # leaves the table through its own done callback.
-        self._live_executions.setdefault(task_id, set()).add(task)
-        # Registered before the cleanup callback, so the handle has left the
-        # table by the time cleanup signals a freed slot.
-        task.add_done_callback(
-            lambda finished: self._drop_live_execution(task_id, finished)
-        )
+        self._track_live_execution(task_id, task)
         from .task_coordinator_runtime import current_task_coordinator
 
         coordinator = current_task_coordinator(task_id)
@@ -4935,12 +4938,7 @@ class BackgroundTaskManager:
             raise RuntimeError(f"Task {task_id} has no reserved resume slot")
         # Counted from here, so a handle that track_execution cancels still
         # leaves the table through its own done callback.
-        self._live_executions.setdefault(task_id, set()).add(task)
-        # Registered before the cleanup callback, so the handle has left the
-        # table by the time cleanup signals a freed slot.
-        task.add_done_callback(
-            lambda finished: self._drop_live_execution(task_id, finished)
-        )
+        self._track_live_execution(task_id, task)
         from .task_coordinator_runtime import current_task_coordinator
 
         coordinator = current_task_coordinator(task_id)
