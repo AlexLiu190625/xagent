@@ -270,6 +270,42 @@ async def test_idle_check_releases_lease_when_cap_closed(
         assert other_runner_candidate(host, ids[0]) is None
 
 
+async def test_idle_check_releases_lease_once_cap_closes(
+    cap_host: CapHost,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An owner that answered busy with a free slot re-reads the cap each pass."""
+
+    host = cap_host
+    set_limit(monkeypatch, 2)
+    host.live(host.new_task())
+    target = host.new_task()
+    start = add_command(host, target, "start")
+    outcomes = record_idle_outcomes(monkeypatch)
+    caplog.set_level(logging.INFO, logger=runtime.logger.name)
+
+    coordinator = await host.registry.ensure(target)
+    assert coordinator is not None
+    coordinator._ensure_idle_check()
+    await eventually(lambda: outcomes)
+    assert outcomes[0] == "busy"
+    assert lease_runner(host, target) == "worker"
+
+    # Another execution fills the last slot; this process will not run the start.
+    host.live(host.new_task())
+    coordinator.wake()
+    await eventually(lambda: outcomes[-1] == "released")
+
+    assert lease_runner(host, target) is None
+    assert other_runner_candidate(host, start) == start
+    assert [r.getMessage() for r in caplog.records if CAP_LOG in r.getMessage()] == [
+        f"Task {target} lease released by runner worker at its dispatch cap "
+        "(limit=2, active=2); 1 queued execution command(s) left for a process "
+        "with a free slot"
+    ]
+
+
 async def test_full_process_hands_held_start_to_other_runners(
     cap_host: CapHost, monkeypatch: pytest.MonkeyPatch
 ) -> None:
