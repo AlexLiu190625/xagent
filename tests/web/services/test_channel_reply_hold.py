@@ -5,8 +5,9 @@ The hold is derived: ``_read_channel_result`` asks
 shared channel leaf leaves the START without a ``channel_result`` only when
 it recorded ``scheduled``, and the resumed run stores its answer on the
 START. A new channel turn accepted before the resume hands off supersedes
-it. Channel tasks are not scheduled yet, so every case seeds the recovery
-row (or forces the recorded state) directly. Runs on SQLite and, when
+it, and one sent while it hands off is refused as busy. Most cases seed the
+recovery row (or force the recorded state) directly; the shared channel
+cases at the end record and dispatch it for real. Runs on SQLite and, when
 ``XAGENT_TEST_POSTGRES_URL`` is set, on PostgreSQL; the lock-order cases are
 PostgreSQL only.
 """
@@ -50,6 +51,7 @@ from tests.web.services.test_task_execution_event_writer import (
     canonical as canonical_fixture,
 )
 from tests.web.services.test_task_lease_expiry_interruption import _fail_recording
+from xagent.core.agent.interruption import InterruptionReason
 from xagent.web.models import database
 from xagent.web.models.database import Base, get_engine, get_session_local
 from xagent.web.models.task import Task, TaskStatus
@@ -85,9 +87,16 @@ from xagent.web.services.task_execution import (
     _finalize_resumed_task,
     _PreparedTaskFileOutputs,
 )
-from xagent.web.services.task_interaction_close import ActiveInteractionAbsent
+from xagent.web.services.task_interaction_close import (
+    ActiveInteractionAbsent,
+    ActiveInteractionFound,
+)
 from xagent.web.services.task_lease_service import acquire_task_lease, utc_now
-from xagent.web.services.task_orchestrator import TaskTurnPayload
+from xagent.web.services.task_orchestrator import (
+    TaskTurnError,
+    TaskTurnPayload,
+    settle_task_lease_isolated,
+)
 from xagent.web.services.task_settlement_report import SettlementReport
 
 engine = engine_fixture
@@ -1283,3 +1292,313 @@ def test_postgresql_claim_guard_waits_for_an_acceptance_without_deadlock(
     with get_session_local()() as db:
         row = db.get(TaskAutoRecovery, channel.task_id)
         assert (row.state, row.state_detail) == ("stale", "new_turn")
+
+
+# --------------------------------------------------------------------------
+# 10-14. Shared channel tasks are scheduled (9b)
+# --------------------------------------------------------------------------
+
+
+def _paused_channel_turn(selected, path: str) -> SimpleNamespace:
+    """M1 accepted, its run started and stopped for an unavailable model,
+    settled by the channel leaf (S4) or the exception path (S2)."""
+    command_id = _accept_first_turn(selected)
+    with get_session_local()() as db:
+        tid = int(db.get(TaskExecutionCommand, command_id).task_id)
+        db.get(Task, tid).conversation_storage_version = 2
+        db.commit()
+        lease = acquire_task_lease(db, tid, new_run=True)
+    with get_session_local()() as db:
+        start = db.get(TaskExecutionCommand, command_id)
+        start.target_run_id = lease.run_id
+        start.status = "completed"
+        start.result = {"run_id": lease.run_id, "lease_attempt_id": lease.attempt_id}
+        db.commit()
+    _checkpoint(get_session_local(), tid, lease.run_id)
+    if path == "leaf":
+        with get_session_local()() as db:
+            assert finalize_managed_task_lease_result(
+                db,
+                lease,
+                status=TaskStatus.FAILED,
+                execution_result=dict(LLM_RESULT),
+                completion=(command_id, {"success": False, "status": "failed"}),
+                settle_interruption=True,
+            )
+    else:
+        assert settle_task_lease_isolated(
+            lease,
+            error_message="setup/run error: LLMTimeoutError: provider timed out",
+            interruption=InterruptionReason.LLM_UNAVAILABLE,
+        )
+    with get_session_local()() as db:
+        task = db.get(Task, tid)
+        assert (task.status, task.control_state) == (TaskStatus.PAUSED, "paused")
+        version = int(task.state_version)
+    return SimpleNamespace(
+        turn=selected,
+        command_id=command_id,
+        task_id=tid,
+        run_id=lease.run_id,
+        version=version,
+        channel_id=selected.selection.channel_id,
+    )
+
+
+def _row_state(tid: int) -> tuple[str, str | None]:
+    with get_session_local()() as db:
+        row = db.get(TaskAutoRecovery, tid)
+        return row.state, row.state_detail
+
+
+@pytest.mark.parametrize("path", ["leaf", "exception"])
+@pytest.mark.parametrize("auto_resume", ["true", "false"])
+def test_a_shared_channel_interruption_is_scheduled_and_held(
+    selected, monkeypatch, path, auto_resume
+):
+    """S4 and S2 (S5: ``test_eligible_tasks_record_their_kind``)."""
+    monkeypatch.setenv(PAUSE_SWITCH, "true")
+    monkeypatch.setenv(AUTO_RESUME_SWITCH, auto_resume)
+
+    ch = _paused_channel_turn(selected, path)
+
+    stored = _start_result_of(ch.command_id).get("channel_result")
+    read = shared._read_channel_result(ch.command_id, ch.run_id)
+    if auto_resume == "true":
+        assert _row_state(ch.task_id) == ("scheduled", None)
+        assert stored is None
+        assert read is None
+    else:
+        assert _row_state(ch.task_id) == ("manual", "auto_resume_disabled")
+        # The leaf stores it; after S2 the reader derives the same reply.
+        assert stored == (interrupted_channel_result() if path == "leaf" else None)
+        assert read == interrupted_channel_result()
+
+
+def _start_result_of(command_id: int) -> dict[str, Any]:
+    with get_session_local()() as db:
+        return dict(db.get(TaskExecutionCommand, command_id).result or {})
+
+
+def _due_tick(tid: int) -> task_auto_resume.AutoResumeTickReport:
+    with get_session_local()() as db:
+        due = db.get(TaskAutoRecovery, tid).next_attempt_at
+    if due.tzinfo is None:
+        due = due.replace(tzinfo=timezone.utc)
+    return task_auto_resume.run_auto_resume_tick(now=due + timedelta(seconds=1))
+
+
+@pytest.mark.parametrize("switch", ["on", "drained"])
+def test_the_sweeper_dispatches_a_channel_row_or_drains_it(
+    selected, monkeypatch, switch
+):
+    monkeypatch.setenv(PAUSE_SWITCH, "true")
+    monkeypatch.setenv(AUTO_RESUME_SWITCH, "true")
+    ch = _paused_channel_turn(selected, "leaf")
+    if switch == "drained":
+        monkeypatch.setenv(AUTO_RESUME_SWITCH, "false")
+
+    _due_tick(ch.task_id)
+
+    read = shared._read_channel_result(ch.command_id, ch.run_id)
+    if switch == "on":
+        assert _row_state(ch.task_id) == ("dispatched", None)
+        with get_session_local()() as db:
+            (auto,) = db.scalars(
+                sa.select(TaskExecutionCommand).where(
+                    TaskExecutionCommand.task_id == ch.task_id,
+                    TaskExecutionCommand.kind == "resume",
+                )
+            ).all()
+            assert auto.status == "pending"
+        assert read is None
+    else:
+        assert _row_state(ch.task_id) == ("manual", "auto_resume_disabled")
+        assert read == interrupted_channel_result()
+
+
+@pytest.mark.parametrize("state", ["handing_off", "running"])
+def test_a_turn_sent_while_the_resume_hands_off_or_runs_is_busy(channel, state):
+    auto_command_id = _record(channel, state="dispatched", command_status="processing")
+    with get_session_local()() as db:
+        task = db.get(Task, channel.task_id)
+        if state == "handing_off":
+            task.control_state = "resume_requested"
+        else:
+            task.status = TaskStatus.RUNNING
+            task.control_state = "running"
+        db.commit()
+
+    with pytest.raises(TaskTurnError) as refused:
+        shared._accept_channel_turn(
+            _second_turn(channel), TaskTurnPayload("again"), "ingress"
+        )
+
+    assert refused.value.reason == "busy"
+    with get_session_local()() as db:
+        assert int(db.get(Task, channel.task_id).state_version) == channel.version
+        assert _row_state(channel.task_id) == ("dispatched", None)
+        assert [
+            c.command_id
+            for c in db.scalars(
+                sa.select(TaskExecutionCommand).where(
+                    TaskExecutionCommand.task_id == channel.task_id
+                )
+            )
+            if c.id != channel.command_id
+        ] == [auto_command_id]
+    # M1 still waits for the resumed run.
+    assert shared._read_channel_result(channel.command_id, channel.run_id) is None
+
+
+def _hand_off(ch, *, row: dict[str, Any] | None, manual_resume: str | None) -> None:
+    """The task rests PAUSED, ``resume_requested``, on its run: optionally a
+    recovery row (``_recovery_row`` kwargs) and a person's RESUME command
+    with status ``manual_resume``."""
+    with get_session_local()() as db:
+        if row is not None:
+            _recovery_row(db, ch.task_id, ch.run_id, ch.version, **row)
+        if manual_resume is not None:
+            db.add(
+                TaskExecutionCommand(
+                    task_id=ch.task_id,
+                    actor_user_id=db.get(Task, ch.task_id).user_id,
+                    command_id=f"manual-resume-{uuid.uuid4().hex[:8]}",
+                    kind="resume",
+                    payload={"type": "resume_task"},
+                    target_run_id=ch.run_id,
+                    status=manual_resume,
+                )
+            )
+        db.get(Task, ch.task_id).control_state = "resume_requested"
+        db.commit()
+
+
+@pytest.mark.parametrize(
+    ("row", "manual_resume", "busy"),
+    [
+        pytest.param(None, "pending", True, id="manual_resume_queued"),
+        pytest.param(
+            {"state": "manual", "interrupted_ago": 30},
+            "processing",
+            True,
+            id="manual_resume_running_on_a_manual_row",
+        ),
+        # Its command ended, but an automatic resume within the window still
+        # holds the reply: its run may yet take the lease.
+        pytest.param(
+            {
+                "state": "dispatched",
+                "interrupted_ago": 30,
+                "command_status": "completed",
+            },
+            None,
+            True,
+            id="automatic_within_the_window",
+        ),
+        # Stranded: nothing can still start the resumed run.
+        pytest.param(None, "completed", False, id="stranded_manual"),
+        pytest.param(
+            {
+                "state": "dispatched",
+                "interrupted_ago": "past",
+                "command_status": "completed",
+            },
+            None,
+            False,
+            id="stranded_automatic_past_the_window",
+        ),
+    ],
+)
+def test_a_turn_is_busy_only_while_the_hand_off_can_complete(
+    channel, row, manual_resume, busy
+):
+    if row is not None and row["interrupted_ago"] == "past":
+        row = {**row, "interrupted_ago": _limit() + 5}
+    _hand_off(channel, row=row, manual_resume=manual_resume)
+    with get_session_local()() as db:
+        before = {
+            c.id
+            for c in db.scalars(
+                sa.select(TaskExecutionCommand).where(
+                    TaskExecutionCommand.task_id == channel.task_id
+                )
+            )
+        }
+
+    def accept() -> int:
+        return shared._accept_channel_turn(
+            _second_turn(channel), TaskTurnPayload("again"), "ingress"
+        )
+
+    if busy:
+        with pytest.raises(TaskTurnError) as refused:
+            accept()
+        assert refused.value.reason == "busy"
+    else:
+        accepted = accept()
+    with get_session_local()() as db:
+        assert int(db.get(Task, channel.task_id).state_version) == channel.version
+        added = [
+            c
+            for c in db.scalars(
+                sa.select(TaskExecutionCommand).where(
+                    TaskExecutionCommand.task_id == channel.task_id
+                )
+            )
+            if c.id not in before
+        ]
+        if busy:
+            assert added == []
+        else:
+            (start,) = added
+            assert (start.id, start.kind, start.status) == (
+                accepted,
+                "start",
+                "pending",
+            )
+            assert start.payload["state_version"] == channel.version
+
+
+@pytest.mark.asyncio
+async def test_an_unanswered_question_ends_the_hold_within_the_limit(
+    channel, handler, monkeypatch
+):
+    """The interaction gate is unreachable today; made reachable, the
+    automatic resume is skipped, rescheduled and finally exhausted, and the
+    held reply is released once."""
+    monkeypatch.setenv(AUTO_RESUME_SWITCH, "true")
+    auto_command_id = _record(channel, state="dispatched", command_status="processing")
+    handler.interaction.return_value = ActiveInteractionFound(interaction_id=1)
+
+    skipped = await _auto_resume(channel, auto_command_id, attempt_count=1)
+
+    assert skipped.outcome is ResumeCommandOutcome.AUTO_SKIPPED
+    assert skipped.reason_code == "interaction_pending"
+    handler.background.assert_not_called()
+    assert shared._read_channel_result(channel.command_id, channel.run_id) is None
+    with get_session_local()() as db:
+        auto = db.scalars(
+            sa.select(TaskExecutionCommand).where(
+                TaskExecutionCommand.command_id == auto_command_id
+            )
+        ).one()
+        auto.status = "completed"
+        auto.result = {"resume_outcome": "auto_skipped"}
+        db.commit()
+
+    _due_tick(channel.task_id)  # housekeeping: the resume did not happen
+    assert _row_state(channel.task_id)[0] == "scheduled"
+    assert shared._read_channel_result(channel.command_id, channel.run_id) is None
+
+    with get_session_local()() as db:
+        row = db.get(TaskAutoRecovery, channel.task_id)
+        row.no_progress_resumes = row.total_resumes = 3
+        db.commit()
+    _due_tick(channel.task_id)
+
+    assert _row_state(channel.task_id)[0] == "exhausted"
+    assert (
+        shared._read_channel_result(channel.command_id, channel.run_id)
+        == interrupted_channel_result()
+    )

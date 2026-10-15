@@ -751,8 +751,7 @@ def test_channel_pause_fills_the_report_after_the_commit(canonical):
     assert report.paused_for is InterruptionReason.LLM_UNAVAILABLE
     assert report.control_state["status"] == "paused"
     assert report.control_state["run_id"] == lease.run_id
-    # Channel tasks are not scheduled yet, so nothing announces this; pin
-    # the snapshot for when the channel hold lands.
+    # What ``publish_settlement_pause`` announces.
     with factory() as db:
         row = db.get(TaskAutoRecovery, ids["task"])
         assert report.recovery == RecordedInterruption.from_row(row)
@@ -798,8 +797,8 @@ def test_pause_projects_like_lease_recovery(
     right = _full_projection(factory, recovered, recovered_lease)
     if path == "channel":
         # Lease recovery leaves no channel result; a reader derives this one.
-        # A scheduled resume (this task's kind is scheduled; a channel task's
-        # is not yet) leaves none either: the channel waits for the resume.
+        # A scheduled resume leaves none either: the channel waits for the
+        # resume.
         assert left.pop("channel_result") == (
             None if auto_resume == "true" else interrupted_channel_result()
         )
@@ -1350,10 +1349,17 @@ async def _run_shared_channel_turn(
         "background_task_manager",
         task_execution.BackgroundTaskManager(),
     )
+
+    def settled() -> bool:
+        with get_session_local()() as db:
+            task = db.get(Task, selected.selection.task_id)
+            return task.runner_id is None and task.status != TaskStatus.RUNNING
+
     try:
         await task_command_execution.execute_durable_task_command(command)
         async with asyncio.timeout(10):
-            while shared._read_channel_result(command.id, selected.run_id) is None:
+            # A held reply stays unread: wait for the settlement itself.
+            while not settled():
                 await asyncio.sleep(0.01)
             # The channel result commits with the settlement, before the run
             # broadcasts it; let the run finish rather than have shutdown
@@ -1368,28 +1374,43 @@ async def _run_shared_channel_turn(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reason", ["llm_unavailable", "persistence_failure"])
-async def test_shared_channel_turn_pauses_and_its_channel_reads_interrupted(
-    selected, monkeypatch, reason
+@pytest.mark.parametrize(
+    ("reason", "auto_resume"),
+    [
+        ("llm_unavailable", "true"),
+        ("persistence_failure", "true"),
+        # Unusable model output pauses a channel task too: the resume
+        # resamples it.
+        ("model_output_invalid", "true"),
+        ("llm_unavailable", "false"),
+        ("persistence_failure", "false"),
+    ],
+)
+async def test_shared_channel_turn_pauses_and_holds_its_channel_reply(
+    selected, monkeypatch, reason, auto_resume
 ):
-    """The shared channel leaf pauses an eligible interrupted run. Its
-    channel gets the same "interrupted" reply a lease-expiry pause produces
-    (until a later change holds the reply across an automatic resume).
-    Automatic resume leaves channel tasks to their user until then, so the
-    pause records ``manual`` and announces no resume."""
+    """The shared channel leaf pauses an eligible interrupted run. With
+    automatic resume on, the pause schedules a resume and the channel reply
+    waits for it: nothing is stored on the START. Off, the channel gets the
+    same "interrupted" reply a lease-expiry pause produces and the row is
+    left to the user."""
 
-    monkeypatch.setenv(AUTO_RESUME_SWITCH, "true")
+    monkeypatch.setenv(AUTO_RESUME_SWITCH, auto_resume)
+    held = auto_resume == "true"
     published = _capture_task_events(monkeypatch)
 
     command = await _run_shared_channel_turn(selected, monkeypatch, RESULTS[reason])
 
     tid = selected.selection.task_id
     channel_result = shared._read_channel_result(command.id, selected.run_id)
-    assert channel_result == interrupted_channel_result()
-    assert (
-        project_execution_result_for_channel(channel_result).visible_text
-        == INTERRUPTED_USER_MESSAGE
-    )
+    if held:
+        assert channel_result is None
+    else:
+        assert channel_result == interrupted_channel_result()
+        assert (
+            project_execution_result_for_channel(channel_result).visible_text
+            == INTERRUPTED_USER_MESSAGE
+        )
     with get_session_local()() as db:
         task = db.get(Task, tid)
         assert (task.status, task.control_state) == (TaskStatus.PAUSED, "paused")
@@ -1398,17 +1419,18 @@ async def test_shared_channel_turn_pauses_and_its_channel_reads_interrupted(
         assert task.error_message is None
         # A pause keeps the previous output, as lease recovery does.
         assert task.output == PREVIOUS_OUTPUT
-        assert (
-            db.get(TaskExecutionCommand, command.id).result["channel_result"]
-            == interrupted_channel_result()
+        stored = db.get(TaskExecutionCommand, command.id).result
+        assert stored.get("channel_result") == (
+            None if held else interrupted_channel_result()
         )
         row = db.get(TaskAutoRecovery, tid)
         assert (row.reason, row.state, row.state_detail, row.run_id) == (
             reason,
-            "manual",
-            "channel_hold_pending",
+            "scheduled" if held else "manual",
+            None if held else "auto_resume_disabled",
             selected.run_id,
         )
+        assert (row.next_attempt_at is not None) is held
         assert row.paused_state_version == task.state_version
         assert row.progress_marker is not None
         assert (
@@ -1420,7 +1442,7 @@ async def test_shared_channel_turn_pauses_and_its_channel_reads_interrupted(
         ] == [PAUSED_FACT]
         state_version = task.state_version
     # A web viewer of the task learns of the pause, with the committed
-    # control identity and why the run stopped.
+    # control identity and why the run stopped, and of the planned resume.
     paused = [event for event in published if event["type"] == "task_paused"]
     assert len(paused) == 1
     assert paused[0]["interruption_reason"] == reason
@@ -1432,7 +1454,11 @@ async def test_shared_channel_turn_pauses_and_its_channel_reads_interrupted(
         paused[0]["state_version"],
     ) == (tid, "paused", "paused", selected.run_id, state_version)
     assert RESULTS[reason]["error"] not in str(paused)
-    assert not [e for e in published if e["type"] == "task_recovery_update"]
+    assert [
+        event["auto_resume"]["status"]
+        for event in published
+        if event["type"] == "task_recovery_update"
+    ] == (["scheduled"] if held else [])
 
 
 @pytest.mark.asyncio
@@ -1507,15 +1533,11 @@ def _leaf_failed_channel_result(result: dict[str, Any]) -> dict[str, Any]:
 async def test_shared_channel_turn_that_does_not_pause_fails_as_before(
     selected, monkeypatch, reason, switch
 ):
-    """Switch off, or unusable model output on a channel task (automatic
-    resume does not schedule channel tasks yet, so nothing would resample
-    it, even with automatic resume on): the channel command, its result and
-    the task output are what the leaf has always written for a FAILED
-    result."""
+    """Switch off, or unusable model output with automatic resume off
+    (nothing would resample it): the channel command, its result and the
+    task output are what the leaf has always written for a FAILED result."""
 
     monkeypatch.setenv(PAUSE_SWITCH, switch)
-    if reason == "model_output_invalid":
-        monkeypatch.setenv(AUTO_RESUME_SWITCH, "true")
     published = _capture_task_events(monkeypatch)
 
     command = await _run_shared_channel_turn(selected, monkeypatch, RESULTS[reason])

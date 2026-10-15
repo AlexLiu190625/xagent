@@ -60,6 +60,7 @@ from .task_command_transport import (
     stage_task_command,
 )
 from .task_event_bridge import get_task_event_bridge
+from .task_execution_controller import TaskControlState
 from .task_lease_service import TaskLease, TaskLeaseLostError, utc_now
 from .task_orchestrator import (
     TaskTurnError,
@@ -397,9 +398,25 @@ def accept_channel_turn_no_commit(
         or task.user_id != owner.user_id
     ):
         raise TaskTurnError("task_not_found")
+    from .task_auto_resume import (
+        resume_hand_off_can_complete,
+        supersede_pending_auto_resume_no_commit,
+    )
+
     if (
         task.state_version != selection.state_version
         or task.run_id != selection.previous_run_id
+        # A resume handing off (automatic or a person's) is about to run the
+        # paused turn again: busy, as while it runs. Only while that hand-off
+        # can still complete (its RESUME command is queued or running, or an
+        # automatic resume is within its channel window); a stranded one
+        # would refuse the channel forever. A START racing a genuine
+        # hand-off is still refused later as ``start_state_changed``.
+        or (
+            task.status == TaskStatus.PAUSED
+            and task.control_state == TaskControlState.RESUME_REQUESTED.value
+            and resume_hand_off_can_complete(db, task, now=utc_now())
+        )
         or not reserve_task_start_no_commit(
             db,
             task_id=int(task.id),
@@ -414,8 +431,6 @@ def accept_channel_turn_no_commit(
         )
     ):
         raise TaskTurnError("busy")
-    from .task_auto_resume import supersede_pending_auto_resume_no_commit
-
     # A turn accepted while the run waits for an automatic resume replaces
     # it; the START is staged at the version that moved. No notice is
     # published: web clients learn the new version when this START's run

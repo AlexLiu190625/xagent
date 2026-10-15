@@ -545,21 +545,14 @@ def test_eligible_tasks_record_their_kind(factory, monkeypatch, case, kind):
     assert _recover() == 1
 
     _task_row, row, events = _state(factory, task_id)
-    if kind == "channel":
-        # Recorded, not scheduled, until a resumed channel run can hold its
-        # channel.
-        assert (row.state, row.state_detail) == ("manual", "channel_hold_pending")
-        assert row.next_attempt_at is None
-        assert [(e.event, e.detail.get("kind")) for e in events] == [
-            ("interrupted", kind)
-        ]
-    else:
-        assert (row.state, row.state_detail) == ("scheduled", None)
-        assert row.next_attempt_at is not None
-        assert [(e.event, e.detail.get("kind")) for e in events] == [
-            ("interrupted", kind),
-            ("scheduled", None),
-        ]
+    # A shared channel task is scheduled too: its channel reply waits for the
+    # resumed run.
+    assert (row.state, row.state_detail) == ("scheduled", None)
+    assert row.next_attempt_at is not None
+    assert [(e.event, e.detail.get("kind")) for e in events] == [
+        ("interrupted", kind),
+        ("scheduled", None),
+    ]
 
 
 def _rerun(factory: sessionmaker, task_id: int, *, run_id: str | None = None):

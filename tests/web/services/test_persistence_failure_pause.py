@@ -1821,7 +1821,7 @@ def test_result_pause_reports_the_scheduled_resume(canonical, monkeypatch, path)
             [("task_paused", None), ("task_recovery_update", "stopped")],
         ),
         ("manual", "auto_resume_disabled", [("task_paused", None)]),
-        ("manual", "channel_hold_pending", [("task_paused", None)]),
+        ("manual", "supersede_check_failed", [("task_paused", None)]),
         ("ineligible", "ineligible:source_sdk", [("task_paused", None)]),
     ],
 )

@@ -528,9 +528,10 @@ def get_task_infra_failure_pause_enabled() -> bool:
     :func:`get_task_auto_resume_enabled`: a paused run that nothing resumes
     is worse than a terminal failure for unattended (e.g. scheduled) tasks,
     so pausing is the default only while automatic resume is on. Channel
-    tasks are the exception automatic resume does not schedule yet: they
-    pause, their channel gets the "interrupted" reply, and the next channel
-    message starts a new turn from the pause, as after a lease expiry. Set it
+    tasks under shared execution hold their channel reply while an automatic
+    resume is pending, and reply "interrupted" once it stops without
+    resuming (see ``_read_channel_result``); channel tasks of a combined
+    (inline) host are not eligible and are never resumed automatically. Set it
     explicitly to pause for a manual resume with automatic resume off, or to
     fail as before with it on. Lease-expiry recovery pauses regardless, as it
     always has.
