@@ -26,6 +26,7 @@ from xagent.core.agent import (
     ToolCallRecord,
 )
 from xagent.core.agent.checkpoint import CheckpointPersistenceError
+from xagent.core.agent.context import execution as execution_module
 from xagent.core.agent.context.execution import CLOCK_TIMEZONE_METADATA_KEY
 from xagent.core.agent.pattern.final_answer_stream import ReActFinalAnswerStreamer
 from xagent.core.agent.pattern.react.react import (
@@ -5718,6 +5719,24 @@ async def test_forced_turn_exposes_read_tool_result(set_point: str) -> None:
     assert run.llm.calls[forced_index]["tool_choice"] == "required"
 
 
+_FROZEN_TURN_START = datetime(2026, 8, 24, 22, 3, 37, tzinfo=timezone.utc)
+
+
+class _FrozenDatetime(datetime):
+    @classmethod
+    def now(cls, tz: Any = None) -> datetime:  # type: ignore[override]
+        if tz is None:
+            return _FROZEN_TURN_START.replace(tzinfo=None)
+        return _FROZEN_TURN_START.astimezone(tz)
+
+
+@pytest.fixture
+def frozen_turn_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Freeze the clock the context stamps as its turn start, so prompts
+    from separate runs render the same "Turn started at" line."""
+    monkeypatch.setattr(execution_module, "datetime", _FrozenDatetime)
+
+
 async def _forced_turn_call(
     *, stored: bool, reader: bool, **counters: Any
 ) -> tuple[ReActPattern, dict[str, Any]]:
@@ -5745,7 +5764,7 @@ async def _forced_turn_call(
     ],
 )
 async def test_forced_turn_stays_single_tool(
-    cell: str, overrides: dict[str, Any]
+    cell: str, overrides: dict[str, Any], frozen_turn_start: None
 ) -> None:
     """When any condition for offering reads fails, the forced turn sends
     exactly the baseline final_answer schema. Where no allowance is used up,
