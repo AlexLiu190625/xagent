@@ -39,8 +39,8 @@ Field meanings:
   blocked at flush time.
 - ``gate_held_s``: seconds in the window this process was at its cap
   (``XAGENT_DISPATCHER_MAX_INFLIGHT_PER_PROCESS``): its active task ids
-  numbered at least the limit, so the dispatcher held execution-opening
-  commands for other processes. It is time at the cap, not time work waited:
+  numbered at least the limit, so its dispatcher did not claim commands that
+  would start a new execution here. It is time at the cap, not time work waited:
   a process running exactly the limit with nothing queued reports the whole
   window. Checked at each dispatch attempt and at the flush, so each change
   is late by at most the gap between attempts (0.5 s while the dispatcher is

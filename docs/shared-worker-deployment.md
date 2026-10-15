@@ -65,8 +65,8 @@ line shows liveness and `loop_lag_*` only, with `inflight=0`. `inflight` counts
 unfinished executions in that process and differs from the
 `xagent.agent_tasks.running` gauge, which also counts finished executions that
 are still registered. `gate_held_s` is the number of seconds in the minute that the
-process was at `XAGENT_DISPATCHER_MAX_INFLIGHT_PER_PROCESS`; while it is non-zero
-the process leaves new executions to other processes. A process that is full with
+process was at `XAGENT_DISPATCHER_MAX_INFLIGHT_PER_PROCESS`. While a process is at
+the cap it does not claim commands that would start a new execution there. A process that is full with
 nothing queued also reports it, so read it together with `inflight` and
 `started_1m`. The line is not logged when `XAGENT_LOG_LEVEL` is above
 `INFO`.

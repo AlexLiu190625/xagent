@@ -539,13 +539,13 @@ async def test_gate_held_counts_a_full_process_with_nothing_queued(
 @pytest.mark.parametrize("row", ["shutdown_closes_interval", "new_lifespan_resets"])
 async def test_gate_held_after_shutdown_and_new_lifespan(manager, monkeypatch, row):
     clock, _, _, drain = _gate_probe(manager, monkeypatch)
-    running = asyncio.create_task(asyncio.sleep(3600))
-    manager.register_task(1, running)
     clock.now = 0.0
+    # A reservation outlives cancellation, so only the observation that
+    # follows shutdown's clearing of the tables can end the interval at 4.0.
+    assert manager.reserve_dispatch_slot(1, limit=1) is not None
     manager.dispatch_cap_snapshot(1)
     clock.now = 4.0
     await manager.shutdown()
-    await asyncio.gather(running, return_exceptions=True)
 
     if row == "shutdown_closes_interval":
         assert drain(10) == 4.0
