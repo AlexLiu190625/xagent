@@ -1595,6 +1595,49 @@ async def _persist_task_command_disposition(
     return persisted
 
 
+def _owner_lease_recovery_settled(runner_id: str, now: datetime) -> Any:
+    """Skip tasks whose RUNNING owner is another runner with an expired lease.
+
+    Such a task needs lease recovery before acquisition. Our own owner can
+    still process commands: expiry alone does not revoke its immutable lease
+    identity.
+    """
+    return or_(
+        Task.runner_id == runner_id,
+        task_status_predicate.ne(TaskStatus.RUNNING),
+        Task.lease_expires_at.is_(None),
+        Task.lease_expires_at >= now,
+    )
+
+
+def _dispatcher_candidate_query(
+    db: Session,
+    *,
+    runner_id: str,
+    command_db_id: int | None,
+    shared: bool,
+    cap: DispatchCapSnapshot | None = None,
+) -> Query[Any]:
+    """The database part of the dispatcher's candidate selection.
+
+    ``_claimable_query``, plus the owner lease-recovery filter when
+    ``shared``. The shared dispatcher's scan and
+    ``count_claimable_task_commands`` both build on this, so a database
+    predicate added here reaches both. Process-local state stays with the
+    caller: the scan passes its dispatch-cap snapshot through ``cap`` and adds
+    the busy-task list and the reply-first kind order itself; the count passes
+    neither.
+    Without shared execution ``claim_task_command`` looks up with
+    ``_claimable_query`` alone, so a predicate for both modes belongs there.
+    """
+    query = _claimable_query(
+        db, runner_id=runner_id, command_db_id=command_db_id, cap=cap
+    )
+    if shared:
+        query = query.filter(_owner_lease_recovery_settled(runner_id, _utc_now()))
+    return query
+
+
 def _find_command_candidate(
     command_db_id: int | None,
     busy_task_ids: tuple[int, ...] = (),
@@ -1606,22 +1649,18 @@ def _find_command_candidate(
     with get_session_local()() as db:
 
         def first_candidate(kind: TaskCommandKind | None = None) -> Any:
-            query = _claimable_query(
-                db, runner_id=runner_id, command_db_id=command_db_id, cap=cap
+            # This scan serves only shared execution (dispatch_one_task_command).
+            query = _dispatcher_candidate_query(
+                db,
+                runner_id=runner_id,
+                command_db_id=command_db_id,
+                shared=True,
+                cap=cap,
             )
             if kind is not None:
                 query = query.filter(TaskExecutionCommand.kind == kind.value)
             return query.filter(
-                TaskExecutionCommand.task_id.notin_(busy_task_ids),
-                # A different expired RUNNING owner needs recovery before
-                # acquisition. Our own owner can still process commands:
-                # expiry alone does not revoke its immutable lease identity.
-                or_(
-                    Task.runner_id == runner_id,
-                    task_status_predicate.ne(TaskStatus.RUNNING),
-                    Task.lease_expires_at.is_(None),
-                    Task.lease_expires_at >= _utc_now(),
-                ),
+                TaskExecutionCommand.task_id.notin_(busy_task_ids)
             ).first()
 
         row = None
@@ -1641,6 +1680,60 @@ def _find_command_candidate(
         return (
             (int(row.id), int(row.task_id), TaskCommandKind(row.kind)) if row else None
         )
+
+
+def count_claimable_task_commands(db: Session, *, runner_id: str) -> int:
+    """Count the commands that pass the dispatcher's database checks.
+
+    Builds on the same query as the dispatcher's candidate scan
+    (``_dispatcher_candidate_query``), seen from ``runner_id``: claim
+    availability, team admission, the earlier-unfinished-command gate and
+    runner routing, plus the START/RESUME_INPUT exclusion without shared
+    execution and the owner lease-recovery filter with it. Whether shared
+    execution is on, and so which variant of each predicate applies, comes
+    from the calling process's ``get_shared_task_execution_enabled()``, not
+    from the worker that would claim. Without shared execution the
+    dispatcher claims through ``claim_task_command``, whose lookup is
+    ``_claimable_query`` alone, which is what this applies in that mode.
+
+    The result is an upper bound on what a dispatcher in ``runner_id`` could
+    claim now. Process-local state is not applied: the per-process dispatch
+    cap (``DispatchCapSnapshot``), which narrows the shared scan while closed
+    and reserves a slot once a candidate that opens an execution is picked,
+    and the busy-task list.
+    Neither are the checks made after a candidate is picked: whether the
+    process consumes commands at all (``consumes_task_commands()``), task
+    owner acquisition and lease checks, and the admission reservation that
+    rechecks capacity under lock. Each of them can only turn a counted
+    command away.
+
+    This is not a backlog depth either. Only the first unfinished command of
+    each task passes, except that a cancel or pause may pass an earlier
+    command that still waits for admission. Under team admission a ticketed
+    command passes when its ticket already holds a slot under the task's
+    current owner, or when no older ticket of its bucket waits for the next
+    slot, the bucket has a free slot and startup pacing allows it. An older
+    ticket queued behind its own task's earlier command, or guidance joining
+    a running execution, does not wait for a slot (``_older_waiter``). A
+    command without a ticket is not gated by admission, and a guidance
+    message that joins its task's running execution passes whatever its
+    ticket says.
+
+    The query runs in ``db``. Unlike the dispatcher's ``first()`` lookup, a
+    count evaluates the correlated admission and earlier-command subqueries
+    for every candidate row, so callers that need a bound should set a
+    statement timeout on that session.
+    """
+    return (
+        _dispatcher_candidate_query(
+            db,
+            runner_id=runner_id,
+            command_db_id=None,
+            shared=get_shared_task_execution_enabled(),
+        )
+        .order_by(None)
+        .count()
+    )
 
 
 async def dispatch_one_task_command(
