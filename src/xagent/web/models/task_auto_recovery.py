@@ -60,6 +60,8 @@ class TaskRecoveryEventType(str, enum.Enum):
     EXPIRED = "expired"
     SUPERSEDED = "superseded"
     INELIGIBLE = "ineligible"
+    # A person stopped the automatic resume; the row rests in
+    # ``manual(user_cancelled)``.
     SKIPPED_USER_INTENT = "skipped_user_intent"
     DISPATCH_FAILED = "dispatch_failed"
     STALE = "stale"

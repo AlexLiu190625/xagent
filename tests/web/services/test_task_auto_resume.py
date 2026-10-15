@@ -333,6 +333,7 @@ def test_command_id_is_unique_per_fence_and_attempt_and_fits_the_column():
         # Recorded for a channel task before channel tasks were scheduled.
         ("manual", "channel_hold_pending", ("stopped", "ineligible")),
         ("manual", None, ("stopped", "ineligible")),
+        ("manual", "user_cancelled", ("stopped", "cancelled")),
         ("stale", "dispatch:run_id", None),
         ("disabled", None, None),
     ],

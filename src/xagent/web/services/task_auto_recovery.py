@@ -92,6 +92,10 @@ logger = logging.getLogger(__name__)
 # check for a later run of its scheduled trigger failed.
 AUTO_RESUME_DISABLED_DETAIL = "auto_resume_disabled"
 SUPERSEDE_CHECK_FAILED_DETAIL = "supersede_check_failed"
+# ``state_detail`` of a ``manual`` row whose pending automatic resume a person
+# cancelled (``task_auto_resume.cancel_pending_auto_resume_no_commit``); only
+# that cancel writes it, at the fence it moves the row to.
+AUTO_RESUME_USER_CANCELLED_DETAIL = "user_cancelled"
 
 # The recorded states automatic resume has a plan for: each is logged as an
 # extra event of its own name and announced as ``task_recovery_update``

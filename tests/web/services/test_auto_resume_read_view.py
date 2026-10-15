@@ -173,6 +173,11 @@ def _k(auto_resume: dict[str, Any]) -> tuple[int, int]:
         ({"state": "manual", "state_detail": "supersede_check_failed"}, None),
         ({"state": "manual", "state_detail": "channel_hold_pending"}, None),
         ({"state": "manual", "state_detail": "interaction_pending"}, None),
+        # Only a person's cancel writes it, announced at this very fence.
+        (
+            {"state": "manual", "state_detail": "user_cancelled", "total_resumes": 2},
+            ("stopped", "cancelled", 2, None),
+        ),
         ({"state": "ineligible", "state_detail": "ineligible:source_sdk"}, None),
         ({"state": "ineligible", "state_detail": "ineligible:preview"}, None),
         ({"state": "stale", "state_detail": "dispatch:run_id"}, None),
