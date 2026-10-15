@@ -715,14 +715,10 @@ class TaskCoordinator:
                         # Built on the loop: the snapshot reads the execution
                         # registry and records the cap state for gate_held_s.
                         cap = build_dispatch_cap_snapshot()
+                        held_by_cap = None if cap.admits(self.task_id) else cap
                         outcome = await run_db_io_cancellation_safe(
                             functools.partial(
-                                self._release_if_idle,
-                                held_by_cap=(
-                                    cap
-                                    if cap.closed and self.task_id not in cap.active_ids
-                                    else None
-                                ),
+                                self._release_if_idle, held_by_cap=held_by_cap
                             )
                         )
                         if outcome != "busy":
