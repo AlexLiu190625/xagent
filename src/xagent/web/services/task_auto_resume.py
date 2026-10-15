@@ -2544,7 +2544,7 @@ class TerminalView:
 
 
 def _terminal_view_snapshot(db: Session, task_id: int) -> Any:
-    """The task, its recovery row and the two command facts, in one statement."""
+    """The task, its recovery row and the command facts, in one statement."""
 
     last_dispatch = (
         select(TaskExecutionCommand.id)
@@ -2554,6 +2554,15 @@ def _terminal_view_snapshot(db: Session, task_id: int) -> Any:
         )
         .correlate(TaskAutoRecovery)
         .scalar_subquery()
+    )
+    last_dispatch_exists = (
+        select(TaskExecutionCommand.id)
+        .where(
+            TaskExecutionCommand.task_id == TaskAutoRecovery.task_id,
+            TaskExecutionCommand.command_id == TaskAutoRecovery.last_command_id,
+        )
+        .correlate(TaskAutoRecovery)
+        .exists()
     )
     person_control_since = (
         select(TaskExecutionCommand.id)
@@ -2595,8 +2604,8 @@ def _terminal_view_snapshot(db: Session, task_id: int) -> Any:
             TaskAutoRecovery.state_detail,
             TaskAutoRecovery.reason,
             TaskAutoRecovery.paused_state_version,
-            TaskAutoRecovery.last_command_id,
             TaskAutoRecovery.updated_at,
+            last_dispatch_exists.label("last_dispatch_exists"),
             opening_queued.label("opening_queued"),
             person_control_since.label("person_control_since"),
         )
@@ -2609,8 +2618,9 @@ def _terminal_view_snapshot(db: Session, task_id: int) -> Any:
 def status_only_terminal_view(db: Session, task_id: int) -> TerminalView | None:
     """Whether a status-only caller should read ``task_id`` as failed, and why.
 
-    A read model for the public ``/v1`` task reads only: it is computed by one
-    caller, never written anywhere, and the task row stays PAUSED. A caller
+    A read model for the public ``/v1`` task reads only: its one caller is
+    ``_load_task_info_snapshot``, it is never written anywhere, and the task
+    row stays PAUSED. A caller
     that sees nothing but the status cannot tell a task waiting for its next
     automatic resume from one that stopped for good, so it would wait on the
     second forever. The answer is a :class:`TerminalView` when all hold:
@@ -2623,9 +2633,10 @@ def status_only_terminal_view(db: Session, task_id: int) -> TerminalView | None:
        ``ineligible``, ``superseded``) or rests in ``manual`` for a reason
        other than a person's own cancel (which is the person's intent);
     5. the task is at the row's fence, or two versions on (a resume that
-       rolled back) when the row is ``dispatch_failed`` or ``manual``, names
-       its last dispatch, and no person has resumed, paused or cancelled the
-       task since (the sweeper's own commands do not count);
+       rolled back) when the row is ``dispatch_failed`` or ``manual``, its
+       last dispatch command still exists (without it nothing can tell
+       whether a person acted since), and no person has resumed, paused or
+       cancelled the task since (the sweeper's own commands do not count);
     6. no command that could open an execution is queued or running (an
        append's START, a person's resume).
 
@@ -2684,7 +2695,7 @@ def status_only_terminal_view(db: Session, task_id: int) -> TerminalView | None:
             TaskAutoRecoveryState.DISPATCH_FAILED.value,
             TaskAutoRecoveryState.MANUAL.value,
         )
-        and snap.last_command_id is not None
+        and snap.last_dispatch_exists
         and not snap.person_control_since
     ):
         return None

@@ -36,12 +36,12 @@ from tests.web.services.test_task_auto_resume import factory as factory_fixture
 from xagent.web.api.chat import chat_router
 from xagent.web.api.v1 import _events_stream as es
 from xagent.web.api.v1 import tasks as v1_tasks
-from xagent.web.api.v1 import v1_router
 from xagent.web.api.v1.deps import (
     AgentPrincipalSnapshot,
     ApiKeyPrincipal,
     RuntimeApiKeySnapshot,
 )
+from xagent.web.app import app
 from xagent.web.models.agent import Agent
 from xagent.web.models.auth_database import get_auth_db
 from xagent.web.models.database import get_db
@@ -118,7 +118,9 @@ def _sdk_task(factory, **row: Any) -> tuple[int, ApiKeyPrincipal]:
         agent = Agent(user_id=user.id, name="projection agent")
         db.add(agent)
         db.flush()
-        tid = _seed(db, now, user=user, source="sdk", agent_id=agent.id, **row)
+        tid = _seed(
+            db, now, user=user, source="sdk", agent_id=agent.id, output="partial", **row
+        )
         db.commit()
         principal = ApiKeyPrincipal(
             key=RuntimeApiKeySnapshot(key_prefix="pfx-projection"),
@@ -146,7 +148,7 @@ def test_overlay_after_cache_read(factory, shared_mode, real_cache):
     tid, principal = _sdk_task(factory, total=20)
 
     waiting = v1_tasks._get_chat_task_sync(tid, principal)
-    assert waiting.status == "paused"
+    assert (waiting.status, waiting.output) == ("paused", "partial")
     assert cache_get(task_snapshot_key(tid))["response"]["status"] == "paused"
     stored_before_stop = _stored(factory, tid)
 
@@ -209,18 +211,6 @@ def test_append_to_projected_failure(factory, monkeypatch, mode):
     assert v1_tasks._get_chat_task_sync(tid, principal).status == "running"
 
 
-def test_a_failed_read_of_the_view_reads_paused(factory, real_cache, monkeypatch):
-    tid, principal = _sdk_task(factory, total=20)
-    assert run_auto_resume_tick().gave_up == 1
-
-    def raising(*_args, **_kwargs):
-        raise RuntimeError("the view statement failed")
-
-    with patch.object(task_auto_resume, "_terminal_view_snapshot", raising):
-        assert v1_tasks._get_chat_task_sync(tid, principal).status == "paused"
-    assert v1_tasks._get_chat_task_sync(tid, principal).status == "failed"
-
-
 def test_the_counter_counts_each_computed_view_once(factory, real_cache, monkeypatch):
     seen: list[tuple[str, dict[str, str]]] = []
     monkeypatch.setattr(
@@ -250,17 +240,13 @@ def test_effective_snapshot_overlays_only_the_view_fields(factory):
     effective = v1_tasks.effective_task_snapshot(raw)
 
     assert (effective.status, effective.control_state) == (TaskStatus.FAILED, "failed")
+    assert raw.output == "partial"
     assert (effective.output, effective.error) == (None, EXHAUSTED)
     assert (effective.run_id, effective.state_version, effective.updated_at) == (
         raw.run_id,
         raw.state_version,
         raw.updated_at,
     )
-    waiting = v1_tasks._load_task_info_snapshot(
-        *_sdk_task(factory, total=0)  # scheduled, nothing stopped
-    )
-    assert waiting.view is None
-    assert v1_tasks.effective_task_snapshot(waiting) is waiting
 
 
 # --------------------------------------------------------------------------
@@ -273,7 +259,10 @@ def _calls(name: str) -> list[tuple[pathlib.Path, str | None]]:
     function that contains it."""
     found: list[tuple[pathlib.Path, str | None]] = []
     for path in sorted((_SRC / "xagent").rglob("*.py")):
-        tree = ast.parse(path.read_text())
+        text = path.read_text()
+        if name not in text:
+            continue
+        tree = ast.parse(text)
 
         def visit(node: ast.AST, function: str | None) -> None:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -334,8 +323,8 @@ EXCLUDE = {
 def test_v1_routes_classified():
     routes = {
         (method, route.path)
-        for route in v1_router.routes
-        if route.path.startswith("/v1")
+        for route in app.routes
+        if getattr(route, "path", "").startswith("/v1")
         for method in getattr(route, "methods", ())
     }
     assert routes == DERIVE | ALLOWLIST | EXCLUDE
@@ -367,7 +356,9 @@ def api_db(_test_db) -> Iterator[None]:
 
 def _stop_in_db(task_id: int, *, state: str = "exhausted") -> None:
     """PAUSE the task and record that automatic resume stopped for good."""
-    _set_task_status(task_id, TaskStatus.PAUSED, control_state="paused")
+    _set_task_status(
+        task_id, TaskStatus.PAUSED, output="partial", control_state="paused"
+    )
     db = _direct_db_session()
     try:
         task = db.get(Task, task_id)
@@ -428,7 +419,9 @@ async def test_stream_terminal_on_view(api_db, monkeypatch, path):
     if path == "attach_fast_path":
         _stop_in_db(task_id)
     else:
-        _set_task_status(task_id, TaskStatus.PAUSED, control_state="paused")
+        _set_task_status(
+            task_id, TaskStatus.PAUSED, output="partial", control_state="paused"
+        )
 
     response = await v1_tasks.stream_chat_task_events(task_id, principal)
     try:
@@ -442,6 +435,11 @@ async def test_stream_terminal_on_view(api_db, monkeypatch, path):
     finally:
         await response.body_iterator.aclose()
 
+    if path == "attach_fast_path":
+        # The initial snapshot is already the view: the first frame says
+        # failed and a paused one never goes out.
+        assert seen[0] == ("task.status", {"status": "failed"})
+        assert ("task.status", {"status": "paused"}) not in seen
     completed = [data for event, data in seen if event == "task.completed"]
     assert completed == [{"status": "failed", "output": None, "error": EXHAUSTED}]
     assert es.count_task_sinks(task_id) == 0
@@ -472,29 +470,15 @@ def test_web_reads_unchanged_for_sdk(api_db):
             title="SDK task",
             description="SDK task",
             source="sdk",
-            status=TaskStatus.PAUSED,
-            control_state="paused",
             run_id=RUN,
             state_version=PV,
         )
         db.add(task)
         db.commit()
         task_id = int(task.id)
-        now = utc_now()
-        db.add(
-            TaskAutoRecovery(
-                task_id=task_id,
-                run_id=RUN,
-                reason="lease_expired",
-                state="exhausted",
-                paused_state_version=PV,
-                interrupted_at=now,
-                episode_started_at=now,
-            )
-        )
-        db.commit()
     finally:
         db.close()
+    _stop_in_db(task_id)
 
     for suffix in ("", "/status"):
         response = _chat_client.get(

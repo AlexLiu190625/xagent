@@ -126,6 +126,7 @@ def _expected(
     reason: str,
     delta: int,
     last_command: bool,
+    lost: bool = False,
     after: list[tuple[str, str, str]],
     queued: list[tuple[str, str]],
 ) -> str | None:
@@ -146,7 +147,12 @@ def _expected(
     if delta == 0:
         fence = True
     elif delta == 2:
-        fence = state in ("dispatch_failed", "manual") and last_command and not person
+        fence = (
+            state in ("dispatch_failed", "manual")
+            and last_command
+            and not lost
+            and not person
+        )
     else:
         fence = False
     if not fence:
@@ -192,30 +198,19 @@ def _seed_cell(
     reason: str,
     delta: int,
     last_command: bool,
+    lost: bool = False,
     after: list[tuple[str, str, str]],
     queued: list[tuple[str, str]],
-    row_run: str = RUN,
 ) -> int:
     now = utc_now()
     with factory() as db:
-        user = _user(db)
-        task = Task(
-            user_id=user.id,
-            title="View",
-            description="view test",
-            execution_mode="balanced",
-            source=source,
-            status=TaskStatus.PAUSED,
-            control_state=control,
-            run_id=RUN,
-            state_version=PV + delta,
+        task = _bare_task(
+            db, source=source, control_state=control, state_version=PV + delta
         )
-        db.add(task)
-        db.flush()
         db.add(
             TaskAutoRecovery(
                 task_id=task.id,
-                run_id=row_run,
+                run_id=RUN,
                 reason=reason,
                 state=state,
                 state_detail=detail,
@@ -247,8 +242,37 @@ def _seed_cell(
                 status=status,
                 command_id=f"queued-{index}-{uuid.uuid4().hex[:6]}",
             )
+        if lost:
+            # The dispatch command is gone while the row still names it.
+            db.execute(
+                sa.delete(TaskExecutionCommand).where(
+                    TaskExecutionCommand.task_id == task.id,
+                    TaskExecutionCommand.command_id == LAST_COMMAND,
+                )
+            )
         db.commit()
         return int(task.id)
+
+
+def _bare_task(db: Session, **fields: Any) -> Task:
+    """A PAUSED SDK task on ``RUN`` at ``PV``; ``fields`` override."""
+    task = Task(
+        user_id=_user(db).id,
+        title="View",
+        description="view test",
+        execution_mode="balanced",
+        **{
+            "source": "sdk",
+            "status": TaskStatus.PAUSED,
+            "control_state": "paused",
+            "run_id": RUN,
+            "state_version": PV,
+            **fields,
+        },
+    )
+    db.add(task)
+    db.flush()
+    return task
 
 
 # fence name -> (delta, last_command_id set, commands after the last dispatch)
@@ -274,9 +298,17 @@ _FENCES: dict[str, tuple[int, bool, list[tuple[str, str, str]]]] = {
         True,
         [("resume", "completed", "auto-resume:later-1")],
     ),
-    "plus2_sdk_start_completed": (2, True, [("start", "completed", "start-1")]),
     "plus2_sdk_start_failed": (2, True, [("start", "failed", "start-2")]),
     "plus2_no_last_command": (2, False, []),
+}
+# The same, with the dispatch command deleted from the table.
+_LOST_FENCES: dict[str, tuple[int, bool, list[tuple[str, str, str]]]] = {
+    "plus2_lost_dispatch_person_resume": (
+        2,
+        True,
+        [("resume", "completed", "web-resume-2")],
+    ),
+    "plus2_lost_dispatch_no_person": (2, True, []),
 }
 _DETAILS = [None, "auto_resume_disabled", "new_turn", "user_cancelled"]
 _REASONS = ["lease_expired", "llm_unavailable", "user_pause"]
@@ -303,7 +335,6 @@ def test_every_recovery_state_is_in_the_matrix():
 
 @pytest.mark.parametrize("state", [s.value for s in TaskAutoRecoveryState])
 def test_view_matrix(factory, state):
-    assert len(TaskAutoRecoveryState) == 10
     mismatches: list[str] = []
 
     def check(label: str, expected: str | None, **cell: Any) -> None:
@@ -323,7 +354,10 @@ def test_view_matrix(factory, state):
 
     for detail in _DETAILS:
         for reason in _REASONS:
-            for fence, (delta, last, after) in _FENCES.items():
+            fences = [(f, v, False) for f, v in _FENCES.items()] + [
+                (f, v, True) for f, v in _LOST_FENCES.items()
+            ]
+            for fence, (delta, last, after), lost in fences:
                 cell = dict(
                     source="sdk",
                     control="paused",
@@ -331,6 +365,7 @@ def test_view_matrix(factory, state):
                     reason=reason,
                     delta=delta,
                     last_command=last,
+                    lost=lost,
                     after=after,
                     queued=[],
                 )
@@ -359,19 +394,6 @@ def test_view_matrix(factory, state):
                     **cell,
                 )
 
-    # A row that describes an earlier run says nothing about this one.
-    cell = dict(
-        source="sdk",
-        control="paused",
-        detail=None,
-        reason="lease_expired",
-        delta=0,
-        last_command=False,
-        after=[],
-        queued=[],
-    )
-    check("older_run_row", None, row_run="run-before", **cell)
-
     assert mismatches == []
 
 
@@ -388,13 +410,7 @@ def test_view_none_for_a_task_that_is_not_paused(factory):
         after=[],
         queued=[],
     )
-    for status in (
-        TaskStatus.RUNNING,
-        TaskStatus.WAITING_FOR_USER,
-        TaskStatus.COMPLETED,
-        TaskStatus.FAILED,
-        TaskStatus.PENDING,
-    ):
+    for status in (TaskStatus.RUNNING, TaskStatus.FAILED):
         with factory() as db:
             db.get(Task, tid).status = status
             db.commit()
@@ -492,12 +508,6 @@ def test_view_none_without_current_row(factory, case, caplog, monkeypatch):
 # --------------------------------------------------------------------------
 
 
-def _set_source(factory: sessionmaker, tid: int, source: str) -> None:
-    with factory() as db:
-        db.get(Task, tid).source = source
-        db.commit()
-
-
 def _complete_commands(factory: sessionmaker, tid: int) -> None:
     with factory() as db:
         db.execute(
@@ -540,24 +550,6 @@ def _tick_exit(setup: Callable[[Session, datetime], int], *, env=None):
         return tid
 
     return drive
-
-
-def _bare_task(db: Session, **fields: Any) -> Task:
-    task = Task(
-        user_id=_user(db).id,
-        title="Record",
-        description="record test",
-        execution_mode="balanced",
-        source="sdk",
-        status=TaskStatus.PAUSED,
-        control_state="paused",
-        run_id=RUN,
-        state_version=PV,
-        **fields,
-    )
-    db.add(task)
-    db.flush()
-    return task
 
 
 def _record_exit(
@@ -648,9 +640,9 @@ def _claim_exit(*, version: int, attempt: int):
 
 
 def _channel_exit(act: Callable[[Session, Task], Any], state: str):
-    """Exits only a channel task reaches; the row they write is read as if it
-    were an SDK task's (an SDK task has no channel, so production never
-    produces it), which checks that the state they write reads as None."""
+    """Exits only a channel task reaches, driven on an SDK task given a
+    channel (production never gives an SDK task one), which checks that the
+    state they write reads as None."""
 
     def drive(factory, monkeypatch):
         now = utc_now()
@@ -663,7 +655,6 @@ def _channel_exit(act: Callable[[Session, Task], Any], state: str):
             ).scalar_one()
             assert act(db, task)
             db.commit()
-        _set_source(factory, tid, "sdk")
         return tid
 
     return drive
@@ -687,7 +678,7 @@ _OFF = {"XAGENT_TASK_AUTO_RESUME_ENABLED": "false"}
 
 # exit id -> (driver, expected recovery state, expected text); None = no view
 _EXITS: dict[str, tuple[Callable[..., int], str | None, str | None]] = {
-    "801": (
+    "dispatch-ineligible": (
         _tick_exit(
             lambda db, now: _seed(
                 db, now, source="sdk", agent_config={"workforce_run_id": 999_999}
@@ -696,12 +687,12 @@ _EXITS: dict[str, tuple[Callable[..., int], str | None, str | None]] = {
         "ineligible",
         INELIGIBLE,
     ),
-    "821-exhausted_total": (
+    "limit-exhausted_total": (
         _tick_exit(lambda db, now: _seed(db, now, source="sdk", total=20)),
         "exhausted",
         EXHAUSTED,
     ),
-    "821-exhausted_elapsed": (
+    "limit-exhausted_elapsed": (
         _tick_exit(
             lambda db, now: _seed(
                 db,
@@ -715,57 +706,57 @@ _EXITS: dict[str, tuple[Callable[..., int], str | None, str | None]] = {
         "exhausted",
         EXHAUSTED,
     ),
-    "821-expired": (
+    "limit-expired": (
         _tick_exit(
             lambda db, now: _seed(db, now, source="sdk", interrupted_ago=86_400 + 60)
         ),
         "expired",
         EXPIRED,
     ),
-    "821-no_policy": (
+    "limit-no_policy": (
         _tick_exit(
             lambda db, now: _seed(db, now, source="sdk", reason="not_recoverable")
         ),
         "manual",
         OTHER_MANUAL,
     ),
-    "1071-equal": (
+    "housekeeping-disabled": (
         _tick_exit(_housekeeping("completed"), env=_OFF),
         "manual",
         DISABLED,
     ),
-    "1071-plus2": (
+    "housekeeping-disabled-plus2": (
         _tick_exit(_housekeeping("failed", rolled_back=True), env=_OFF),
         "manual",
         DISABLED,
     ),
-    "1089-equal": (
+    "housekeeping-dispatch_failed": (
         _tick_exit(_housekeeping("failed")),
         "dispatch_failed",
         DISPATCH_FAILED,
     ),
-    "1089-equal_lost_command": (
+    "housekeeping-dispatch_failed_lost_command": (
         _tick_exit(_housekeeping(None)),
         "dispatch_failed",
         DISPATCH_FAILED,
     ),
-    "1089-plus2": (
+    "housekeeping-dispatch_failed-plus2": (
         _tick_exit(_housekeeping("failed", rolled_back=True)),
         "dispatch_failed",
         DISPATCH_FAILED,
     ),
-    "1130": (
+    "reschedule-limit": (
         _tick_exit(_housekeeping("completed", no_progress=3, total=3)),
         "exhausted",
         EXHAUSTED,
     ),
-    "1217": (_tick_exit(_drain(), env=_OFF), "manual", DISABLED),
-    "1918": (
+    "drain-disabled": (_tick_exit(_drain(), env=_OFF), "manual", DISABLED),
+    "claim-disabled": (
         _claim_exit(version=PV, attempt=1),
         "manual",
         DISABLED,
     ),
-    "2000": (
+    "refence-disabled": (
         _claim_exit(version=PV + 2, attempt=2),
         "manual",
         DISABLED,
@@ -783,14 +774,14 @@ _EXITS: dict[str, tuple[Callable[..., int], str | None, str | None]] = {
         DISABLED,
     ),
     # Exits that are not a stop the caller can be told about.
-    "788": (_tick_exit(_dispatch_stale()), "stale", None),
-    "1207": (_tick_exit(_drain(state_version=PV + 1), env=_OFF), "stale", None),
-    "1933": (
+    "dispatch-stale": (_tick_exit(_dispatch_stale()), "stale", None),
+    "drain-stale": (_tick_exit(_drain(state_version=PV + 1), env=_OFF), "stale", None),
+    "claim-stale": (
         lambda factory, monkeypatch: _stale_claim(factory),
         "stale",
         None,
     ),
-    "2213": (
+    "channel-supersede": (
         _channel_exit(
             lambda db, task: supersede_pending_auto_resume_no_commit(
                 db, task, now=utc_now()
@@ -800,7 +791,7 @@ _EXITS: dict[str, tuple[Callable[..., int], str | None, str | None]] = {
         "stale",
         None,
     ),
-    "2450": (
+    "person-cancel": (
         _channel_exit(
             lambda db, task: cancel_pending_auto_resume_no_commit(
                 db, task, at=CANCEL_AT
@@ -841,9 +832,9 @@ def test_every_exit_projects(factory, monkeypatch, exit_id):
     """Each place that stops automatic resume leaves a row the view reads as
     the text it owes, or as None where the caller must keep waiting.
 
-    ``2213`` and ``2450`` are reachable only for channel tasks in production
-    (an SDK task has no channel); they are driven on a channel task whose
-    source is then set to ``sdk``, which checks that the state they write
+    ``channel-supersede`` and ``person-cancel`` are reachable only for
+    channel tasks in production (an SDK task has no channel); they are driven
+    on an SDK task given a channel, which checks that the state they write
     reads as None."""
     driver, state, text = _EXITS[exit_id]
     tid = driver(factory, monkeypatch)

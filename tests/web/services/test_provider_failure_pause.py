@@ -906,9 +906,12 @@ async def test_status_only_settlement(
 
     projection = _full_projection(factory, sdk, sdk_lease)
     other = _full_projection(factory, baseline, baseline_lease)
-    # Two runs hold their own lease identity and expiry while RUNNING.
-    for key in ("lease_attempt_id", "lease_expires_at"):
-        projection.pop(key, None), other.pop(key, None)
+    if projection["status"] == TaskStatus.RUNNING:
+        # Two runs hold their own lease identity and expiry while RUNNING; a
+        # settled run holds none, and the baseline must agree on that.
+        for key in ("lease_attempt_id", "lease_expires_at"):
+            projection.pop(key, None)
+            other.pop(key, None)
     assert projection == other
     assert sdk_deferred == baseline_deferred
     _task, row, _events = _state(factory, sdk["task"])

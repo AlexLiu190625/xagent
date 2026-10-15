@@ -410,6 +410,22 @@ class _TaskInfoSnapshot:
     view: TerminalView | None = None
 
 
+# The snapshot fields a terminal view replaces. The one place that names them:
+# :func:`effective_task_snapshot` applies them and the GET response copies them.
+_OVERLAID_FIELDS = ("status", "control_state", "output", "error")
+
+
+def _overlaid_values(view: TerminalView) -> dict[str, Any]:
+    values: dict[str, Any] = {
+        "status": TaskStatus.FAILED,
+        "control_state": TaskStatus.FAILED.value,
+        "output": None,
+        "error": view.error,
+    }
+    assert tuple(values) == _OVERLAID_FIELDS
+    return values
+
+
 def effective_task_snapshot(snapshot: _TaskInfoSnapshot) -> _TaskInfoSnapshot:
     """``snapshot`` as the caller must read it: ``failed`` when it carries a
     terminal view, the stored values otherwise.
@@ -421,13 +437,7 @@ def effective_task_snapshot(snapshot: _TaskInfoSnapshot) -> _TaskInfoSnapshot:
     view = snapshot.view
     if view is None:
         return snapshot
-    return replace(
-        snapshot,
-        status=TaskStatus.FAILED,
-        control_state=TaskStatus.FAILED.value,
-        output=None,
-        error=view.error,
-    )
+    return replace(snapshot, **_overlaid_values(view))
 
 
 @dataclass(frozen=True)
@@ -692,13 +702,11 @@ def _get_chat_task_sync(
     )
     overlay: dict[str, Any] = {"pending_interaction": pending_interaction}
     if task.view is not None:
-        overlay.update(
-            status=TaskStatus.FAILED.value,
-            control_state=TaskStatus.FAILED.value,
-            output=None,
-            error=task.view.error,
-            completed_at=task.view.stopped_at,
-        )
+        effective = effective_task_snapshot(task)
+        for name in _OVERLAID_FIELDS:
+            value = getattr(effective, name)
+            overlay[name] = value.value if isinstance(value, TaskStatus) else value
+        overlay["completed_at"] = task.view.stopped_at
     cache_key = task_snapshot_key(task_id)
     task_updated_at = cache_version_token(task.updated_at)
     cached = cache_get(cache_key)

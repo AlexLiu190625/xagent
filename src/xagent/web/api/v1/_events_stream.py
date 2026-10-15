@@ -1446,10 +1446,12 @@ async def watchdog_check_once(
         )
     if status is TaskStatus.PAUSED:
         # SDK wait() semantics: PAUSED keeps waiting, doesn't close, because
-        # the task can still be resumed. A paused task whose automatic resume
-        # stopped for good never reaches this branch as PAUSED: the snapshot
-        # reader reports it as FAILED (``status_only_terminal_view``), so the
-        # stream closes with ``task.completed`` on the next watchdog cycle.
+        # the task can still be resumed. A status-only caller's task whose
+        # automatic resume stopped for good, with nothing queued, is reported
+        # by the snapshot reader as FAILED (``status_only_terminal_view``) and
+        # closes the stream with ``task.completed`` on the next watchdog
+        # cycle; one a person cancelled or paused, or with a command queued,
+        # still arrives here as PAUSED.
         # A "was this paused by an orphaned process?" check was considered
         # and rejected: a normal pause and an orphaned one leave identical
         # values in every lease-tracking column (runner id, lease
