@@ -523,12 +523,18 @@ def current_auto_recovery_view(db: Session, task: Task) -> dict[str, Any] | None
     current ``state_version`` -- is shown; a FAILED run's row (``manual`` or
     ``disabled``) is bookkeeping, not something its user can act on.
 
-    Deliberately minimal: ``reason`` and ``interrupted_at`` are written by the
-    same transaction as the task's own PAUSED write, so a cache keyed on the
-    task's ``updated_at`` (the legacy history replay's) cannot serve a stale
-    view. ``state`` is left out on purpose -- it changes without a task write
-    and is not a client contract yet -- as are the operator-only
-    ``last_error``, ``state_detail``, counters and command ids.
+    ``reason`` and ``interrupted_at`` describe the interruption; ``run_id``
+    and ``state_version`` name the fence, as a ``task_recovery_update``
+    notice's envelope does; ``auto_resume`` is that notice's payload for the
+    row as it stands (:func:`~.task_auto_resume.current_auto_resume_view`),
+    ``None`` when no automatic resume is to be shown. The operator-only
+    ``state``, ``state_detail``, ``last_error``, counters and command ids are
+    left out.
+
+    ``auto_resume`` changes without a task write (the sweeper's transitions
+    write only this row), so the view is computed per request, outside any
+    response cached on the task row; the legacy history replay keys its
+    cache on the view itself.
 
     Informational only: a failed read is logged and reads as ``None``, inside
     a SAVEPOINT so the caller's transaction stays usable (on PostgreSQL a
@@ -553,9 +559,14 @@ def current_auto_recovery_view(db: Session, task: Task) -> dict[str, Any] | None
         or row.paused_state_version != int(task.state_version or 0)
     ):
         return None
+    from .task_auto_resume import current_auto_resume_view  # module cycle
+
     return {
         "reason": row.reason,
         "interrupted_at": format_datetime_for_api(row.interrupted_at),
+        "run_id": row.run_id,
+        "state_version": int(row.paused_state_version),
+        "auto_resume": current_auto_resume_view(task, row),
     }
 
 

@@ -2055,7 +2055,11 @@ def _add_interruption_reason(
         status_event["interruption_reason"] = auto_recovery["reason"]
 
 
-def _history_task_info(db: Any, task: Any, task_id: int) -> dict[str, Any]:
+def _history_task_info(
+    db: Any, task: Any, task_id: int, *, auto_recovery: dict[str, Any] | None
+) -> dict[str, Any]:
+    """``auto_recovery`` is ``current_auto_recovery_view`` for ``task``, read
+    by the caller so a cache can key on it."""
     from ..models.agent import Agent
 
     # Determine is_dag from agent config if agent_id exists
@@ -2105,7 +2109,7 @@ def _history_task_info(db: Any, task: Any, task_id: int) -> dict[str, Any]:
             "waiting_question": waiting_question,
             "waiting_interactions": waiting_interactions,
             # The interruption that left the task as it stands, if any.
-            "auto_recovery": current_auto_recovery_view(db, task),
+            "auto_recovery": auto_recovery,
             "created_at": safe_timestamp_to_unix(task.created_at)
             if task.created_at
             else None,
@@ -2128,7 +2132,9 @@ def _load_event_historical_stream_snapshot(
 
     task_id = int(task.id)
     horizon = display_horizon(db, task_id)
-    info = _history_task_info(db, task, task_id)
+    info = _history_task_info(
+        db, task, task_id, auto_recovery=current_auto_recovery_view(db, task)
+    )
     state = task_control_snapshot(task).as_dict()
     active_run_id = (
         db.query(Task.run_id)
@@ -2219,7 +2225,9 @@ def _load_event_historical_stream_snapshot(
     current_state = task_control_snapshot(task).as_dict()
     state_changed = current_state != state
     if state_changed:
-        info = _history_task_info(db, task, task_id)
+        info = _history_task_info(
+            db, task, task_id, auto_recovery=current_auto_recovery_view(db, task)
+        )
         events[0] = info
     if task.status in {TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER}:
         kind, default = _waiting_or_paused_event_fields(task.status)
@@ -2324,6 +2332,10 @@ def _load_historical_stream_snapshot_sync(
             cache_key = web_task_history_key(task_id)
             task_updated_at = cache_version_token(task.updated_at)
             control_state = task_control_snapshot(task).as_dict()
+            # The recovery row moves without a task write (the sweeper's
+            # transitions), so the view is part of the cache key rather than
+            # only of the cached replay.
+            auto_recovery = current_auto_recovery_view(db, task)
             # Redis is synchronous I/O. Never spend its timeout budget while
             # pinning a database pool slot: this phase is read-only, so return
             # the connection before consulting the cache. The Session remains
@@ -2338,6 +2350,7 @@ def _load_historical_stream_snapshot_sync(
                 and cached.get("updated_at") == task_updated_at
                 and cached.get("max_trace_event_id") == int(max_trace_event_id)
                 and cached.get("max_chat_message_id") == int(max_chat_message_id)
+                and cached.get("auto_recovery") == auto_recovery
                 and isinstance(cached.get("events"), list)
             ):
                 cached_events = tuple(
@@ -2353,7 +2366,9 @@ def _load_historical_stream_snapshot_sync(
 
             cached_stream_events: list[dict[str, Any]] = []
 
-            task_event = _history_task_info(db, task, task_id)
+            task_event = _history_task_info(
+                db, task, task_id, auto_recovery=auto_recovery
+            )
             waiting_question = task_event["data"]["waiting_question"]
             waiting_interactions = task_event["data"]["waiting_interactions"]
             cached_stream_events.append(task_event)
@@ -2778,6 +2793,7 @@ def _load_historical_stream_snapshot_sync(
                         "updated_at": task_updated_at,
                         "max_trace_event_id": int(max_trace_event_id),
                         "max_chat_message_id": int(max_chat_message_id),
+                        "auto_recovery": auto_recovery,
                         "events": detached_events,
                     },
                     ttl_seconds=task_cache_ttl_seconds(),

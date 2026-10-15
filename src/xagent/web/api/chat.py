@@ -1061,7 +1061,8 @@ def _raise_task_expired_or_not_found(db: Session, user: User, task_id: int) -> N
 def _with_auto_recovery(
     response: Dict[str, Any], auto_recovery: Dict[str, Any] | None
 ) -> Dict[str, Any]:
-    """A task detail/status response with its current interruption, if any."""
+    """A task detail/status response with its current interruption and
+    automatic resume, if any; computed per request, never cached with it."""
     return {**response, "auto_recovery": auto_recovery}
 
 
