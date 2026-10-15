@@ -2312,9 +2312,20 @@ def test_unconfirmed_dispatches_whose_command_ended_are_not_in_flight(
     assert _events(factory, ended) == []
 
 
-def test_failure_while_postponing_is_logged_and_the_scan_continues(
-    factory, notified, monkeypatch, caplog
+@pytest.mark.parametrize(
+    "postpone_error",
+    [
+        RuntimeError("postpone failed"),
+        OperationalError("UPDATE", {}, Exception("connection reset")),
+        SATimeoutError("QueuePool limit reached"),
+    ],
+    ids=["other_error", "db_unavailable", "pool_timeout"],
+)
+def test_failure_while_postponing(
+    factory, notified, monkeypatch, caplog, postpone_error
 ):
+    """A postpone that fails on a database outage or a pool timeout ends the
+    tick; any other failure is logged and the scan goes on."""
     real = task_execution_admission.stage_task_admission
     full_for: set[int] = set()
 
@@ -2324,7 +2335,7 @@ def test_failure_while_postponing_is_logged_and_the_scan_continues(
         real(db, command)
 
     def broken(*_args, **_kwargs):
-        raise RuntimeError("postpone failed")
+        raise postpone_error
 
     monkeypatch.setattr(
         "xagent.web.services.task_execution_admission.stage_task_admission", admission
@@ -2338,15 +2349,20 @@ def test_failure_while_postponing_is_logged_and_the_scan_continues(
     full_for.add(refused)
 
     with caplog.at_level(logging.WARNING, logger=task_auto_resume.__name__):
-        report = run_auto_resume_tick(now=now)
-
-    assert "postpone" in caplog.text
-    assert report.dispatched == 1
+        if isinstance(postpone_error, RuntimeError):
+            report = run_auto_resume_tick(now=now)
+            assert "postpone" in caplog.text
+            assert report.dispatched == 1
+            assert _row(factory, healthy).state == "dispatched"
+        else:
+            with pytest.raises(type(postpone_error)):
+                run_auto_resume_tick(now=now)
+            # Nothing behind the refused row ran.
+            assert _row(factory, healthy).state == "scheduled"
     # Nothing committed for the refused row: the next tick retries it.
     row = _row(factory, refused)
     assert (row.state, row.total_resumes) == ("scheduled", 0)
     assert _aware(row.next_attempt_at) == now - timedelta(seconds=10)
-    assert _row(factory, healthy).state == "dispatched"
 
 
 class _HostHookRefusal(Exception):
@@ -2369,24 +2385,41 @@ def _raising_stage(exc: BaseException, task_id_box: list[int]):
     "exc",
     [
         RuntimeError("Execution admission requires shared task execution"),
-        _HostHookRefusal("team membership required"),
         TaskCommandOwnerStateError("pending writes failed to flush"),
         ValueError("Drain the admission bucket before changing its policy"),
+        AttributeError("x"),
+        TypeError("y"),
+        _HostHookRefusal("team membership required"),
         IntegrityError("INSERT", {}, Exception("duplicate")),
         OperationalError("SELECT", {}, Exception("connection reset")),
         SATimeoutError("QueuePool limit reached"),
     ],
     ids=[
         "hook_runtime_error",
-        "host_hook_error",
         "owner_state_error",
         "value_error",
+        "attribute_error",
+        "type_error",
+        "host_hook_error",
         "integrity_error",
         "db_unavailable",
         "pool_timeout",
     ],
 )
 def test_staging_refusal_postpones(factory, notified, monkeypatch, caplog, exc):
+    """Every refused row is postponed. ``ValueError`` and ``RuntimeError``
+    count as refused (WARNING); any other class counts as a failed candidate
+    (ERROR)."""
+    counters: list[tuple[str, dict[str, Any] | None]] = []
+    real_counter = task_auto_resume.increment_counter
+    monkeypatch.setattr(
+        task_auto_resume,
+        "increment_counter",
+        lambda name, attributes=None, **kw: (
+            counters.append((name, attributes)),
+            real_counter(name, attributes=attributes, **kw),
+        ),
+    )
     now = utc_now()
     with factory() as db:
         refused = _seed(db, now, due_in=-10)
@@ -2415,19 +2448,28 @@ def test_staging_refusal_postpones(factory, notified, monkeypatch, caplog, exc):
     # The scan continued past the refused row in every case.
     assert _row(factory, healthy).state == "dispatched"
     assert report.dispatched == 1
-    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    problems = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    refused_count = counters.count(
+        ("xagent.task.auto_resume.skipped", {"outcome": "staging_refused"})
+    )
+    failed_count = counters.count(("xagent.task.auto_resume.candidate_failed", None))
     if isinstance(exc, IntegrityError):
         assert report.raced == 1
         assert _aware(row.next_attempt_at) == now - timedelta(seconds=10)
-        assert warnings == []
+        assert problems == []
     elif isinstance(exc, OperationalError):
         assert report.failed == 1
         assert _aware(row.next_attempt_at) == now - timedelta(seconds=10)
-    else:
-        assert report.failed == 0
+    elif isinstance(exc, (ValueError, RuntimeError)):
+        assert (report.failed, refused_count, failed_count) == (0, 1, 0)
         assert _aware(row.next_attempt_at) == now + timedelta(seconds=60)
-        assert len(warnings) == 1 and warnings[0].exc_info is not None
-        assert warnings[0].exc_info[1] is exc
+        assert len(problems) == 1 and problems[0].levelno == logging.WARNING
+        assert problems[0].exc_info is not None and problems[0].exc_info[1] is exc
+    else:
+        assert (report.failed, refused_count, failed_count) == (1, 0, 1)
+        assert _aware(row.next_attempt_at) == now + timedelta(seconds=60)
+        assert len(problems) == 1 and problems[0].levelno == logging.ERROR
+        assert problems[0].exc_info is not None and problems[0].exc_info[1] is exc
 
 
 def test_dispatch_delay_is_observed(factory, notified, monkeypatch):

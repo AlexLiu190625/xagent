@@ -894,7 +894,7 @@ async def test_status_only_settlement(
     else:
         # The recorder reads eligibility inside its own SAVEPOINT; a
         # connectivity failure there skips the row, never the settlement.
-        assert row is None or (row.reason, row.state) == (reason, "manual")
+        assert row is None
 
 
 @pytest.mark.parametrize(

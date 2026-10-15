@@ -310,9 +310,7 @@ def record_interruption_no_commit(
         state, state_detail = TaskAutoRecoveryState.INELIGIBLE, eligibility.detail
     elif (
         gated_by_settlement_switches
-        and _pausable_with_infra_switch(
-            reason, eligibility.kind, str(task.source or "internal")
-        )
+        and _pausable_with_infra_switch(reason, eligibility.kind, task.source)
         and not get_task_infra_failure_pause_enabled()
     ):
         state, state_detail = TaskAutoRecoveryState.DISABLED, None
@@ -783,7 +781,7 @@ SETTLEMENT_PAUSE_DEFERRED_REASONS: frozenset[InterruptionReason] = frozenset()
 def _pausable_with_infra_switch(
     reason: InterruptionReason,
     kind: str | None = None,
-    source: str | None = None,
+    source: Any = None,
 ) -> bool:
     """Whether ``XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED`` decides ``reason``.
 

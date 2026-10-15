@@ -135,6 +135,7 @@ from .task_lease_service import (
     run_while_task_lease_owned,
     stop_task_lease_heartbeat,
     task_lease_attempt_predicate,
+    utc_now,
     validate_preacquired_task_lease_isolated,
 )
 from .task_runtime import mcp_runtime_authorization_policy_required
@@ -1220,13 +1221,25 @@ def _lock_status_only_append_no_commit(db: Session, task_id: int) -> Task | None
     changes after creation, so the object the caller already loaded decides
     first, before any lock or re-read. Then the row is locked and re-read:
     only the START reservation would otherwise take the lock, after the state
-    this must decide on was read. A RESUME handing off is about to run the
-    paused turn again, so the append is busy; a hand-off no RESUME is left to
-    finish is stranded, not busy.
+    this must decide on was read. On PostgreSQL the lock holds the row until
+    commit. SQLite ignores row locks and takes its write lock only at the
+    START reservation's UPDATE, so there the busy check and the supersede's
+    first reads can see a row another writer then changes; the supersede's
+    compare-and-swap on the version and on the recovery row as read rejects
+    that as busy.
+
+    A RESUME handing off is about to run the paused turn again, so the append
+    is busy. The RESUME command ends before the resumed run claims its lease,
+    so its status alone does not say the hand-off is over: the test is the
+    channel acceptance's (``resume_hand_off_can_complete``), a RESUME still
+    queued or running, or the run's automatic resume still inside the channel
+    window and its grace. A hand-off past that window is treated as stranded
+    and the append is accepted; if it claims its lease after all, the START
+    accepted in between can still be rejected, as on the channel path.
     """
     from sqlalchemy import select
 
-    from .task_auto_resume import resume_command_in_flight
+    from .task_auto_resume import resume_hand_off_can_complete
 
     loaded = db.get(Task, task_id)
     if loaded is None or not is_status_only_source(loaded.source):
@@ -1237,7 +1250,7 @@ def _lock_status_only_append_no_commit(db: Session, task_id: int) -> Task | None
         raise TaskTurnNotFoundError(task_id)
     if (
         locked.control_state == TaskControlState.RESUME_REQUESTED.value
-        and resume_command_in_flight(db, task_id)
+        and resume_hand_off_can_complete(db, locked, now=utc_now())
     ):
         raise TaskTurnError("busy")
     return locked
@@ -1341,10 +1354,15 @@ def _accept_turn_no_commit(
             supersede_pending_auto_resume_for_append_no_commit,
         )
 
+        # A START that replaced a pending automatic resume and is then
+        # rejected (for example ``start_identity_changed``) leaves the task
+        # PAUSED with automatic resume stopped (``manual`` / ``new_turn``):
+        # the message is marked delivery-failed and the paused run is not
+        # resumed. No terminal status is reported to the caller in that case.
+        #
         # The START is staged at the version this may move: the version
         # snapshot below is read after it.
         supersede_pending_auto_resume_for_append_no_commit(db, locked)
-        db.refresh(locked)
 
     if not queued:
         from .task_admission_execution import require_execution_admission

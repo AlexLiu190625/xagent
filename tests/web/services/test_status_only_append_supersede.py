@@ -14,6 +14,8 @@ from __future__ import annotations
 import ast
 import pathlib
 import uuid
+from datetime import timedelta
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
@@ -26,9 +28,12 @@ from tests.web.services.test_channel_reply_hold import (
     CID,
     PV,
     RUN,
+    _auto_resume,
+    _limit,
     _recovery_row,
 )
 from tests.web.services.test_channel_reply_hold import factory as factory_fixture
+from tests.web.services.test_channel_reply_hold import handler as handler_fixture
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import get_engine
 from xagent.web.models.task import Task, TaskStatus
@@ -46,7 +51,12 @@ from xagent.web.services.task_auto_resume import (
     check_auto_resume_claim_sync,
     run_auto_resume_tick,
 )
+from xagent.web.services.task_command_execution import ResumeCommandOutcome
+from xagent.web.services.task_command_transport import SettledTaskCommand
+from xagent.web.services.task_execution import _acquire_resume_task_lease
 from xagent.web.services.task_execution_controller import TaskControlState
+from xagent.web.services.task_interaction_close import ActiveInteractionAbsent
+from xagent.web.services.task_lease_service import utc_now
 from xagent.web.services.task_orchestrator import (
     TaskTurnError,
     TaskTurnOrchestrator,
@@ -55,6 +65,7 @@ from xagent.web.services.task_orchestrator import (
 
 engine = engine_fixture
 factory = factory_fixture
+handler = handler_fixture
 
 SERVICES = pathlib.Path(task_auto_resume.__file__).parent
 
@@ -199,6 +210,20 @@ def _hand_off_start(factory, tid: int, command_db_id: int) -> Any:
     return task_start_consumer._commit_handoff(command, lease)
 
 
+def _complete_resume_commands(factory, tid: int) -> None:
+    """End the RESUME commands of the task, as its handler returning does."""
+    with factory() as db:
+        db.execute(
+            sa.update(TaskExecutionCommand)
+            .where(
+                TaskExecutionCommand.task_id == tid,
+                TaskExecutionCommand.kind == "resume",
+            )
+            .values(status="completed")
+        )
+        db.commit()
+
+
 PENDING_ROWS = {
     "scheduled": dict(row="scheduled"),
     "dispatched_pending": dict(row="dispatched", command_status="pending"),
@@ -265,42 +290,57 @@ def test_append_supersedes_queued_auto_resume(factory, row_state):
         ] == []
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("row_state", sorted(PENDING_ROWS))
-def test_superseded_resume_cannot_reject_the_start(factory, row_state):
-    """Message M runs: the queued RESUME, fenced on the version it admitted
-    from, can no longer move the task, so the START is accepted by the
-    consumer and the task moves to a new run."""
+async def test_superseded_resume_cannot_reject_the_start(factory, handler, row_state):
+    """Message M runs: the RESUME already queued, fenced on the version it
+    admitted from, can no longer move the task, so the START is accepted by
+    the consumer and the task moves to a new run. A ``scheduled`` row has no
+    RESUME command yet: the sweeper finds nothing to dispatch. The others
+    drive the real ``resume_task``: a pending RESUME has the append accepted
+    between its claim guard and its RESUME_REQUESTED transition; a rolled-back
+    one is skipped by its guard."""
     seed = PENDING_ROWS[row_state]
     tid = _seed(factory, source="sdk", **seed)
     version = seed.get("version", PV)
-    prepared = _accept(factory, tid)
 
-    with factory() as db:
-        moved = db.execute(
-            sa.update(Task)
-            .where(
-                Task.id == tid,
-                Task.state_version == version,
-                Task.control_state == TaskControlState.PAUSED.value,
-            )
-            .values(
-                control_state=TaskControlState.RESUME_REQUESTED.value,
-                state_version=Task.state_version + 1,
-            )
-        ).rowcount
-        db.commit()
-    assert moved == 0
-    # The guard skips the RESUME, which ends and lets the START be claimed.
-    with factory() as db:
-        db.execute(
-            sa.update(TaskExecutionCommand)
-            .where(
-                TaskExecutionCommand.task_id == tid,
-                TaskExecutionCommand.kind == "resume",
-            )
-            .values(status="completed")
+    ch = SimpleNamespace(task_id=tid, run_id=RUN, version=PV)
+    if row_state == "scheduled":
+        prepared = _accept(factory, tid)
+        assert run_auto_resume_tick().dispatched == 0
+    elif row_state == "dispatched_rolled_back":
+        # The task is already past the RESUME's fence: its claim guard skips
+        # it before the transition, with or without the supersede.
+        prepared = _accept(factory, tid)
+        retry = await _auto_resume(ch, CID, attempt_count=2)
+        assert retry.outcome is ResumeCommandOutcome.AUTO_SKIPPED
+        handler.background.assert_not_called()
+        _complete_resume_commands(factory, tid)
+    else:
+        accepted: list[Any] = []
+
+        def accept_between_guard_and_transition(_task_id):
+            accepted.append(_accept(factory, tid))
+            return ActiveInteractionAbsent()
+
+        handler.interaction.side_effect = accept_between_guard_and_transition
+        first = await _auto_resume(ch, CID, attempt_count=1)
+        # The transition is fenced on the version it admitted from.
+        assert first.outcome is ResumeCommandOutcome.DEFERRED
+        handler.interaction.side_effect = None
+        retry = await _auto_resume(ch, CID, attempt_count=2)
+        # The claim guard skips the retry.
+        assert retry.outcome is ResumeCommandOutcome.AUTO_SKIPPED
+        handler.background.assert_not_called()
+        prepared = accepted[0]
+        assert _snapshot(factory, tid)["task"] == (
+            TaskStatus.PAUSED,
+            "paused",
+            RUN,
+            version + 1,
         )
-        db.commit()
+        # The skipped RESUME ends and lets the START be claimed.
+        _complete_resume_commands(factory, tid)
 
     outcome = _hand_off_start(factory, tid, prepared.command_db_id)
     assert isinstance(outcome, task_start_consumer._StartHandoff)
@@ -309,6 +349,35 @@ def test_superseded_resume_cannot_reject_the_start(factory, row_state):
         task = db.get(Task, tid)
         assert (task.status, task.run_id) == (TaskStatus.RUNNING, outcome.start.run_id)
         assert task.run_id != RUN
+
+
+def test_rejected_start_after_supersede_leaves_the_task_paused(factory, monkeypatch):
+    """A START that replaced the pending resume and is then rejected for an
+    unrelated reason leaves the task PAUSED with automatic resume stopped; the
+    message is marked delivery-failed. This pins that outcome: changing it
+    (rescheduling the resume, failing the task) must change this test too."""
+    tid = _seed(factory, source="sdk", row="scheduled")
+    prepared = _accept(factory, tid)
+    monkeypatch.setattr(
+        task_start_consumer, "command_identity_matches_task", lambda *_a: False
+    )
+
+    outcome = _hand_off_start(factory, tid, prepared.command_db_id)
+
+    assert isinstance(outcome, SettledTaskCommand)
+    assert outcome.result == {"rejection_reason": "start_identity_changed"}
+    after = _snapshot(factory, tid)
+    assert after["task"] == (TaskStatus.PAUSED, "paused", RUN, PV + 1)
+    assert after["row"][:3] == ("manual", "new_turn", PV + 1)
+    with factory() as db:
+        delivery = db.scalars(
+            sa.select(TaskChatMessage.delivery_status).where(
+                TaskChatMessage.task_id == tid
+            )
+        ).all()
+    assert delivery == ["failed"]
+    assert run_auto_resume_tick().dispatched == 0
+    assert [c for c in _snapshot(factory, tid)["commands"] if c[0] == "resume"] == []
 
 
 # --------------------------------------------------------------------------
@@ -389,21 +458,15 @@ def _zero_rowcount_on(monkeypatch, call: int) -> None:
         "version_cas_loses",
         "refence_loses",
         "give_up_cas_loses",
-        "stranded_hand_off",
     ],
 )
 def test_append_busy(factory, monkeypatch, case):
-    if case in {"resume_requested_with_live_resume", "stranded_hand_off"}:
+    if case == "resume_requested_with_live_resume":
         tid = _seed(
             factory,
             source="sdk",
             row="dispatched",
-            # A hand-off with no RESUME left to finish is stranded, not busy.
-            command_status=(
-                "processing"
-                if case == "resume_requested_with_live_resume"
-                else "completed"
-            ),
+            command_status="processing",
             version=PV + 1,
             control_state="resume_requested",
         )
@@ -415,16 +478,72 @@ def test_append_busy(factory, monkeypatch, case):
         )
     before = _snapshot(factory, tid)
 
-    if case == "stranded_hand_off":
-        _accept(factory, tid)
-        after = _snapshot(factory, tid)
-        assert after["messages"] == ["append-turn"]
-        assert after["row"][:2] == ("dispatched", None)
-        return
     with pytest.raises(TaskTurnError, match="busy"):
         _accept(factory, tid)
 
     assert _snapshot(factory, tid) == before
+
+
+async def _resume_until_hand_off(factory, handler) -> int:
+    """A task whose automatic RESUME ran through the real ``resume_task``: the
+    task is ``resume_requested``, the resumed run has not taken its lease, and
+    the RESUME command has ended."""
+    tid = _seed(factory, source="sdk", row="dispatched", command_status="processing")
+    ch = SimpleNamespace(task_id=tid, run_id=RUN, version=PV)
+    result = await _auto_resume(ch, CID, attempt_count=1)
+    assert result.outcome is ResumeCommandOutcome.SCHEDULED
+    handler.background.assert_called_once()
+    assert _snapshot(factory, tid)["task"] == (
+        TaskStatus.PAUSED,
+        "resume_requested",
+        RUN,
+        PV + 1,
+    )
+    _complete_resume_commands(factory, tid)
+    return tid
+
+
+@pytest.mark.asyncio
+async def test_append_is_busy_until_the_hand_off_takes_its_lease(factory, handler):
+    """The RESUME command ends before the resumed run claims its lease; an
+    append accepted in between would stage its START at a version the claim
+    then moves, and lose the message."""
+    tid = await _resume_until_hand_off(factory, handler)
+    before = _snapshot(factory, tid)
+
+    with pytest.raises(TaskTurnError, match="busy"):
+        _accept(factory, tid)
+
+    assert _snapshot(factory, tid) == before
+    with factory() as db:
+        owner = db.get(Task, tid).user_id
+    assert _acquire_resume_task_lease(tid, owner, RUN) is not None
+    with factory() as db:
+        task = db.get(Task, tid)
+        assert (task.status, task.run_id) == (TaskStatus.RUNNING, RUN)
+
+
+@pytest.mark.asyncio
+async def test_a_stranded_hand_off_accepts_past_the_window(factory, handler):
+    """A hand-off whose automatic resume is past the channel window and its
+    grace is treated as stranded: the append is accepted and its START takes
+    over the task."""
+    tid = await _resume_until_hand_off(factory, handler)
+    with factory() as db:
+        db.get(TaskAutoRecovery, tid).interrupted_at = utc_now() - timedelta(
+            seconds=_limit() + 5
+        )
+        db.commit()
+
+    prepared = _accept(factory, tid)
+
+    assert _snapshot(factory, tid)["messages"] == ["append-turn"]
+    outcome = _hand_off_start(factory, tid, prepared.command_db_id)
+    assert isinstance(outcome, task_start_consumer._StartHandoff)
+    with factory() as db:
+        task = db.get(Task, tid)
+        assert (task.status, task.run_id) == (TaskStatus.RUNNING, outcome.start.run_id)
+        assert task.run_id != RUN
 
 
 # --------------------------------------------------------------------------
