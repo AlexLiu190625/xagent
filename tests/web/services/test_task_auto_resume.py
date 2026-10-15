@@ -22,6 +22,8 @@ from typing import Any
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import TimeoutError as SATimeoutError
 from sqlalchemy.orm import Session, sessionmaker
 
 from tests.web.services.task_database_shared import engine as engine_fixture
@@ -29,6 +31,7 @@ from xagent.web.models import database
 from xagent.web.models.agent import Agent
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.task_admission import TaskAdmissionBucket, TaskAdmissionTicket
 from xagent.web.models.task_auto_recovery import TaskAutoRecovery, TaskRecoveryEvent
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.trigger import (
@@ -39,7 +42,7 @@ from xagent.web.models.trigger import (
 )
 from xagent.web.models.user import User
 from xagent.web.models.user_channel import UserChannel
-from xagent.web.services import ops_signals, task_auto_resume
+from xagent.web.services import ops_signals, task_auto_resume, task_execution_admission
 from xagent.web.services.task_auto_recovery import (
     TASK_INTERRUPTION_PAUSED_TRIGGER_ERROR,
 )
@@ -54,8 +57,14 @@ from xagent.web.services.task_auto_resume import (
     public_auto_resume_view,
     run_auto_resume_tick,
 )
-from xagent.web.services.task_command_transport import COMMAND_ID_PATTERN
-from xagent.web.services.task_execution_admission import AdmissionQueueFull
+from xagent.web.services.task_command_transport import (
+    COMMAND_ID_PATTERN,
+    TaskCommandOwnerStateError,
+)
+from xagent.web.services.task_execution_admission import (
+    AdmissionPolicy,
+    AdmissionQueueFull,
+)
 from xagent.web.services.task_lease_service import utc_now
 
 engine = engine_fixture
@@ -1109,25 +1118,29 @@ def test_an_existing_command_with_the_same_id_commits_only_if_it_will_run(
         assert len(_events(factory, task_id)) == events_before
 
 
-def test_full_admission_queue_postpones_and_stops_the_tick(
-    factory, notified, monkeypatch
-):
-    def full(_db, _command):
-        raise AdmissionQueueFull("Execution queue is full")
+def test_full_admission_queue_postpones_only_that_row(factory, notified, monkeypatch):
+    full_for: set[int] = set()
+    real = task_execution_admission.stage_task_admission
+
+    def admission(db, command):
+        if command.task_id in full_for:
+            raise AdmissionQueueFull("Execution queue is full")
+        real(db, command)
 
     monkeypatch.setattr(
-        "xagent.web.services.task_execution_admission.stage_task_admission", full
+        "xagent.web.services.task_execution_admission.stage_task_admission", admission
     )
     now = utc_now()
     with factory() as db:
         first = _seed(db, now, due_in=-10)
         second = _seed(db, now, due_in=-5)
         db.commit()
+    full_for.add(first)
 
     report = run_auto_resume_tick(now=now)
 
     assert report.admission_full
-    assert report.dispatched == 0
+    assert report.dispatched == 1
     row = _row(factory, first)
     assert row.state == "scheduled"
     assert (row.no_progress_resumes, row.total_resumes) == (0, 0)
@@ -1135,9 +1148,109 @@ def test_full_admission_queue_postpones_and_stops_the_tick(
     assert _aware(row.next_attempt_at) == now + timedelta(seconds=30)
     assert _commands(factory, first) == []
     assert _events(factory, first) == []
-    # The bucket is shared: the next candidate is not even tried.
-    assert _aware(_row(factory, second).next_attempt_at) == now - timedelta(seconds=5)
-    assert notified == []
+    # The scan went on: the next candidate was dispatched in the same tick.
+    assert _row(factory, second).state == "dispatched"
+    assert len(_commands(factory, second)) == 1
+    assert notified == [1]
+
+
+def _team_admission(
+    factory: sessionmaker, monkeypatch, request, *, full_for: User
+) -> None:
+    """Admission buckets per user (a stand-in for a team), the user's bucket
+    already holding its one pending slot."""
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+
+    def classify(db, command):
+        owner = db.get(Task, command.task_id).user_id
+        return AdmissionPolicy(bucket=f"team:{owner}", capacity=1, max_pending=1)
+
+    task_execution_admission.set_task_admission_hook(classify)
+    request.addfinalizer(lambda: task_execution_admission.set_task_admission_hook(None))
+    now = utc_now()
+    with factory() as db:
+        holder = _seed(db, now, user=full_for, state="manual", due_in=None)
+        command = TaskExecutionCommand(
+            task_id=holder,
+            actor_user_id=full_for.id,
+            command_id=f"holder-{holder}",
+            kind="resume",
+            payload={"type": "resume_task"},
+            status="pending",
+        )
+        db.add(command)
+        db.add(
+            TaskAdmissionBucket(key=f"team:{full_for.id}", capacity=1, max_pending=1)
+        )
+        db.flush()
+        db.add(
+            TaskAdmissionTicket(
+                command_id=command.id,
+                task_id=holder,
+                bucket_key=f"team:{full_for.id}",
+            )
+        )
+        db.commit()
+
+
+def test_admission_full_in_one_team_does_not_block_another(
+    factory, notified, monkeypatch, request
+):
+    now = utc_now()
+    with factory() as db:
+        team_a, team_b = _user(db), _user(db)
+        db.commit()
+        team_a_id, team_b_id = team_a.id, team_b.id
+    with factory() as db:
+        team_a, team_b = db.get(User, team_a_id), db.get(User, team_b_id)
+        _team_admission(factory, monkeypatch, request, full_for=team_a)
+        # Team A's row is due first, then team B's, then an unhooked one.
+        a_row = _seed(db, now, user=team_a, due_in=-30)
+        b_row = _seed(db, now, user=team_b, due_in=-20)
+        db.commit()
+
+    report = run_auto_resume_tick(now=now)
+
+    assert report.admission_full
+    assert report.dispatched == 1
+    row = _row(factory, a_row)
+    assert (row.state, _aware(row.next_attempt_at)) == (
+        "scheduled",
+        now + timedelta(seconds=30),
+    )
+    assert _commands(factory, a_row) == []
+    assert _row(factory, b_row).state == "dispatched"
+    assert len(_commands(factory, b_row)) == 1
+
+
+def test_a_team_with_many_due_rows_delays_another_for_a_bounded_number_of_ticks(
+    factory, notified, monkeypatch, request
+):
+    now = utc_now()
+    with factory() as db:
+        team_a, team_b = _user(db), _user(db)
+        db.commit()
+        team_a_id, team_b_id = team_a.id, team_b.id
+    with factory() as db:
+        team_a, team_b = db.get(User, team_a_id), db.get(User, team_b_id)
+        _team_admission(factory, monkeypatch, request, full_for=team_a)
+        a_rows = [
+            _seed(db, now, user=team_a, due_in=-1000 + index) for index in range(200)
+        ]
+        b_row = _seed(db, now, user=team_b, due_in=-1)
+        db.commit()
+    scan_limit = 4 * 20
+    ticks_bound = -(-len(a_rows) // scan_limit) + 1
+
+    for tick in range(ticks_bound):
+        run_auto_resume_tick(now=now + timedelta(seconds=5 * tick))
+        if _row(factory, b_row).state == "dispatched":
+            break
+
+    assert _row(factory, b_row).state == "dispatched"
+    assert tick + 1 <= ticks_bound == 4
+    # Team A never got through its full bucket.
+    assert all(_commands(factory, task_id) == [] for task_id in a_rows[:5])
 
 
 def test_candidate_failure_is_isolated(factory, notified, monkeypatch):
@@ -2210,32 +2323,116 @@ def test_unconfirmed_dispatches_whose_command_ended_are_not_in_flight(
     assert _events(factory, ended) == []
 
 
-def test_failure_while_postponing_after_a_full_queue_fails_the_tick(
-    factory, notified, monkeypatch
+def test_failure_while_postponing_is_logged_and_the_scan_continues(
+    factory, notified, monkeypatch, caplog
 ):
-    def full(_db, _command):
-        raise AdmissionQueueFull("Execution queue is full")
+    real = task_execution_admission.stage_task_admission
+    full_for: set[int] = set()
+
+    def admission(db, command):
+        if command.task_id in full_for:
+            raise AdmissionQueueFull("Execution queue is full")
+        real(db, command)
 
     def broken(*_args, **_kwargs):
         raise RuntimeError("postpone failed")
 
     monkeypatch.setattr(
-        "xagent.web.services.task_execution_admission.stage_task_admission", full
+        "xagent.web.services.task_execution_admission.stage_task_admission", admission
     )
-    monkeypatch.setattr(task_auto_resume, "_postpone_after_admission_full", broken)
+    monkeypatch.setattr(task_auto_resume, "_postpone_candidate", broken)
     now = utc_now()
     with factory() as db:
-        task_id = _seed(db, now)
+        refused = _seed(db, now, due_in=-10)
+        healthy = _seed(db, now, due_in=-5)
         db.commit()
+    full_for.add(refused)
 
-    with pytest.raises(RuntimeError, match="postpone failed"):
-        run_auto_resume_tick(now=now)
+    with caplog.at_level(logging.WARNING, logger=task_auto_resume.__name__):
+        report = run_auto_resume_tick(now=now)
 
-    # Nothing committed: the row is still due and the next tick retries it.
-    row = _row(factory, task_id)
+    assert "postpone" in caplog.text
+    assert report.dispatched == 1
+    # Nothing committed for the refused row: the next tick retries it.
+    row = _row(factory, refused)
     assert (row.state, row.total_resumes) == ("scheduled", 0)
-    assert _aware(row.next_attempt_at) == now - timedelta(seconds=1)
-    assert notified == []
+    assert _aware(row.next_attempt_at) == now - timedelta(seconds=10)
+    assert _row(factory, healthy).state == "dispatched"
+
+
+def _raising_stage(exc: BaseException, task_id_box: list[int]):
+    """``stage_task_command`` that raises ``exc`` for the first seeded task."""
+    real = task_auto_resume.stage_task_command
+
+    def stage(db, *, task_id, **kwargs):
+        if task_id == task_id_box[0]:
+            raise exc
+        return real(db, task_id=task_id, **kwargs)
+
+    return stage
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        RuntimeError("Execution admission requires shared task execution"),
+        TaskCommandOwnerStateError("pending writes failed to flush"),
+        ValueError("Drain the admission bucket before changing its policy"),
+        IntegrityError("INSERT", {}, Exception("duplicate")),
+        OperationalError("SELECT", {}, Exception("connection reset")),
+        SATimeoutError("QueuePool limit reached"),
+    ],
+    ids=[
+        "hook_runtime_error",
+        "owner_state_error",
+        "value_error",
+        "integrity_error",
+        "db_unavailable",
+        "pool_timeout",
+    ],
+)
+def test_staging_refusal_postpones(factory, notified, monkeypatch, caplog, exc):
+    now = utc_now()
+    with factory() as db:
+        refused = _seed(db, now, due_in=-10)
+        healthy = _seed(db, now, due_in=-5)
+        db.commit()
+    monkeypatch.setattr(
+        task_auto_resume, "stage_task_command", _raising_stage(exc, [refused])
+    )
+
+    with caplog.at_level(logging.WARNING, logger=task_auto_resume.__name__):
+        if isinstance(exc, SATimeoutError):
+            with pytest.raises(SATimeoutError):
+                run_auto_resume_tick(now=now)
+            # Unchanged: a pool timeout ends the tick, nothing behind it ran.
+            assert _row(factory, healthy).state == "scheduled"
+            assert _aware(_row(factory, refused).next_attempt_at) == now - timedelta(
+                seconds=10
+            )
+            return
+        report = run_auto_resume_tick(now=now)
+
+    row = _row(factory, refused)
+    assert (row.state, row.total_resumes, row.last_command_id) == ("scheduled", 0, None)
+    assert _events(factory, refused) == []
+    assert _commands(factory, refused) == []
+    # The scan continued past the refused row in every case.
+    assert _row(factory, healthy).state == "dispatched"
+    assert report.dispatched == 1
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    if isinstance(exc, IntegrityError):
+        assert report.raced == 1
+        assert _aware(row.next_attempt_at) == now - timedelta(seconds=10)
+        assert warnings == []
+    elif isinstance(exc, OperationalError):
+        assert report.failed == 1
+        assert _aware(row.next_attempt_at) == now - timedelta(seconds=10)
+    else:
+        assert report.failed == 0
+        assert _aware(row.next_attempt_at) == now + timedelta(seconds=60)
+        assert len(warnings) == 1 and warnings[0].exc_info is not None
+        assert warnings[0].exc_info[1] is exc
 
 
 def test_dispatch_delay_is_observed(factory, notified, monkeypatch):

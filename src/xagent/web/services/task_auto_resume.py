@@ -64,6 +64,7 @@ from ...config import (
     get_task_auto_resume_max_inflight,
     get_task_auto_resume_max_per_tick,
 )
+from ...core.agent.interruption import is_database_unavailable
 from ...core.runtime_performance import (
     increment_counter,
     observe_value,
@@ -122,6 +123,10 @@ logger = logging.getLogger(__name__)
 DISPATCH_CHECK_GRACE_SECONDS = 60
 # A full admission queue pushes the candidate this far out.
 ADMISSION_FULL_DELAY_SECONDS = 30
+# So does a refused staging that is neither a full queue nor a race nor a
+# database outage: a configuration or programming fault repeats on every
+# attempt, so retrying it on every tick only adds load.
+STAGING_REFUSED_DELAY_SECONDS = 60
 _COMMAND_ID_MAX_CHARS = 64
 # Consecutive failed ticks before TASK_AUTO_RESUME_UNAVAILABLE is raised.
 _UNAVAILABLE_AFTER_FAILURES = 3
@@ -727,13 +732,29 @@ def _limit_state(
 # --------------------------------------------------------------------------
 
 
-class _AdmissionFull(Exception):
-    """``AdmissionQueueFull`` carrying the fence the candidate was seen at."""
+class _DispatchRefused(Exception):
+    """A dispatch whose staging was refused, carrying the fence the candidate
+    was seen at. The scan postpones that one row and goes on."""
+
+    delay_seconds: int
 
     def __init__(self, task_id: int, paused_state_version: int) -> None:
         super().__init__(task_id, paused_state_version)
         self.task_id = task_id
         self.paused_state_version = paused_state_version
+
+
+class _AdmissionFull(_DispatchRefused):
+    """``AdmissionQueueFull``: the candidate's admission bucket is full."""
+
+    delay_seconds = ADMISSION_FULL_DELAY_SECONDS
+
+
+class _StagingRefused(_DispatchRefused):
+    """``stage_task_command`` raised something a retry will not get past
+    (chained as ``__cause__``)."""
+
+    delay_seconds = STAGING_REFUSED_DELAY_SECONDS
 
 
 def _process_due_candidate_no_commit(
@@ -859,6 +880,13 @@ def _process_due_candidate_no_commit(
         )
     except AdmissionQueueFull as exc:
         raise _AdmissionFull(task_id, paused_state_version) from exc
+    except IntegrityError:
+        # A race on the command row: ``_settle_candidate`` counts it.
+        raise
+    except Exception as exc:
+        if is_database_unavailable(exc) or is_database_pool_timeout(exc):
+            raise
+        raise _StagingRefused(task_id, paused_state_version) from exc
     if not staged.created:
         # Only a race that dispatched this exact (fence, attempt) gets here.
         # Commit ``dispatched`` only if that command is this dispatch and is
@@ -905,10 +933,19 @@ def _process_due_candidate_no_commit(
     )
 
 
-def _postpone_after_admission_full(
-    task_id: int, paused_state_version: int, now: datetime
+def _postpone_candidate(
+    task_id: int,
+    *,
+    state: TaskAutoRecoveryState,
+    paused_state_version: int,
+    now: datetime,
+    delay_seconds: int,
 ) -> None:
-    """Push a candidate the admission queue refused; a single-row CAS."""
+    """Push a candidate its dispatch was refused for; a single-row CAS.
+
+    Fresh session: the candidate's own transaction was rolled back. Matches
+    only a row still in ``state`` at ``paused_state_version``.
+    """
 
     from ..models.database import get_session_local
 
@@ -918,13 +955,10 @@ def _postpone_after_admission_full(
                 update(TaskAutoRecovery)
                 .where(
                     TaskAutoRecovery.task_id == task_id,
-                    TaskAutoRecovery.state == _SCHEDULED.value,
+                    TaskAutoRecovery.state == state.value,
                     TaskAutoRecovery.paused_state_version == paused_state_version,
                 )
-                .values(
-                    next_attempt_at=now
-                    + timedelta(seconds=ADMISSION_FULL_DELAY_SECONDS)
-                )
+                .values(next_attempt_at=now + timedelta(seconds=delay_seconds))
                 .execution_options(synchronize_session=False)
             )
             db.commit()
@@ -1355,7 +1389,7 @@ def _settle_candidate(
 
     A failure is logged and skipped so one bad row cannot stall the rest,
     except a pool timeout, which ends the tick as lease recovery does.
-    ``_AdmissionFull`` propagates for the dispatch path to handle.
+    ``_DispatchRefused`` propagates for the dispatch path to handle.
     """
 
     try:
@@ -1364,7 +1398,7 @@ def _settle_candidate(
             db.commit()
         else:
             db.rollback()
-    except _AdmissionFull:
+    except _DispatchRefused:
         db.rollback()
         raise
     except IntegrityError:
@@ -1523,8 +1557,13 @@ def scan_due(
 
     Once the budget is spent, a row that needs a dispatch is left unwritten
     and the scan goes on, so rows behind it can still expire, go stale or be
-    superseded. Only a full admission queue stops it early (its buckets are
-    shared, so the next dispatch would be refused too).
+    superseded. A row whose staging is refused is postponed on its own
+    (``_DispatchRefused``) and the scan goes on too: a host may bucket
+    admission per team, so one full bucket says nothing about the next row.
+    A team with more due rows than ``scan_limit`` ahead of everyone else still
+    uses up the scan, so another team's row waits at most
+    ``ceil(rows / scan_limit)`` ticks plus the one that dispatches it; each
+    further due row of a full bucket costs one refused staging.
     """
 
     for db, task_id in _candidates(_SCHEDULED, now=now, limit=scan_limit):
@@ -1538,20 +1577,47 @@ def scan_due(
                     db, task_id, now=now, can_dispatch=can_dispatch
                 ),
             )
-        except _AdmissionFull as full:
-            report.admission_full = True
-            increment_counter(
-                "xagent.task.auto_resume.skipped",
-                attributes={"outcome": "admission_full"},
-            )
-            _postpone_after_admission_full(full.task_id, full.paused_state_version, now)
-            logger.info(
-                "component=auto-resume task_id=%s admission queue is full; "
-                "postponed %ss",
-                full.task_id,
-                ADMISSION_FULL_DELAY_SECONDS,
-            )
-            return
+        except _DispatchRefused as refused:
+            if isinstance(refused, _AdmissionFull):
+                report.admission_full = True
+                increment_counter(
+                    "xagent.task.auto_resume.skipped",
+                    attributes={"outcome": "admission_full"},
+                )
+                logger.info(
+                    "component=auto-resume task_id=%s admission queue is full; "
+                    "postponing %ss",
+                    refused.task_id,
+                    refused.delay_seconds,
+                )
+            else:
+                increment_counter(
+                    "xagent.task.auto_resume.skipped",
+                    attributes={"outcome": "staging_refused"},
+                )
+                logger.warning(
+                    "component=auto-resume task_id=%s staging the resume was "
+                    "refused; postponing %ss",
+                    refused.task_id,
+                    refused.delay_seconds,
+                    exc_info=refused.__cause__,
+                )
+            try:
+                _postpone_candidate(
+                    refused.task_id,
+                    state=_SCHEDULED,
+                    paused_state_version=refused.paused_state_version,
+                    now=now,
+                    delay_seconds=refused.delay_seconds,
+                )
+            except Exception:
+                logger.warning(
+                    "component=auto-resume task_id=%s postponing the refused "
+                    "candidate failed; it is retried next tick",
+                    refused.task_id,
+                    exc_info=True,
+                )
+            continue
         if result is not None and result.dispatch_delay_seconds is not None:
             observe_value(
                 "xagent.task.auto_resume.dispatch_delay_seconds",
