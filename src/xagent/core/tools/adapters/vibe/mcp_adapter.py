@@ -70,6 +70,7 @@ from .connector_runtime import (
     runtime_bindings_from_config,
 )
 from .mcp_approval_gate import gate_mcp_tools
+from .mcp_result_integrity import MCPResultIntegrityGuard
 from .sandboxed_tool.chrome_session import (
     ChromeDaemonLaunchSpec,
     ChromeExecutionScope,
@@ -1901,6 +1902,10 @@ class MCPToolAdapter(AbstractBaseTool):
         self._args_type = self._build_args_model()
         self._args_validator = self._build_args_validator()
         self._return_type = self._build_return_model()
+        self._result_integrity = MCPResultIntegrityGuard(
+            source_server=self.source_server,
+            tool_name=self.mcp_tool.name,
+        )
 
     @property
     def name(self) -> str:
@@ -3000,6 +3005,21 @@ class MCPToolAdapter(AbstractBaseTool):
                     ):
                         result = await self._run_upload_staging_operation(
                             self._register_workspace_download_result, result
+                        )
+                    try:
+                        result = await self._result_integrity.validate(
+                            tool_args, result
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "MCP result integrity guard failed for server %s "
+                            "tool %s (%s)",
+                            self.source_server,
+                            self.mcp_tool.name,
+                            type(exc).__name__,
+                        )
+                        result = self._result_integrity.failure_result(
+                            "the local integrity check could not complete"
                         )
                     if bound_args:
                         result["runtime_bound_arguments"] = bound_args
