@@ -26,6 +26,7 @@ from xagent.config import (
     CELERY_BROKER_URL,
     CELERY_ENABLED,
     CELERY_RESULT_BACKEND,
+    CORS_ORIGINS,
     DATABASE_URL,
     DB_MAX_OVERFLOW,
     DB_POOL_SIZE,
@@ -137,6 +138,7 @@ from xagent.config import (
     get_celery_broker_url,
     get_celery_enabled,
     get_celery_result_backend,
+    get_cors_origins,
     get_database_url,
     get_db_max_overflow,
     get_db_pool_size,
@@ -561,6 +563,31 @@ class TestAuthEmailConfig:
         assert get_slack_client_secret() is None
         assert get_slack_app_token() is None
         assert get_slack_oauth_redirect_uri() is None
+
+    def test_cors_origins_default_to_frontend_url(self, monkeypatch):
+        monkeypatch.delenv(CORS_ORIGINS, raising=False)
+        monkeypatch.setenv("XAGENT_FRONTEND_URL", " https://app.example.com/ ")
+        assert get_cors_origins() == ["https://app.example.com"]
+
+    def test_cors_origins_parse_explicit_list(self, monkeypatch):
+        monkeypatch.setenv(
+            CORS_ORIGINS,
+            " https://app.example.com/ , https://admin.example.com ",
+        )
+        assert get_cors_origins() == [
+            "https://app.example.com",
+            "https://admin.example.com",
+        ]
+
+    def test_cors_origins_treat_blank_as_unset(self, monkeypatch):
+        monkeypatch.setenv(CORS_ORIGINS, "")
+        monkeypatch.setenv("XAGENT_FRONTEND_URL", "https://app.example.com")
+        assert get_cors_origins() == ["https://app.example.com"]
+
+    def test_cors_origins_reject_wildcard_with_credentials(self, monkeypatch):
+        monkeypatch.setenv(CORS_ORIGINS, "*")
+        with pytest.raises(ValueError, match=r"cannot contain '\*'"):
+            get_cors_origins()
 
     def test_slack_oauth_config_uses_explicit_values(self, monkeypatch):
         monkeypatch.setenv(SLACK_CLIENT_ID, " client-id ")
@@ -3958,3 +3985,27 @@ def test_execution_budget_env_default_cannot_exceed_maximum(monkeypatch):
     monkeypatch.setenv("XAGENT_EXECUTION_BUDGET_MAX_TOKENS", "100")
     with pytest.raises(ValueError, match="must not exceed"):
         get_execution_budget_defaults()
+
+
+@pytest.mark.parametrize("value", [None, "", "   ", " development ", "DEVELOPMENT"])
+def test_environment_defaults_and_normalizes_development(monkeypatch, value):
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+    if value is None:
+        monkeypatch.delenv("XAGENT_ENVIRONMENT", raising=False)
+    else:
+        monkeypatch.setenv("XAGENT_ENVIRONMENT", value)
+
+    assert config.get_environment() == "development"
+
+
+def test_legacy_environment_alias_is_normalized(monkeypatch):
+    monkeypatch.delenv("XAGENT_ENVIRONMENT", raising=False)
+    monkeypatch.setenv("ENVIRONMENT", " Production ")
+
+    assert config.get_environment() == "production"
+
+
+def test_blank_environment_override_falls_back_to_legacy_alias(monkeypatch):
+    monkeypatch.setenv("XAGENT_ENVIRONMENT", "  ")
+    monkeypatch.setenv("ENVIRONMENT", " production ")
+    assert config.get_environment() == "production"
