@@ -85,6 +85,11 @@ export interface ChatMessageProps {
   rawContent?: string;
   traceEvents?: TraceEvent[];
   showProcessView?: boolean;
+  // Whether an interrupted process draws its own "Interrupted" line. A caller
+  // whose turn already shows the interruption elsewhere passes false; the
+  // message row then has nothing left to draw, so only the trace renders (and
+  // nothing at all when the process view is off).
+  showInterruptedStatus?: boolean;
   isVirtual?: boolean;
   taskStatus?: string;
   processStatus?: string;
@@ -317,6 +322,7 @@ export function ChatMessage({
   // Default matches TaskConversationPanelProps: an unwired caller gets the
   // internal-page behavior; public surfaces opt out explicitly.
   showProcessView = true,
+  showInterruptedStatus = true,
   taskStatus,
   processStatus,
   timestamp,
@@ -446,18 +452,31 @@ export function ChatMessage({
     isStoppedTraceProcessStatus(resolvedProcessStatus) &&
     resolvedProcessStatus !== "completed";
 
+  // An interrupted process never draws the status indicator below, so once the
+  // caller has turned its own "Interrupted" line off, an empty message row has
+  // nothing to show, whatever showEmptyStatus or showProcessView say.
+  const hasSilencedInterruption =
+    resolvedProcessStatus === "interrupted" && !showInterruptedStatus;
+
   // A trace-only turn carries no answer text and no status line of its own, so
   // its bubble would render as a bare avatar. Drop it whether the trace above
   // was rendered (internal pages) or suppressed (embedded chat) — keying this
   // off the events themselves rather than off shouldShowProcess. Stopped
   // unanswered turns are the exception once the trace is hidden (see above).
+  // An interrupted process is another exception, unless the caller has turned
+  // its own "Interrupted" line off: that line is the message's content.
   const isProcessOnlyMessage =
     hasTraceEvents &&
-    resolvedProcessStatus !== "interrupted" &&
     !isUser &&
     !content &&
-    showEmptyStatus === false &&
-    (showProcessView || !isStoppedWithoutAnswer);
+    (
+      hasSilencedInterruption ||
+      (
+        resolvedProcessStatus !== "interrupted" &&
+        showEmptyStatus === false &&
+        (showProcessView || !isStoppedWithoutAnswer)
+      )
+    );
 
   // The trace carries the backend's raw error string (a Python exception, more
   // often than not). With the trace hidden the failure line must not become its
@@ -624,7 +643,7 @@ export function ChatMessage({
                   />
                 </div>
               )}
-              {resolvedProcessStatus === "interrupted" && (
+              {resolvedProcessStatus === "interrupted" && showInterruptedStatus && (
                 <div className="py-3 text-sm text-muted-foreground">{t("agent.layout.status.interrupted")}</div>
               )}
             </div>

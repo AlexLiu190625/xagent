@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useMemo } from "react";
+import React, { useState, useRef, useEffect, useId, useMemo } from "react";
 import { createFileChipHTML } from "./FileChip";
 import { useRouter } from "next/navigation";
 import { Paperclip, X, File as FileIcon, Sparkles, Pause, Play, Loader2, ArrowUp, Globe, Mic, Square } from "lucide-react";
@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { cn, generateClientMessageId, getApiUrl, getUploadApiUrl } from "@/lib/utils";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
+import type { SessionStopState } from "@/contexts/app-context-chat";
 import { useAuth } from "@/contexts/auth-context";
 import { ConfigDialog } from "@/components/config-dialog";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -55,6 +56,8 @@ interface ChatInputProps {
   taskStatus?: TaskStatus | string;
   onPause?: () => void;
   onResume?: () => void;
+  onStop?: () => void;
+  stopState?: SessionStopState;
   taskConfig?: Partial<AgentConfig>;
   hideConfig?: boolean;
   readOnlyConfig?: boolean;
@@ -118,6 +121,8 @@ export function ChatInput({
   taskStatus,
   onPause,
   onResume,
+  onStop,
+  stopState = "idle",
   taskConfig,
   hideConfig = false,
   readOnlyConfig = false,
@@ -674,15 +679,79 @@ export function ChatInput({
       };
     }
   }, [currentInteractionRequestId, hasDraft]);
+  // The stop control exists only in the compact toolbar, and only when the
+  // caller passes onStop. Every stop rule in this composer -- the stop square,
+  // its hints, the "Stopping..." names and the hold on sending -- keys on this
+  // one condition, so a composer without the stop control behaves the same
+  // whatever stopState it is handed.
+  const offersStopControl = compact && !!onStop;
+  const isStopInFlight = offersStopControl && stopState === "stopping";
   const canSubmit = () => {
     const isUploadingFiles = uploadingFiles.size > 0;
-    return hasDraft && !isInputBusy && !isUploadingFiles;
+    // A stop request the server has not answered yet still owns this turn, so
+    // a composer that offers the stop control accepts nothing new until it
+    // resolves: the send control stays in its slot, dimmed and inert, instead
+    // of delivering a message into the run the visitor has just asked to end.
+    return hasDraft && !isInputBusy && !isUploadingFiles && !isStopInFlight;
   };
   const canPauseTask =
     !!isLoading &&
     !!onPause &&
     isPausableTaskStatus(normalizedTaskStatus);
   const shouldShowPauseButton = canPauseTask && !hasDraft;
+  const reactId = useId();
+  const stopHintId = `${reactId}-stop-hint`;
+  // The stop control lives only in the compact toolbar. That is deliberate:
+  // the compact toolbar is the only layout that offers it, and the wider
+  // toolbar below carries the pause control instead, so a caller that passes
+  // `onStop` without `compact` gets no stop control at all. It steps aside for
+  // the send button whenever there is a draft — the same rule the pause button
+  // already follows above — but a send button shown while a stop is in flight
+  // is inert (see canSubmit), so stepping aside never opens a way into the
+  // turn being stopped. The not-sent and timed-out hints both explain that
+  // control, so each is gated on exactly the same condition; a hint with no
+  // visible control on screen would have nothing to refer to.
+  const showStopButton = offersStopControl && !hasDraft;
+  // The stop control and the send control take turns in the same slot, so the
+  // size and the box styling come from here instead of each of them carrying
+  // its own copy: the slot keeps one shape whichever control is on screen.
+  const composerActionButtonProps = (isDimmed: boolean) => ({
+    size: "icon" as const,
+    className: cn(
+      "h-8 w-8 rounded-lg transition-all duration-300",
+      // opacity-50 and pointer-events-none repeat what Button's `disabled:`
+      // styles give a natively disabled control, so the stop control -- which
+      // uses aria-disabled to keep focus -- looks and behaves under the
+      // pointer exactly like the send control when either is dimmed.
+      isDimmed && "bg-muted text-muted-foreground/50 opacity-50 pointer-events-none"
+    ),
+  });
+  // Two outcomes, two sentences: "timed_out" means the request went out and
+  // was never confirmed; "not_sent" means the socket refused it and nobody
+  // received it.
+  const stopHintKey =
+    stopState === "timed_out"
+      ? "widgetSession.stopTimedOut"
+      : stopState === "not_sent"
+        ? "widgetSession.stopNotSent"
+        : null;
+  const showStopHint = showStopButton && stopHintKey !== null;
+  const stopButtonLabel = isStopInFlight
+    ? t("widgetSession.stoppingResponse")
+    : t("widgetSession.stopResponse");
+  // With a draft the send control takes the stop control's slot, and while a
+  // stop is in flight it is inert (see canSubmit). It carries the same
+  // "Stopping..." name the stop control would, so the reason stays on screen.
+  const sendButtonLabel = isStopInFlight
+    ? t("widgetSession.stoppingResponse")
+    : t("common.send");
+  // The hint's status region stays mounted for as long as this composer
+  // offers the stop control, and only its text changes: a status region that
+  // appears together with its text is not announced by many screen readers.
+  // It is empty when there is nothing to say (no hint, or a draft has put the
+  // send control in the stop control's slot), and composers without the stop
+  // control do not render it at all.
+  const stopHintText = showStopHint ? t(stopHintKey) : "";
 
   const handleDragEnter = (e: React.DragEvent<HTMLFormElement>) => {
     if (
@@ -989,7 +1058,19 @@ export function ChatInput({
   }, [filesDisabled, message, promptHighlightTerms]);
 
   return (
-    <div className="space-y-3">
+    // No space-y here: the hint region below is mounted while it is empty, so
+    // it carries its own gap and only while it has text, which keeps the
+    // composer from shifting when the region mounts.
+    <div>
+      {offersStopControl && (
+        <p
+          id={stopHintId}
+          role="status"
+          className={cn("text-xs text-muted-foreground", stopHintText && "mb-3")}
+        >
+          {stopHintText}
+        </p>
+      )}
       {/* Input area */}
       <div
         className="relative"
@@ -1152,21 +1233,40 @@ export function ChatInput({
                   )}
                 </Button>
               )}
-              <Button
-                type="submit"
-                size="icon"
-                disabled={!canSubmit()}
-                className={cn(
-                  "h-8 w-8 rounded-lg transition-all duration-300",
-                  !canSubmit() && "bg-muted text-muted-foreground/50"
-                )}
-              >
-                {isInputBusy ? (
-                  <Sparkles className="h-4 w-4 animate-pulse" />
-                ) : (
-                  <ArrowUp className="h-4 w-4" />
-                )}
-              </Button>
+              {showStopButton ? (
+                <Button
+                  type="button"
+                  {...composerActionButtonProps(isStopInFlight)}
+                  // Not `disabled`: the visitor has just pressed this button,
+                  // and disabling a focused button drops keyboard focus to the
+                  // page. While a stop is pending it stays focusable, reports
+                  // itself unavailable, reads "Stopping...", and ignores presses.
+                  aria-disabled={isStopInFlight || undefined}
+                  onClick={() => {
+                    if (isStopInFlight) return;
+                    onStop?.();
+                  }}
+                  aria-label={stopButtonLabel}
+                  title={stopButtonLabel}
+                  aria-describedby={showStopHint ? stopHintId : undefined}
+                >
+                  <Square className="h-3.5 w-3.5 fill-current" />
+                </Button>
+              ) : (
+                <Button
+                  type="submit"
+                  {...composerActionButtonProps(!canSubmit())}
+                  disabled={!canSubmit()}
+                  aria-label={sendButtonLabel}
+                  title={sendButtonLabel}
+                >
+                  {isInputBusy ? (
+                    <Sparkles className="h-4 w-4 animate-pulse" />
+                  ) : (
+                    <ArrowUp className="h-4 w-4" />
+                  )}
+                </Button>
+              )}
             </div>
           ) : (
             <div className="absolute bottom-0 left-0 right-0 flex items-center justify-between bg-card px-4 py-3">

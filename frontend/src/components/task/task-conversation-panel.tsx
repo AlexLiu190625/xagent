@@ -59,6 +59,7 @@ type CombinedItem = {
   interactionRequestId?: string
   showEmptyStatus?: boolean
   processStatus?: string
+  showInterruptedStatus?: boolean
   timelineOrder?: number
   isSystemNotice?: boolean
 }
@@ -252,6 +253,9 @@ export function TaskConversationPanel({
     taskControlsEnabled,
     pauseTask,
     resumeTask,
+    canStopTask,
+    stopTask,
+    stopState,
     openFilePreview,
     closeFilePreview,
     requestStatus,
@@ -460,7 +464,22 @@ export function TaskConversationPanel({
       const isCurrentTurnGroup =
         groupIndex >= userTurnCount && groupIndex === latestGroupIndex
       const inferredProcessStatus = resolveTraceProcessStatus({ traceEvents: events })
-      const processStatus = isCurrentTurnGroup
+      // A turn the visitor stopped is recorded by the id of the user message
+      // that opened it (the group's anchor). That record outranks both the
+      // task status and the inferred status, for the current turn and for
+      // earlier ones, so the group carries no "failed" status either and
+      // never takes the turn's task-id failure reference. It is kept while
+      // the same task stays bound and is cleared when the bound task changes
+      // or the conversation or its messages are reset. When a bubble follows
+      // the group, that bubble already says the turn was interrupted, so the
+      // process does not repeat it; when nothing follows (the group still
+      // shows the empty status), the process keeps its "Interrupted" line,
+      // since nothing else on screen says so.
+      const isVisitorStoppedGroup =
+        !!anchor && state.stoppedTurnAnchorIds.includes(anchor.id)
+      const processStatus = isVisitorStoppedGroup
+        ? "interrupted"
+        : isCurrentTurnGroup
         ? resolveTraceProcessStatus({
             processStatus: state.currentTask?.status,
             traceEvents: events,
@@ -475,10 +494,15 @@ export function TaskConversationPanel({
         role: "assistant",
         content: null,
         timestamp: groupTimestamp,
-        status: shouldShowEmptyStatus ? state.currentTask?.status : undefined,
+        status:
+          shouldShowEmptyStatus && !isVisitorStoppedGroup
+            ? state.currentTask?.status
+            : undefined,
         traceEvents: events,
         showEmptyStatus: shouldShowEmptyStatus,
         processStatus,
+        showInterruptedStatus:
+          isVisitorStoppedGroup && !shouldShowEmptyStatus ? false : undefined,
         timelineOrder: groupIndex * 2,
       })
     })
@@ -494,6 +518,7 @@ export function TaskConversationPanel({
     hasFinalAssistantMessage,
     messageItems,
     state.currentTask?.status,
+    state.stoppedTurnAnchorIds,
     managerTraceEvents,
   ])
 
@@ -812,6 +837,16 @@ export function TaskConversationPanel({
     && state.currentTask.status === "paused"
     ? state.currentTask.autoResume
     : undefined
+  // The virtual message belongs to the latest turn, so it follows that turn's
+  // stopped record the same way the process groups above do, including taking
+  // no task-id failure reference. It only appears while the turn has no answer
+  // and no trace group of its own, so its "Interrupted" line is then the
+  // turn's only sign of the interruption and stays on.
+  const latestUserMessage = [...state.messages]
+    .reverse()
+    .find((message) => message.role === "user")
+  const isLatestTurnVisitorStopped =
+    !!latestUserMessage && state.stoppedTurnAnchorIds.includes(latestUserMessage.id)
   const shouldShowVirtualMessage =
     (state.isProcessing ||
       state.currentTask?.status === "paused" ||
@@ -881,6 +916,7 @@ export function TaskConversationPanel({
                         rawContent={item.rawContent}
                         traceEvents={item.traceEvents as any || []}
                         showProcessView={showProcessView}
+                        showInterruptedStatus={item.showInterruptedStatus}
                         processStatus={item.status === "interrupted" ? "interrupted" : item.processStatus}
                         taskStatus={
                           isFailedResultMessage
@@ -918,7 +954,7 @@ export function TaskConversationPanel({
                       traceEvents={currentTurnTraceEvents as any || []}
                       showProcessView={showProcessView}
                       isVirtual
-                      processStatus={state.currentTask?.status}
+                      processStatus={isLatestTurnVisitorStopped ? "interrupted" : state.currentTask?.status}
                       taskStatus={state.currentTask?.status}
                       interactions={state.currentTask?.status === "waiting_for_user" ? waitingInteractions : undefined}
                       interactionRequestId={state.currentTask?.status === "waiting_for_user" ? state.currentTask.waitingRequestId : undefined}
@@ -926,6 +962,7 @@ export function TaskConversationPanel({
                       onOpenExecutionPlan={showDagPreview ? openDagPreview : undefined}
                       onAgentExecutionClick={onAgentExecutionClick}
                       failureTaskId={
+                        !isLatestTurnVisitorStopped &&
                         !lastTurnHasFailureReference &&
                         state.currentTask?.id === String(state.taskId) &&
                         state.currentTask.status === "failed"
@@ -1002,6 +1039,8 @@ export function TaskConversationPanel({
               taskStatus={state.currentTask?.status}
               onPause={taskControlsEnabled ? pauseTask : undefined}
               onResume={taskControlsEnabled ? resumeTask : undefined}
+              onStop={canStopTask ? stopTask : undefined}
+              stopState={stopState}
               taskConfig={state.currentTask ? {
                 model: state.currentTask.modelId || state.currentTask.modelName,
                 smallFastModel: state.currentTask.smallFastModelId,

@@ -123,6 +123,7 @@ const MAX_TRACKED_TASK_STATE_VERSIONS = 500
 const MAX_RETIRED_SESSION_TASK_IDS = 500
 const SESSION_RESET_ACK_TIMEOUT_MS = 30_000
 const SESSION_TASK_ADOPTION_TIMEOUT_MS = 30_000
+const SESSION_STOP_TIMEOUT_MS = 30_000
 const MAX_SESSION_PRE_ADOPTION_FRAMES = 64
 const MAX_SESSION_PRE_ADOPTION_BYTES = 256 * 1024
 
@@ -134,6 +135,25 @@ type SessionConversationState =
   | { phase: "replacement_sending"; connectionIdentity: string; taskId: null }
   | { phase: "replacement_awaiting_task"; connectionIdentity: string; taskId: null }
   | { phase: "reload_required"; connectionIdentity: string | null; taskId: null }
+
+// The stop control's own state. The server sends no acknowledgement frame for
+// a stop, so "stopping" ends in one of six ways: this task's terminal frame,
+// the local timeout above, an agent_error for this task that carries no code
+// or carries external_stop_not_applied, a reconnect (the button's own state is
+// per-connection and cannot outlive the connection it was set on), the
+// control ceasing to be available while the run pauses without ending or
+// while the socket is down (see the effect keyed on canStopTask), or a later
+// stop attempt that the socket refuses, which moves the state straight to
+// "not_sent" (see stopTask). The last one is defensive: the stop button ignores
+// presses while a stop is pending, so only a caller other than the button can
+// reach it. That agent_error only returns the control to pressable and does
+// not end the stop intent: it is broadcast to every connection on the task
+// without naming which stop press it answers. "not_sent" itself is usually
+// short-lived: a socket that refuses a frame is normally closing or already
+// replaced, and once the drop or the new connection is observed the control
+// returns to "idle" (the effect keyed on canStopTask, or the one keyed on the
+// connection identity).
+export type SessionStopState = "idle" | "stopping" | "timed_out" | "not_sent"
 
 type SessionConversationAction =
   | { type: "SESSION_TASK_INFO"; connectionIdentity: string; taskId: number }
@@ -1294,6 +1314,11 @@ const normalizeDagExecutionPayload = (raw: Record<string, unknown>): DAGExecutio
 export interface AppState {
   streamRecoveryTaskId?: number | null
   messages: Message[]
+  // Ids of the user messages that opened a turn the visitor stopped. Kept
+  // here rather than on a bubble because a terminal frame that names a
+  // message_id adds no bubble. The conversation panel reads it to draw that
+  // turn's process as stopped. Live only: a reload does not rebuild it.
+  stoppedTurnAnchorIds: string[]
   currentTask: Task | null
   taskRuntimeExtensions: TaskRuntimeExtensions
   dagExecution: DAGExecution | null
@@ -1346,6 +1371,7 @@ type AppAction =
   | { type: "SET_TASK_ID"; payload: number | null }
   | { type: "ADOPT_SESSION_TASK"; payload: { taskId: number; task: Task } }
   | { type: "RESET_SESSION_CONVERSATION" }
+  | { type: "MARK_TURN_STOPPED"; payload: { anchorMessageId: string } }
   | { type: "ADD_MESSAGE"; payload: Message }
   | { type: "UPSERT_STREAMING_FINAL_ANSWER"; payload: { messageId: string; executionSequence?: number; delta?: string; content?: string; status?: Message["status"]; timestamp: string } }
   | { type: "SET_CURRENT_TASK"; payload: Task | null }
@@ -1393,6 +1419,7 @@ type AppAction =
 
 const createInitialState = (): AppState => ({
   messages: [],
+  stoppedTurnAnchorIds: [],
   currentTask: null,
   taskRuntimeExtensions: {},
   dagExecution: null,
@@ -1459,6 +1486,7 @@ function projectAppState(state: AppState, action: AppAction): AppState {
       // Clear messages if task ID changes
       const taskChanged = state.taskId !== action.payload
       const messages = taskChanged ? [] : state.messages
+      const stoppedTurnAnchorIds = taskChanged ? [] : state.stoppedTurnAnchorIds
       const contextUsage = taskChanged ? null : state.contextUsage
       const taskRuntimeExtensions = taskChanged ? {} : state.taskRuntimeExtensions
       // Also clear the previous task's DAG plan/phase here - otherwise
@@ -1471,6 +1499,7 @@ function projectAppState(state: AppState, action: AppAction): AppState {
         ...state,
         taskId: action.payload,
         messages,
+        stoppedTurnAnchorIds,
         contextUsage,
         taskRuntimeExtensions,
         dagExecution,
@@ -1490,7 +1519,23 @@ function projectAppState(state: AppState, action: AppAction): AppState {
         taskId: action.payload.taskId,
         currentTask: clearStaleAutoRecovery(withDagTerminatedAt(action.payload.task)),
         taskRuntimeExtensions: {},
+        // The server re-sends task_info for the same task at the start of
+        // every turn, so adopting the task already bound must keep the record
+        // of the turns the visitor stopped; only a different task drops it.
+        stoppedTurnAnchorIds:
+          state.taskId === action.payload.taskId ? state.stoppedTurnAnchorIds : [],
       }
+
+    case "MARK_TURN_STOPPED":
+      return state.stoppedTurnAnchorIds.includes(action.payload.anchorMessageId)
+        ? state
+        : {
+            ...state,
+            stoppedTurnAnchorIds: [
+              ...state.stoppedTurnAnchorIds,
+              action.payload.anchorMessageId,
+            ],
+          }
 
     case "RESET_SESSION_CONVERSATION":
       return {
@@ -2010,9 +2055,9 @@ function projectAppState(state: AppState, action: AppAction): AppState {
             isStreamingFinalAnswerMessage(message)
           )
         })
-        return { ...state, messages: messagesToKeep }
+        return { ...state, messages: messagesToKeep, stoppedTurnAnchorIds: [] }
       }
-      return { ...state, messages: [] }
+      return { ...state, messages: [], stoppedTurnAnchorIds: [] }
 
     case "RESET_STATE":
       return {
@@ -2229,6 +2274,9 @@ interface AppContextType {
   sameTaskReconnects: number
   connectionError: Error | null
   startNewConversation: () => Promise<void>
+  canStopTask: boolean
+  stopTask: () => void
+  stopState: SessionStopState
   isConversationResetPending: boolean
   isMessageDeliveryPending: boolean
   isSessionInteractionLocked: boolean
@@ -2261,6 +2309,10 @@ export interface AppProviderTransportCapabilities {
   // (including "page"): only the embedded Chat Widget opts in, since that is
   // the only surface where an in-tab navigation abandons the visitor's iframe.
   linksOpenInNewTab?: TransportCapabilityState
+  // Same default-closed rule as linksOpenInNewTab above: only a transport that
+  // explicitly asks for it gets a stop control, because only the delegated
+  // session endpoint reads a stop frame at all.
+  taskStop?: TransportCapabilityState
 }
 
 export interface AppProviderTransportConfig {
@@ -2457,6 +2509,9 @@ export function AppProvider({
   // wrong default here — this must stay off everywhere except the transports
   // that explicitly request it.
   const linksOpenInNewTab = transport?.capabilities?.linksOpenInNewTab === "enabled"
+  // Default-closed for the same reason as the line above: only the session
+  // endpoint reads a stop frame.
+  const taskStopEnabled = transport?.capabilities?.taskStop === "enabled"
   const voiceInputEnabled = resolveTransportCapability(
     sessionTransport,
     sessionTransport?.voice,
@@ -2487,6 +2542,31 @@ export function AppProvider({
     (message: WebSocketMessage, owner: SessionMessageOwner) => void
   >(() => {})
   const mountedRef = useRef(false)
+  const [stopState, setStopState] = useState<SessionStopState>("idle")
+  const stopTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Per task, not per connection: "the visitor asked to stop task N" stays
+  // true across a token-refresh reconnect and across an isProcessing dip. It
+  // is cleared by that task's own terminal frame -- failure or completion --
+  // and by this connection binding a different task. Nothing else clears it:
+  // an agent_error, coded external_stop_not_applied or codeless, is broadcast
+  // to every connection on the task without naming which stop press it
+  // answers, so it releases the control and leaves the intent standing.
+  const stopIntentTaskIdRef = useRef<number | null>(null)
+  const previousBoundSessionTaskIdRef = useRef<number | null>(null)
+
+  const clearStopTimeout = useCallback(() => {
+    if (stopTimeoutRef.current !== null) {
+      clearTimeout(stopTimeoutRef.current)
+      stopTimeoutRef.current = null
+    }
+  }, [])
+  // Returns the button to pressable and disarms its window. It deliberately
+  // leaves stopIntentTaskIdRef alone: the intent is per task and outlives the
+  // button (a reconnect, a waiting turn), so each caller decides it itself.
+  const releaseStopControl = useCallback(() => {
+    clearStopTimeout()
+    setStopState("idle")
+  }, [clearStopTimeout])
   const { t } = useI18n()
   const router = useRouter()
   const lastConnectedTaskId = useRef<number | null>(null)
@@ -2677,10 +2757,39 @@ export function AppProvider({
     state.taskId,
   ])
 
+  const boundSessionTaskId =
+    state.sessionConversation.phase === "bound"
+      ? state.sessionConversation.taskId
+      : null
+  useEffect(() => {
+    if (boundSessionTaskId === null) return
+    const previousBoundTaskId = previousBoundSessionTaskIdRef.current
+    previousBoundSessionTaskIdRef.current = boundSessionTaskId
+    if (
+      previousBoundTaskId === null
+      || previousBoundTaskId === boundSessionTaskId
+    ) return
+    // The task this connection is bound to changed. It had to pass through an
+    // unbound or replacement phase to get here — SESSION_TASK_INFO leaves the
+    // bound id alone when a task_info names a different task — so whatever the
+    // visitor asked to stop, this connection no longer follows it. Only the
+    // intent is cleared here: the control was already released on the way
+    // through that phase, because canStopTask is false there.
+    stopIntentTaskIdRef.current = null
+  }, [boundSessionTaskId])
+
+  useEffect(() => clearStopTimeout, [clearStopTimeout])
+
   useEffect(() => {
     const previousIdentity = previousSessionConnectionIdentityRef.current
     previousSessionConnectionIdentityRef.current = sessionConnectionIdentity
     if (previousIdentity === sessionConnectionIdentity) return
+
+    // Per-connection button state only. The stop intent is per task and
+    // deliberately survives this: the session token is re-issued 60s before
+    // expiry, which changes the connection identity mid-cancel, and the turn's
+    // terminal frame must still render as a stopped turn afterwards.
+    releaseStopControl()
 
     if (sessionConversationRef.current.phase === "bound") {
       if (sessionConnectionIdentity) {
@@ -2696,7 +2805,7 @@ export function AppProvider({
         new Error("Conversation outcome is unknown after a connection refresh; reload required.")
       )
     }
-  }, [dispatchSessionConversation, requireSessionReload, sessionConnectionIdentity])
+  }, [dispatchSessionConversation, releaseStopControl, requireSessionReload, sessionConnectionIdentity])
 
   const onConnect = useCallback(() => {
     if (sessionTransport?.history === "none") {
@@ -2824,6 +2933,29 @@ export function AppProvider({
     onConnect: onConnect, // Pass the callback
     autoConnect: true,
   })
+
+  const canStopTask =
+    taskStopEnabled
+    // A press while the socket is down can only end in "not_sent".
+    && isConnected
+    && state.isProcessing
+    && state.sessionConversation.phase === "bound"
+
+  // The control's own state lasts only as long as the control is available,
+  // and availability is wider than "this run is over": a task that pauses to
+  // ask the visitor a question also stops counting as processing, and a
+  // dropped socket makes the control unavailable too, so a stop still
+  // outstanding at that moment loses its "stopping" state and its
+  // unconfirmed-timeout window, and the control returns pressable with no
+  // record of the earlier press. Accepted as it stands: the per-task stop
+  // intent lives in a ref this effect does not touch, so the turn still
+  // renders as a stopped turn when its own terminal frame says it was
+  // interrupted — what is lost is the button's memory of the press, not the
+  // outcome of the stop.
+  useEffect(() => {
+    if (canStopTask) return
+    releaseStopControl()
+  }, [canStopTask, releaseStopControl])
 
   useEffect(() => {
     if (!sessionTransport || isConnected) return
@@ -5972,6 +6104,19 @@ export function AppProvider({
           settleConnectorRuntimeTurn(currentState.taskId, false)
         }
 
+        // A stop intent lives until this task's next terminal frame, and a
+        // normal completion is the other terminal frame. Without this, an
+        // intent recorded for a turn that finished on its own would still be
+        // standing when a later turn of the same task is interrupted by a stop
+        // this visitor did not ask for, and that turn would render as this
+        // visitor's stopped turn. Rendering below is untouched.
+        if (
+          stopIntentTaskIdRef.current !== null
+          && controlEnvelope.taskId === stopIntentTaskIdRef.current
+        ) {
+          stopIntentTaskIdRef.current = null
+        }
+
         if (!taskData.success) {
           // error_details carries the structured reason ({code, ..., message});
           // fall back to its message when the terminal event omits output. The
@@ -6378,6 +6523,33 @@ export function AppProvider({
             status: "failed",
           },
         })
+        // A stop the server could not confirm is answered on this channel,
+        // not on the terminal one, as an agent_error carrying
+        // external_stop_not_applied. A stop that found the turn already
+        // over, a server that predates that code, and any other
+        // external-scope command that fails on this task are answered with
+        // the same frame and no code at all. Either way the frame is broadcast
+        // to every connection on the task and does not name which stop press
+        // it answers, so it cannot end the stop intent: a second press on
+        // this page, or a press on another page bound to the same task, may
+        // still take effect, and the intent is left standing to be retired
+        // only by this task's own terminal frame or by this connection
+        // binding a different task. What the frame does answer is the
+        // button: the visitor has just been shown a sentence about a failure
+        // on this task, and a control still stuck on "Stopping..." would
+        // contradict it, so the control leaves "stopping" here rather than
+        // waiting out the local 30-second window. Any other code names a
+        // different failure and leaves the control alone.
+        if (
+          (
+            !getWebSocketErrorCodeField(message).present
+            || agentErrorCode === "external_stop_not_applied"
+          )
+          && stopIntentTaskIdRef.current !== null
+          && controlEnvelope.taskId === stopIntentTaskIdRef.current
+        ) {
+          releaseStopControl()
+        }
         break
 
       case "error":
@@ -6425,6 +6597,45 @@ export function AppProvider({
           )
         }
 
+        const stopIntentTaskId = stopIntentTaskIdRef.current
+        // A stop intent ends with this task's TERMINAL frame only.
+        // errorFrame.isTerminal is the discriminator: the root "error" type is
+        // a mixed channel that also carries rejected chat messages and
+        // rejected pause/resume while the task is still RUNNING, and a
+        // rejection is neither this turn's result nor the answer to a stop.
+        // Reading a rejection as the stopped turn would both render a live
+        // turn as finished and retire the intent before the real terminal
+        // frame arrives, leaving that frame to render as a plain failure.
+        const endsStopIntent =
+          errorFrame.isTerminal
+          && stopIntentTaskId !== null
+          && controlEnvelope.taskId === stopIntentTaskId
+        // Only a turn the server itself says was interrupted renders as the
+        // stopped turn. Any other terminal failure -- a connector-runtime code
+        // that raced the stop, or a codeless failure after the stop was lost
+        // or timed out -- is a real failure and keeps the red bubble and its
+        // own wording, though it still ends the intent.
+        const isVisitorStoppedTurn =
+          endsStopIntent
+          && errorFrame.terminalErrorCode === "external_turn_interrupted"
+        // The stopped mark is recorded before, and independent of, the bubble
+        // check below: a frame that names a message_id adds no bubble, yet its
+        // turn is still the stopped one. The turn is identified by the user
+        // message that opened it; with no user message there is nothing to
+        // anchor to and the turn keeps the failed rendering.
+        if (isVisitorStoppedTurn) {
+          const anchorMessage = [...currentState.messages]
+            .reverse()
+            .find((candidate) => candidate.role === "user")
+          if (anchorMessage) {
+            dispatch({
+              type: "MARK_TURN_STOPPED",
+              payload: { anchorMessageId: anchorMessage.id },
+            })
+          }
+        }
+        // A frame that names a message_id adds no bubble below: that message
+        // is drawn from its own display event. It still ends the intent.
         if (
           !message.message_id && !isDuplicateMessageForViewedTask(
             errorFrame.dedupText,
@@ -6434,17 +6645,39 @@ export function AppProvider({
         ) {
           dispatch({
             type: "ADD_MESSAGE",
-            payload: {
-              id: generateMessageId("msg-error"),
-              role: "assistant",
-              content: errorFrame.bubbleContent,
-              timestamp: message.timestamp,
-              status: "failed",
-              isResult: errorFrame.isResult,
-              // Delivery uncertainty is informational, not the task's result.
-              isSystemNotice: getWebSocketErrorCode(message) === "message_outcome_unknown",
-            },
+            payload: isVisitorStoppedTurn
+              ? {
+                  id: generateMessageId("msg-stopped"),
+                  role: "assistant",
+                  // The client's own sentence for the interruption code, read
+                  // from the same table as every other coded bubble and with no
+                  // error prefix. A reload replays the persisted English row,
+                  // so the two views differ only in language.
+                  content: errorFrame.bubbleContent,
+                  timestamp: message.timestamp,
+                  // The turn ended because the visitor asked it to, so this is
+                  // the turn's result. status is not "failed", which keeps the
+                  // bubble out of ChatMessage's red branch; isResult lets it
+                  // through the conversation panel's filter, which renders
+                  // only user / isResult / system-notice messages.
+                  status: "completed",
+                  isResult: true,
+                }
+              : {
+                  id: generateMessageId("msg-error"),
+                  role: "assistant",
+                  content: errorFrame.bubbleContent,
+                  timestamp: message.timestamp,
+                  status: "failed",
+                  isResult: errorFrame.isResult,
+                  // Delivery uncertainty is informational, not the task's result.
+                  isSystemNotice: getWebSocketErrorCode(message) === "message_outcome_unknown",
+                },
           })
+        }
+        if (endsStopIntent) {
+          stopIntentTaskIdRef.current = null
+          releaseStopControl()
         }
         break
       }
@@ -6470,7 +6703,7 @@ export function AppProvider({
         }
         break
     }
-  }, [trustLegacyErrorProse])
+  }, [releaseStopControl, trustLegacyErrorProse])
 
   const handleSessionMessage = (
     message: WebSocketMessage,
@@ -7456,6 +7689,44 @@ export function AppProvider({
     sessionTransport?.supportsConversationReset,
   ])
 
+  const stopTask = useCallback(() => {
+    // Same belt as the phase guard below, on the other half of the rule: a
+    // caller that does not come from the button must not send a stop frame on
+    // a transport that never declared the capability.
+    if (!taskStopEnabled) return
+    const lifecycle = sessionConversationRef.current
+    // Guard duplicated on purpose with the caller-side visibility rule: a
+    // caller that does not come from the button (a future keyboard shortcut, a
+    // console call) must not be able to send a stop frame when this connection
+    // has no bound task to attribute it to.
+    if (lifecycle.phase !== "bound") return
+    const boundTaskId = lifecycle.taskId
+    // No try/catch here, unlike startNewConversation above: sendMessage in
+    // use-websocket already wraps socket.send and returns "not_sent" instead of
+    // throwing, and a stop owns no promise and no session state to roll back.
+    // startNewConversation wraps its send because its catch escalates to
+    // requireSessionReload; a failed stop must not lock the visitor out.
+    if (sendRawMessage({ type: "stop" }) !== "sent") {
+      // The frame never left the socket, so nobody received the request, so
+      // the hint says so rather than reusing the unconfirmed-timeout wording.
+      setStopState("not_sent")
+      return
+    }
+    stopIntentTaskIdRef.current = boundTaskId
+    setStopState("stopping")
+    // Cleared here, next to the arm, rather than on the way in: a call that
+    // sends no frame must leave an earlier attempt's window running, so the
+    // request that did leave the socket can still reach its unconfirmed
+    // timeout instead of ending in a state nothing ever advances. Defensive:
+    // the stop button ignores presses while a stop is pending, so only a
+    // caller other than the button can call this with a window still armed.
+    clearStopTimeout()
+    stopTimeoutRef.current = setTimeout(() => {
+      stopTimeoutRef.current = null
+      setStopState("timed_out")
+    }, SESSION_STOP_TIMEOUT_MS)
+  }, [clearStopTimeout, sendRawMessage, taskStopEnabled])
+
   // Initialize the replay scheduler function
   const initializeReplayScheduler = useCallback(() => {
     // Get cached events
@@ -7655,6 +7926,9 @@ export function AppProvider({
           sameTaskReconnects,
           connectionError,
           startNewConversation,
+          canStopTask,
+          stopTask,
+          stopState,
           isConversationResetPending:
             state.sessionConversation.phase === "reset_requested",
           isMessageDeliveryPending: messageDeliveryCount > 0,
