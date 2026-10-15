@@ -1761,6 +1761,14 @@ describe("TaskConversationPanel", () => {
       expect(container.querySelector("svg[data-icon='interrupted']")).not.toBeNull()
       expect(container.querySelector(".text-red-500")).toBeNull()
       for (const text of FAILURE_TEXTS) expect(screen.queryByText(text)).toBeNull()
+      expect(screen.queryByTestId("task-failure-reference")).toBeNull()
+      // No bubble says the turn was interrupted, so the process says it once.
+      // The step icon's screen-reader label carries the same words.
+      expect(
+        screen
+          .queryAllByText("agent.layout.status.interrupted")
+          .filter((element) => !element.classList.contains("sr-only"))
+      ).toHaveLength(1)
     })
 
     it("shows the interruption once, in the turn's own bubble", () => {
@@ -1790,6 +1798,7 @@ describe("TaskConversationPanel", () => {
       expect(screen.getByText("agent.layout.status.interrupted")).toBeInTheDocument()
       expect(container.querySelector(".text-red-500")).toBeNull()
       for (const text of FAILURE_TEXTS) expect(screen.queryByText(text)).toBeNull()
+      expect(screen.queryByTestId("task-failure-reference")).toBeNull()
     })
 
     it("re-renders the process as interrupted when only the record changes", () => {

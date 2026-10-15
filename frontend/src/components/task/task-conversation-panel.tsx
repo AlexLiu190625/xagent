@@ -467,10 +467,14 @@ export function TaskConversationPanel({
       // A turn the visitor stopped is recorded by the id of the user message
       // that opened it (the group's anchor). That record outranks both the
       // task status and the inferred status, for the current turn and for
-      // earlier ones. It is kept while the same task stays bound and is
-      // cleared when the bound task changes or the conversation or its
-      // messages are reset. The turn's own bubble already says it was
-      // interrupted, so the process does not repeat it.
+      // earlier ones, so the group carries no "failed" status either and
+      // never takes the turn's task-id failure reference. It is kept while
+      // the same task stays bound and is cleared when the bound task changes
+      // or the conversation or its messages are reset. When a bubble follows
+      // the group, that bubble already says the turn was interrupted, so the
+      // process does not repeat it; when nothing follows (the group still
+      // shows the empty status), the process keeps its "Interrupted" line,
+      // since nothing else on screen says so.
       const isVisitorStoppedGroup =
         !!anchor && state.stoppedTurnAnchorIds.includes(anchor.id)
       const processStatus = isVisitorStoppedGroup
@@ -490,11 +494,15 @@ export function TaskConversationPanel({
         role: "assistant",
         content: null,
         timestamp: groupTimestamp,
-        status: shouldShowEmptyStatus ? state.currentTask?.status : undefined,
+        status:
+          shouldShowEmptyStatus && !isVisitorStoppedGroup
+            ? state.currentTask?.status
+            : undefined,
         traceEvents: events,
         showEmptyStatus: shouldShowEmptyStatus,
         processStatus,
-        showInterruptedStatus: isVisitorStoppedGroup ? false : undefined,
+        showInterruptedStatus:
+          isVisitorStoppedGroup && !shouldShowEmptyStatus ? false : undefined,
         timelineOrder: groupIndex * 2,
       })
     })
@@ -830,10 +838,10 @@ export function TaskConversationPanel({
     ? state.currentTask.autoResume
     : undefined
   // The virtual message belongs to the latest turn, so it follows that turn's
-  // stopped record the same way the process groups above do. It only appears
-  // while the turn has no answer and no trace group of its own, so its
-  // "Interrupted" line is then the turn's only sign of the interruption and
-  // stays on.
+  // stopped record the same way the process groups above do, including taking
+  // no task-id failure reference. It only appears while the turn has no answer
+  // and no trace group of its own, so its "Interrupted" line is then the
+  // turn's only sign of the interruption and stays on.
   const latestUserMessage = [...state.messages]
     .reverse()
     .find((message) => message.role === "user")
@@ -954,6 +962,7 @@ export function TaskConversationPanel({
                       onOpenExecutionPlan={showDagPreview ? openDagPreview : undefined}
                       onAgentExecutionClick={onAgentExecutionClick}
                       failureTaskId={
+                        !isLatestTurnVisitorStopped &&
                         !lastTurnHasFailureReference &&
                         state.currentTask?.id === String(state.taskId) &&
                         state.currentTask.status === "failed"

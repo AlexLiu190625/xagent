@@ -144,9 +144,15 @@ type SessionConversationState =
 // control ceasing to be available while the run pauses without ending or
 // while the socket is down (see the effect keyed on canStopTask), or a later
 // stop attempt that the socket refuses, which moves the state straight to
-// "not_sent" (see stopTask). That agent_error only returns the control to
-// pressable and does not end the stop intent: it is broadcast to every
-// connection on the task without naming which stop press it answers.
+// "not_sent" (see stopTask). The last one is defensive: the stop button ignores
+// presses while a stop is pending, so only a caller other than the button can
+// reach it. That agent_error only returns the control to pressable and does
+// not end the stop intent: it is broadcast to every connection on the task
+// without naming which stop press it answers. "not_sent" itself is usually
+// short-lived: a socket that refuses a frame is normally closing or already
+// replaced, and once the drop or the new connection is observed the control
+// returns to "idle" (the effect keyed on canStopTask, or the one keyed on the
+// connection identity).
 export type SessionStopState = "idle" | "stopping" | "timed_out" | "not_sent"
 
 type SessionConversationAction =
@@ -2506,7 +2512,6 @@ export function AppProvider({
   // Default-closed for the same reason as the line above: only the session
   // endpoint reads a stop frame.
   const taskStopEnabled = transport?.capabilities?.taskStop === "enabled"
-  const sessionConversationPhase = state.sessionConversation.phase
   const voiceInputEnabled = resolveTransportCapability(
     sessionTransport,
     sessionTransport?.voice,
@@ -2767,12 +2772,11 @@ export function AppProvider({
     // The task this connection is bound to changed. It had to pass through an
     // unbound or replacement phase to get here — SESSION_TASK_INFO leaves the
     // bound id alone when a task_info names a different task — so whatever the
-    // visitor asked to stop, this connection no longer follows it. The control
-    // was already released on the way through that phase (canStopTask is false
-    // there); releasing it here too keeps every clear site the same shape.
+    // visitor asked to stop, this connection no longer follows it. Only the
+    // intent is cleared here: the control was already released on the way
+    // through that phase, because canStopTask is false there.
     stopIntentTaskIdRef.current = null
-    releaseStopControl()
-  }, [boundSessionTaskId, releaseStopControl])
+  }, [boundSessionTaskId])
 
   useEffect(() => clearStopTimeout, [clearStopTimeout])
 
@@ -2935,7 +2939,7 @@ export function AppProvider({
     // A press while the socket is down can only end in "not_sent".
     && isConnected
     && state.isProcessing
-    && sessionConversationPhase === "bound"
+    && state.sessionConversation.phase === "bound"
 
   // The control's own state lasts only as long as the control is available,
   // and availability is wider than "this run is over": a task that pauses to
@@ -7713,7 +7717,9 @@ export function AppProvider({
     // Cleared here, next to the arm, rather than on the way in: a call that
     // sends no frame must leave an earlier attempt's window running, so the
     // request that did leave the socket can still reach its unconfirmed
-    // timeout instead of ending in a state nothing ever advances.
+    // timeout instead of ending in a state nothing ever advances. Defensive:
+    // the stop button ignores presses while a stop is pending, so only a
+    // caller other than the button can call this with a window still armed.
     clearStopTimeout()
     stopTimeoutRef.current = setTimeout(() => {
       stopTimeoutRef.current = null
