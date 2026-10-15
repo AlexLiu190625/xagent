@@ -126,9 +126,11 @@ def interruption_pause_result() -> dict[str, Any]:
     return {"error": None}
 
 
-# Callers that own their own protocol for a stopped run: SDK and A2A clients,
-# external cancellation, and anonymous visitors of a widget or shared link.
-_INELIGIBLE_SOURCES = frozenset({"sdk", "a2a", "external", "widget", "shared_link"})
+# Callers that own their own protocol for a stopped run: A2A clients, external
+# cancellation, and anonymous visitors of a widget or shared link. SDK tasks
+# are eligible: an SDK ``wait()`` keeps waiting on a PAUSED task, so a client
+# still waiting on it receives the resumed run's result.
+_INELIGIBLE_SOURCES = frozenset({"a2a", "external", "widget", "shared_link"})
 _TRIGGER_TYPES = frozenset(member.value for member in TriggerType)
 
 # TriggerRun error for a run a settling path paused after an interruption
@@ -160,7 +162,7 @@ def auto_recovery_eligibility(db: Session, task: Task) -> AutoRecoveryEligibilit
 
     Rules apply in order and the first match wins:
 
-    1. SDK, A2A, external, widget and shared-link tasks are ineligible.
+    1. A2A, external, widget and shared-link tasks are ineligible.
     2. Workforce tasks are eligible unless their run is a preview (or the
        run row is gone, so it cannot be shown not to be one).
     3. Trigger tasks are eligible.

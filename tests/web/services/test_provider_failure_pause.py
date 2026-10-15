@@ -834,7 +834,7 @@ def _switch_case(m: pytest.MonkeyPatch, case: str) -> str:
     elif case in {"infra_default", "pause_requested"}:
         if case == "infra_default":
             m.delenv(PAUSE_SWITCH)
-    return "sdk" if case == "ineligible" else "trigger"
+    return "a2a" if case == "ineligible" else "trigger"
 
 
 @pytest.mark.parametrize(

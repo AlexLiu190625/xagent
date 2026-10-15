@@ -411,7 +411,7 @@ def _recorded(state: str, detail: str | None = None) -> Any:
         ("manual", "channel_hold_pending", "default", None),
         ("manual", "supersede_check_failed", "default", None),
         ("manual", None, "default", None),
-        ("ineligible", "ineligible:source_sdk", "default", None),
+        ("ineligible", "ineligible:source_a2a", "default", None),
     ],
 )
 def test_recorded_interruption_maps_to_trigger_error_and_notice(
