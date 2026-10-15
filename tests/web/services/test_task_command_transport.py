@@ -3717,6 +3717,34 @@ def test_reply_first_claim_order_puts_a_reply_ahead_of_an_older_control_command(
     )
 
 
+@pytest.mark.parametrize("reply_task_is_active", [False, True])
+def test_reply_first_claim_order_is_not_used_while_the_cap_is_closed(
+    shared_dispatch_db, reply_task_is_active: bool
+) -> None:
+    from xagent.web.services.task_dispatch_cap import DispatchCapSnapshot
+
+    db = shared_dispatch_db
+    user, start_task = _create_running_task(db)
+    start_task.runner_id = None
+    start_task.lease_expires_at = None
+    db.commit()
+    reply_task = _unowned_task(db, int(user.id), "waiting")
+    older_start = _insert_command(
+        db, int(start_task.id), TaskCommandKind.START, "start-active"
+    )
+    _insert_command(db, int(reply_task.id), TaskCommandKind.RESUME_INPUT, "reply")
+    active = {int(start_task.id)} | (
+        {int(reply_task.id)} if reply_task_is_active else set()
+    )
+    closed = DispatchCapSnapshot(len(active), frozenset(active))
+
+    assert task_command_transport_module._find_command_candidate(None, (), closed) == (
+        older_start,
+        int(start_task.id),
+        TaskCommandKind.START,
+    )
+
+
 def test_reply_first_claim_order_falls_back_past_a_reply_on_a_busy_task(
     shared_dispatch_db,
 ) -> None:

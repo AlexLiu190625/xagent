@@ -38,6 +38,7 @@ import shutil
 import time
 import uuid
 import weakref
+from collections import Counter
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -98,6 +99,7 @@ from .task_auto_recovery import (
     settlement_interruption_for_failure,
     settlement_interruption_for_result,
 )
+from .task_dispatch_cap import DispatchCapSnapshot
 from .task_events import DeliveryNotifier, publish_task_event
 from .task_execution_event_writer import (
     FactWitness,
@@ -4701,6 +4703,18 @@ class AnyResumeRun:
 ANY_RESUME_RUN = AnyResumeRun()
 
 
+class DispatchReservation:
+    __slots__ = ("task_id", "released")
+
+    def __init__(self, task_id: int) -> None:
+        self.task_id = task_id
+        self.released = False
+
+
+def _running_loop_time() -> float:
+    return asyncio.get_running_loop().time()
+
+
 class BackgroundTaskManager:
     """Manages background task execution, ensuring only one background process per task at a time"""
 
@@ -4736,6 +4750,94 @@ class BackgroundTaskManager:
         self._window_finished_ok = 0
         self._window_finished_failed = 0
         self._window_finished_cancelled = 0
+        # Every live execution handle by task id, whatever registry table it
+        # sits in. A handle leaves only through its own done callback, so an
+        # execution counts until it has finished unwinding, not merely until it
+        # called ``cleanup_task``. Kept apart from ``_counted_tasks``, which is
+        # not keyed by task id and so cannot answer whether a task is active.
+        self._live_executions: dict[int, set[asyncio.Task]] = {}
+        # One entry per in-flight dispatch attempt that took a slot for a task
+        # and has not yet seen its execution registered or the attempt end.
+        self._dispatch_reservations: Counter[int] = Counter()
+        # Time this process spent at its dispatch cap, for the diagnostics
+        # line's ``gate_held_s``. Observed at every cap snapshot and at each
+        # drain; between two observations the earlier one's state is assumed.
+        # Zeroed by ``drain_gate_held_seconds`` and by ``start_accepting``;
+        # ``shutdown`` keeps the total for the final line.
+        self._cap_clock: Callable[[], float] = _running_loop_time
+        self._cap_last_limit: int | None = None
+        self._cap_closed_since: float | None = None
+        self._cap_closed_total = 0.0
+
+    def _track_live_execution(self, task_id: int, task: asyncio.Task) -> None:
+        self._live_executions.setdefault(task_id, set()).add(task)
+        # Both callers run this before they register the cleanup callback, so
+        # the handle has left the table by the time cleanup signals a freed slot.
+        task.add_done_callback(
+            lambda finished: self._drop_live_execution(task_id, finished)
+        )
+
+    def _drop_live_execution(self, task_id: int, task: asyncio.Task) -> None:
+        handles = self._live_executions.get(task_id)
+        if handles is None:
+            return
+        handles.discard(task)
+        if not handles:
+            del self._live_executions[task_id]
+
+    def _active_task_ids(self) -> frozenset[int]:
+        return (
+            frozenset(self._live_executions)
+            | frozenset(self.resume_tasks)
+            | frozenset(self._dispatch_reservations)
+        )
+
+    def _record_cap_state(self, closed: bool, now: float) -> None:
+        since = self._cap_closed_since
+        if closed:
+            if since is None:
+                self._cap_closed_since = now
+        elif since is not None:
+            self._cap_closed_total += max(0.0, now - since)
+            self._cap_closed_since = None
+
+    def _observe_current_cap_state(self, now: float) -> None:
+        limit = self._cap_last_limit
+        if limit is None:
+            return
+        self._record_cap_state(
+            DispatchCapSnapshot(limit, self._active_task_ids()).closed, now
+        )
+
+    def dispatch_cap_snapshot(self, limit: int) -> DispatchCapSnapshot:
+        snapshot = DispatchCapSnapshot(limit, self._active_task_ids())
+        self._cap_last_limit = limit
+        self._record_cap_state(snapshot.closed, self._cap_clock())
+        return snapshot
+
+    def reserve_dispatch_slot(
+        self, task_id: int, *, limit: int
+    ) -> DispatchReservation | None:
+        """Take a slot for ``task_id`` unless the cap is full for it.
+
+        Reads the active set and adds the token with no await in between, so
+        concurrent dispatch attempts cannot both take the last slot.
+        """
+
+        if not self.dispatch_cap_snapshot(limit).admits(task_id):
+            return None
+        self._dispatch_reservations[task_id] += 1
+        return DispatchReservation(task_id)
+
+    def release_dispatch_slot(self, token: DispatchReservation | None) -> None:
+        if token is None or token.released:
+            return
+        token.released = True
+        remaining = self._dispatch_reservations.get(token.task_id, 0) - 1
+        if remaining > 0:
+            self._dispatch_reservations[token.task_id] = remaining
+        else:
+            self._dispatch_reservations.pop(token.task_id, None)
 
     def start_accepting(self) -> None:
         """Reopen admission for a new application lifespan."""
@@ -4747,6 +4849,8 @@ class BackgroundTaskManager:
             or self._resume_run_ids
             or self._resume_reservations
             or self._resume_owner_started_at
+            or self._live_executions
+            or self._dispatch_reservations
         ):
             raise RuntimeError("Background task manager still owns background work")
         # asyncio synchronization primitives are bound to the event loop that
@@ -4755,6 +4859,9 @@ class BackgroundTaskManager:
         self._shutdown_lock = asyncio.Lock()
         self._shutting_down = False
         self.drain_window_counts()
+        self._cap_last_limit = None
+        self._cap_closed_since = None
+        self._cap_closed_total = 0.0
 
     async def wait_for_previous(self, task_id: int) -> None:
         """Wait for previous background task of this task to complete"""
@@ -4795,6 +4902,9 @@ class BackgroundTaskManager:
         if self._shutting_down:
             task.cancel()
             raise RuntimeError("Background task manager is shutting down")
+        # Counted from here, so a handle that track_execution cancels still
+        # leaves the table through its own done callback.
+        self._track_live_execution(task_id, task)
         from .task_coordinator_runtime import current_task_coordinator
 
         coordinator = current_task_coordinator(task_id)
@@ -4904,6 +5014,9 @@ class BackgroundTaskManager:
             raise RuntimeError("Background task manager is shutting down")
         if task_id not in self._resume_reservations:
             raise RuntimeError(f"Task {task_id} has no reserved resume slot")
+        # Counted from here, so a handle that track_execution cancels still
+        # leaves the table through its own done callback.
+        self._track_live_execution(task_id, task)
         from .task_coordinator_runtime import current_task_coordinator
 
         coordinator = current_task_coordinator(task_id)
@@ -5033,6 +5146,23 @@ class BackgroundTaskManager:
         self._window_finished_cancelled = 0
         return counts
 
+    def drain_gate_held_seconds(self, now: float) -> float:
+        """Return and zero the seconds at the dispatch cap since the last drain.
+
+        Observes the cap once more at ``now``. A closed interval still open is
+        split: the part up to ``now`` is returned and the rest counts towards
+        the next drain. ``0.0`` in a process that never built a cap snapshot.
+        """
+
+        self._observe_current_cap_state(now)
+        held = self._cap_closed_total
+        since = self._cap_closed_since
+        if since is not None:
+            held += max(0.0, now - since)
+            self._cap_closed_since = now
+        self._cap_closed_total = 0.0
+        return held
+
     def cleanup_task(
         self,
         task_id: int,
@@ -5059,6 +5189,9 @@ class BackgroundTaskManager:
             self._resume_run_ids.pop(task_id, None)
             self._resume_owner_started_at.pop(task_id, None)
             logger.info("Cleaned up resume coordinator for task %s", task_id)
+        from .task_command_transport import notify_dispatcher_slot_freed
+
+        notify_dispatcher_slot_freed()
 
     async def cancel_task(
         self,
@@ -5080,6 +5213,10 @@ class BackgroundTaskManager:
             self._resume_reservations.discard(task_id)
             self._resume_owner_started_at.pop(task_id, None)
         if not tasks:
+            if not self._shutting_down:
+                from .task_command_transport import notify_dispatcher_slot_freed
+
+                notify_dispatcher_slot_freed()
             return BackgroundTaskCancelOutcome(requested=False)
 
         requested = False
@@ -5110,6 +5247,9 @@ class BackgroundTaskManager:
             self.resume_tasks.pop(task_id, None)
             self._resume_run_ids.pop(task_id, None)
             self._resume_owner_started_at.pop(task_id, None)
+            from .task_command_transport import notify_dispatcher_slot_freed
+
+            notify_dispatcher_slot_freed()
         return BackgroundTaskCancelOutcome(requested=requested)
 
     def cancel_was_requested(self, task: asyncio.Task | None) -> bool:
@@ -5147,6 +5287,12 @@ class BackgroundTaskManager:
                 self._resume_run_ids.clear()
                 self._resume_reservations.clear()
                 self._resume_owner_started_at.clear()
+                self._live_executions.clear()
+                self._dispatch_reservations.clear()
+                # The tables are empty now; close any cap interval here so
+                # the final diagnostics line does not count later shutdown
+                # steps as time at the cap.
+                self._observe_current_cap_state(self._cap_clock())
 
 
 background_task_manager = BackgroundTaskManager()

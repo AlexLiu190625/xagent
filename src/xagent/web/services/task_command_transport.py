@@ -51,6 +51,12 @@ from .task_command_terminal_events import (
     stage_terminal_event,
     terminal_event_draft_for_error,
 )
+from .task_dispatch_cap import (
+    CONTROL_KINDS,
+    EXECUTION_OPENING_KINDS,
+    DispatchCapSnapshot,
+    build_dispatch_cap_snapshot,
+)
 from .task_execution_host import consumes_task_commands
 from .task_lease_service import get_runner_id
 
@@ -835,7 +841,11 @@ def _unfinished_earlier_command() -> Any:
 
 
 def _claimable_query(
-    db: Session, *, runner_id: str, command_db_id: int | None
+    db: Session,
+    *,
+    runner_id: str,
+    command_db_id: int | None,
+    cap: DispatchCapSnapshot | None = None,
 ) -> Query[Any]:
     from .task_execution_admission import admission_eligible
 
@@ -858,6 +868,15 @@ def _claimable_query(
             _command_routing_predicate(runner_id, now),
         )
     )
+    if cap is not None and cap.closed:
+        # Without a free slot only what needs none is worth claiming: a
+        # control of any task, or a command of a task that already holds a slot.
+        query = query.filter(
+            or_(
+                TaskExecutionCommand.kind.in_(sorted(CONTROL_KINDS)),
+                TaskExecutionCommand.task_id.in_(sorted(cap.active_ids)),
+            )
+        )
     if command_db_id is not None:
         query = query.filter(TaskExecutionCommand.id == command_db_id)
     return query.order_by(TaskExecutionCommand.id.asc())
@@ -916,6 +935,7 @@ def claim_task_command(
     *,
     runner_id: str | None = None,
     command_db_id: int | None = None,
+    cap: DispatchCapSnapshot | None = None,
 ) -> ClaimedTaskCommand | None:
     """Atomically claim the oldest eligible command for this worker."""
 
@@ -926,6 +946,7 @@ def claim_task_command(
         db,
         runner_id=resolved_runner_id,
         command_db_id=command_db_id,
+        cap=cap,
     ).first()
     if candidate is None:
         return None
@@ -1018,6 +1039,7 @@ def _claim_task_command_isolated(
     *,
     runner_id: str,
     command_db_id: int | None,
+    cap: DispatchCapSnapshot | None = None,
 ) -> ClaimedTaskCommand | None:
     """Claim in a worker-owned short session and return a detached snapshot."""
 
@@ -1029,6 +1051,7 @@ def _claim_task_command_isolated(
             db,
             runner_id=runner_id,
             command_db_id=command_db_id,
+            cap=cap,
         )
 
 
@@ -1491,6 +1514,7 @@ CommandExecutor = Callable[
 ]
 CommandDisposition = Callable[[], bool]
 _dispatcher_wakeup: asyncio.Event | None = None
+_dispatcher_slot_freed: asyncio.Event | None = None
 _dispatcher_task: asyncio.Task[Any] | None = None
 _dispatcher_loop: asyncio.AbstractEventLoop | None = None
 _prompt_dispatch_tasks: set[asyncio.Task[bool]] = set()
@@ -1501,6 +1525,36 @@ def notify_task_command_dispatcher() -> None:
     loop = _dispatcher_loop
     if wakeup is not None and loop is not None and not loop.is_closed():
         loop.call_soon_threadsafe(wakeup.set)
+
+
+def notify_dispatcher_slot_freed() -> None:
+    """Tell the dispatcher an execution ended or was cancelled.
+
+    Separate from ``notify_task_command_dispatcher``: a freed slot says nothing
+    about the database, so only an idle wait listens to it.
+    """
+
+    slot_freed = _dispatcher_slot_freed
+    loop = _dispatcher_loop
+    if slot_freed is not None and loop is not None and not loop.is_closed():
+        loop.call_soon_threadsafe(slot_freed.set)
+
+
+async def _wait_for_work(
+    wakeup: asyncio.Event, slot_freed: asyncio.Event | None, timeout: float
+) -> None:
+    """Sleep until a new command is announced, a slot frees, or ``timeout``."""
+
+    waiters = {asyncio.ensure_future(wakeup.wait())}
+    if slot_freed is not None:
+        waiters.add(asyncio.ensure_future(slot_freed.wait()))
+    try:
+        await asyncio.wait(
+            waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+        )
+    finally:
+        for waiter in waiters:
+            waiter.cancel()
 
 
 async def _persist_task_command_disposition(
@@ -1544,6 +1598,7 @@ async def _persist_task_command_disposition(
 def _find_command_candidate(
     command_db_id: int | None,
     busy_task_ids: tuple[int, ...] = (),
+    cap: DispatchCapSnapshot | None = None,
 ) -> tuple[int, int, TaskCommandKind] | None:
     from ..models.database import get_session_local
 
@@ -1552,7 +1607,7 @@ def _find_command_candidate(
 
         def first_candidate(kind: TaskCommandKind | None = None) -> Any:
             query = _claimable_query(
-                db, runner_id=runner_id, command_db_id=command_db_id
+                db, runner_id=runner_id, command_db_id=command_db_id, cap=cap
             )
             if kind is not None:
                 query = query.filter(TaskExecutionCommand.kind == kind.value)
@@ -1570,14 +1625,16 @@ def _find_command_candidate(
             ).first()
 
         row = None
-        if command_db_id is None:
+        if command_db_id is None and (cap is None or not cap.closed):
             # A reply to a waiting task is served before any other claimable
             # command, oldest first. That deliberately includes older pause
             # and cancel commands of other tasks; each waits behind at most
             # one reply per waiting task, because the shared claimable query
             # still enforces each task's own order. This order applies to the
             # scan only: an admission ticket can still keep a reply behind
-            # older work waiting in the same bucket.
+            # older work waiting in the same bucket. With the cap closed a
+            # reply that needs a new slot is not claimable, so the narrow
+            # query decides.
             row = first_candidate(TaskCommandKind.RESUME_INPUT)
         if row is None:
             row = first_candidate()
@@ -1602,27 +1659,48 @@ async def dispatch_one_task_command(
         _CoordinatorInterrupted,
         get_task_coordinator_registry,
     )
+    from .task_execution import background_task_manager
 
     registry = get_task_coordinator_registry()
     skipped_task_ids = set(registry.busy_command_tasks())
     while True:
+        cap = build_dispatch_cap_snapshot()
         candidate = await run_db_io_cancellation_safe(
-            lambda: _find_command_candidate(command_db_id, tuple(skipped_task_ids))
+            lambda: _find_command_candidate(command_db_id, tuple(skipped_task_ids), cap)
         )
         if candidate is None:
             return False
         selected_id, task_id, kind = candidate
-        coordinator = await registry.ensure(task_id)
+        reservation = None
+        if kind.value in EXECUTION_OPENING_KINDS:
+            reservation = background_task_manager.reserve_dispatch_slot(
+                task_id, limit=cap.limit
+            )
+            if reservation is None:
+                # The cap filled after the snapshot. An execution end signals
+                # the dispatcher, which retries then. Releasing another
+                # attempt's reservation signals nothing, so when the slot was
+                # held by an attempt that ends without starting an execution,
+                # the retry waits for the idle interval or the next notify.
+                return False
+        try:
+            coordinator = await registry.ensure(task_id)
+        except BaseException:
+            background_task_manager.release_dispatch_slot(reservation)
+            raise
         if coordinator is not None and not coordinator._command_tasks:
             break
         # Ownership can change after candidate selection. Skip this task
         # without spending its business retry budget; keep the exclusion
         # local to this scan so a later dispatch can reconsider it.
+        background_task_manager.release_dispatch_slot(reservation)
         skipped_task_ids.add(task_id)
 
     async def apply() -> bool:
         try:
-            return await _dispatch_task_command(executor, command_db_id=selected_id)
+            return await _dispatch_task_command(
+                executor, command_db_id=selected_id, cap=cap
+            )
         except BaseException:
             coordinator.require_recovery()
             raise
@@ -1645,18 +1723,22 @@ async def dispatch_one_task_command(
             kind.value,
         )
         return False
+    finally:
+        background_task_manager.release_dispatch_slot(reservation)
 
 
 async def _dispatch_task_command(
     executor: CommandExecutor,
     *,
     command_db_id: int | None = None,
+    cap: DispatchCapSnapshot | None = None,
 ) -> bool:
     runner_id = get_runner_id()
     command = await run_db_io_cancellation_safe(
         lambda: _claim_task_command_isolated(
             runner_id=runner_id,
             command_db_id=command_db_id,
+            cap=cap,
         )
     )
     if command is None:
@@ -1910,12 +1992,16 @@ async def _run_task_command_dispatcher_worker(executor: CommandExecutor) -> None
     last_failure_logged_at: float | None = None
     while True:
         wakeup = _dispatcher_wakeup
+        slot_freed = _dispatcher_slot_freed
         if wakeup is None:
             return
         # Clear before checking for work. A notify that arrives during the DB
         # claim remains set, so an empty claim cannot erase that wakeup and
-        # sleep while work is waiting.
+        # sleep while work is waiting. The slot-freed event follows the same
+        # rule.
         wakeup.clear()
+        if slot_freed is not None:
+            slot_freed.clear()
         try:
             processed = await dispatch_one_task_command(executor)
         except asyncio.CancelledError as exc:
@@ -1967,15 +2053,16 @@ async def _run_task_command_dispatcher_worker(executor: CommandExecutor) -> None
             last_failure_logged_at = None
         if processed:
             continue
-        await idle_wait(wakeup)
+        await _wait_for_work(wakeup, slot_freed, DISPATCHER_IDLE_SECONDS)
 
 
 async def run_task_command_dispatcher(executor: CommandExecutor) -> None:
     """Recover queued commands without serializing unrelated tasks."""
 
-    global _dispatcher_loop, _dispatcher_wakeup
+    global _dispatcher_loop, _dispatcher_wakeup, _dispatcher_slot_freed
     _dispatcher_loop = asyncio.get_running_loop()
     _dispatcher_wakeup = asyncio.Event()
+    _dispatcher_slot_freed = asyncio.Event()
     workers = [
         asyncio.create_task(_run_task_command_dispatcher_worker(executor))
         for _ in range(DISPATCHER_CONCURRENCY)
@@ -2087,6 +2174,7 @@ async def supervise_task_command_dispatcher(
 
 async def stop_task_command_dispatcher() -> None:
     global _dispatcher_loop, _dispatcher_task, _dispatcher_wakeup
+    global _dispatcher_slot_freed
     prompt_tasks = list(_prompt_dispatch_tasks)
     for prompt_task in prompt_tasks:
         prompt_task.cancel()
@@ -2097,6 +2185,7 @@ async def stop_task_command_dispatcher() -> None:
     task = _dispatcher_task
     _dispatcher_task = None
     _dispatcher_wakeup = None
+    _dispatcher_slot_freed = None
     _dispatcher_loop = None
     if task is not None and not task.done():
         task.cancel()
