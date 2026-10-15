@@ -274,7 +274,7 @@ def test_postgresql_reply_first_lookup_uses_the_partial_index(
         user = User(username="plan-user", password_hash="hash", is_admin=False)
         session.add(user)
         session.flush()
-        for task_id in range(1, 21):
+        for task_id in range(1, 401):
             session.add(
                 Task(
                     id=task_id,
@@ -292,10 +292,10 @@ def test_postgresql_reply_first_lookup_uses_the_partial_index(
             text(
                 f"INSERT INTO {TABLE} (task_id, command_id, kind, payload, status, "
                 "created_at, updated_at) "
-                "SELECT (g % 20) + 1, 'c' || g, "
-                "CASE WHEN g % 3 = 0 THEN 'resume_input' ELSE 'start' END, "
+                "SELECT (g % 400) + 1, 'c' || g, "
+                "CASE WHEN g = 4000 THEN 'resume_input' ELSE 'start' END, "
                 "'{}', "
-                "CASE WHEN g > 3990 THEN 'pending' ELSE 'completed' END, "
+                "CASE WHEN g > 3600 THEN 'pending' ELSE 'completed' END, "
                 "NOW(), NOW() FROM generate_series(1, 4000) AS g"
             )
         )

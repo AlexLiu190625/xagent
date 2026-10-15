@@ -38,6 +38,14 @@ class TaskExecutionCommand(Base):  # type: ignore
             sqlite_where=_CLAIMABLE_STATUS_CLAUSE,
             postgresql_where=_CLAIMABLE_STATUS_CLAUSE,
         ),
+        # Serves the dispatcher's oldest-first fallback lookup, which takes
+        # the oldest claimable id of any kind.
+        Index(
+            "ix_task_commands_claimable_id",
+            "id",
+            sqlite_where=_CLAIMABLE_STATUS_CLAUSE,
+            postgresql_where=_CLAIMABLE_STATUS_CLAUSE,
+        ),
     )
 
     id = Column(Integer, primary_key=True)
