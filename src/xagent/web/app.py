@@ -1,18 +1,20 @@
 import asyncio
 import json
 import logging
+import mimetypes
 import os
 import random
 import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
+from pathlib import PurePosixPath
 from typing import Any, cast
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.middleware.sessions import SessionMiddleware
@@ -23,6 +25,7 @@ from ..config import (
     get_agent_runtime,
     get_background_job_sweep_interval_seconds,
     get_cors_origins,
+    get_environment,
     get_external_upload_dirs,
     get_file_storage_startup_sync_enabled,
     get_gmail_watch_enabled,
@@ -102,6 +105,7 @@ from .api.websocket import ws_router
 from .api.widget import widget_router
 from .api.workforces import router as workforces_router
 from .auth_config import validate_auth_config
+from .content_security import is_active_content_type
 from .dynamic_memory_store import get_memory_store
 from .logging_config import setup_logging
 from .models.database import init_db
@@ -236,8 +240,14 @@ get_external_upload_dirs()
 
 
 # FastAPI app creation here
+_is_production_environment = get_environment() != "development"
 app = FastAPI(
-    title="xagent", description="The Agent Operating System", redirect_slashes=False
+    title="xagent",
+    description="The Agent Operating System",
+    redirect_slashes=False,
+    docs_url=None if _is_production_environment else "/docs",
+    redoc_url=None if _is_production_environment else "/redoc",
+    openapi_url=None if _is_production_environment else "/openapi.json",
 )
 
 # Track background migration task for graceful shutdown cleanup.
@@ -1518,12 +1528,81 @@ app.add_middleware(PublicWidgetCORSMiddleware)
 app.add_middleware(SessionMiddleware, secret_key=get_session_secret(), same_site="lax")
 app.add_middleware(FileStorageStartupSyncGateMiddleware)
 
+
+def _security_header_values(path: str) -> dict[str, str]:
+    """Return headers appropriate for an API, preview, upload, or SPA path."""
+    is_widget_page = path == "/widget" or path.startswith("/widget/")
+    is_upload = path == "/uploads" or path.startswith("/uploads/")
+    is_api = path == "/api" or path.startswith("/api/")
+    is_preview = path.startswith(("/api/files/preview/", "/api/files/public/preview/"))
+    headers = {
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "strict-origin-when-cross-origin",
+    }
+    if is_api or is_upload:
+        frame_ancestors = "'self'" if is_upload or is_preview else "'none'"
+        headers["Content-Security-Policy"] = (
+            "default-src 'self'; base-uri 'self'; object-src 'none'; "
+            f"frame-ancestors {frame_ancestors}; img-src 'self' data: blob: https:; "
+            "font-src 'self' data: https:; style-src 'self' 'unsafe-inline' https:; "
+            "script-src 'self' 'unsafe-inline' 'unsafe-eval'; connect-src 'self' https: wss:"
+        )
+    if not is_widget_page and not is_upload and not is_preview:
+        headers["X-Frame-Options"] = "DENY"
+    return headers
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next: Any) -> Any:
+    """Add browser hardening headers without breaking the SPA or previews."""
+    response = await call_next(request)
+    for name, value in _security_header_values(request.url.path).items():
+        response.headers.setdefault(name, value)
+    return response
+
+
 current_dir = os.path.dirname(os.path.abspath(__file__))
 
+
 # For static files
+_BLOCKED_UPLOAD_EXTENSIONS = frozenset(
+    {
+        ".html",
+        ".htm",
+        ".xhtml",
+        ".xht",
+        ".xsl",
+        ".xslt",
+        ".mathml",
+        ".svg",
+        ".svgz",
+        ".xml",
+        ".rdf",
+        ".atom",
+        ".rss",
+    }
+)
+
+
+def _blocked_upload_extension(path: str) -> bool:
+    media_type, _encoding = mimetypes.guess_type(path)
+    if is_active_content_type(media_type):
+        return True
+    return PurePosixPath(path).suffix.lower() in _BLOCKED_UPLOAD_EXTENSIONS
+
+
+class SafeUploadsStaticFiles(StaticFiles):
+    """Serve only non-active content from the legacy public uploads mount."""
+
+    async def get_response(self, path: str, scope: Scope) -> Any:
+        if _blocked_upload_extension(path):
+            return PlainTextResponse("Not found", status_code=404)
+        return await super().get_response(path, scope)
+
+
 app.mount(
     "/uploads",
-    StaticFiles(directory=str(uploads_dir)),
+    SafeUploadsStaticFiles(directory=str(uploads_dir)),
     name="uploads",
 )
 
