@@ -1731,8 +1731,32 @@ def _mcp_return_value_as_string(value: Any) -> str:
         return str(value)
 
 
+# The third-party Xero server can report a failed call as one line of
+# ordinary text, ``Error <doing something>: <cause>``, without setting
+# ``isError``. Left alone, such a result counts as a success for the agent's
+# repeated-tool accounting.
+_PLAIN_TEXT_ERROR_PATTERN = re.compile(r"Error [^:\n]{1,80}: [^\n]+")
+_PLAIN_TEXT_ERROR_MAX_CHARS = 1000
+
+
+def _is_plain_text_error_result(content: list[dict[str, Any]]) -> bool:
+    if len(content) != 1:
+        return False
+    item = content[0]
+    text = item.get("text")
+    if item.get("type") != "text" or not isinstance(text, str):
+        return False
+    return (
+        len(text) <= _PLAIN_TEXT_ERROR_MAX_CHARS
+        and _PLAIN_TEXT_ERROR_PATTERN.fullmatch(text.strip()) is not None
+    )
+
+
 def _normalized_mcp_call_result(
-    value: Any, *, validate_wire: bool = False
+    value: Any,
+    *,
+    validate_wire: bool = False,
+    detect_legacy_plain_text_error: bool = False,
 ) -> dict[str, Any]:
     """Validate a wire result and render the stable agent-facing shape."""
 
@@ -1764,7 +1788,8 @@ def _normalized_mcp_call_result(
     return {
         "content": content,
         "structured_content": other_fields.get("structuredContent"),
-        "is_error": bool(other_fields.get("isError")),
+        "is_error": bool(other_fields.get("isError"))
+        or (detect_legacy_plain_text_error and _is_plain_text_error_result(content)),
     }
 
 
@@ -1886,6 +1911,13 @@ class MCPToolAdapter(AbstractBaseTool):
         self._is_excel_tool = (
             self.source_server == "excel" and self.mcp_tool.name.startswith("excel_")
         )
+        # The third-party Xero server can return failures as a successful,
+        # single-line ``Error <operation>: <cause>`` payload. Keep this narrow
+        # compatibility only for Xero: applying the heuristic to every MCP
+        # server misclassifies legitimate output such as an error-budget metric.
+        self._detect_legacy_plain_text_error = (
+            str(source_server or "").casefold() == "xero"
+        )
         self.concurrency_safe = _mcp_tool_is_concurrency_safe(
             self.mcp_tool.name,
             concurrency_safe=concurrency_safe,
@@ -1897,6 +1929,9 @@ class MCPToolAdapter(AbstractBaseTool):
         from .base import ToolCategory
 
         self.category = ToolCategory.MCP
+        # Every MCP tool shares ``ToolCategory.MCP``, which would otherwise
+        # make unrelated tools of any server one repeated-action stream.
+        self.decision_group = self.name
 
         # Build models from MCP tool schema
         self._args_type = self._build_args_model()
@@ -3115,7 +3150,10 @@ class MCPToolAdapter(AbstractBaseTool):
                 meta=dict(tool_meta) or None,
             )
 
-            normalized = _normalized_mcp_call_result(result)
+            normalized = _normalized_mcp_call_result(
+                result,
+                detect_legacy_plain_text_error=(self._detect_legacy_plain_text_error),
+            )
             if self._is_excel_tool:
                 failure_code = _excel_failure_code(normalized)
                 if failure_code is not None:
@@ -3387,7 +3425,11 @@ class ChromeExecutionMCPToolAdapter(MCPToolAdapter):
             tool_args,
         )
         try:
-            return _normalized_mcp_call_result(result, validate_wire=True)
+            return _normalized_mcp_call_result(
+                result,
+                validate_wire=True,
+                detect_legacy_plain_text_error=(self._detect_legacy_plain_text_error),
+            )
         except ChromeSessionContractError:
             await self._chrome_pool.close_shielded(self._chrome_scope)
             raise

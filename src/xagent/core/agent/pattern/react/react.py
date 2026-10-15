@@ -186,6 +186,30 @@ REACT_DECISION_FINAL_ANSWER = "final_answer"
 USER_INTERACTION_CONTROL_TOOL_NAMES = CONTROL_TOOL_NAMES - {REACT_DECISION_FINAL_ANSWER}
 REACT_DECISION_TOOL_CALL = "tool_call"
 UNGROUPED_TOOL_DECISION_CATEGORIES = frozenset({"basic", "other"})
+# Argument names that mark a call as one page of a larger list. A repeated run
+# of such calls has not read the whole list just because several pages came back.
+PAGINATION_ARGUMENT_NAMES = frozenset(
+    {
+        "page",
+        "page_number",
+        "pageNumber",
+        "page_token",
+        "pageToken",
+        "next_page_token",
+        "nextPageToken",
+        "cursor",
+        "offset",
+        "skip",
+        "next_skip",
+        "nextSkip",
+        "starting_after",
+        "startingAfter",
+        "page_index",
+        "pageIndex",
+        "start_at",
+        "startAt",
+    }
+)
 # Bounds for the final_answer-strip warning's tool-name list. Tool names come
 # straight from the model, so the log line is shaped like the rest of this
 # module's untrusted-input logging: bounded length, escaped, never raw.
@@ -550,6 +574,33 @@ def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
         )
 
     return normalized
+
+
+def _records_advance_pagination(records: list[ToolCallRecord]) -> bool:
+    """Return whether recorded calls actually moved through pagination.
+
+    Merely repeating ``page=1`` is a stuck loop, not evidence that more pages
+    should be fetched. Compare only pagination arguments so identical requests
+    stay unmarked while page, cursor, offset and connector-specific tokens that
+    change across calls are recognised.
+    """
+
+    signatures: list[dict[str, Any]] = []
+    has_pagination_argument = False
+    for record in records:
+        args = record.args
+        if not isinstance(args, dict):
+            continue
+        signature = {
+            name: args[name] for name in PAGINATION_ARGUMENT_NAMES if name in args
+        }
+        has_pagination_argument = has_pagination_argument or bool(signature)
+        signatures.append(signature)
+    return (
+        has_pagination_argument
+        and len(signatures) >= 2
+        and any(signature != signatures[0] for signature in signatures[1:])
+    )
 
 
 def _unique_field(base_field: str, used_fields: set[str]) -> str:
@@ -5516,15 +5567,21 @@ class ReActPattern(AgentPattern):
         same_tool_threshold = self.repeated_tool_decision_after_consecutive_tool_calls
         if same_tool_threshold is not None and same_tool_threshold > 0:
             tool_group = self._tool_decision_group_for_name(tool_name)
-            same_tool_count = self._consecutive_successful_tool_group_count(tool_group)
+            same_tool_records = self._consecutive_successful_tool_group_records(
+                tool_group
+            )
+            same_tool_count = len(same_tool_records)
             if same_tool_count >= same_tool_threshold:
-                return {
+                metadata: dict[str, Any] = {
                     "trigger": "same_tool_successes",
                     "tool_name": tool_group,
                     "latest_tool_name": tool_name,
                     "consecutive_tool_calls": same_tool_count,
                     "threshold": same_tool_threshold,
                 }
+                if _records_advance_pagination(same_tool_records):
+                    metadata["paginated"] = True
+                return metadata
 
         work_tool_threshold = (
             self.repeated_tool_decision_after_consecutive_work_tool_calls
@@ -5532,16 +5589,26 @@ class ReActPattern(AgentPattern):
         if work_tool_threshold is None or work_tool_threshold <= 0:
             return None
 
-        work_tool_count = self._consecutive_work_tool_call_count()
+        work_tool_records = self._consecutive_work_tool_records()
+        work_tool_count = len(work_tool_records)
         if work_tool_count < work_tool_threshold:
             return None
-        return {
+        metadata = {
             "trigger": "work_tool_attempts",
             "tool_name": tool_name,
             "latest_tool_name": tool_name,
             "consecutive_tool_calls": work_tool_count,
             "threshold": work_tool_threshold,
         }
+        tool_group = self._tool_decision_group_for_name(tool_name)
+        same_group_work_records = [
+            record
+            for record in work_tool_records
+            if self._tool_decision_group_for_name(record.tool_name) == tool_group
+        ]
+        if _records_advance_pagination(same_group_work_records):
+            metadata["paginated"] = True
+        return metadata
 
     def _messages_for_repeated_tool_decision(
         self,
@@ -5605,6 +5672,18 @@ class ReActPattern(AgentPattern):
             "Use this as the controlling request when deciding whether "
             f"{completion_clause}."
         )
+        pagination_clause = (
+            " The consecutive calls were paging through a list: their arguments "
+            "carry a page, cursor, offset, or skip. A page that came back full, or "
+            "results with no total or last-page marker, mean more pages may "
+            f"exist, so choose {REACT_DECISION_TOOL_CALL} to fetch the next page "
+            "unless the latest user request only asks for a sample or the "
+            "first few items, or the results already show the end of the list "
+            "(a short or empty page, or an explicit total or no-next-page "
+            "marker)."
+            if metadata.get("paginated")
+            else ""
+        )
         prompt = (
             f"You must call {REACT_DECISION_TOOL_NAME} exactly once. Decide whether "
             "the current ReAct run should finish or make another work-tool call. "
@@ -5636,6 +5715,7 @@ class ReActPattern(AgentPattern):
             "requested number as already completed. If the latest user request "
             "explicitly requires more completed work-tool calls or results than "
             f"the current context contains, choose {REACT_DECISION_TOOL_CALL}."
+            f"{pagination_clause}"
         )
         return [*messages, {"role": "user", "content": prompt}]
 
@@ -5710,8 +5790,10 @@ class ReActPattern(AgentPattern):
             }
         return None
 
-    def _consecutive_successful_tool_group_count(self, tool_group: str) -> int:
-        count = 0
+    def _consecutive_successful_tool_group_records(
+        self, tool_group: str
+    ) -> list[ToolCallRecord]:
+        records: list[ToolCallRecord] = []
         control_tool_names = self._control_tool_names()
         for record in reversed(self._provider_compatible_tool_records()):
             if record.tool_name in control_tool_names:
@@ -5722,19 +5804,22 @@ class ReActPattern(AgentPattern):
                 record.result
             ):
                 break
-            count += 1
-        return count
+            records.append(record)
+        return records
 
     def _consecutive_work_tool_call_count(self) -> int:
-        count = 0
+        return len(self._consecutive_work_tool_records())
+
+    def _consecutive_work_tool_records(self) -> list[ToolCallRecord]:
+        records: list[ToolCallRecord] = []
         control_tool_names = self._control_tool_names()
         for record in reversed(self._provider_compatible_tool_records()):
             if record.tool_name in control_tool_names:
                 continue
             if record.status not in {"completed", "failed"}:
                 continue
-            count += 1
-        return count
+            records.append(record)
+        return records
 
     async def _finalize_success(
         self,
