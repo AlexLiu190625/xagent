@@ -578,6 +578,28 @@ class FakeLLM:
         return self.responses.pop(0)
 
 
+def final_answer_response(
+    answer: str, response_language: str = "English"
+) -> dict[str, Any]:
+    return {
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "call_final",
+                "function": {
+                    "name": "final_answer",
+                    "arguments": json.dumps(
+                        {
+                            "response_language": response_language,
+                            "answer": answer,
+                        }
+                    ),
+                },
+            }
+        ],
+    }
+
+
 class FakeNamedLLM(FakeLLM):
     """FakeLLM carrying a ``model_name``, for tests that assert on it in logs."""
 
@@ -1727,10 +1749,10 @@ async def test_react_retries_provider_tool_protocol_error_with_work_tools() -> N
     assert llm_end_events[1]["data"]["success"] is True
 
 
-def test_react_accepts_null_tool_calls_in_forced_final_response() -> None:
+def test_react_rejects_null_tool_calls_in_forced_final_response() -> None:
     pattern = ReActPattern()
 
-    assert not pattern._response_requires_tool_protocol_retry(
+    assert pattern._response_requires_tool_protocol_retry(
         {"content": "Done.", "tool_calls": None},
         force_final_answer=True,
     )
@@ -3324,7 +3346,7 @@ async def test_react_pattern_finalizes_with_completion_evidence() -> None:
                 ],
                 "done": False,
             },
-            {"content": "Created output/en_poster.html."},
+            final_answer_response("Created output/en_poster.html."),
         ]
     )
     pattern = ReActPattern(max_iterations=3, finalize_after_tool_result=True)
@@ -3398,7 +3420,7 @@ async def test_react_pattern_uses_decision_for_repeated_tools() -> None:
                     }
                 ],
             },
-            "可以基于已有搜索结果回答。",
+            final_answer_response("可以基于已有搜索结果回答。", "Simplified Chinese"),
         ]
     )
     pattern = ReActPattern(
@@ -3503,7 +3525,7 @@ async def test_react_repeated_decision_drains_current_tool_call_batch() -> None:
                     }
                 ],
             },
-            "Both pending searches were executed.",
+            final_answer_response("Both pending searches were executed."),
         ]
     )
     pattern = ReActPattern(
@@ -3590,7 +3612,7 @@ async def test_react_pattern_uses_decision_after_cross_tool_attempts() -> None:
                     }
                 ],
             },
-            "已有跨工具结果，直接回答。",
+            final_answer_response("已有跨工具结果，直接回答。", "Simplified Chinese"),
         ]
     )
     pattern = ReActPattern(
@@ -3679,7 +3701,7 @@ async def test_react_pattern_uses_decision_after_tool_group_successes() -> None:
                     }
                 ],
             },
-            "AirPods 4 uses USB-C.",
+            final_answer_response("AirPods 4 uses USB-C."),
         ]
     )
     pattern = ReActPattern(
@@ -3759,7 +3781,7 @@ async def test_react_pattern_accepts_legacy_auto_reroute_kwarg() -> None:
                     }
                 ],
             },
-            "可以基于已有搜索结果回答。",
+            final_answer_response("可以基于已有搜索结果回答。", "Simplified Chinese"),
         ]
     )
     pattern = ReActPattern(
@@ -3980,7 +4002,7 @@ async def test_react_pattern_repeated_guard_can_fire_twice_in_single_run() -> No
                     }
                 ],
             },
-            "第三次搜索后信息足够。",
+            final_answer_response("第三次搜索后信息足够。", "Simplified Chinese"),
         ]
     )
     pattern = ReActPattern(
@@ -10019,7 +10041,10 @@ async def test_resumed_settlement_replaces_original_tool_result_after_rebuild() 
     )
     assert record.result == {"success": True, "post_urn": "urn:li:share:123"}
     assert (
-        restored_pattern._consecutive_successful_tool_group_count("approval_gate") == 1
+        len(
+            restored_pattern._consecutive_successful_tool_group_records("approval_gate")
+        )
+        == 1
     )
     assert restored_pattern._consecutive_work_tool_call_count() == 1
     projected_messages = [
@@ -10395,7 +10420,7 @@ async def test_non_successful_settlement_fails_the_original_tool_call(
     assert pattern.force_final_answer_next is guarded
     assert pattern.settlement_final_answer_fence is guarded
     assert pattern.settlement_fence_turn_id == ("approval-turn" if guarded else None)
-    assert pattern._consecutive_successful_tool_group_count("approval_gate") == 0
+    assert len(pattern._consecutive_successful_tool_group_records("approval_gate")) == 0
     assert pattern._consecutive_work_tool_call_count() == 1
     assert _settlement_trace_events(tracer, "call-1") == [
         "action_start_tool",
@@ -14284,3 +14309,214 @@ async def test_skipped_checkpoint_reports_the_queued_request_identity() -> None:
     skipped = _checkpoint_metadata(tracer, "tool_interaction_response_skipped")
     assert skipped["reason"] == "resume_callback_unavailable"
     assert skipped["invocation_id"] == "queued-invocation"
+
+
+def _record_completed_calls(
+    pattern: ReActPattern, calls: list[tuple[str, dict[str, Any]]]
+) -> None:
+    for index, (tool_name, args) in enumerate(calls):
+        record = ToolCallRecord(
+            tool_call_id=f"call_{index}",
+            invocation_id=f"inv_{index}",
+            tool_name=tool_name,
+            args=args,
+            args_hash=f"hash_{index}",
+            status="completed",
+            result={"content": [{"text": "ok"}], "is_error": False},
+        )
+        pattern.tool_ledger[record.invocation_id] = record
+        pattern.tool_call_id_index[record.tool_call_id] = record.invocation_id
+
+
+def _react_mcp_tool_adapter(tool_name: str):
+    from xagent.core.tools.adapters.vibe.mcp_adapter import MCPToolAdapter
+
+    return MCPToolAdapter(
+        mcp_tool=SimpleNamespace(
+            name=tool_name,
+            description=tool_name,
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        connection={"transport": "stdio", "command": "python", "args": []},
+        name_prefix="mcp_Xero_",
+        source_server="xero",
+    )
+
+
+def test_react_repeated_guard_counts_each_decision_group_separately() -> None:
+    pattern = ReActPattern(repeated_tool_decision_after_consecutive_tool_calls=4)
+    tools = [
+        _react_mcp_tool_adapter("list_invoices"),
+        _react_mcp_tool_adapter("list_aged_receivables"),
+    ]
+    pattern._tool_decision_groups_by_name = pattern._tool_decision_groups_for_tools(
+        tools
+    )
+    _record_completed_calls(
+        pattern,
+        [
+            ("mcp_Xero_list_invoices", {"page": 2}),
+            ("mcp_Xero_list_invoices", {"page": 3}),
+            ("mcp_Xero_list_invoices", {"page": 4}),
+            ("mcp_Xero_list_aged_receivables", {"contactId": "c1"}),
+        ],
+    )
+
+    assert (
+        pattern._repeated_tool_call_metadata(
+            {"name": "mcp_Xero_list_aged_receivables", "args": {}}
+        )
+        is None
+    )
+
+
+def test_react_repeated_guard_marks_paged_runs() -> None:
+    pattern = ReActPattern(repeated_tool_decision_after_consecutive_tool_calls=3)
+    _record_completed_calls(
+        pattern,
+        [("list_invoices", {"page": page}) for page in (1, 2, 3)],
+    )
+
+    metadata = pattern._repeated_tool_call_metadata({"name": "list_invoices"})
+
+    assert metadata is not None
+    assert metadata["paginated"] is True
+    messages = pattern._messages_for_repeated_tool_decision(
+        ExecutionContext(), metadata
+    )
+    prompt = messages[-1]["content"]
+    assert "paging through a list" in prompt
+    assert "more pages may exist" in prompt
+
+
+@pytest.mark.parametrize(
+    ("argument", "values"),
+    [
+        ("page", (1, 2, 3, 4)),
+        ("cursor", ("a", "b", "c", "d")),
+        ("offset", (0, 50, 100, 150)),
+        ("page_token", ("a", "b", "c", "d")),
+        ("skip", (0, 50, 100, 150)),
+        ("next_skip", (0, 50, 100, 150)),
+        ("starting_after", ("a", "b", "c", "d")),
+        ("page_index", (0, 1, 2, 3)),
+    ],
+)
+def test_react_repeated_guard_marks_advancing_paged_runs(
+    argument: str, values: tuple[Any, ...]
+) -> None:
+    pattern = ReActPattern(repeated_tool_decision_after_consecutive_tool_calls=4)
+    _record_completed_calls(
+        pattern,
+        [("mcp_Xero_list_overdue_invoices", {argument: value}) for value in values],
+    )
+
+    metadata = pattern._repeated_tool_call_metadata(
+        {"name": "mcp_Xero_list_overdue_invoices"}
+    )
+
+    assert metadata is not None
+    assert metadata["paginated"] is True
+    prompt = pattern._messages_for_repeated_tool_decision(ExecutionContext(), metadata)[
+        -1
+    ]["content"]
+    assert "offset, or skip" in prompt
+
+
+def test_react_repeated_guard_does_not_mark_identical_page_arguments() -> None:
+    pattern = ReActPattern(repeated_tool_decision_after_consecutive_tool_calls=4)
+    _record_completed_calls(
+        pattern,
+        [("list_invoices", {"page": 1}) for _ in range(4)],
+    )
+
+    metadata = pattern._repeated_tool_call_metadata({"name": "list_invoices"})
+
+    assert metadata is not None
+    assert "paginated" not in metadata
+
+
+def test_react_repeated_guard_marks_cursor_added_after_first_page() -> None:
+    pattern = ReActPattern(repeated_tool_decision_after_consecutive_tool_calls=2)
+    _record_completed_calls(
+        pattern,
+        [
+            ("list_invoices", {"status": "open"}),
+            ("list_invoices", {"status": "open", "cursor": "next-page"}),
+        ],
+    )
+
+    metadata = pattern._repeated_tool_call_metadata({"name": "list_invoices"})
+
+    assert metadata is not None
+    assert metadata["paginated"] is True
+
+
+def test_react_work_attempt_guard_marks_pagination_after_failed_page() -> None:
+    pattern = ReActPattern(
+        repeated_tool_decision_after_consecutive_tool_calls=4,
+        repeated_tool_decision_after_consecutive_work_tool_calls=3,
+    )
+    _record_completed_calls(
+        pattern,
+        [("list_invoices", {"page": 1}), ("list_invoices", {"page": 2})],
+    )
+    failed = ToolCallRecord(
+        tool_call_id="call_failed",
+        invocation_id="inv_failed",
+        tool_name="list_invoices",
+        args={"page": 3},
+        args_hash="hash_failed",
+        status="failed",
+        result={
+            "content": [{"text": "Error listing invoices: boom"}],
+            "is_error": True,
+        },
+    )
+    pattern.tool_ledger[failed.invocation_id] = failed
+    pattern.tool_call_id_index[failed.tool_call_id] = failed.invocation_id
+
+    metadata = pattern._repeated_tool_call_metadata({"name": "list_invoices"})
+
+    assert metadata is not None
+    assert metadata["trigger"] == "work_tool_attempts"
+    assert metadata["paginated"] is True
+
+
+def test_react_work_attempt_guard_ignores_other_tools_pagination() -> None:
+    pattern = ReActPattern(
+        repeated_tool_decision_after_consecutive_tool_calls=4,
+        repeated_tool_decision_after_consecutive_work_tool_calls=3,
+    )
+    _record_completed_calls(
+        pattern,
+        [
+            ("list_invoices", {"page": 1}),
+            ("list_invoices", {"page": 2}),
+            ("send_reminder", {"invoice_id": "inv-1"}),
+        ],
+    )
+
+    metadata = pattern._repeated_tool_call_metadata({"name": "send_reminder"})
+
+    assert metadata is not None
+    assert metadata["trigger"] == "work_tool_attempts"
+    assert "paginated" not in metadata
+
+
+def test_react_repeated_guard_leaves_unpaged_runs_unmarked() -> None:
+    pattern = ReActPattern(repeated_tool_decision_after_consecutive_tool_calls=2)
+    _record_completed_calls(
+        pattern,
+        [("web_search", {"query": "a"}), ("web_search", {"query": "b"})],
+    )
+
+    metadata = pattern._repeated_tool_call_metadata({"name": "web_search"})
+
+    assert metadata is not None
+    assert "paginated" not in metadata
+    messages = pattern._messages_for_repeated_tool_decision(
+        ExecutionContext(), metadata
+    )
+    prompt = messages[-1]["content"]
+    assert "paging through a list" not in prompt

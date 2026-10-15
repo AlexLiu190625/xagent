@@ -151,6 +151,7 @@ from .execution_result_projection import (
     FailedResultPresentation,
     completion_outcome_for_status,
     present_failed_result,
+    project_execution_result_for_channel,
 )
 from .file_reference_output_service import (
     reconcile_assistant_file_references,
@@ -3217,6 +3218,47 @@ def _finalize_resumed_task(
             task,
             interruption_pause_result() if pause_reason is not None else result,
         )
+        if task.channel_id is not None and final_task_status in {
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.WAITING_FOR_USER,
+        }:
+            # A channel turn whose run paused and resumed: its START stores
+            # the answer the leaf would have (first writer wins), so a channel
+            # still waiting for it gets the leaf's projection, questions and
+            # coded failure text included.
+            from .shared_channel_execution import (
+                channel_durable_result,
+                stamp_channel_result_no_commit,
+            )
+
+            # Best effort: a failed stamp never undoes the settlement; the
+            # channel then falls back to the task row. The stamp only assigns
+            # the START's result, so it is flushed (and the savepoint
+            # released) inside the ``try``: a failing UPDATE is caught too.
+            stamp = db.begin_nested()
+            try:
+                stamp_channel_result_no_commit(
+                    db,
+                    task_id=task_id,
+                    run_id=task_lease.run_id,
+                    channel_result=channel_durable_result(
+                        result,
+                        project_execution_result_for_channel(result),
+                        # The text this transaction stored, file links
+                        # rewritten.
+                        transcript=output if success and output.strip() else None,
+                    ),
+                )
+                db.flush()
+                stamp.commit()
+            except Exception:
+                stamp.rollback()
+                logger.exception(
+                    "Storing the channel result of resumed task %s failed; "
+                    "its channel reads the task row instead",
+                    task_id,
+                )
         # A lost acknowledgement here is not reconciled yet: the lease is
         # released in this transaction, so only the result fact's witness
         # (returned above) can prove the commit. That belongs with the

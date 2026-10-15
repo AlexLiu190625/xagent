@@ -330,6 +330,7 @@ def test_command_id_is_unique_per_fence_and_attempt_and_fits_the_column():
         ("dispatch_failed", None, ("stopped", "failed")),
         ("ineligible", "ineligible:preview", ("stopped", "ineligible")),
         ("manual", "auto_resume_disabled", ("stopped", "disabled")),
+        # Recorded for a channel task before channel tasks were scheduled.
         ("manual", "channel_hold_pending", ("stopped", "ineligible")),
         ("manual", None, ("stopped", "ineligible")),
         ("stale", "dispatch:run_id", None),
@@ -405,6 +406,7 @@ def _recorded(state: str, detail: str | None = None) -> Any:
         # Recorded manual outcomes keep the caller's message and stay silent:
         # the pause the client already shows is all there is.
         ("manual", "auto_resume_disabled", "default", None),
+        # Recorded for a channel task before channel tasks were scheduled.
         ("manual", "channel_hold_pending", "default", None),
         ("manual", "supersede_check_failed", "default", None),
         ("manual", None, "default", None),
@@ -600,14 +602,14 @@ def _workforce_missing(db: Session, now: datetime) -> int:
     return _seed(db, now, agent_config={"workforce_run_id": 999_999})
 
 
-def _channel_task(db: Session, now: datetime) -> int:
+def _channel_task(db: Session, now: datetime, **kwargs: Any) -> int:
     user = _user(db)
     channel = UserChannel(
         user_id=user.id, channel_type="slack", channel_name="ops", config={}
     )
     db.add(channel)
     db.flush()
-    return _seed(db, now, user=user, channel_id=channel.id)
+    return _seed(db, now, user=user, channel_id=channel.id, **kwargs)
 
 
 @pytest.mark.parametrize(
@@ -621,7 +623,15 @@ def _channel_task(db: Session, now: datetime) -> int:
             "ineligible",
         ),
         # Leaving an announced ``scheduled`` row: the client must hear it.
-        ("channel", "manual", "channel_hold_pending", "ineligible", "ineligible"),
+        (
+            "channel_inline",
+            "ineligible",
+            "ineligible:channel_inline",
+            "ineligible",
+            "ineligible",
+        ),
+        # A channel task's own (shorter) window.
+        ("channel_expired", "expired", None, "expired", "expired"),
         ("expired", "expired", None, "expired", "expired"),
         ("no_progress", "exhausted", None, "exhausted", "limit_reached"),
         ("total", "exhausted", None, "exhausted", "limit_reached"),
@@ -632,13 +642,18 @@ def _channel_task(db: Session, now: datetime) -> int:
 def test_dispatch_time_limits_stop_without_a_command(
     factory, notified, monkeypatch, case, state, detail, event, stop_reason
 ):
-    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setenv(
+        "XAGENT_SHARED_TASK_EXECUTION_ENABLED",
+        "false" if case == "channel_inline" else "true",
+    )
     now = utc_now()
     with factory() as db:
         if case == "workforce_missing":
             task_id = _workforce_missing(db, now)
-        elif case == "channel":
+        elif case == "channel_inline":
             task_id = _channel_task(db, now)
+        elif case == "channel_expired":
+            task_id = _channel_task(db, now, interrupted_ago=1_800 + 60)
         elif case == "expired":
             task_id = _seed(db, now, interrupted_ago=86_400 + 60)
         elif case == "no_progress":
@@ -669,6 +684,23 @@ def test_dispatch_time_limits_stop_without_a_command(
     assert [n.auto_resume["stop_reason"] for n in report.notices] == (
         [stop_reason] if stop_reason else []
     )
+
+
+def test_shared_channel_row_is_dispatched_like_any_other(
+    factory, notified, monkeypatch
+):
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    now = utc_now()
+    with factory() as db:
+        task_id = _channel_task(db, now, interrupted_ago=1_800 - 60)
+        db.commit()
+
+    report = run_auto_resume_tick(now=now)
+
+    assert (report.dispatched, report.gave_up) == (1, 0)
+    row = _row(factory, task_id)
+    assert (row.state, row.state_detail) == ("dispatched", None)
+    assert [c.command_id for c in _commands(factory, task_id)] == [row.last_command_id]
 
 
 @pytest.mark.parametrize(

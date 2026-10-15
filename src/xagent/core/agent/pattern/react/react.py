@@ -75,6 +75,7 @@ from ....file_ref import (
     WORKSPACE_OUTPUT_FILES_TOOL_NAME,
     final_deliverable_file_reference_instructions,
 )
+from ....model.chat.basic.base import compatible_tool_choice_for_llm
 from ....model.chat.exceptions import LLMToolProtocolError
 from ....model.chat.tool_protocol import get_tool_protocol_error
 from ....tools.adapters.vibe.interaction_types import (
@@ -121,7 +122,7 @@ from ...context.execution import (
 from ...context.memory_tool import build_memory_tools
 from ...context.skill_tool import build_load_skill_tool
 from ...grounding import evidence_facts, grounding_rule
-from ...language import final_answer_language_rule
+from ...language import effective_output_language, final_answer_language_rule
 from ...result import (
     CONTROL_TOOL_NAMES,
     normalize_tool_failure_code,
@@ -185,6 +186,30 @@ REACT_DECISION_FINAL_ANSWER = "final_answer"
 USER_INTERACTION_CONTROL_TOOL_NAMES = CONTROL_TOOL_NAMES - {REACT_DECISION_FINAL_ANSWER}
 REACT_DECISION_TOOL_CALL = "tool_call"
 UNGROUPED_TOOL_DECISION_CATEGORIES = frozenset({"basic", "other"})
+# Argument names that mark a call as one page of a larger list. A repeated run
+# of such calls has not read the whole list just because several pages came back.
+PAGINATION_ARGUMENT_NAMES = frozenset(
+    {
+        "page",
+        "page_number",
+        "pageNumber",
+        "page_token",
+        "pageToken",
+        "next_page_token",
+        "nextPageToken",
+        "cursor",
+        "offset",
+        "skip",
+        "next_skip",
+        "nextSkip",
+        "starting_after",
+        "startingAfter",
+        "page_index",
+        "pageIndex",
+        "start_at",
+        "startAt",
+    }
+)
 # Bounds for the final_answer-strip warning's tool-name list. Tool names come
 # straight from the model, so the log line is shaped like the rest of this
 # module's untrusted-input logging: bounded length, escaped, never raw.
@@ -549,6 +574,33 @@ def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
         )
 
     return normalized
+
+
+def _records_advance_pagination(records: list[ToolCallRecord]) -> bool:
+    """Return whether recorded calls actually moved through pagination.
+
+    Merely repeating ``page=1`` is a stuck loop, not evidence that more pages
+    should be fetched. Compare only pagination arguments so identical requests
+    stay unmarked while page, cursor, offset and connector-specific tokens that
+    change across calls are recognised.
+    """
+
+    signatures: list[dict[str, Any]] = []
+    has_pagination_argument = False
+    for record in records:
+        args = record.args
+        if not isinstance(args, dict):
+            continue
+        signature = {
+            name: args[name] for name in PAGINATION_ARGUMENT_NAMES if name in args
+        }
+        has_pagination_argument = has_pagination_argument or bool(signature)
+        signatures.append(signature)
+    return (
+        has_pagination_argument
+        and len(signatures) >= 2
+        and any(signature != signatures[0] for signature in signatures[1:])
+    )
 
 
 def _unique_field(base_field: str, used_fields: set[str]) -> str:
@@ -1092,6 +1144,10 @@ class ReActPattern(AgentPattern):
                 )
                 note_compaction_evidence_loss(context, compact_result)
 
+            require_structured_final_answer = force_final_answer_now and (
+                settlement_fence or tool_evidence_state(context) != "intact"
+            )
+
             # Computed once, after compaction (compaction can change which
             # message is the latest visible user message), at the site that
             # builds this call's real final messages -- not at the routing
@@ -1100,12 +1156,18 @@ class ReActPattern(AgentPattern):
                 context, force_final_answer=force_final_answer_now
             )
             llm_metadata.update(form_answer_decision.trace_metadata())
+            supports_forced_tool_choice = getattr(
+                call_llm, "supports_forced_tool_choice", True
+            )
             messages = self._messages_for_llm(
                 context,
                 has_tools=bool(tool_schemas),
                 force_final_answer=force_final_answer_now,
                 tool_names=self._schema_tool_names(tool_schemas),
                 form_answer_continuation=form_answer_decision.applied,
+                allow_plain_text_final_answer=(
+                    not supports_forced_tool_choice and not force_final_answer_now
+                ),
             )
             await runtime.checkpoint("before_llm", context=context, pattern=self)
             await runtime.on_llm_start(
@@ -1118,12 +1180,15 @@ class ReActPattern(AgentPattern):
             protocol_retry_performed = False
             response_already_traced = False
             try:
-                effective_tool_choice = (
+                requested_tool_choice = (
                     "required"
                     if force_final_answer_now
                     else self.tool_choice
                     if tool_schemas
                     else None
+                )
+                effective_tool_choice = compatible_tool_choice_for_llm(
+                    call_llm, requested_tool_choice
                 )
                 llm_kwargs = {
                     "messages": messages,
@@ -1225,6 +1290,9 @@ class ReActPattern(AgentPattern):
             requires_protocol_retry = self._response_requires_tool_protocol_retry(
                 normalized,
                 force_final_answer=force_final_answer_now,
+                require_structured_final_answer=(
+                    require_structured_final_answer and force_final_answer_now
+                ),
                 reject_mixed_control_calls=protocol_retry_performed,
                 allowed_tool_names=frozenset(self._schema_tool_names(tool_schemas)),
             )
@@ -1296,6 +1364,9 @@ class ReActPattern(AgentPattern):
                 empty_final_answer = (
                     None if truncated else self._empty_final_answer_call(normalized)
                 )
+                empty_plain_text = (
+                    False if truncated else self._empty_plain_text_response(normalized)
+                )
                 if empty_final_answer is not None:
                     logger.warning(
                         "ReAct final_answer carried no answer text; discarding the "
@@ -1314,12 +1385,21 @@ class ReActPattern(AgentPattern):
                     recovery_reason = "empty_final_answer"
                 elif settlement_fence:
                     recovery_reason = "settlement_final_answer_required"
-                elif (
-                    protocol_error is not None
-                    and protocol_error.get("code") == "malformed_tool_arguments"
+                elif protocol_error is not None:
+                    # Provider protocol errors commonly carry neither content nor
+                    # tool calls. Preserve their own repair path instead of
+                    # misclassifying the envelope as an empty plain-text reply.
+                    recovery_reason = (
+                        "malformed_tool_arguments"
+                        if protocol_error.get("code") == "malformed_tool_arguments"
+                        else None
+                    )
+                elif empty_plain_text:
+                    recovery_reason = "empty_plain_text"
+                elif require_structured_final_answer and not normalized.get(
+                    "tool_calls"
                 ):
-                    # The same repair the raised form of this error gets.
-                    recovery_reason = "malformed_tool_arguments"
+                    recovery_reason = "structured_final_answer_required"
                 else:
                     recovery_reason = None
                 try:
@@ -1334,6 +1414,10 @@ class ReActPattern(AgentPattern):
                         tool_schemas=normal_tool_schemas,
                         force_final_answer=(
                             force_final_answer_now and not recover_full_tool_set
+                        ),
+                        require_structured_final_answer=(
+                            require_structured_final_answer
+                            and not recover_full_tool_set
                         ),
                         recovery_reason=recovery_reason,
                         empty_final_answer=empty_final_answer is not None,
@@ -1355,6 +1439,9 @@ class ReActPattern(AgentPattern):
                 if self._response_requires_tool_protocol_retry(
                     normalized,
                     force_final_answer=force_final_answer_now,
+                    require_structured_final_answer=(
+                        require_structured_final_answer and not recover_full_tool_set
+                    ),
                     reject_mixed_control_calls=recover_full_tool_set,
                     allowed_tool_names=frozenset(self._schema_tool_names(tool_schemas)),
                 ):
@@ -1547,6 +1634,21 @@ class ReActPattern(AgentPattern):
                 return dict(calls[0]["args"])
             return None
 
+        def parse_plain_text_response(response: Any) -> dict[str, Any] | None:
+            if response_finish_reason(response) in {"length", "max_tokens"}:
+                return None
+            normalized = self._normalize_llm_response(response)
+            calls = normalized.get("tool_calls") or []
+            content = normalized.get("content")
+            if not calls and isinstance(content, str) and content.strip():
+                return {
+                    "response_language": effective_output_language(context)
+                    or "Unspecified",
+                    "answer": content,
+                    "outcome": "partial",
+                }
+            return None
+
         schema = self._final_answer_tool_schema()
         schema["function"]["parameters"]["properties"]["outcome"]["enum"] = [
             "partial",
@@ -1559,6 +1661,7 @@ class ReActPattern(AgentPattern):
             messages=messages,
             schema=schema,
             parse_response=parse_response,
+            parse_plain_text_response=parse_plain_text_response,
             metadata={
                 "iteration": self.current_iteration,
                 "phase": "iteration_limit_delivery",
@@ -1762,6 +1865,7 @@ class ReActPattern(AgentPattern):
         force_final_answer: bool = False,
         tool_names: list[str] | None = None,
         form_answer_continuation: bool = False,
+        allow_plain_text_final_answer: bool = False,
     ) -> list[dict[str, Any]]:
         messages = list(
             context.get_messages_for_llm(
@@ -1838,10 +1942,12 @@ class ReActPattern(AgentPattern):
                     "Do not call any other tool and do not output "
                     "tool-call markup as plain text. "
                 )
-            instruction = (
+            delivery_rule = (
                 "Produce the final user-facing answer by calling the final_answer "
                 f"control tool exactly once{source_phrase}. "
-                f"{evidence_facts_text}"
+            )
+            instruction = (
+                delivery_rule + f"{evidence_facts_text}"
                 f"{read_instruction}"
                 f"{tool_rule}{outcome_rule}"
                 "If a "
@@ -1894,14 +2000,26 @@ class ReActPattern(AgentPattern):
                 "them; finish with outcome=blocked and explain that the required "
                 "user choice cannot be obtained in this run. "
             )
+            completion_rule = (
+                "When the current task is complete, call the final_answer tool "
+                "exactly once instead of calling another work tool or returning "
+                "plain assistant text. "
+                if not allow_plain_text_final_answer
+                else "When the current task is complete, prefer calling the "
+                "final_answer tool exactly once so the completion outcome is "
+                "explicit. You may return plain assistant text only when the task "
+                "is fully complete and that text is the complete final user-facing "
+                "answer. Never use plain assistant text for a progress update, a "
+                "preamble, a partial result, a blocked outcome, or an explanation "
+                "of missing information; use final_answer with the appropriate "
+                "outcome for a terminal partial or blocked response. "
+            )
             instruction = (
                 "Use available tools when the user asks you to generate, compute, run, "
                 "execute, inspect, read, write, or otherwise produce a concrete result "
                 "that a tool can determine. After a successful tool call, base the "
                 "final answer on the latest tool result instead of repeating the same "
-                "tool work. When the current task is complete, call the final_answer "
-                "tool exactly once instead of calling another work tool or returning "
-                "plain assistant text. Never put final_answer in the same response "
+                f"tool work. {completion_rule}Never put final_answer in the same response "
                 "as any other tool call: run the work tools first, then answer on a "
                 "later turn from their results. Do not write assistant text in the "
                 "same response as a work tool call; call the tool directly. "
@@ -1983,6 +2101,7 @@ class ReActPattern(AgentPattern):
         force_final_answer: bool,
         recovery_reason: str | None = None,
         empty_final_answer: bool = False,
+        require_structured_final_answer: bool = False,
     ) -> tuple[Any, ReActFinalAnswerStreamer]:
         # tool_schemas is the repaired turn's ordinary surface. Whether that
         # turn, if forced, offered reads was decided when it was built
@@ -2008,6 +2127,10 @@ class ReActPattern(AgentPattern):
             force_final_answer=force_final_answer,
             tool_names=self._schema_tool_names(tools),
             form_answer_continuation=form_answer_decision.applied,
+            allow_plain_text_final_answer=(
+                not getattr(llm, "supports_forced_tool_choice", True)
+                and not force_final_answer
+            ),
         )
         if recovery_reason == "unavailable_tool_call":
             retry_instruction = (
@@ -2026,6 +2149,13 @@ class ReActPattern(AgentPattern):
                 "concise explanation of the recorded outcome."
             )
             retry_phase = "settlement_final_answer_recovery"
+        elif recovery_reason == "structured_final_answer_required":
+            retry_instruction = (
+                "This forced final-answer turn must preserve an explicit completion "
+                "outcome. Call final_answer with the complete user-facing response "
+                "and the appropriate completed, partial, or blocked outcome."
+            )
+            retry_phase = "structured_final_answer_recovery"
         elif recovery_reason == "malformed_tool_arguments":
             retry_instruction = (
                 "The previous response returned malformed JSON arguments for a "
@@ -2073,6 +2203,22 @@ class ReActPattern(AgentPattern):
                 "whitespace-only answer."
             )
             retry_phase = "empty_final_answer_recovery"
+        elif recovery_reason == "empty_plain_text":
+            retry_instruction = (
+                "The previous response returned no answer text and made no tool "
+                "call, so the user received no reply at all. "
+                + (
+                    "Retry by calling final_answer with the complete user-facing "
+                    "response."
+                    if force_final_answer
+                    else "Retry by calling an appropriate available tool with a "
+                    "complete response."
+                    if getattr(llm, "supports_forced_tool_choice", True)
+                    else "Retry with either an appropriate available tool call or "
+                    "a complete non-empty plain-text answer."
+                )
+            )
+            retry_phase = "empty_plain_text_recovery"
         else:
             retry_instruction = (
                 "The previous response used an invalid tool protocol. Retry the same "
@@ -2121,7 +2267,7 @@ class ReActPattern(AgentPattern):
                 llm,
                 messages=messages,
                 tools=tools,
-                tool_choice="required",
+                tool_choice=compatible_tool_choice_for_llm(llm, "required"),
                 on_chunk=answer_streamer.handle_chunk,
             )
         except LLMCallInterrupted:
@@ -2139,6 +2285,7 @@ class ReActPattern(AgentPattern):
         retry_is_invalid = self._response_requires_tool_protocol_retry(
             normalized,
             force_final_answer=force_final_answer,
+            require_structured_final_answer=require_structured_final_answer,
             reject_mixed_control_calls=(recovery_reason == "unavailable_tool_call"),
             allowed_tool_names=frozenset(self._schema_tool_names(tools)),
         )
@@ -2160,6 +2307,7 @@ class ReActPattern(AgentPattern):
         normalized: dict[str, Any],
         *,
         force_final_answer: bool,
+        require_structured_final_answer: bool | None = None,
         reject_mixed_control_calls: bool = False,
         allowed_tool_names: frozenset[str] | None = None,
     ) -> bool:
@@ -2177,6 +2325,12 @@ class ReActPattern(AgentPattern):
             return True
         allowed_names = allowed_tool_names or frozenset({"final_answer"})
         tool_calls = normalized.get("tool_calls") or []
+        if require_structured_final_answer is None:
+            # Preserve the strict default for direct protocol checks. Runtime
+            # callers always pass the narrower outcome-sensitive decision.
+            require_structured_final_answer = force_final_answer
+        if require_structured_final_answer and not tool_calls:
+            return True
         if (
             reject_mixed_control_calls
             and len(tool_calls) > 1
@@ -2201,18 +2355,28 @@ class ReActPattern(AgentPattern):
             # not allowed to reintroduce. The empty-answer repair owns
             # responses whose only calls are control tools.
             return False
-        return self._empty_final_answer_call(normalized) is not None
+        return self._empty_final_answer_call(
+            normalized
+        ) is not None or self._empty_plain_text_response(normalized)
+
+    @staticmethod
+    def _empty_plain_text_response(normalized: dict[str, Any]) -> bool:
+        if normalized.get("tool_calls"):
+            return False
+        content = normalized.get("content")
+        return content is None or not str(content).strip()
 
     def _empty_final_answer_call(
         self, normalized: dict[str, Any]
     ) -> dict[str, Any] | None:
         """Return the first ``final_answer`` call that carries no answer text.
 
-        Under ``tool_choice="required"`` ``final_answer`` is the only way ReAct
-        can reply, so an empty ``answer`` produces a run that completes with
-        nothing streamed and nothing persisted. Treating it as a tool-protocol
-        violation routes it into the pattern's existing single repair retry
-        instead of finalizing silently.
+        On forced-choice models ``final_answer`` is the only way ReAct can
+        reply. Auto-only models may instead return plain text, but once they
+        choose this tool an empty ``answer`` still produces a run with nothing
+        streamed and nothing persisted. Treating it as a tool-protocol
+        violation routes either path into the pattern's existing single repair
+        retry instead of finalizing silently.
         """
 
         for tool_call in normalized.get("tool_calls") or []:
@@ -5289,7 +5453,7 @@ class ReActPattern(AgentPattern):
                 call_llm,
                 messages=messages,
                 tools=decision_tools,
-                tool_choice="required",
+                tool_choice=compatible_tool_choice_for_llm(call_llm, "required"),
                 thinking={"type": "disabled", "enable": False},
             )
         except LLMCallInterrupted:
@@ -5403,15 +5567,21 @@ class ReActPattern(AgentPattern):
         same_tool_threshold = self.repeated_tool_decision_after_consecutive_tool_calls
         if same_tool_threshold is not None and same_tool_threshold > 0:
             tool_group = self._tool_decision_group_for_name(tool_name)
-            same_tool_count = self._consecutive_successful_tool_group_count(tool_group)
+            same_tool_records = self._consecutive_successful_tool_group_records(
+                tool_group
+            )
+            same_tool_count = len(same_tool_records)
             if same_tool_count >= same_tool_threshold:
-                return {
+                metadata: dict[str, Any] = {
                     "trigger": "same_tool_successes",
                     "tool_name": tool_group,
                     "latest_tool_name": tool_name,
                     "consecutive_tool_calls": same_tool_count,
                     "threshold": same_tool_threshold,
                 }
+                if _records_advance_pagination(same_tool_records):
+                    metadata["paginated"] = True
+                return metadata
 
         work_tool_threshold = (
             self.repeated_tool_decision_after_consecutive_work_tool_calls
@@ -5419,16 +5589,26 @@ class ReActPattern(AgentPattern):
         if work_tool_threshold is None or work_tool_threshold <= 0:
             return None
 
-        work_tool_count = self._consecutive_work_tool_call_count()
+        work_tool_records = self._consecutive_work_tool_records()
+        work_tool_count = len(work_tool_records)
         if work_tool_count < work_tool_threshold:
             return None
-        return {
+        metadata = {
             "trigger": "work_tool_attempts",
             "tool_name": tool_name,
             "latest_tool_name": tool_name,
             "consecutive_tool_calls": work_tool_count,
             "threshold": work_tool_threshold,
         }
+        tool_group = self._tool_decision_group_for_name(tool_name)
+        same_group_work_records = [
+            record
+            for record in work_tool_records
+            if self._tool_decision_group_for_name(record.tool_name) == tool_group
+        ]
+        if _records_advance_pagination(same_group_work_records):
+            metadata["paginated"] = True
+        return metadata
 
     def _messages_for_repeated_tool_decision(
         self,
@@ -5492,6 +5672,18 @@ class ReActPattern(AgentPattern):
             "Use this as the controlling request when deciding whether "
             f"{completion_clause}."
         )
+        pagination_clause = (
+            " The consecutive calls were paging through a list: their arguments "
+            "carry a page, cursor, offset, or skip. A page that came back full, or "
+            "results with no total or last-page marker, mean more pages may "
+            f"exist, so choose {REACT_DECISION_TOOL_CALL} to fetch the next page "
+            "unless the latest user request only asks for a sample or the "
+            "first few items, or the results already show the end of the list "
+            "(a short or empty page, or an explicit total or no-next-page "
+            "marker)."
+            if metadata.get("paginated")
+            else ""
+        )
         prompt = (
             f"You must call {REACT_DECISION_TOOL_NAME} exactly once. Decide whether "
             "the current ReAct run should finish or make another work-tool call. "
@@ -5523,6 +5715,7 @@ class ReActPattern(AgentPattern):
             "requested number as already completed. If the latest user request "
             "explicitly requires more completed work-tool calls or results than "
             f"the current context contains, choose {REACT_DECISION_TOOL_CALL}."
+            f"{pagination_clause}"
         )
         return [*messages, {"role": "user", "content": prompt}]
 
@@ -5597,8 +5790,10 @@ class ReActPattern(AgentPattern):
             }
         return None
 
-    def _consecutive_successful_tool_group_count(self, tool_group: str) -> int:
-        count = 0
+    def _consecutive_successful_tool_group_records(
+        self, tool_group: str
+    ) -> list[ToolCallRecord]:
+        records: list[ToolCallRecord] = []
         control_tool_names = self._control_tool_names()
         for record in reversed(self._provider_compatible_tool_records()):
             if record.tool_name in control_tool_names:
@@ -5609,19 +5804,22 @@ class ReActPattern(AgentPattern):
                 record.result
             ):
                 break
-            count += 1
-        return count
+            records.append(record)
+        return records
 
     def _consecutive_work_tool_call_count(self) -> int:
-        count = 0
+        return len(self._consecutive_work_tool_records())
+
+    def _consecutive_work_tool_records(self) -> list[ToolCallRecord]:
+        records: list[ToolCallRecord] = []
         control_tool_names = self._control_tool_names()
         for record in reversed(self._provider_compatible_tool_records()):
             if record.tool_name in control_tool_names:
                 continue
             if record.status not in {"completed", "failed"}:
                 continue
-            count += 1
-        return count
+            records.append(record)
+        return records
 
     async def _finalize_success(
         self,

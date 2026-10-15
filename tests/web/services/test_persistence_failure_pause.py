@@ -131,7 +131,7 @@ NO_OUTPUTS = _PreparedTaskFileOutputs((), (), ())
 
 @pytest.fixture(autouse=True)
 def _pause_switch_on(monkeypatch):
-    # Off by default until automatic resume ships; these tests exercise it on.
+    # Unset, the switch follows automatic resume; these tests exercise it on.
     monkeypatch.setenv(PAUSE_SWITCH, "true")
 
 
@@ -1821,7 +1821,7 @@ def test_result_pause_reports_the_scheduled_resume(canonical, monkeypatch, path)
             [("task_paused", None), ("task_recovery_update", "stopped")],
         ),
         ("manual", "auto_resume_disabled", [("task_paused", None)]),
-        ("manual", "channel_hold_pending", [("task_paused", None)]),
+        ("manual", "supersede_check_failed", [("task_paused", None)]),
         ("ineligible", "ineligible:source_sdk", [("task_paused", None)]),
     ],
 )

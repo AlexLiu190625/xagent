@@ -88,6 +88,26 @@ def _patch_task_command_dispatcher_disabled(
     )
 
 
+@pytest.fixture(autouse=True)
+def unregister_startup_task_extensions():
+    """Undo the task extensions ``startup_event()`` registers.
+
+    These tests call ``startup_event()`` without the matching shutdown, so the
+    providers it registers (e.g. ``local_browser``) would otherwise stay in the
+    process-wide registry and send later tests down the provider branch.
+    """
+    from xagent.web.services.task_runtime import (
+        registered_task_extensions,
+        unregister_task_extension,
+    )
+
+    before = set(registered_task_extensions())
+    yield
+    for name in registered_task_extensions():
+        if name not in before:
+            unregister_task_extension(name)
+
+
 @pytest.fixture
 def temp_lancedb_dir():
     """Create a temporary directory for LanceDB."""
@@ -1411,9 +1431,7 @@ async def test_failed_startup_leaves_no_unsignaled_temp_file_cleanup(
         "xagent.web.services.kb_file_service.reconcile_uploaded_files",
         lambda *args, **kwargs: {},
     )
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local", lambda: _FakeSession
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", _FakeSession)
 
     def _blocking_cleanup(*, stop_event=None) -> int:
         # Stand in for a real sweep of a large tree: an executor walk that only

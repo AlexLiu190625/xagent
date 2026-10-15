@@ -497,3 +497,109 @@ def receive_event(ws, event_type):
             return event, events
         assert event["type"] != "error", event
     pytest.fail(f"Missing {event_type}: {events}")
+
+
+# ---------------------------------------------------------------- crash helpers
+
+# Lease recovery takes the lease TTL (10s) plus a few polls; leave room for a
+# cold worker start.
+SETTLE_TIMEOUT = 60
+
+
+def restart_hosts(app, *roles: str, **environment: str) -> None:
+    """Replace every host, with ``environment`` applied to the new ones."""
+
+    app.close()
+    app.processes.clear()
+    app.pipes.clear()
+    app.client = None
+    app.environment.update(environment)
+    app.start_all(*roles)
+
+
+def wait_for(predicate, app, what: str, timeout: float = SETTLE_TIMEOUT) -> Any:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = predicate()
+        if value:
+            return value
+        time.sleep(0.05)
+    pytest.fail(f"Timed out waiting for {what}\n{app.diagnostics()}")
+
+
+def kill_host(app, process) -> None:
+    """SIGKILL one host and forget it."""
+    process.kill()
+    process.join(10)
+    assert process.exitcode == -signal.SIGKILL
+    index = app.processes.index(process)
+    app.processes.pop(index)
+    app.pipes.pop(index).close()
+
+
+def model_calls(app) -> list[dict[str, Any]]:
+    return [
+        json.loads(line)
+        for path in app.root.glob("model-*.jsonl")
+        for line in path.read_text().splitlines()
+    ]
+
+
+def task_state(task_id: int) -> dict[str, Any]:
+    from xagent.web.models.database import get_session_local
+    from xagent.web.models.task import Task
+
+    with get_session_local()() as db:
+        task = db.get(Task, task_id)
+        return {
+            "status": task.status.value,
+            "control_state": task.control_state,
+            "run_id": task.run_id,
+            "runner_id": task.runner_id,
+            "state_version": task.state_version,
+        }
+
+
+def recovery_state(task_id: int) -> tuple[dict[str, Any] | None, list[str]]:
+    """The task's recovery row and its event names, in order."""
+    import sqlalchemy as sa
+
+    from xagent.web.models.database import get_session_local
+    from xagent.web.models.task_auto_recovery import (
+        TaskAutoRecovery,
+        TaskRecoveryEvent,
+    )
+
+    with get_session_local()() as db:
+        row = db.get(TaskAutoRecovery, task_id)
+        events = [
+            event.event
+            for event in db.scalars(
+                sa.select(TaskRecoveryEvent)
+                .where(TaskRecoveryEvent.task_id == task_id)
+                .order_by(TaskRecoveryEvent.id)
+            )
+        ]
+        if row is None:
+            return None, events
+        return {
+            "state": row.state,
+            "state_detail": row.state_detail,
+            "reason": row.reason,
+            "run_id": row.run_id,
+            "total_resumes": row.total_resumes,
+        }, events
+
+
+def auto_resume_commands(task_id: int) -> list[str]:
+    from xagent.web.models.database import get_session_local
+    from xagent.web.models.task_command import TaskExecutionCommand
+
+    with get_session_local()() as db:
+        return [
+            command.command_id
+            for command in db.query(TaskExecutionCommand)
+            .filter(TaskExecutionCommand.task_id == task_id)
+            .order_by(TaskExecutionCommand.id)
+            if command.command_id.startswith("auto-resume:")
+        ]

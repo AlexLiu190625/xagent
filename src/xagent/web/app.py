@@ -14,12 +14,15 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.datastructures import Headers, MutableHeaders
 from starlette.middleware.sessions import SessionMiddleware
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.responses import Response
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from ..config import (
     get_agent_runtime,
     get_background_job_sweep_interval_seconds,
+    get_cors_origins,
     get_external_upload_dirs,
     get_file_storage_startup_sync_enabled,
     get_gmail_watch_enabled,
@@ -98,6 +101,7 @@ from .api.v1.errors import V1ApiError, V1ErrorCode, v1_api_error_handler
 from .api.websocket import ws_router
 from .api.widget import widget_router
 from .api.workforces import router as workforces_router
+from .auth_config import validate_auth_config
 from .dynamic_memory_store import get_memory_store
 from .logging_config import setup_logging
 from .models.database import init_db
@@ -140,6 +144,55 @@ setup_logging()  # Uses XAGENT_LOG_LEVEL env var or defaults to INFO
 logger = logging.getLogger(__name__)
 
 __all__ = ["app"]
+
+
+class PublicWidgetCORSMiddleware:
+    """Allow credential-free widget calls from customer embedding origins."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or not str(scope.get("path", "")).startswith(
+            "/api/widget/"
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        request_headers = Headers(scope=scope)
+        origin = request_headers.get("origin")
+        if not origin:
+            await self.app(scope, receive, send)
+            return
+
+        if scope.get("method") == "OPTIONS" and request_headers.get(
+            "access-control-request-method"
+        ):
+            response = Response(
+                status_code=200,
+                headers={
+                    "Access-Control-Allow-Origin": origin,
+                    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                    "Access-Control-Allow-Headers": request_headers.get(
+                        "access-control-request-headers", ""
+                    ),
+                    "Access-Control-Max-Age": "600",
+                    "Vary": "Origin",
+                },
+            )
+            await response(scope, receive, send)
+            return
+
+        async def send_widget_response(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                response_headers = MutableHeaders(scope=message)
+                response_headers["Access-Control-Allow-Origin"] = origin
+                if "access-control-allow-credentials" in response_headers:
+                    del response_headers["access-control-allow-credentials"]
+                response_headers.add_vary_header("Origin")
+            await send(message)
+
+        await self.app(scope, receive, send_widget_response)
 
 
 @contextmanager
@@ -1456,11 +1509,12 @@ app.add_exception_handler(
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # TODO: "*" should not be used in production
+    allow_origins=get_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(PublicWidgetCORSMiddleware)
 app.add_middleware(SessionMiddleware, secret_key=get_session_secret(), same_site="lax")
 app.add_middleware(FileStorageStartupSyncGateMiddleware)
 
@@ -1707,6 +1761,7 @@ async def startup_event() -> None:
     global _migration_task
     from ..config import get_task_execution_role, validate_task_execution_host_config
 
+    validate_auth_config()
     validate_task_execution_host_config()
     if get_task_execution_role() == "worker":
         raise ValueError("Use python -m xagent.web.worker for the worker role")
