@@ -172,9 +172,6 @@ class KnowledgeSearchArgs(BaseModel):
         description="Search type: 'dense' (semantic), 'sparse' (keyword), or 'hybrid' (combined)",
     )
     top_k: int = Field(default=5, description="Maximum results per collection")
-    min_score: float = Field(
-        default=0.3, description="Minimum relevance score (0.0-1.0)"
-    )
     embedding_model_id: Optional[str] = Field(
         default=None, description="Optional embedding model ID to use for searches"
     )
@@ -1033,7 +1030,6 @@ async def _search_knowledge_base_impl(
         base_search_config = {
             "search_type": tool_args.search_type,
             "top_k": tool_args.top_k,
-            "min_score": tool_args.min_score,
             "merge_results": True,
             # Retrieval must not *build indexes*: create_index() commits to the
             # LanceDB table, and searching collections concurrently can now race
