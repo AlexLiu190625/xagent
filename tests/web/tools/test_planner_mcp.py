@@ -433,14 +433,21 @@ def test_list_plans_fetches_next_page(monkeypatch):
     assert mock_request.call_args.kwargs["url"] == next_link
 
 
-def test_list_plans_preserves_null_web_url_and_missing_id(monkeypatch):
+@pytest.mark.parametrize(
+    ("tool_name", "args"),
+    [
+        pytest.param("planner_list_plans", ("group-1",), id="group-plans"),
+        pytest.param("planner_list_my_plans", (), id="shared-plans"),
+    ],
+)
+def test_list_plans_preserves_null_web_url_and_missing_id(monkeypatch, tool_name, args):
     monkeypatch.setenv("AUTH_TOKEN", "opaque-token")
     mock_request = Mock(
         return_value=MockResponse({"value": [{"title": "No id"}, {"id": "plan-1"}]})
     )
     monkeypatch.setattr(planner.requests, "request", mock_request)
 
-    result = json.loads(planner.planner_list_plans("group-1"))
+    result = json.loads(getattr(planner, tool_name)(*args))
 
     assert result["status"] == "success"
     assert result["plans"] == [
@@ -449,7 +456,14 @@ def test_list_plans_preserves_null_web_url_and_missing_id(monkeypatch):
     ]
 
 
-def test_list_plans_decodes_tenant_once(monkeypatch):
+@pytest.mark.parametrize(
+    ("tool_name", "args"),
+    [
+        pytest.param("planner_list_plans", ("group-1",), id="group-plans"),
+        pytest.param("planner_list_my_plans", (), id="shared-plans"),
+    ],
+)
+def test_list_plans_decodes_tenant_once(monkeypatch, tool_name, args):
     tenant_id = Mock(return_value=TENANT_ID)
     monkeypatch.setattr(planner, "_tenant_id_from_auth_token", tenant_id)
     monkeypatch.setattr(
@@ -460,13 +474,20 @@ def test_list_plans_decodes_tenant_once(monkeypatch):
         ),
     )
 
-    result = json.loads(planner.planner_list_plans("group-1"))
+    result = json.loads(getattr(planner, tool_name)(*args))
 
     assert result["status"] == "success"
     tenant_id.assert_called_once_with()
 
 
-def test_list_plans_logs_missing_tenant_once(monkeypatch, caplog):
+@pytest.mark.parametrize(
+    ("tool_name", "args"),
+    [
+        pytest.param("planner_list_plans", ("group-1",), id="group-plans"),
+        pytest.param("planner_list_my_plans", (), id="shared-plans"),
+    ],
+)
+def test_list_plans_logs_missing_tenant_once(monkeypatch, caplog, tool_name, args):
     monkeypatch.setenv("AUTH_TOKEN", "opaque-token")
     monkeypatch.setattr(
         planner.requests,
@@ -477,7 +498,7 @@ def test_list_plans_logs_missing_tenant_once(monkeypatch, caplog):
     )
 
     with caplog.at_level("WARNING", logger="planner-mcp"):
-        result = json.loads(planner.planner_list_plans("group-1"))
+        result = json.loads(getattr(planner, tool_name)(*args))
 
     assert result["status"] == "success"
     assert (
@@ -497,6 +518,84 @@ def test_list_plans_rejects_forged_next_link(monkeypatch):
 
     assert result["status"] == "error"
     mock_request.assert_not_called()
+
+
+def test_list_my_plans_success(monkeypatch):
+    next_link = f"{planner.GRAPH_BASE_URL}/me/planner/plans?%24skip=50"
+    mock_request = Mock(
+        return_value=MockResponse(
+            {
+                "value": [
+                    {
+                        "id": "plan-1",
+                        "title": "Launch",
+                        "owner": "group-1",
+                        "createdDateTime": "2026-10-15T00:00:00Z",
+                    }
+                ],
+                "@odata.nextLink": next_link,
+            }
+        )
+    )
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+
+    result = json.loads(planner.planner_list_my_plans())
+
+    assert result == {
+        "status": "success",
+        "plans": [
+            {
+                "web_url": (
+                    "https://planner.cloud.microsoft/webui/plan/plan-1/view/board?"
+                    f"tid={TENANT_ID}"
+                ),
+                "id": "plan-1",
+                "title": "Launch",
+                "owner": "group-1",
+                "createdDateTime": "2026-10-15T00:00:00Z",
+            }
+        ],
+        "next_link": next_link,
+        "truncated": False,
+    }
+    assert mock_request.call_args.kwargs["url"].endswith("/me/planner/plans")
+
+
+def test_list_my_plans_fetches_next_page(monkeypatch):
+    mock_request = Mock(return_value=MockResponse({"value": [{"id": "plan-2"}]}))
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+    next_link = f"{planner.GRAPH_BASE_URL}/me/planner/plans?%24skip=50"
+
+    result = json.loads(planner.planner_list_my_plans(next_link=next_link))
+
+    assert result["status"] == "success"
+    assert result["plans"][0]["id"] == "plan-2"
+    assert mock_request.call_args.kwargs["url"] == next_link
+
+
+def test_list_my_plans_rejects_other_graph_collection(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+    next_link = f"{planner.GRAPH_BASE_URL}/me/planner/tasks?%24skip=50"
+
+    result = json.loads(planner.planner_list_my_plans(next_link=next_link))
+
+    assert result["status"] == "error"
+    assert "next_link" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_list_my_plans_rejects_non_list_collection(monkeypatch):
+    monkeypatch.setattr(
+        planner.requests,
+        "request",
+        Mock(return_value=MockResponse({"value": {"id": "plan-1"}})),
+    )
+
+    result = json.loads(planner.planner_list_my_plans())
+
+    assert result["status"] == "error"
+    assert "non-list" in result["message"]
 
 
 def test_create_plan_builds_container_url(monkeypatch):

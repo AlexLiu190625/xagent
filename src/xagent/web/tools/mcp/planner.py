@@ -607,9 +607,38 @@ def _build_assignments(user_ids: list[str] | None) -> dict[str, Any] | None:
     }
 
 
+def _list_plans_page(default_path: str, next_link: str | None) -> str:
+    path = _resolve_list_path(default_path, next_link)
+    result = _graph_request("GET", path)
+    tenant_id = _tenant_id_from_auth_token()
+    if tenant_id is None:
+        logger.warning(
+            "Planner web URLs unavailable: the token has no usable tenant id; "
+            "there is no shareable link, so open plans from Planner or Teams"
+        )
+    plans = result.get("value", [])
+    if not isinstance(plans, list):
+        raise RuntimeError("Planner returned a non-list value collection")
+    plans = [
+        _with_plan_web_url(plan, tenant_id) if isinstance(plan, dict) else plan
+        for plan in plans
+    ]
+    return _bounded_list_response(
+        "plans",
+        plans,
+        next_link=result.get("@odata.nextLink"),
+        retry_next_link=next_link,
+    )
+
+
 @mcp.tool()
 def planner_list_plans(group_id: str, next_link: str | None = None) -> str:
     """List the Planner plans owned by a Microsoft 365 group.
+
+    Use this tool only when a specific Microsoft 365 group id is already
+    known. For requests such as "what plans do I have?", use
+    ``planner_list_my_plans`` instead; do not guess a group id from a user,
+    SharePoint site, drive, or drive owner.
 
     Each returned plan includes ``web_url``. Use it for user-facing links;
     ``container.url`` is a Graph API endpoint, not a Planner page. If
@@ -619,31 +648,35 @@ def planner_list_plans(group_id: str, next_link: str | None = None) -> str:
     next_link is optional -- pass the next_link value from a previous
     response to fetch the next page instead of the first."""
     try:
-        path = _resolve_list_path(
+        return _list_plans_page(
             f"/groups/{url_path_id(group_id, 'group_id')}/planner/plans", next_link
-        )
-        result = _graph_request("GET", path)
-        tenant_id = _tenant_id_from_auth_token()
-        if tenant_id is None:
-            logger.warning(
-                "Planner web URLs unavailable: the token has no usable tenant id; "
-                "there is no shareable link, so open plans from Planner or Teams"
-            )
-        plans = result.get("value", [])
-        if not isinstance(plans, list):
-            raise RuntimeError("Planner returned a non-list value collection")
-        plans = [
-            _with_plan_web_url(plan, tenant_id) if isinstance(plan, dict) else plan
-            for plan in plans
-        ]
-        return _bounded_list_response(
-            "plans",
-            plans,
-            next_link=result.get("@odata.nextLink"),
-            retry_next_link=next_link,
         )
     except Exception as e:
         logger.error("Error listing Planner plans for group %s: %s", group_id, e)
+        return _error(str(e))
+
+
+@mcp.tool()
+def planner_list_my_plans(next_link: str | None = None) -> str:
+    """List Planner plans shared with the user (Graph ``/me/planner/plans``).
+
+    Use this tool for requests such as "what plans do I have?". It does not
+    require a Microsoft 365 group id. ``planner_list_my_tasks`` is not a
+    substitute: a user can have access to a plan without having an assigned
+    task in it.
+
+    Each returned plan includes ``web_url``. Use it for user-facing links;
+    ``container.url`` is a Graph API endpoint, not a Planner page. If
+    ``web_url`` is null, open the plan from Planner or Teams instead of
+    composing a URL.
+
+    next_link is optional -- pass the next_link value from a previous
+    response to fetch the next page instead of the first.
+    """
+    try:
+        return _list_plans_page("/me/planner/plans", next_link)
+    except Exception as e:
+        logger.error("Error listing the signed-in user's Planner plans: %s", e)
         return _error(str(e))
 
 
