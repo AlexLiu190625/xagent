@@ -386,6 +386,10 @@ def test_infra_failure_pause_switch_does_not_gate_lease_expiry(factory, monkeypa
         # Ineligibility is permanent, so it wins over the temporary switch.
         ("a2a", "false", ("ineligible", "ineligible:source_a2a", "ineligible")),
         ("a2a", "true", ("ineligible", "ineligible:source_a2a", "ineligible")),
+        # A status-only source is never paused for a settlement failure, so
+        # the switch is not what kept it from pausing.
+        ("sdk", "false", ("manual", None, "interrupted")),
+        ("sdk", "true", ("manual", None, "interrupted")),
     ],
 )
 def test_gated_settlement_state_precedence(
@@ -506,6 +510,7 @@ def test_ineligible_tasks_recover_unchanged_and_record_why(
         # An SDK wait() keeps waiting on a PAUSED task, so the resumed run's
         # result still reaches it.
         ("sdk", "normal"),
+        ("sdk_workforce", "workforce"),
         ("trigger", "trigger_webhook"),
         ("trigger_no_type", "trigger"),
         ("trigger_unknown_type", "trigger"),
@@ -535,6 +540,11 @@ def test_eligible_tasks_record_their_kind(factory, monkeypatch, case, kind):
             }[case]
         elif case == "sdk":
             fields["source"] = "sdk"
+        elif case == "sdk_workforce":
+            fields["source"] = "sdk"
+            fields["agent_config"] = {
+                "workforce_run_id": _workforce_run(db, user, is_preview=False)
+            }
         elif case == "workforce":
             fields["agent_config"] = {
                 "workforce_run_id": _workforce_run(db, user, is_preview=False)
