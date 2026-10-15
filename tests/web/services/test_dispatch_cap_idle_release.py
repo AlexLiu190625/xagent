@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -46,6 +47,7 @@ def add_command(
     *,
     status: str = "pending",
     attempts: int = 0,
+    retry_available_at: datetime | None = None,
 ) -> int:
     host._identity += 1
     with host.factory() as db:
@@ -56,6 +58,7 @@ def add_command(
             payload={},
             status=status,
             attempt_count=attempts,
+            retry_available_at=retry_available_at,
         )
         db.add(row)
         db.commit()
@@ -125,16 +128,6 @@ IDLE_ROWS = [
         1,
         TaskStatus.FAILED,
         [("message", "pending", 0)],
-        False,
-        "released",
-        1,
-        False,
-    ),
-    (
-        "handed_back",
-        1,
-        TaskStatus.PENDING,
-        [("start", "pending", 1)],
         False,
         "released",
         1,
@@ -268,6 +261,55 @@ async def test_idle_check_releases_lease_when_cap_closed(
     else:
         assert lease_runner(host, target) == "worker"
         assert other_runner_candidate(host, ids[0]) is None
+
+
+async def test_idle_check_releases_handed_back_start(
+    cap_host: CapHost,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A start handed back for a retry is held as well; it is claimable once due.
+
+    Both hand-back paths (``defer_task_command`` and
+    ``return_to_admission_queue``) leave the row pending with a future
+    ``retry_available_at``, which the claim query honours.
+    """
+
+    host = cap_host
+    set_limit(monkeypatch, 1)
+    host.live(host.new_task())
+    target = host.new_task()
+    start = add_command(
+        host,
+        target,
+        "start",
+        attempts=1,
+        retry_available_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+    )
+    outcomes = record_idle_outcomes(monkeypatch)
+    caplog.set_level(logging.INFO, logger=runtime.logger.name)
+
+    coordinator = await host.registry.ensure(target)
+    assert coordinator is not None
+    coordinator._ensure_idle_check()
+    await eventually(lambda: outcomes)
+
+    assert outcomes[0] == "released"
+    assert lease_runner(host, target) is None
+    assert [r.getMessage() for r in caplog.records if CAP_LOG in r.getMessage()] == [
+        f"Task {target} lease released by runner worker at its dispatch cap "
+        "(limit=1, active=1); 1 queued execution command(s) left for a process "
+        "with a free slot"
+    ]
+    # No process claims it inside its retry window.
+    assert other_runner_candidate(host, start) is None
+    with host.factory() as db:
+        db.get(TaskExecutionCommand, start).retry_available_at = datetime.now(
+            timezone.utc
+        ) - timedelta(seconds=1)
+        db.commit()
+    # Once due, any process with a free slot can claim it.
+    assert other_runner_candidate(host, start) == start
 
 
 async def test_idle_check_releases_lease_once_cap_closes(
