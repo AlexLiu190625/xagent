@@ -135,11 +135,13 @@ def interruption_pause_result() -> dict[str, Any]:
 _INELIGIBLE_SOURCES = frozenset({"a2a", "external", "widget", "shared_link"})
 
 # Callers that only ever read a task's status. A settlement interruption of
-# one of their runs ends FAILED with the provider's error, as it always has;
-# pausing it would leave the task PAUSED for good once automatic resume gives
-# up, which is worse for a caller that sees nothing but the status. Lease
-# expiry is not a settlement interruption and is paused (and resumed) for
-# them as for any other task.
+# one of their runs is paused only while automatic resume is on: pausing is
+# worth it only when something will resume the run, and when automatic resume
+# stops, the ``/v1`` read of the task reports ``failed``
+# (``task_auto_resume.status_only_terminal_view``). With automatic resume off
+# the run ends FAILED with the provider's error. Lease expiry is not a
+# settlement interruption and is paused (and resumed) for them as for any
+# other task.
 _STATUS_ONLY_SOURCES = frozenset({"sdk"})
 
 
@@ -788,8 +790,9 @@ def _pausable_with_infra_switch(
     """Whether ``XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED`` decides ``reason``.
 
     False for a deferred reason and for a status-only ``source``
-    (:data:`_STATUS_ONLY_SOURCES`): settlement never pauses their runs, so the
-    switch does not decide them. ``model_output_invalid`` is not an
+    (:data:`_STATUS_ONLY_SOURCES`) while automatic resume is off: nothing
+    would resume their paused run, so the switch does not decide it.
+    ``model_output_invalid`` is not an
     infrastructure failure: a run paused for it is worth stopping only when
     an automatic resume will resample it, so it also needs automatic resume
     on and, when ``kind`` is known, a task kind it schedules
@@ -797,7 +800,9 @@ def _pausable_with_infra_switch(
     is unreachable and kept as the seam). Otherwise it fails as before.
     """
 
-    if reason in SETTLEMENT_PAUSE_DEFERRED_REASONS or is_status_only_source(source):
+    if reason in SETTLEMENT_PAUSE_DEFERRED_REASONS:
+        return False
+    if is_status_only_source(source) and not get_task_auto_resume_enabled():
         return False
     if reason is InterruptionReason.MODEL_OUTPUT_INVALID:
         return get_task_auto_resume_enabled() and (
@@ -931,8 +936,9 @@ def decide_interruption(
     1. Settlement does not pause for ``reason`` (:func:`settlement_pause_enabled`:
        the switch is off, the reason is deferred, or it is
        ``model_output_invalid`` with automatic resume off), a task of a
-       status-only source (:data:`_STATUS_ONLY_SOURCES`, decided from the row
-       alone before anything is read), an ineligible task, or
+       status-only source (:data:`_STATUS_ONLY_SOURCES`) while automatic
+       resume is off (decided from the row alone before anything is read; with
+       it on, such a task is judged like any other), an ineligible task, or
        ``model_output_invalid`` on a task kind automatic resume does not
        schedule (:func:`auto_resume_schedulable`; nothing would resample it;
        unreachable today, every eligible kind is scheduled): ``LEGACY``.
@@ -954,7 +960,9 @@ def decide_interruption(
         return legacy_interruption_decision(reason)
     # Attribute-only, before any database read: a connectivity failure
     # reading eligibility must not defer a run that was never going to pause.
-    if is_status_only_source(task.source):
+    # A status-only caller's paused run is worth having only when automatic
+    # resume will pick it up.
+    if is_status_only_source(task.source) and not get_task_auto_resume_enabled():
         return legacy_interruption_decision(reason)
     try:
         eligibility = auto_recovery_eligibility(db, task)

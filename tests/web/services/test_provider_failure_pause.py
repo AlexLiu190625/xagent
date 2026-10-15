@@ -852,6 +852,15 @@ async def _settle_status_only(path: str, factory, ids, lease, reason: str) -> No
         _settle_result(path, factory, ids, lease, RESULTS[reason])
 
 
+async def _settle_or_defer(path: str, factory, ids, lease, reason: str) -> bool:
+    """Settle the run; whether settlement was deferred to TTL recovery."""
+    try:
+        await _settle_status_only(path, factory, ids, lease, reason)
+    except InterruptionSettlementDeferred:
+        return True
+    return False
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("db", ["ok", "unavailable_during_eligibility"])
 @pytest.mark.parametrize("path", ["result", "resumed_result", "channel", "exception"])
@@ -861,9 +870,12 @@ async def _settle_status_only(path: str, factory, ids, lease, reason: str) -> No
 async def test_status_only_settlement(
     canonical, monkeypatch, auto, infra, reason, path, db
 ):
-    """An SDK task's interruption settles FAILED with its own error, whatever
-    the switches, exactly like an A2A task, and the verdict never reads the
-    database (so a connectivity failure cannot defer it)."""
+    """With automatic resume off, an SDK task's interruption settles FAILED
+    with its own error exactly like an A2A task, and the verdict never reads
+    the database (so a connectivity failure cannot defer it). With it on, the
+    task settles exactly like an internal task under the same switches and
+    the same database failure: paused unless the infra switch is false, and
+    deferred when eligibility cannot be read."""
 
     monkeypatch.setenv(AUTO_RESUME_SWITCH, "true" if auto == "on" else "false")
     if infra == "unset":
@@ -873,7 +885,7 @@ async def test_status_only_settlement(
     factory, _tid = canonical
     sdk, baseline = (
         _projected_task(factory, source="sdk"),
-        _projected_task(factory, source="a2a"),
+        _projected_task(factory, source="a2a" if auto == "off" else "internal"),
     )
     sdk_lease = _prepare_run(factory, sdk)
     baseline_lease = _prepare_run(factory, baseline)
@@ -881,20 +893,56 @@ async def test_status_only_settlement(
     with monkeypatch.context() as m:
         if db != "ok":
             _break_decision(m, "eligibility", _connection_reset())
-        await _settle_status_only(path, factory, sdk, sdk_lease, reason)
-    await _settle_status_only(path, factory, baseline, baseline_lease, reason)
+        sdk_deferred = await _settle_or_defer(path, factory, sdk, sdk_lease, reason)
+        if auto == "on":
+            baseline_deferred = await _settle_or_defer(
+                path, factory, baseline, baseline_lease, reason
+            )
+    if auto == "off":
+        baseline_deferred = await _settle_or_defer(
+            path, factory, baseline, baseline_lease, reason
+        )
+        assert (sdk_deferred, baseline_deferred) == (False, False)
 
     projection = _full_projection(factory, sdk, sdk_lease)
-    assert projection == _full_projection(factory, baseline, baseline_lease)
-    assert projection["status"] == TaskStatus.FAILED
-    assert projection["runner_id"] is None
+    other = _full_projection(factory, baseline, baseline_lease)
+    # Two runs hold their own lease identity and expiry while RUNNING.
+    for key in ("lease_attempt_id", "lease_expires_at"):
+        projection.pop(key, None), other.pop(key, None)
+    assert projection == other
+    assert sdk_deferred == baseline_deferred
     _task, row, _events = _state(factory, sdk["task"])
-    if db == "ok":
-        assert (row.reason, row.state) == (reason, "manual")
+    _task, baseline_row, _events = _state(factory, baseline["task"])
+    shape = None if row is None else (row.reason, row.state)
+    if auto == "on":
+        # The same row as an internal task's, the `disabled` label included.
+        assert shape == (
+            None if baseline_row is None else (baseline_row.reason, baseline_row.state)
+        )
+    if auto == "off":
+        assert projection["status"] == TaskStatus.FAILED
+        assert projection["runner_id"] is None
+        if db == "ok":
+            assert shape == (reason, "manual")
+        else:
+            # The recorder reads eligibility inside its own SAVEPOINT; a
+            # connectivity failure there skips the row, never the settlement.
+            assert row is None
     else:
-        # The recorder reads eligibility inside its own SAVEPOINT; a
-        # connectivity failure there skips the row, never the settlement.
-        assert row is None
+        pauses = infra != "false"
+        if not pauses:
+            assert projection["status"] == TaskStatus.FAILED
+            assert not sdk_deferred
+            if db == "ok":
+                assert shape == (reason, "disabled")
+        elif db != "ok":
+            # Eligibility cannot be read: the run keeps its lease for TTL
+            # recovery (the exception path reports it without raising).
+            assert sdk_deferred == (path != "exception")
+            assert projection["status"] == TaskStatus.RUNNING
+        else:
+            assert projection["status"] == TaskStatus.PAUSED
+            assert shape == (reason, "scheduled")
 
 
 @pytest.mark.parametrize(
