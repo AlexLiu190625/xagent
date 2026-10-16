@@ -4,6 +4,9 @@ commands that process holds for its task, and settles them when it completes."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import functools
+import itertools
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -55,6 +58,8 @@ from xagent.web.services.task_lease_service import utc_now
 
 HELD_KINDS = ("start", "resume", "resume_input", "message")
 STOPPED = "Task command stopped by a control request."
+SETTLED = ("failed", 0, STOPPED, {"rejection_reason": "cancelled_before_admission"})
+RUN = "run-1"
 SETTLE_LOGGER = "xagent.web.services.task_execution_admission"
 EXTERNAL_COMMAND_ID = "ext-" + uuid.UUID(int=7).hex + uuid.UUID(int=8).hex[:24]
 
@@ -80,9 +85,6 @@ def host(
     )
     set_limit(monkeypatch, 1)
     return cap_host
-
-
-# --- helpers -----------------------------------------------------------------
 
 
 def make_agent(host: CapHost) -> int:
@@ -114,8 +116,63 @@ def enqueue(host: CapHost, task_id: int, kind: str, **fields: Any) -> int:
         return int(row.id)
 
 
-def a2a_cancel_payload(agent_id: int, version: int, **extra: Any) -> dict[str, Any]:
-    return {"agent_id": agent_id, "target_state_version": version, **extra}
+async def hold_cap(host: CapHost) -> None:
+    """Fill the one slot with an execution of another task."""
+
+    host.live(host.new_task())
+
+
+async def cap_held_task(
+    host: CapHost,
+    status: TaskStatus,
+    version: int = 3,
+    *,
+    source: str = "a2a",
+    run_id: str | None = RUN,
+    **fields: Any,
+) -> tuple[int, int]:
+    """A task of a new agent while the one slot is held: ``(agent_id, task_id)``."""
+
+    agent_id = make_agent(host)
+    await hold_cap(host)
+    task_id = host.new_task(
+        source=source,
+        agent_id=agent_id,
+        status=status,
+        run_id=run_id,
+        state_version=version,
+        **fields,
+    )
+    return agent_id, task_id
+
+
+def enqueue_at(
+    host: CapHost, task_id: int, kind: str, version: int, **fields: Any
+) -> int:
+    """Enqueue a command recorded against the task's run and ``version``."""
+
+    return enqueue(
+        host,
+        task_id,
+        kind,
+        target_run_id=fields.pop("run_id", RUN),
+        target_state_version=version,
+        **fields,
+    )
+
+
+def enqueue_cancel(
+    host: CapHost, task_id: int, agent_id: int, version: int, **extra: Any
+) -> int:
+    run_id = extra.pop("run_id", RUN)
+    return enqueue_at(
+        host,
+        task_id,
+        "cancel",
+        version,
+        run_id=run_id,
+        payload={"agent_id": agent_id, "target_state_version": version, **extra},
+    )
 
 
 def state(host: CapHost, command_id: int) -> tuple[Any, ...]:
@@ -166,12 +223,6 @@ def add_user_row(host: CapHost, task_id: int, turn_id: str, status: str) -> None
         db.commit()
 
 
-async def hold_cap(host: CapHost) -> None:
-    """Fill the one slot with an execution of another task."""
-
-    host.live(host.new_task())
-
-
 async def handler(command: Any) -> dict[str, Any]:
     return await task_command_execution.execute_durable_task_command(command)
 
@@ -191,57 +242,37 @@ def settle_directly(host: CapHost, cancel_id: int) -> None:
         db.commit()
 
 
-def complete(host: CapHost, command_id: int) -> None:
-    with host.factory() as db:
-        db.query(TaskExecutionCommand).filter(
-            TaskExecutionCommand.id == command_id
-        ).update(
-            {
-                TaskExecutionCommand.status: "completed",
-                TaskExecutionCommand.attempt_count: 1,
-            }
-        )
-        db.commit()
-
-
-# --- I-1 overtake range ------------------------------------------------------
-
-
 def _matrix_cases() -> list[Any]:
-    cases: list[Any] = []
-    for kind in HELD_KINDS:
-        for control in ("cancel", "pause"):
-            for cap_state in ("open", "closed_task_inactive", "closed_task_active"):
-                cases.append(
-                    pytest.param(
-                        kind,
-                        control,
-                        cap_state,
-                        "held_first",
-                        id=f"{kind}-{control}-{cap_state}",
-                    )
-                )
-    for control in ("cancel", "pause"):
-        for cap_state in ("open", "closed_task_inactive"):
-            cases.append(
-                pytest.param(
-                    "start",
-                    control,
-                    cap_state,
-                    "control_first",
-                    id=f"arrival-control-first-{control}-{cap_state}",
-                )
-            )
-    cases.append(
+    held_first = [
+        pytest.param(
+            kind, control, cap_state, "held_first", id=f"{kind}-{control}-{cap_state}"
+        )
+        for kind, control, cap_state in itertools.product(
+            HELD_KINDS,
+            ("cancel", "pause"),
+            ("open", "closed_task_inactive", "closed_task_active"),
+        )
+    ]
+    control_first = [
         pytest.param(
             "start",
-            "cancel",
-            "closed_task_inactive",
-            "pause_between",
-            id="earlier-pause-blocks-cancel",
+            control,
+            cap_state,
+            "control_first",
+            id=f"arrival-control-first-{control}-{cap_state}",
         )
+        for control, cap_state in itertools.product(
+            ("cancel", "pause"), ("open", "closed_task_inactive")
+        )
+    ]
+    pause_between = pytest.param(
+        "start",
+        "cancel",
+        "closed_task_inactive",
+        "pause_between",
+        id="earlier-pause-blocks-cancel",
     )
-    return cases
+    return [*held_first, *control_first, pause_between]
 
 
 @pytest.mark.parametrize("held_kind,control,cap_state,order", _matrix_cases())
@@ -284,9 +315,6 @@ async def test_cancel_overtake_matrix(
     else:
         assert layer1 == held_candidate
         assert layer2 is None
-
-
-# --- I-2 the claim UPDATE uses the same snapshot -----------------------------
 
 
 @pytest.mark.parametrize("variant", ["overtakes", "claimed_between", "cap_reopened"])
@@ -355,9 +383,6 @@ async def test_claim_update_honours_cancel_overtake(
         assert host.row(start_id).status == "pending"
 
 
-# --- I-3 only never-claimed pending rows are passed --------------------------
-
-
 def _claimed_rows() -> dict[str, dict[str, Any]]:
     return {
         "message_outcome_unknown": {
@@ -403,17 +428,8 @@ async def test_cancel_does_not_overtake_claimed_rows(host: CapHost, name: str) -
     assert host.row(cancel_id).attempt_count == 0
 
 
-# --- I-4 what a completed cancel settles -------------------------------------
-
-RUN = "run-1"
-
-
 async def _a2a_new_task_start(host: CapHost) -> None:
-    agent_id = make_agent(host)
-    await hold_cap(host)
-    task_id = host.new_task(
-        source="a2a", agent_id=agent_id, status=TaskStatus.PENDING, state_version=0
-    )
+    agent_id, task_id = await cap_held_task(host, TaskStatus.PENDING, 0, run_id=None)
     accepted = task_orchestrator._begin_turn_atomic_sync(
         task_id,
         host.user_id,
@@ -423,22 +439,12 @@ async def _a2a_new_task_start(host: CapHost) -> None:
     start_id = accepted.command_db_id
     turn_id = accepted.command_payload["turn_id"]
     assert delivery_rows(host, task_id) == [(turn_id, "pending")]
-    cancel_id = enqueue(
-        host,
-        task_id,
-        "cancel",
-        payload=a2a_cancel_payload(agent_id, 0),
-    )
+    cancel_id = enqueue_cancel(host, task_id, agent_id, 0, run_id=None)
 
     assert await run(cancel_id) is True
 
     assert host.row(cancel_id).status == "completed"
-    assert state(host, start_id) == (
-        "failed",
-        0,
-        STOPPED,
-        {"rejection_reason": "cancelled_before_admission"},
-    )
+    assert state(host, start_id) == SETTLED
     assert task_state(host, task_id) == (
         TaskStatus.FAILED,
         "Task canceled by A2A client.",
@@ -450,91 +456,44 @@ async def _a2a_new_task_start(host: CapHost) -> None:
     assert len(events_of(host, cancel_id)) == 1
 
 
-async def _a2a_waiting_reply(host: CapHost) -> int:
-    agent_id = make_agent(host)
-    await hold_cap(host)
-    task_id = host.new_task(
-        source="a2a",
-        agent_id=agent_id,
-        status=TaskStatus.WAITING_FOR_USER,
-        run_id=RUN,
-        state_version=3,
-    )
-    reply_id = enqueue(
-        host, task_id, "resume_input", target_run_id=RUN, target_state_version=3
-    )
-    cancel_id = enqueue(
-        host,
-        task_id,
-        "cancel",
-        target_run_id=RUN,
-        target_state_version=3,
-        payload=a2a_cancel_payload(agent_id, 3),
-    )
+async def _a2a_waiting_reply(host: CapHost) -> None:
+    agent_id, task_id = await cap_held_task(host, TaskStatus.WAITING_FOR_USER)
+    reply_id = enqueue_at(host, task_id, "resume_input", 3)
+    cancel_id = enqueue_cancel(host, task_id, agent_id, 3)
 
     assert await run() is True
 
-    assert state(host, reply_id) == (
-        "failed",
-        0,
-        STOPPED,
-        {"rejection_reason": "cancelled_before_admission"},
-    )
+    assert state(host, reply_id) == SETTLED
     assert host.row(cancel_id).status == "completed"
     assert task_state(host, task_id)[0] == TaskStatus.FAILED
     assert task_state(host, task_id)[2] == 4
     (event,) = events_of(host, reply_id)
     assert event.include_command_identity is True
-    return reply_id
+    # The client waiting on its reply is told to retry with a new id.
+    assert task_resume_command._read_reply_outcome(reply_id) == {
+        "outcome": "busy",
+        "retry_with_new_id": True,
+    }
 
 
 async def _a2a_paused_user_resume(host: CapHost) -> None:
-    agent_id = make_agent(host)
-    await hold_cap(host)
-    task_id = host.new_task(
-        source="a2a",
-        agent_id=agent_id,
-        status=TaskStatus.PAUSED,
-        control_state="paused",
-        run_id=RUN,
-        state_version=3,
+    agent_id, task_id = await cap_held_task(
+        host, TaskStatus.PAUSED, control_state="paused"
     )
-    resume_id = enqueue(
-        host,
-        task_id,
-        "resume",
-        command_id="resume-by-owner",
-        target_run_id=RUN,
-        target_state_version=3,
-    )
-    enqueue(
-        host,
-        task_id,
-        "cancel",
-        target_run_id=RUN,
-        target_state_version=3,
-        payload=a2a_cancel_payload(agent_id, 3),
-    )
+    resume_id = enqueue_at(host, task_id, "resume", 3, command_id="resume-by-owner")
+    enqueue_cancel(host, task_id, agent_id, 3)
 
     assert await run() is True
 
-    assert host.row(resume_id).status == "failed"
-    assert host.row(resume_id).error == STOPPED
+    assert state(host, resume_id) == SETTLED
     assert task_state(host, task_id)[0] == TaskStatus.FAILED
 
 
 async def _a2a_paused_auto_resume(host: CapHost) -> None:
-    agent_id = make_agent(host)
-    await hold_cap(host)
-    now = utc_now()
-    task_id = host.new_task(
-        source="a2a",
-        agent_id=agent_id,
-        status=TaskStatus.PAUSED,
-        control_state="paused",
-        run_id=RUN,
-        state_version=3,
+    agent_id, task_id = await cap_held_task(
+        host, TaskStatus.PAUSED, control_state="paused"
     )
+    now = utc_now()
     command_id = auto_resume_command_id(3, 1, RUN)
     with host.factory() as db:
         db.add(
@@ -553,27 +512,19 @@ async def _a2a_paused_auto_resume(host: CapHost) -> None:
             )
         )
         db.commit()
-    resume_id = enqueue(
+    resume_id = enqueue_at(
         host,
         task_id,
         "resume",
+        3,
         command_id=command_id,
-        target_run_id=RUN,
-        target_state_version=3,
         payload={"type": "resume_task"},
     )
-    enqueue(
-        host,
-        task_id,
-        "cancel",
-        target_run_id=RUN,
-        target_state_version=3,
-        payload=a2a_cancel_payload(agent_id, 3),
-    )
+    enqueue_cancel(host, task_id, agent_id, 3)
 
     assert await run() is True
 
-    assert host.row(resume_id).status == "failed"
+    assert state(host, resume_id) == SETTLED
     with host.factory() as db:
         result = task_auto_resume._housekeep_candidate_no_commit(db, task_id, now=now)
         db.commit()
@@ -585,155 +536,74 @@ async def _a2a_paused_auto_resume(host: CapHost) -> None:
 
 
 async def _a2a_new_turn_message(host: CapHost) -> None:
-    agent_id = make_agent(host)
-    await hold_cap(host)
-    task_id = host.new_task(
-        source="a2a",
-        agent_id=agent_id,
-        status=TaskStatus.PAUSED,
-        control_state="paused",
-        run_id=RUN,
-        state_version=3,
+    agent_id, task_id = await cap_held_task(
+        host, TaskStatus.PAUSED, control_state="paused"
     )
     add_user_row(host, task_id, "turn-earlier", "dispatched")
     add_user_row(host, task_id, "turn-open", "pending")
     rows_before = delivery_rows(host, task_id)
-    message_id = enqueue(
-        host,
-        task_id,
-        "message",
-        command_id="web-message-1",
-        target_run_id=RUN,
-        target_state_version=3,
-    )
-    enqueue(
-        host,
-        task_id,
-        "cancel",
-        target_run_id=RUN,
-        target_state_version=3,
-        payload=a2a_cancel_payload(agent_id, 3),
-    )
+    message_id = enqueue_at(host, task_id, "message", 3, command_id="web-message-1")
+    enqueue_cancel(host, task_id, agent_id, 3)
 
     assert await run() is True
 
-    assert host.row(message_id).status == "failed"
-    assert host.row(message_id).error == STOPPED
+    assert state(host, message_id) == SETTLED
     assert delivery_rows(host, task_id) == rows_before
     assert len(events_of(host, message_id)) == 1
 
 
 async def _external_message(host: CapHost, *, with_user_row: bool) -> None:
-    agent_id = make_agent(host)
-    await hold_cap(host)
-    task_id = host.new_task(
-        source="external",
-        agent_id=agent_id,
-        status=TaskStatus.WAITING_FOR_USER,
-        run_id=RUN,
-        state_version=5,
+    agent_id, task_id = await cap_held_task(
+        host, TaskStatus.WAITING_FOR_USER, 5, source="external"
     )
     turn_id = "delivery-1"
     if with_user_row:
         add_user_row(host, task_id, turn_id, "pending")
-    message_id = enqueue(
+    message_id = enqueue_at(
         host,
         task_id,
         "message",
+        5,
         command_id=EXTERNAL_COMMAND_ID,
-        target_run_id=RUN,
-        target_state_version=5,
         payload={"scope": "external", "turn_id": turn_id},
     )
-    enqueue(
-        host,
-        task_id,
-        "cancel",
-        target_run_id=RUN,
-        target_state_version=5,
-        payload=a2a_cancel_payload(agent_id, 5, scope="external", end_user_id=9),
-    )
+    enqueue_cancel(host, task_id, agent_id, 5, scope="external", end_user_id=9)
 
     assert await run() is True
 
-    assert host.row(message_id).status == "failed"
-    assert host.row(message_id).error == STOPPED
+    assert state(host, message_id) == SETTLED
     assert task_state(host, task_id)[:2] == (
         TaskStatus.FAILED,
         "Stopped by the visitor.",
     )
     (event,) = events_of(host, message_id)
     assert event.include_command_identity is False
-    if with_user_row:
-        assert delivery_rows(host, task_id) == [(turn_id, "dispatched")]
-    else:
-        assert delivery_rows(host, task_id) == []
-
-
-async def _external_message_no_user_row(host: CapHost) -> None:
-    await _external_message(host, with_user_row=False)
-
-
-async def _external_message_with_user_row(host: CapHost) -> None:
-    await _external_message(host, with_user_row=True)
+    expected = [(turn_id, "dispatched")] if with_user_row else []
+    assert delivery_rows(host, task_id) == expected
 
 
 async def _two_held_rows(host: CapHost) -> None:
-    agent_id = make_agent(host)
-    await hold_cap(host)
-    task_id = host.new_task(
-        source="a2a",
-        agent_id=agent_id,
-        status=TaskStatus.WAITING_FOR_USER,
-        run_id=RUN,
-        state_version=3,
-    )
-    reply_id = enqueue(
-        host, task_id, "resume_input", target_run_id=RUN, target_state_version=3
-    )
-    message_id = enqueue(
-        host, task_id, "message", target_run_id=RUN, target_state_version=3
-    )
-    enqueue(
-        host,
-        task_id,
-        "cancel",
-        target_run_id=RUN,
-        target_state_version=3,
-        payload=a2a_cancel_payload(agent_id, 3),
-    )
+    agent_id, task_id = await cap_held_task(host, TaskStatus.WAITING_FOR_USER)
+    reply_id = enqueue_at(host, task_id, "resume_input", 3)
+    message_id = enqueue_at(host, task_id, "message", 3)
+    enqueue_cancel(host, task_id, agent_id, 3)
 
     assert await run() is True
 
     for command_id in (reply_id, message_id):
-        assert host.row(command_id).status == "failed"
-        assert host.row(command_id).error == STOPPED
+        assert state(host, command_id) == SETTLED
         assert len(events_of(host, command_id)) == 1
 
 
 async def _cancel_without_version_change(host: CapHost) -> None:
-    agent_id = make_agent(host)
-    await hold_cap(host)
-    task_id = host.new_task(
-        source="a2a",
-        agent_id=agent_id,
-        status=TaskStatus.FAILED,
+    agent_id, task_id = await cap_held_task(
+        host,
+        TaskStatus.FAILED,
         control_state="failed",
-        run_id=RUN,
-        state_version=3,
         agent_config={"a2a_state": "TASK_STATE_CANCELED"},
     )
-    resume_id = enqueue(
-        host, task_id, "resume", target_run_id=RUN, target_state_version=3
-    )
-    cancel_id = enqueue(
-        host,
-        task_id,
-        "cancel",
-        target_run_id=RUN,
-        target_state_version=3,
-        payload=a2a_cancel_payload(agent_id, 3),
-    )
+    resume_id = enqueue_at(host, task_id, "resume", 3)
+    cancel_id = enqueue_cancel(host, task_id, agent_id, 3)
 
     assert await run() is True
 
@@ -744,31 +614,19 @@ async def _cancel_without_version_change(host: CapHost) -> None:
 
 
 async def _rejected_cancel(host: CapHost) -> None:
-    agent_id = make_agent(host)
-    await hold_cap(host)
-    task_id = host.new_task(
-        source="external",
-        agent_id=agent_id,
-        status=TaskStatus.WAITING_FOR_USER,
-        run_id=RUN,
-        state_version=5,
+    agent_id, task_id = await cap_held_task(
+        host, TaskStatus.WAITING_FOR_USER, 5, source="external"
     )
-    message_id = enqueue(
+    message_id = enqueue_at(
         host,
         task_id,
         "message",
+        4,
         command_id=EXTERNAL_COMMAND_ID,
-        target_run_id=RUN,
-        target_state_version=4,
         payload={"scope": "external", "turn_id": "delivery-1"},
     )
-    cancel_id = enqueue(
-        host,
-        task_id,
-        "cancel",
-        target_run_id=RUN,
-        target_state_version=4,
-        payload=a2a_cancel_payload(agent_id, 4, scope="external", end_user_id=9),
+    cancel_id = enqueue_cancel(
+        host, task_id, agent_id, 4, scope="external", end_user_id=9
     )
 
     assert await run() is True
@@ -780,26 +638,9 @@ async def _rejected_cancel(host: CapHost) -> None:
 
 
 async def _settlement_failure(host: CapHost) -> None:
-    agent_id = make_agent(host)
-    await hold_cap(host)
-    task_id = host.new_task(
-        source="a2a",
-        agent_id=agent_id,
-        status=TaskStatus.WAITING_FOR_USER,
-        run_id=RUN,
-        state_version=3,
-    )
-    reply_id = enqueue(
-        host, task_id, "resume_input", target_run_id=RUN, target_state_version=3
-    )
-    cancel_id = enqueue(
-        host,
-        task_id,
-        "cancel",
-        target_run_id=RUN,
-        target_state_version=3,
-        payload=a2a_cancel_payload(agent_id, 3),
-    )
+    agent_id, task_id = await cap_held_task(host, TaskStatus.WAITING_FOR_USER)
+    reply_id = enqueue_at(host, task_id, "resume_input", 3)
+    cancel_id = enqueue_cancel(host, task_id, agent_id, 3)
     engine = host.factory.kw["bind"]
 
     def fail_settlement(conn, cursor, statement, parameters, context, executemany):
@@ -813,10 +654,9 @@ async def _settlement_failure(host: CapHost) -> None:
 
     sa.event.listen(engine, "before_cursor_execute", fail_settlement)
     try:
-        try:
+        # The failure surfaces; what it leaves behind is checked.
+        with contextlib.suppress(Exception):
             await run()
-        except Exception:  # the failure surfaces; what it leaves behind is checked
-            pass
     finally:
         sa.event.remove(engine, "before_cursor_execute", fail_settlement)
 
@@ -835,8 +675,12 @@ SETTLE_SCENARIOS: dict[str, Any] = {
     "3-a2a-paused-user-resume": _a2a_paused_user_resume,
     "4-a2a-paused-auto-resume": _a2a_paused_auto_resume,
     "5-a2a-new-turn-message": _a2a_new_turn_message,
-    "6-external-message-no-user-row": _external_message_no_user_row,
-    "6b-external-message-with-user-row": _external_message_with_user_row,
+    "6-external-message-no-user-row": functools.partial(
+        _external_message, with_user_row=False
+    ),
+    "6b-external-message-with-user-row": functools.partial(
+        _external_message, with_user_row=True
+    ),
     "7-two-held-rows": _two_held_rows,
     "8-cancel-without-version-change": _cancel_without_version_change,
     "9-rejected-cancel": _rejected_cancel,
@@ -845,29 +689,53 @@ SETTLE_SCENARIOS: dict[str, Any] = {
 
 
 @pytest.mark.parametrize("scenario", list(SETTLE_SCENARIOS))
-async def test_cancel_settles_overtaken_commands(host: CapHost, scenario: str) -> None:
-    await SETTLE_SCENARIOS[scenario](host)
-
-
-# --- I-5b legacy mode --------------------------------------------------------
-
-
-async def test_legacy_mode_cancel_settles_nothing(
-    host: CapHost, monkeypatch: pytest.MonkeyPatch
+async def test_cancel_settles_overtaken_commands(
+    host: CapHost, caplog: pytest.LogCaptureFixture, scenario: str
 ) -> None:
-    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "false")
+    with caplog.at_level(logging.INFO, logger=SETTLE_LOGGER):
+        await SETTLE_SCENARIOS[scenario](host)
+
+    records = [r for r in caplog.records if "dispatch-cap" in r.getMessage()]
+    if scenario == "7-two-held-rows":
+        (record,) = records
+        assert record.levelno == logging.INFO
+        message = record.getMessage()
+        assert "settled_commands=2" in message
+        assert "'resume_input': 1" in message and "'message': 1" in message
+    elif scenario in ("8-cancel-without-version-change", "9-rejected-cancel"):
+        assert records == []
+
+
+@pytest.mark.parametrize(
+    "case", ["legacy", "later_row", "pause_control", "earlier_pause_row"]
+)
+async def test_completed_control_settles_nothing(
+    host: CapHost, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """Settlement leaves a command alone unless a shared-mode cancel completed
+    after it was queued and the command is an execution-opening one."""
+
+    if case == "legacy":
+        monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "false")
     task_id = host.new_task(status=TaskStatus.FAILED, state_version=1)
-    resume_id = enqueue(host, task_id, "resume", target_state_version=0)
-    cancel_id = enqueue(host, task_id, "cancel", target_state_version=0)
-    complete(host, cancel_id)
+    done: dict[str, Any] = {"status": "completed", "attempt_count": 1}
+    if case == "later_row":
+        control_id = enqueue(host, task_id, "cancel", **done)
+        untouched_id = enqueue(host, task_id, "message")
+    elif case == "pause_control":
+        untouched_id = enqueue(host, task_id, "resume")
+        control_id = enqueue(host, task_id, "pause", **done)
+    elif case == "earlier_pause_row":
+        untouched_id = enqueue(host, task_id, "pause")
+        control_id = enqueue(host, task_id, "cancel", **done)
+    else:
+        untouched_id = enqueue(host, task_id, "resume")
+        control_id = enqueue(host, task_id, "cancel", **done)
 
-    settle_directly(host, cancel_id)
+    settle_directly(host, control_id)
 
-    assert state(host, resume_id) == ("pending", 0, None, None)
-    assert events_of(host, resume_id) == []
-
-
-# --- I-6 admission tickets stay with the existing settlement -----------------
+    assert state(host, untouched_id) == ("pending", 0, None, None)
+    assert events_of(host, untouched_id) == []
 
 
 def _add_waiting_ticket(host: CapHost, task_id: int, command_id: int) -> None:
@@ -891,15 +759,10 @@ async def test_ticketed_rows_keep_existing_settle_under_cancel(
     host: CapHost, caplog: pytest.LogCaptureFixture, with_cap_held_row: bool
 ) -> None:
     task_id = host.new_task(status=TaskStatus.FAILED, state_version=1)
-    ticketed_id = enqueue(host, task_id, "resume", target_state_version=0)
+    ticketed_id = enqueue(host, task_id, "resume")
     _add_waiting_ticket(host, task_id, ticketed_id)
-    held_id = (
-        enqueue(host, task_id, "message", target_state_version=0)
-        if with_cap_held_row
-        else None
-    )
-    cancel_id = enqueue(host, task_id, "cancel", target_state_version=0)
-    complete(host, cancel_id)
+    held_id = enqueue(host, task_id, "message") if with_cap_held_row else None
+    cancel_id = enqueue(host, task_id, "cancel", status="completed", attempt_count=1)
 
     with host.factory() as db:
         settle_cancelled_admissions(db, cancel_id)
@@ -921,23 +784,11 @@ async def test_ticketed_rows_keep_existing_settle_under_cancel(
         assert "settled_commands=1" in caplog.text
         assert host.row(held_id).status == "failed"
         assert len(events_of(host, held_id)) == 1
+        # Both settlements write the same error text.
+        assert host.row(ticketed_id).error == host.row(held_id).error == STOPPED
 
 
-# --- I-7 a settled reply answers the waiting client --------------------------
-
-
-async def test_cancel_settled_reply_answers_waiting_client(host: CapHost) -> None:
-    reply_id = await _a2a_waiting_reply(host)
-    assert task_resume_command._read_reply_outcome(reply_id) == {
-        "outcome": "busy",
-        "retry_with_new_id": True,
-    }
-
-
-# --- I-8 kinds and text ------------------------------------------------------
-
-
-async def test_cap_overtaking_kinds_and_settle_text(host: CapHost) -> None:
+def test_cap_overtaking_kinds() -> None:
     overtaking = task_dispatch_cap.CAP_OVERTAKING_CONTROL_KINDS
     assert overtaking == {"cancel"}
     assert overtaking <= CONTROL_KINDS
@@ -945,46 +796,3 @@ async def test_cap_overtaking_kinds_and_settle_text(host: CapHost) -> None:
         "a kind that opens an execution was added: decide in "
         "settle_cap_held_commands_no_commit what happens to it once settled"
     )
-
-    task_id = host.new_task(status=TaskStatus.FAILED, state_version=1)
-    ticketed_id = enqueue(host, task_id, "resume", target_state_version=0)
-    _add_waiting_ticket(host, task_id, ticketed_id)
-    held_id = enqueue(host, task_id, "message", target_state_version=0)
-    cancel_id = enqueue(host, task_id, "cancel", target_state_version=0)
-    complete(host, cancel_id)
-    with host.factory() as db:
-        settle_cancelled_admissions(db, cancel_id)
-        db.commit()
-    assert host.row(held_id).status == "pending"
-    with host.factory() as db:
-        task_execution_admission.settle_cap_held_commands_no_commit(db, cancel_id)
-        db.commit()
-
-    assert host.row(ticketed_id).error == host.row(held_id).error == STOPPED
-
-
-# --- I-9 settlement log ------------------------------------------------------
-
-
-@pytest.mark.parametrize("held_kinds", [("resume_input", "message"), ()])
-async def test_cancel_settle_logs_once(
-    host: CapHost, caplog: pytest.LogCaptureFixture, held_kinds: tuple[str, ...]
-) -> None:
-    task_id = host.new_task(status=TaskStatus.FAILED, state_version=1)
-    for kind in held_kinds:
-        enqueue(host, task_id, kind, target_state_version=0)
-    cancel_id = enqueue(host, task_id, "cancel", target_state_version=0)
-    complete(host, cancel_id)
-
-    with caplog.at_level(logging.INFO, logger=SETTLE_LOGGER):
-        settle_directly(host, cancel_id)
-
-    records = [r for r in caplog.records if "dispatch-cap" in r.getMessage()]
-    if held_kinds:
-        (record,) = records
-        assert record.levelno == logging.INFO
-        message = record.getMessage()
-        assert "settled_commands=2" in message
-        assert "'resume_input': 1" in message and "'message': 1" in message
-    else:
-        assert records == []

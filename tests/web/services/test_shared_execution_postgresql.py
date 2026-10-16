@@ -87,6 +87,10 @@ def _settle_cancel(db: Session, cancel_id: int) -> None:
     db.commit()
 
 
+def _snap(row: TaskExecutionCommand) -> tuple[object, ...]:
+    return (row.status, row.attempt_count, row.error, row.result, row.completed_at)
+
+
 @pytest.mark.parametrize("case", ["claimed_once", "already_settled"])
 def test_cancel_settle_is_compare_and_set(monkeypatch, case):
     """The settlement writes a row only while it is still pending and never
@@ -136,25 +140,11 @@ def test_cancel_settle_is_compare_and_set(monkeypatch, case):
                 assert db.get(TaskExecutionCommand, held_id).status == "failed"
             second_cancel = add("cancel-2", "cancel", status="completed")
             db.commit()
-            before = db.get(TaskExecutionCommand, held_id)
-            snapshot = (
-                before.status,
-                before.attempt_count,
-                before.error,
-                before.result,
-                before.completed_at,
-            )
+            snapshot = _snap(db.get(TaskExecutionCommand, held_id))
             events_before = db.query(TaskCommandTerminalEvent).count()
 
             _settle_cancel(db, second_cancel)
 
             db.expire_all()
-            after = db.get(TaskExecutionCommand, held_id)
-            assert (
-                after.status,
-                after.attempt_count,
-                after.error,
-                after.result,
-                after.completed_at,
-            ) == snapshot
+            assert _snap(db.get(TaskExecutionCommand, held_id)) == snapshot
             assert db.query(TaskCommandTerminalEvent).count() == events_before
