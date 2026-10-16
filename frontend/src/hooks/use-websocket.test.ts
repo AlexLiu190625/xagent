@@ -3674,11 +3674,10 @@ describe("useWebSocket normalized connections", () => {
       vi.useFakeTimers()
     })
 
-    it("mirrors the dead threshold in widget.js and keeps a 60 second stable window", () => {
+    it("keeps the widget.js stable window at twice the dead threshold", () => {
       const widgetScript = readFileSync(resolve(process.cwd(), "public/widget.js"), "utf8")
-      const constant = (name: string) => Number(new RegExp(`var ${name} = (\\d+);`).exec(widgetScript)?.[1])
-      expect(constant("CLIENT_DEAD_AFTER_MS")).toBe(DEAD_AFTER_MS)
-      expect(constant("CLIENT_DEAD_AFTER_MS") + constant("STABLE_TRAFFIC_SPAN_MS")).toBe(60_000)
+      const stableWindow = Number(/var SESSION_STABLE_CONNECTION_MS = (\d+);/.exec(widgetScript)?.[1])
+      expect(stableWindow).toBe(2 * DEAD_AFTER_MS)
     })
 
     describe("dead rule", () => {
@@ -3918,6 +3917,20 @@ describe("useWebSocket normalized connections", () => {
         expect(MockWebSocket.instances).toHaveLength(2)
         expect(hook.result.current.connectionPhase).toBe("lost")
       })
+
+      it("reads connecting, not reconnecting, when the caller connects again after a failure", () => {
+        const hook = mountChat()
+        act(() => socketAt(0).triggerError())
+        expect(hook.result.current.connectionPhase).toBe("lost")
+
+        // No disconnect() in between: the caller starts a new cycle directly.
+        act(() => hook.result.current.connect())
+        expect(MockWebSocket.instances).toHaveLength(2)
+        expect(hook.result.current.connectionPhase).toBe("connecting")
+
+        act(() => socketAt(1).open())
+        expect(hook.result.current.connectionPhase).toBe("connected")
+      })
     })
 
     describe("descriptor changes keep the connection key", () => {
@@ -3927,7 +3940,7 @@ describe("useWebSocket normalized connections", () => {
 
       it.each([
         ["on a healthy connection is a reconnect that spends budget", false, 2_000],
-        ["while a retry timer waits keeps the count", true, 4_000],
+        ["while a retry timer waits still spends one slot", true, 4_000],
       ] as const)("a routine descriptor change %s", (_name, dead, expectedDelay) => {
         const hook = mountChat()
         act(() => socketAt(0).open())

@@ -21,7 +21,8 @@ interface RecentMessage {
 }
 
 // Dead after this long without any frame, once the server confirmed heartbeats.
-// Mirrors CLIENT_DEAD_AFTER_SECONDS (server) and CLIENT_DEAD_AFTER_MS (widget.js).
+// The server's HEARTBEAT_INTERVAL_SECONDS fits into it twice, and widget.js
+// SESSION_STABLE_CONNECTION_MS is twice this value.
 export const DEAD_AFTER_MS = 30_000
 const RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000, 15000]
 const RECONNECT_JITTER = 0.2
@@ -1413,8 +1414,13 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     connectRef.current = connect
   }, [connect])
 
-  // Timers and effects run `connect` and recompute the phase themselves.
-  const connectFromCaller = useMemo(() => withPhaseSync(connect), [connect, withPhaseSync])
+  // Timers and effects run `connect` and recompute the phase themselves. A
+  // caller's connect starts a new cycle, so an earlier failure no longer makes
+  // the new attempt read as reconnecting.
+  const connectFromCaller = useMemo(() => withPhaseSync(() => {
+    lifecycleEndedRef.current = false
+    connect()
+  }), [connect, withPhaseSync])
 
   const disconnect = useCallback(() => {
     const owner = socketOwnerRef.current
