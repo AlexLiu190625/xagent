@@ -3308,6 +3308,7 @@ async def test_same_id_resend_runs_one_turn(live_task_lease, db_session) -> None
                 break
             await asyncio.sleep(0.01)
 
+    assert command.status == "completed"
     types = [c.args[0]["type"] for c in ws_manager.send_personal_message.call_args_list]
     assert types.count("message_accepted") == 2
     assert db_session.query(TaskChatMessage).filter_by(turn_id="resend-1").count() == 1

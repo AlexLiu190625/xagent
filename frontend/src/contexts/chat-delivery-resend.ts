@@ -1,6 +1,8 @@
 import { MAX_RECONNECT_CHAIN_MS, MessageDeliveryError } from "@/hooks/use-websocket"
 
-// The reconnect chain plus slack for the open itself.
+// How long a send that lost its connection waits for the next open: the hook's
+// reconnect chain plus slack for the open itself. The Session transport is
+// reconnected by its host page instead, so there it is only a fixed upper bound.
 export const RESEND_RECONNECT_DEADLINE_MS = MAX_RECONNECT_CHAIN_MS + 4_000
 
 // Where a send was made from, captured with the first attempt.
@@ -11,7 +13,10 @@ export interface ResendOwnership {
   session: { deliveryGeneration: number; phase: string } | null
 }
 
-// Every check must hold; an unreadable login never matches.
+// Every check must hold; an unreadable login never matches. A Session send made
+// while unbound may go again while still unbound: the Session server never starts
+// a second task or turn for a client_message_id it already took on another
+// connection of the same session, which a manual same-id retry relies on too.
 export const mayResend = (first: ResendOwnership, now: ResendOwnership): boolean => {
   if (first.loginIdentity === null || now.loginIdentity !== first.loginIdentity) return false
   if (first.session === null) return now.boundTaskId === first.boundTaskId

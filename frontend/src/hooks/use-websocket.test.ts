@@ -3717,6 +3717,78 @@ describe("useWebSocket normalized connections", () => {
       expect(second.send.mock.calls[0][0]).toBe(first.send.mock.calls[0][0].replace('"task_id":1', `"task_id":${retryTaskId}`))
     })
 
+    it("keeps an earlier unknown-outcome attempt's upload when a later same-id attempt is not sent", async () => {
+      let uploadCount = 0
+      const uploadFiles = vi.fn(async () => [{ file_id: `f${++uploadCount}` }])
+      const files = [new File(["a"], "a.txt")]
+      const hook = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1, token: "t1", uploadFiles }))
+      const [first] = MockWebSocket.instances
+      act(() => first.open())
+      const lost = hook.result.current.sendChatMessage("hi", files, false, "retry-id").catch(() => undefined)
+      await waitFor(() => expect(first.send).toHaveBeenCalledOnce())
+      act(() => first.triggerClose(1000))
+      await lost
+      act(() => hook.result.current.connect())
+      const second = MockWebSocket.instances[1]
+      act(() => second.open())
+
+      second.send.mockImplementationOnce(() => { throw new Error("send failed") })
+      await expect(hook.result.current.sendChatMessage("hi", files, false, "retry-id"))
+        .rejects.toMatchObject({ disposition: "not_sent" })
+      void hook.result.current.sendChatMessage("hi", files, false, "retry-id").catch(() => undefined)
+      await waitFor(() => expect(second.send).toHaveBeenCalledTimes(2))
+
+      expect(uploadFiles).toHaveBeenCalledOnce()
+      expect(second.send.mock.calls[1][0]).toBe(first.send.mock.calls[0][0])
+    })
+
+    it("keeps an earlier unknown-outcome attempt's upload when a later same-id attempt fails while preparing", async () => {
+      let uploadCount = 0
+      const uploadFiles = vi.fn(async () => [{ file_id: `f${++uploadCount}` }])
+      const files = [new File(["a"], "a.txt")]
+      const hook = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1, token: "t1", uploadFiles }))
+      const [first] = MockWebSocket.instances
+      act(() => first.open())
+      const lost = hook.result.current.sendChatMessage("hi", files, false, "retry-id").catch(() => undefined)
+      await waitFor(() => expect(first.send).toHaveBeenCalledOnce())
+      act(() => first.triggerClose(1000))
+      await lost
+      act(() => hook.result.current.connect())
+      const second = MockWebSocket.instances[1]
+      act(() => second.open())
+
+      // The cached upload holds one file id for two files, so preparation fails.
+      const twoFiles = [new File(["a"], "a.txt"), new File(["b"], "b.txt")]
+      await expect(hook.result.current.sendChatMessage("hi", twoFiles, false, "retry-id"))
+        .rejects.toMatchObject({ disposition: "not_sent" })
+      void hook.result.current.sendChatMessage("hi", files, false, "retry-id").catch(() => undefined)
+      await waitFor(() => expect(second.send).toHaveBeenCalledOnce())
+
+      expect(uploadFiles).toHaveBeenCalledOnce()
+      expect(second.send.mock.calls[0][0]).toBe(first.send.mock.calls[0][0])
+    })
+
+    it.each([
+      ["an acceptance", true, { type: "message_accepted" }],
+      ["a rejection that was not accepted", true, { type: "message_rejected", rejection_outcome: "not_accepted" }],
+      ["a rejection with an unknown outcome", false, { type: "message_rejected" }],
+    ] as const)("a same-id send after %s uploads again: %s", async (_name, uploadsAgain, ack) => {
+      const uploadFiles = vi.fn(async () => [{ file_id: "f1" }])
+      const files = [new File(["a"], "a.txt")]
+      const hook = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1, token: "t1", uploadFiles }))
+      const [socket] = MockWebSocket.instances
+      act(() => socket.open())
+      const settled = hook.result.current.sendChatMessage("hi", files, false, "ack-id").catch(() => undefined)
+      await waitFor(() => expect(socket.send).toHaveBeenCalledOnce())
+      act(() => socket.receive({ ...ack, client_message_id: "ack-id" }))
+      await settled
+
+      void hook.result.current.sendChatMessage("hi", files, false, "ack-id").catch(() => undefined)
+      await waitFor(() => expect(socket.send).toHaveBeenCalledTimes(2))
+
+      expect(uploadFiles).toHaveBeenCalledTimes(uploadsAgain ? 2 : 1)
+    })
+
     it("treats the same user with another session id as another login", () => {
       const hook = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1 }))
       const before = hook.result.current.getLoginIdentity()

@@ -171,7 +171,9 @@ import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 import { MAX_RECONNECT_CHAIN_MS, MessageDeliveryError } from "@/hooks/use-websocket"
 import {
   RESEND_RECONNECT_DEADLINE_MS,
+  ResendWaiters,
   mayResend,
+  sendWithResend,
   type ResendOwnership,
 } from "./chat-delivery-resend"
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer"
@@ -11164,6 +11166,11 @@ describe("resend after reconnect", () => {
     ["a first failure that was not sent", ["a"], [notSent], () => {}, true, ["a"], 0],
     ["two lost connections", ["a"], [connectionLost("first"), connectionLost("again")], () => {}, true, ["a", "a"], 1],
     ["the phase turning lost", ["a"], undefined, ({ rerender }) => { wsHarness.connectionPhase = "lost"; rerender(tree()) }, false, ["a"], 0],
+    ["a switch to a view with no task", ["a"], undefined, ({ rerender }) => {
+      act(() => getSessionControls().setTaskId(null, { navigate: false }))
+      wsHarness.connectionPhase = "idle"
+      rerender(tree())
+    }, false, ["a"], 0],
     ["an unmount", ["a"], undefined, ({ unmount }) => unmount(), false, ["a"], 0],
     ["a phase that was already lost", ["a"], undefined, () => {}, false, ["a"], 0],
   ])("resends after %s", async (_name, ids, rejections, change, reconnects, expectedIds, settlesWith) => {
@@ -11185,8 +11192,8 @@ describe("resend after reconnect", () => {
     expect(settled[0]).toBe(settlesWith === "ok" ? "ok" : failures[settlesWith])
   })
 
-  it("resends a Session send once on the new connection although its phase reads lost", async () => {
-    wsHarness.connectionPhase = "lost"
+  it.each(["lost", "idle"] as const)("resends a Session send once on the new connection although its phase reads %s", async (phase) => {
+    wsHarness.connectionPhase = phase
     sendChatMessageMock.mockRejectedValueOnce(connectionLost("first"))
     const sessionTree = (identity: string) => (
       <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(identity))}>
@@ -11204,6 +11211,66 @@ describe("resend after reconnect", () => {
     expect(sendChatMessageMock.mock.calls.map(call => call[3])).toEqual(["s-1", "s-1"])
     // The bubble guard compares against the connection of the resend.
     expect(screen.getByTestId("messages").textContent).toContain("Resent turn")
+  })
+
+  it("resends a queued first message once on the next connection", async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ task_id: 7, title: "queued", description: "queued", status: "pending" }),
+    })
+    sendChatMessageMock.mockRejectedValueOnce(connectionLost("first"))
+    // The new task's socket has not connected yet, so the message is queued.
+    wsHarness.isConnected = false
+    render(<AppProvider token="token"><SessionControlsProbe /></AppProvider>)
+    let delivery: Promise<unknown> | undefined
+    await act(async () => {
+      delivery = getSessionControls().sendMessage("queued", { clientMessageId: "q-1" })
+        .then(() => "ok", (error: Error) => error)
+      await new Promise(resolve => setTimeout(resolve, 0))
+    })
+
+    await act(async () => {
+      wsHarness.isConnected = true
+      webSocketOptions.current?.onConnect?.()
+      await new Promise(resolve => setTimeout(resolve, 0))
+    })
+    act(() => webSocketOptions.current?.onConnect?.())
+    await act(async () => { expect(await delivery).toBe("ok") })
+
+    expect(sendChatMessageMock.mock.calls.map(call => call[3])).toEqual(["q-1", "q-1"])
+  })
+
+  describe("a wait with no reconnect", () => {
+    beforeEach(() => { vi.useFakeTimers() })
+    afterEach(() => { vi.useRealTimers() })
+
+    it("ends at the deadline with the original error and leaves no timer", async () => {
+      const lost = connectionLost("first")
+      const send = vi.fn().mockRejectedValueOnce(lost)
+      let outcome: unknown = "pending"
+      void sendWithResend(send, new ResendWaiters(), () => true).then(() => { outcome = "ok" }, (error) => { outcome = error })
+
+      await vi.advanceTimersByTimeAsync(RESEND_RECONNECT_DEADLINE_MS - 1)
+      expect(outcome).toBe("pending")
+      await vi.advanceTimersByTimeAsync(1)
+
+      expect(outcome).toBe(lost)
+      expect(send).toHaveBeenCalledOnce()
+      expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it("clears its deadline timer when the next open ends it", async () => {
+      const waiters = new ResendWaiters()
+      const send = vi.fn().mockRejectedValueOnce(connectionLost("first")).mockResolvedValueOnce("ok")
+      const outcome = sendWithResend(send, waiters, () => true)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(vi.getTimerCount()).toBe(1)
+
+      waiters.release(true)
+
+      expect(await outcome).toBe("ok")
+      expect(vi.getTimerCount()).toBe(0)
+    })
   })
 
   const bound = (taskId: number | null, deliveryGeneration = 0, phase = "bound"): ResendOwnership =>

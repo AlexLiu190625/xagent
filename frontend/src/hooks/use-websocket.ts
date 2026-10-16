@@ -1590,8 +1590,12 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     }
     preparationsRef.current.set(clientMessageId, claim)
 
+    // A binding made before this attempt belongs to an earlier attempt under
+    // this id whose outcome is unknown; a later same-id retry still needs it, so
+    // a failure of this attempt keeps it.
+    const bindingsPredateAttempt = attemptTimezonesRef.current.has(clientMessageId)
     try {
-      if (!attemptTimezonesRef.current.has(clientMessageId)) {
+      if (!bindingsPredateAttempt) {
         attemptTimezonesRef.current.set(clientMessageId, resolveReportedTimezone())
       }
       const reportedTimezone = attemptTimezonesRef.current.get(clientMessageId)
@@ -1785,9 +1789,10 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         ) {
           clearTimeout(pending.timeout)
           pendingDeliveriesRef.current.delete(clientMessageId)
-          // Nothing reached the server, so a same-id retry may re-resolve the
-          // zone freely; drop the binding rather than leak it.
-          releaseAttemptBindings(clientMessageId)
+          // Nothing of this attempt reached the server, so unless an earlier
+          // attempt owns the binding, a same-id retry may re-resolve the zone
+          // and upload again; drop it rather than leak it.
+          if (!bindingsPredateAttempt) releaseAttemptBindings(clientMessageId)
           pending.reject(deliveryError(
             error instanceof Error ? error.message : String(error),
             "not_sent",
@@ -1819,12 +1824,12 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       return delivery
     } catch (error) {
       // Pre-send failures never reached the server; free the attempt binding so
-      // abandoned drafts do not accumulate. An outcome-unknown send cannot land
-      // here (it settles through the delivery promise), so retryable bindings
-      // are untouched.
+      // abandoned drafts do not accumulate. An outcome-unknown send of this
+      // attempt cannot land here (it settles through the delivery promise), and
+      // a binding an earlier outcome-unknown attempt made is kept for its retry.
       const disposition =
         error instanceof MessageDeliveryError ? error.disposition : "not_sent"
-      if (disposition !== "outcome_unknown") {
+      if (disposition !== "outcome_unknown" && !bindingsPredateAttempt) {
         releaseAttemptBindings(clientMessageId)
       }
       if (error instanceof MessageDeliveryError) throw error

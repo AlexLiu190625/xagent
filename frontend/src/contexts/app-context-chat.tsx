@@ -2964,10 +2964,13 @@ export function AppProvider({
     releaseStopControl()
   }, [canStopTask, releaseStopControl])
 
-  // The Session's host page reconnects it, so only the other transports treat
-  // `lost` as the end of the wait.
+  // The Session's host page reconnects it, so only the other transports end the
+  // wait on their phase: `lost` (no reconnect is coming) or `idle` (no task is
+  // open, so no connection will open for the send's task).
   useEffect(() => {
-    resendWaitersRef.current.setEnded(sessionTransport === undefined && connectionPhase === "lost")
+    resendWaitersRef.current.setEnded(
+      sessionTransport === undefined && (connectionPhase === "lost" || connectionPhase === "idle"),
+    )
   }, [connectionPhase, sessionTransport])
 
   // A send whose connection was lost is sent once more on the next connection
