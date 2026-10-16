@@ -846,8 +846,8 @@ def _unfinished_earlier_command(cap: DispatchCapSnapshot | None = None) -> Any:
     applied first and its completion, or a pause's rejection because nothing
     of its task runs, settles that command
     (``settle_cap_held_commands_no_commit``); a rejected cancel, or a pause
-    rejected for another reason (access denied, ``stale_run``, invalid data),
-    settles nothing. Callers that claim must pass the
+    rejected for any other reason (for example access denied, ``stale_run``
+    or invalid data), settles nothing. Callers that claim must pass the
     same snapshot to the candidate query and the claim UPDATE. Neither this
     SQL nor the owner lease keeps the passed command unclaimed while the
     control is processing: the lease lock lasts only for the claim

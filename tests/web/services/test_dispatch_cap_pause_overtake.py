@@ -178,6 +178,7 @@ async def _waiting_reply(host: CapHost) -> None:
         "retry_with_new_id": True,
     }
     assert task_state(host, task_id) == (TaskStatus.WAITING_FOR_USER, None, 3)
+    assert host.agent_builds.await_count == 0
 
 
 async def _new_turn_message(host: CapHost) -> None:
@@ -193,6 +194,8 @@ async def _new_turn_message(host: CapHost) -> None:
     assert_pause_not_applicable(host, pause_id, ALREADY_PAUSED)
     assert_settled(host, message_id)
     assert delivery_rows(host, task_id) == rows_before
+    assert task_state(host, task_id) == (TaskStatus.PAUSED, None, 3)
+    assert host.agent_builds.await_count == 0
 
 
 async def _external_message(host: CapHost) -> None:
@@ -216,18 +219,23 @@ async def _external_message(host: CapHost) -> None:
     (event,) = events_of(host, message_id)
     assert event.include_command_identity is False
     assert delivery_rows(host, task_id) == []
+    assert task_state(host, task_id) == (TaskStatus.WAITING_FOR_USER, None, 5)
+    assert host.agent_builds.await_count == 0
 
 
 async def _two_held_rows(host: CapHost) -> None:
     _, task_id = await cap_held_task(host, TaskStatus.WAITING_FOR_USER)
     reply_id = enqueue_at(host, task_id, "resume_input", 3)
     message_id = enqueue_at(host, task_id, "message", 3)
-    stage_pause(host, task_id)
+    pause_id = stage_pause(host, task_id)
 
     assert await run() is True
 
+    assert_pause_not_applicable(host, pause_id, NO_EXECUTION)
     assert_settled(host, reply_id)
     assert_settled(host, message_id)
+    assert task_state(host, task_id) == (TaskStatus.WAITING_FOR_USER, None, 3)
+    assert host.agent_builds.await_count == 0
 
 
 async def _shared_channel_stop(host: CapHost) -> None:
@@ -298,6 +306,7 @@ async def _other_users_pause(host: CapHost) -> None:
     assert row.status == "failed"
     assert row.error.startswith("Access denied")
     assert_untouched(host, resume_id)
+    assert task_state(host, task_id) == (TaskStatus.PAUSED, None, 3)
     assert host.agent_builds.await_count == 0
 
 
@@ -311,6 +320,26 @@ async def _running_row_nothing_live(host: CapHost) -> None:
     assert host.agent_builds.await_count == 1
     assert_pause_not_applicable(host, pause_id, NO_EXECUTION)
     assert_settled(host, message_id)
+    assert task_state(host, task_id) == (TaskStatus.RUNNING, None, 3)
+
+
+async def _error_payload_read_fails(host: CapHost) -> None:
+    _, task_id = await cap_held_task(host, TaskStatus.RUNNING)
+    message_id = enqueue_at(host, task_id, "message", 3)
+    pause_id = stage_pause(host, task_id)
+
+    with patch.object(
+        task_command_execution,
+        "_read_task_error_payload_offloop",
+        AsyncMock(side_effect=ValueError("payload data invalid")),
+    ):
+        assert await run() is True
+
+    # The pause ends as a data error, not as not applicable: nothing it passed
+    # is settled.
+    row = host.row(pause_id)
+    assert (row.status, row.error) == ("failed", "payload data invalid")
+    assert_untouched(host, message_id)
 
 
 async def _retry_finds_run_paused(host: CapHost) -> None:
@@ -326,7 +355,9 @@ async def _retry_finds_run_paused(host: CapHost) -> None:
     assert await run() is True
 
     assert host.row(pause_id).status == "completed"
+    assert len(events_of(host, pause_id)) == 1
     assert_settled(host, resume_id)
+    assert task_state(host, task_id) == (TaskStatus.PAUSED, None, 3)
     assert host.agent_builds.await_count == 1
 
 
@@ -421,7 +452,9 @@ async def _stale_web_pause(host: CapHost) -> None:
 
     row = host.row(pause_id)
     assert (row.status, row.result) == ("failed", {"rejection_reason": "stale_run"})
+    assert len(events_of(host, pause_id)) == 1
     assert_untouched(host, message_id)
+    assert host.agent_builds.await_count == 0
 
 
 async def _ticketed_start_stopped_by_channel(host: CapHost) -> None:
@@ -461,6 +494,7 @@ PAUSE_SCENARIOS: dict[str, Any] = {
     "S10-ticketed-resume-beside-held-message": _ticketed_resume_beside_held_message,
     "S11-other-users-pause": _other_users_pause,
     "S12-running-row-nothing-live": _running_row_nothing_live,
+    "S12b-error-payload-read-fails": _error_payload_read_fails,
     "S13-retry-finds-run-paused": _retry_finds_run_paused,
     "S14-settlement-failure": _settlement_failure,
     "S15-held-row-read-fails": _held_row_read_fails,

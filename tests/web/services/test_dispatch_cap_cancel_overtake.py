@@ -1,5 +1,7 @@
-"""A cancel claimed by a process at its dispatch cap passes the never-claimed
-commands that process holds for its task, and settles them when it completes."""
+"""A cancel or pause claimed by a process at its dispatch cap passes the
+never-claimed commands that process holds for its task. This module covers
+which commands either control may pass and how a completed cancel settles
+them, and holds the fixtures the pause settlement tests reuse."""
 
 from __future__ import annotations
 
