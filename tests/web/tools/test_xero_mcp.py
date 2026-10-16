@@ -290,6 +290,142 @@ def test_list_invoices_includes_lines_only_for_named_invoices(fake: FakeXero) ->
     assert named["invoices"][0]["line_items"][0]["description"] == "Widget"
 
 
+def test_list_invoices_exposes_expected_and_planned_payment_dates(
+    fake: FakeXero,
+) -> None:
+    receivable = _invoice("INV-AR", "2026-10-20", 10)
+    receivable["ExpectedPaymentDate"] = "/Date(1792454400000+0000)/"
+    payable = _invoice("INV-AP", "2026-10-21", 20)
+    payable["Type"] = "ACCPAY"
+    payable["PlannedPaymentDate"] = "2026-10-22T00:00:00"
+    fake.responder = lambda call: MockResponse({"Invoices": [receivable, payable]})
+
+    result = _call_tool("list_invoices")
+
+    assert result["invoices"][0]["expected_payment_date"] == "2026-10-20T00:00:00Z"
+    assert result["invoices"][1]["planned_payment_date"] == "2026-10-22T00:00:00"
+    assert "planned_payment_date" not in result["invoices"][0]
+    assert "expected_payment_date" not in result["invoices"][1]
+
+
+def test_list_invoice_history_returns_xero_notes_oldest_first(fake: FakeXero) -> None:
+    fake.responder = lambda call: MockResponse(
+        {
+            "HistoryRecords": [
+                {
+                    "Details": "Customer promised payment on Friday",
+                    "Changes": "Note",
+                    "User": "Hannah Example",
+                    "DateUTC": "/Date(1792458000000+0000)/",
+                },
+                {
+                    "Details": "Invoice authorised",
+                    "Changes": "Approved",
+                    "User": "Toby Example",
+                    "DateUTCString": "2026-10-19T23:00:00Z",
+                },
+                {
+                    "Details": "Imported note without timestamp",
+                    "Changes": "Note",
+                    "User": "Migration",
+                },
+            ]
+        }
+    )
+
+    result = _call_tool("list_invoice_history", invoiceId=INVOICE_ID)
+
+    assert result == {
+        "status": "success",
+        "history": [
+            {
+                "details": "Invoice authorised",
+                "changes": "Approved",
+                "user": "Toby Example",
+                "date_utc": "2026-10-19T23:00:00Z",
+            },
+            {
+                "details": "Customer promised payment on Friday",
+                "changes": "Note",
+                "user": "Hannah Example",
+                "date_utc": "2026-10-20T01:00:00Z",
+            },
+            {
+                "details": "Imported note without timestamp",
+                "changes": "Note",
+                "user": "Migration",
+            },
+        ],
+        "total_count": 3,
+        "complete": True,
+        "skip": 0,
+        "returned": 3,
+        "has_more": False,
+    }
+    assert fake.calls[-1]["path"] == f"Invoices/{INVOICE_ID}/History"
+    assert fake.calls[-1]["method"] == "GET"
+
+    first = _call_tool("list_invoice_history", invoiceId=INVOICE_ID, limit=1)
+    assert first["returned"] == 1
+    assert first["has_more"] is True
+    assert first["next_skip"] == 1
+    assert first["history"][0]["details"] == "Invoice authorised"
+
+    second = _call_tool(
+        "list_invoice_history",
+        invoiceId=INVOICE_ID,
+        skip=first["next_skip"],
+        limit=1,
+    )
+    assert second["skip"] == 1
+    assert second["returned"] == 1
+    assert second["has_more"] is True
+    assert second["next_skip"] == 2
+    assert second["history"][0]["details"] == ("Customer promised payment on Friday")
+
+    last = _call_tool(
+        "list_invoice_history",
+        invoiceId=INVOICE_ID,
+        skip=second["next_skip"],
+        limit=1,
+    )
+    assert last["skip"] == 2
+    assert last["returned"] == 1
+    assert last["has_more"] is False
+    assert "next_skip" not in last
+    assert last["history"][0]["details"] == "Imported note without timestamp"
+
+
+def test_list_invoice_history_handles_empty_history_and_clamps_window(
+    fake: FakeXero,
+) -> None:
+    fake.responder = lambda call: MockResponse({})
+
+    result = _call_tool(
+        "list_invoice_history",
+        invoiceId=INVOICE_ID,
+        skip=-10,
+        limit=0,
+    )
+
+    assert result == {
+        "status": "success",
+        "total_count": 0,
+        "complete": True,
+        "skip": 0,
+        "returned": 0,
+        "has_more": False,
+        "history": [],
+    }
+
+
+def test_list_invoice_history_rejects_unsafe_invoice_id(fake: FakeXero) -> None:
+    with pytest.raises(ValueError, match="invoiceId"):
+        xero.list_invoice_history(invoiceId="../Contacts")
+
+    assert fake.calls == []
+
+
 @pytest.mark.parametrize(
     ("arguments", "message"),
     [
@@ -320,6 +456,174 @@ def test_list_payments_where_clause_is_validated_and_built(fake: FakeXero) -> No
     )
     with pytest.raises(ValueError, match="reference contains characters"):
         xero.list_payments(reference='x" OR 1==1')
+
+
+def _paid_invoice(
+    number: str,
+    paid_on: str,
+    *,
+    total: float = 10,
+    currency: str = "AUD",
+    contact_id: str = CONTACT_ID,
+) -> dict[str, Any]:
+    record = _invoice(
+        number,
+        "2026-10-01",
+        0,
+        issued="2026-09-01",
+        currency=currency,
+        contact_id=contact_id,
+        status="PAID",
+    )
+    moment = datetime.fromisoformat(paid_on).replace(tzinfo=timezone.utc)
+    milliseconds = int(moment.timestamp() * 1000)
+    record["FullyPaidOnDate"] = f"/Date({milliseconds}+0000)/"
+    record["Total"] = total
+    record["AmountPaid"] = total
+    return record
+
+
+def _paid_pages(pages: list[list[dict[str, Any]]]) -> Callable[..., MockResponse]:
+    def respond(call: dict[str, Any]) -> MockResponse:
+        page = call["params"]["page"]
+        return MockResponse(
+            {
+                "pagination": {
+                    "page": page,
+                    "pageSize": xero.XERO_BULK_PAGE_SIZE,
+                    "pageCount": len(pages),
+                    "itemCount": sum(len(items) for items in pages),
+                },
+                "Invoices": pages[page - 1],
+            }
+        )
+
+    return respond
+
+
+def test_list_paid_invoices_reads_later_pages_after_mixed_dates(
+    fake: FakeXero,
+) -> None:
+    # Production regression: the first page contained ten 13 Oct settlements;
+    # the next page mixed five more with other dates. Updated ordering is not a
+    # valid boundary for FullyPaidOnDate.
+    first = [_paid_invoice(f"INV-{number}", "2026-10-13") for number in range(1, 11)]
+    second = [
+        *[_paid_invoice(f"INV-{number}", "2026-10-13") for number in range(11, 16)],
+        _paid_invoice("INV-OLDER", "2026-10-12"),
+    ]
+    fake.responder = _paid_pages([first, second])
+
+    result = _call_tool("list_paid_invoices", paidOnDate="2026-10-13")
+
+    assert result["complete"] is True
+    assert result["date_basis"] == "FullyPaidOnDate"
+    assert result["total_count"] == 15
+    assert result["returned"] == 15
+    assert result["has_more"] is False
+    assert {row["invoice_number"] for row in result["invoices"]} == {
+        f"INV-{number}" for number in range(1, 16)
+    }
+    assert result["total_invoice_amount_by_currency"] == {"AUD": "150.00"}
+    api_calls = [call for call in fake.calls if call.get("path") == "Invoices"]
+    assert [call["params"]["page"] for call in api_calls] == [1, 2]
+    assert api_calls[0]["params"]["Statuses"] == "PAID"
+    assert api_calls[0]["params"]["where"] == 'Type=="ACCREC"'
+    assert api_calls[0]["params"]["summaryOnly"] == "true"
+
+
+def test_list_paid_invoices_windows_totals_and_contact_filter(fake: FakeXero) -> None:
+    fake.responder = _paid_pages(
+        [
+            [
+                _paid_invoice("INV-A", "2026-10-13", total=12.5),
+                _paid_invoice(
+                    "INV-B",
+                    "2026-10-13",
+                    total=20.25,
+                    currency="USD",
+                ),
+            ]
+        ]
+    )
+
+    first = _call_tool(
+        "list_paid_invoices",
+        paidOnDate="2026-10-13",
+        contactIds=[CONTACT_ID],
+        limit=1,
+    )
+
+    assert first["total_count"] == 2
+    assert first["total_invoice_amount_by_currency"] == {
+        "AUD": "12.50",
+        "USD": "20.25",
+    }
+    assert first["returned"] == 1
+    assert first["has_more"] is True
+    assert first["next_skip"] == 1
+    assert first["invoices"][0]["invoice_number"] == "INV-A"
+    assert fake.calls[-1]["params"]["ContactIDs"] == CONTACT_ID
+
+    second = _call_tool(
+        "list_paid_invoices",
+        paidOnDate="2026-10-13",
+        contactIds=[CONTACT_ID],
+        skip=first["next_skip"],
+        limit=1,
+    )
+
+    assert second["returned"] == 1
+    assert second["has_more"] is False
+    assert second["invoices"][0]["invoice_number"] == "INV-B"
+
+
+def test_list_paid_invoices_rejects_paid_record_without_settlement_date(
+    fake: FakeXero,
+) -> None:
+    missing_date = _paid_invoice("INV-MISSING", "2026-10-13")
+    missing_date.pop("FullyPaidOnDate")
+    fake.responder = _paid_pages([[missing_date]])
+
+    with pytest.raises(RuntimeError, match="without FullyPaidOnDate"):
+        xero.list_paid_invoices(paidOnDate="2026-10-13")
+
+
+def test_list_paid_invoices_rejects_partial_scan_without_pagination(
+    fake: FakeXero,
+) -> None:
+    fake.responder = lambda call: MockResponse(
+        {"Invoices": [_paid_invoice("INV-1", "2026-10-13")]}
+    )
+
+    with pytest.raises(
+        RuntimeError, match="refusing to report a partial settlement-date list"
+    ):
+        xero.list_paid_invoices(paidOnDate="2026-10-13")
+
+
+def test_list_paid_invoices_rejects_partial_scan_at_safety_limit(
+    fake: FakeXero, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(xero, "PAID_INVOICE_MAX_PAGES", 1)
+    fake.responder = _paid_pages(
+        [
+            [_paid_invoice("INV-1", "2026-10-13")],
+            [_paid_invoice("INV-2", "2026-10-13")],
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="paid-invoice scan reached the safety"):
+        xero.list_paid_invoices(paidOnDate="2026-10-13")
+
+
+def test_list_paid_invoices_rejects_invalid_date_before_calling_xero(
+    fake: FakeXero,
+) -> None:
+    with pytest.raises(ValueError, match="paidOnDate must be YYYY-MM-DD"):
+        xero.list_paid_invoices(paidOnDate="13/10/2026")
+
+    assert fake.calls == []
 
 
 def test_quotes_use_xero_pagination_metadata(fake: FakeXero) -> None:
@@ -1269,6 +1573,8 @@ def _registered_tools() -> dict[str, Any]:
 
 def test_every_preserved_tool_is_registered_plus_the_new_ones() -> None:
     assert set(_registered_tools()) == PRESERVED_TOOLS | {
+        "list_paid_invoices",
+        "list_invoice_history",
         "list_overdue_invoices",
         "list_receivables_ageing",
     }

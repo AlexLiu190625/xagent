@@ -387,6 +387,7 @@ import {
   type WebSocketConnectionFailure,
 } from "@/hooks/use-websocket"
 import { ResendWaiters, mayResend, sendWithResend, type ResendOwnership } from "./chat-delivery-resend"
+import { deriveConnectionNotice, type ConnectionNotice } from "./connection-notice"
 import { generateClientMessageId, getApiUrl, getUploadApiUrl, shouldAutoOpenTaskPreview } from "@/lib/utils"
 import { apiRequest, classifyUploadError, getApiErrorMessage, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
 import { clientErrorTranslationKey, readClientErrorCode, type ClientErrorCode } from "@/lib/client-errors"
@@ -2274,6 +2275,7 @@ interface AppContextType {
   // was last connected to. The first connect for a task does not count.
   sameTaskReconnects: number
   connectionError: Error | null
+  connectionNotice: ConnectionNotice
   startNewConversation: () => Promise<void>
   canStopTask: boolean
   stopTask: () => void
@@ -2811,7 +2813,13 @@ export function AppProvider({
 
   const resendWaitersRef = useRef(new ResendWaiters())
 
-  const onConnect = useCallback(() => {
+  // Tasks a socket has opened for since this provider mounted, keyed by the
+  // opened socket's own task: during a task switch stateRef may already name
+  // the next task before the old socket is retired.
+  const openedTaskIdsRef = useRef(new Set<typeof state.taskId>())
+
+  const onConnect = useCallback((openedTaskId: number | undefined) => {
+    openedTaskIdsRef.current.add(openedTaskId ?? null)
     resendWaitersRef.current.release(true)
     if (sessionTransport?.history === "none") {
       const connectionIdentity = sessionConnectionIdentityRef.current
@@ -3002,6 +3010,15 @@ export function AppProvider({
       () => mayResend(first, capture()),
     )
   }, [getLoginIdentity, sendChatMessage, sessionTransport])
+
+  const connectionNotice = deriveConnectionNotice({
+    isSessionTransport: sessionTransport !== undefined,
+    hadOpen: sessionTransport
+      ? openedTaskIdsRef.current.size > 0
+      : openedTaskIdsRef.current.has(state.taskId),
+    phase: connectionPhase,
+    isConnected,
+  })
 
   useEffect(() => {
     if (!sessionTransport || isConnected) return
@@ -7974,6 +7991,7 @@ export function AppProvider({
           isConnected,
           sameTaskReconnects,
           connectionError,
+          connectionNotice,
           startNewConversation,
           canStopTask,
           stopTask,
