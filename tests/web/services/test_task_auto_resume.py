@@ -1122,10 +1122,10 @@ def test_full_admission_queue_postpones_only_that_row(factory, notified, monkeyp
     full_for: set[int] = set()
     real = task_execution_admission.stage_task_admission
 
-    def admission(db, command):
+    def admission(db, command, policy):
         if command.task_id in full_for:
             raise AdmissionQueueFull("Execution queue is full")
-        real(db, command)
+        real(db, command, policy)
 
     monkeypatch.setattr(
         "xagent.web.services.task_execution_admission.stage_task_admission", admission
@@ -2329,10 +2329,10 @@ def test_failure_while_postponing(
     real = task_execution_admission.stage_task_admission
     full_for: set[int] = set()
 
-    def admission(db, command):
+    def admission(db, command, policy):
         if command.task_id in full_for:
             raise AdmissionQueueFull("Execution queue is full")
-        real(db, command)
+        real(db, command, policy)
 
     def broken(*_args, **_kwargs):
         raise postpone_error

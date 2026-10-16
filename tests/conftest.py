@@ -980,3 +980,12 @@ def clear_langfuse_traces(request):
 #     set_yaml_migration_manager(manager)
 #
 #     yield manager
+
+
+@pytest.fixture(autouse=True, scope="function")
+def _reset_command_classifier() -> Iterator[None]:
+    """Keep a test's installed command classifier from leaking into later tests."""
+    from xagent.web.services.task_execution_admission import reset_command_classifier
+
+    yield
+    reset_command_classifier()
