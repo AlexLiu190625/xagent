@@ -304,8 +304,8 @@ def _mark_cancelled_turn_delivery_dispatched(
     invitation could double-execute it. A message held by a full dispatch cap
     never ran: the cancel passes it, its command fails as
     ``cancelled_before_admission`` (``settle_cap_held_commands_no_commit``),
-    and a pending row of its turn is still closed as ``dispatched`` here, so
-    the message can only be sent again under a new id.
+    and if its turn already has a pending row, that row is still closed as
+    ``dispatched`` here, so the message can only be sent again under a new id.
 
     ``turn_id`` names the exact row when the command carries one, which is
     the only way to be certain the row closed belongs to the turn the stop
