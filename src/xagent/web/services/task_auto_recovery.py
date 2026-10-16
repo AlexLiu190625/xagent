@@ -232,6 +232,30 @@ def auto_recovery_eligibility(db: Session, task: Task) -> AutoRecoveryEligibilit
     return AutoRecoveryEligibility(eligible=True, kind="normal")
 
 
+def shutdown_handoff_eligible(db: Session, task_id: int) -> bool:
+    """Whether a run a host shutdown cancelled may be left to lease recovery.
+
+    Such a run keeps its lease instead of failing, so lease recovery pauses
+    it and automatic resume picks it up, as after a crash. That only helps a
+    task automatic recovery would resume (:func:`auto_recovery_eligibility`);
+    the others must still fail now so their callers see a terminal state.
+    Tasks of a status-only source (:func:`is_status_only_source`) still fail
+    now as well, as their settlement interruptions do: their caller reads
+    nothing but the status, and a deploy should not keep it waiting on a
+    lease TTL. Channel tasks are excluded too until their resumed reply is
+    proven, and nothing is handed off while automatic resume is off.
+    """
+
+    if not get_task_auto_resume_enabled():
+        return False
+    task = db.get(Task, task_id)
+    if task is None or task.status != TaskStatus.RUNNING:
+        return False
+    if is_status_only_source(task.source) or task.channel_id is not None:
+        return False
+    return auto_recovery_eligibility(db, task).eligible
+
+
 def record_interruption_no_commit(
     db: Session,
     *,
