@@ -64,6 +64,7 @@ from ...services.managed_file_ref import (
     DurableStorageOperationError,
 )
 from ...services.task_auto_resume import TerminalView, status_only_terminal_view
+from ...services.task_execution_controller import TaskControlState
 from ...services.task_interaction_read import get_pending_interaction_question
 from ...services.task_orchestrator import (
     TaskTurnError,
@@ -410,22 +411,6 @@ class _TaskInfoSnapshot:
     view: TerminalView | None = None
 
 
-# The snapshot fields a terminal view replaces. The one place that names them:
-# :func:`effective_task_snapshot` applies them and the GET response copies them.
-_OVERLAID_FIELDS = ("status", "control_state", "output", "error")
-
-
-def _overlaid_values(view: TerminalView) -> dict[str, Any]:
-    values: dict[str, Any] = {
-        "status": TaskStatus.FAILED,
-        "control_state": TaskStatus.FAILED.value,
-        "output": None,
-        "error": view.error,
-    }
-    assert tuple(values) == _OVERLAID_FIELDS
-    return values
-
-
 def effective_task_snapshot(snapshot: _TaskInfoSnapshot) -> _TaskInfoSnapshot:
     """``snapshot`` as the caller must read it: ``failed`` when it carries a
     terminal view, the stored values otherwise.
@@ -437,7 +422,13 @@ def effective_task_snapshot(snapshot: _TaskInfoSnapshot) -> _TaskInfoSnapshot:
     view = snapshot.view
     if view is None:
         return snapshot
-    return replace(snapshot, **_overlaid_values(view))
+    return replace(
+        snapshot,
+        status=TaskStatus.FAILED,
+        control_state=TaskStatus.FAILED.value,
+        output=None,
+        error=view.error,
+    )
 
 
 @dataclass(frozen=True)
@@ -523,7 +514,14 @@ def _load_task_info_snapshot(
             pending_question, pending_interactions = get_pending_interaction_question(
                 db, task
             )
-        view = status_only_terminal_view(db, int(task.id))
+        view: TerminalView | None = None
+        # The view re-checks both inside its own statement; this only skips
+        # the query for reads that cannot be terminal.
+        if (
+            task.status == TaskStatus.PAUSED
+            and task.control_state == TaskControlState.PAUSED.value
+        ):
+            view = status_only_terminal_view(db, int(task.id))
         if view is not None:
             increment_counter(
                 "xagent.v1.task.projected_failed", attributes={"state": view.state}
@@ -703,10 +701,13 @@ def _get_chat_task_sync(
     overlay: dict[str, Any] = {"pending_interaction": pending_interaction}
     if task.view is not None:
         effective = effective_task_snapshot(task)
-        for name in _OVERLAID_FIELDS:
-            value = getattr(effective, name)
-            overlay[name] = value.value if isinstance(value, TaskStatus) else value
-        overlay["completed_at"] = task.view.stopped_at
+        overlay.update(
+            status=effective.status.value,
+            control_state=effective.control_state,
+            output=effective.output,
+            error=effective.error,
+            completed_at=task.view.stopped_at,
+        )
     cache_key = task_snapshot_key(task_id)
     task_updated_at = cache_version_token(task.updated_at)
     cached = cache_get(cache_key)

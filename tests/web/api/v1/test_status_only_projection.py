@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import inspect
+import contextlib
 import json
 import pathlib
 from collections.abc import Iterator
+from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import MagicMock, Mock, patch
 
@@ -56,15 +57,17 @@ from xagent.web.services.hot_path_cache import (
     task_snapshot_key,
 )
 from xagent.web.services.task_auto_recovery import current_auto_recovery_view
-from xagent.web.services.task_auto_resume import run_auto_resume_tick
+from xagent.web.services.task_auto_resume import TerminalView, run_auto_resume_tick
 from xagent.web.services.task_lease_service import utc_now
 
 from ..conftest import (
     _admin_headers,
     _direct_db_session,
     _override_get_db,
+    client,
 )
 from .test_events_stream import (
+    _bearer,
     _create_agent_with_key,
     _create_task,
     _long_intervals,
@@ -77,7 +80,7 @@ factory = factory_fixture
 
 EXHAUSTED = (
     "Task failed after a system interruption; "
-    "automatic resume stopped after repeated attempts."
+    "automatic resume stopped after repeated attempts (reason: lease_expired)."
 )
 NEW_TURN = "Task failed: the new message could not be started."
 
@@ -331,14 +334,15 @@ def test_v1_routes_classified():
     assert len(DERIVE) + len(ALLOWLIST) + len(EXCLUDE) == len(
         DERIVE | ALLOWLIST | EXCLUDE
     )
-    # A route that reports task status must read it through the one loader.
-    assert "_load_task_info_snapshot" in inspect.getsource(v1_tasks._get_chat_task_sync)
-    assert "effective_task_snapshot" in inspect.getsource(
-        v1_tasks.stream_chat_task_events
-    )
-    assert "_load_task_info_snapshot" in inspect.getsource(
-        v1_tasks.stream_chat_task_events
-    )
+    # The routes that report a status read it through the one loader, and the
+    # stream overlays what it reads.
+    tasks_py = pathlib.Path(v1_tasks.__file__).resolve()
+    loaders = {name for path, name in _calls("_load_task_info_snapshot")}
+    assert {"_get_chat_task_sync", "stream_chat_task_events"} <= loaders
+    overlaid = {
+        name for path, name in _calls("effective_task_snapshot") if path == tasks_py
+    }
+    assert "stream_chat_task_events" in overlaid
 
 
 # --------------------------------------------------------------------------
@@ -354,7 +358,9 @@ def api_db(_test_db) -> Iterator[None]:
         es.reset_principal_stream_counts_for_testing()
 
 
-def _stop_in_db(task_id: int, *, state: str = "exhausted") -> None:
+def _stop_in_db(
+    task_id: int, *, state: str = "exhausted", detail: str | None = None
+) -> None:
     """PAUSE the task and record that automatic resume stopped for good."""
     _set_task_status(
         task_id, TaskStatus.PAUSED, output="partial", control_state="paused"
@@ -369,6 +375,7 @@ def _stop_in_db(task_id: int, *, state: str = "exhausted") -> None:
                 run_id=task.run_id,
                 reason="lease_expired",
                 state=state,
+                state_detail=detail,
                 paused_state_version=int(task.state_version),
                 interrupted_at=now,
                 episode_started_at=now,
@@ -410,14 +417,37 @@ async def _until_completed(response) -> list[tuple[str, dict[str, Any]]]:
             return seen
 
 
+_STOP = "Task failed after a system interruption; {} (reason: lease_expired)."
+# stop state, state detail -> the text the stream closes with
+_STOP_TEXTS = {
+    ("exhausted", None): _STOP.format(
+        "automatic resume stopped after repeated attempts"
+    ),
+    ("expired", None): _STOP.format(
+        "it was not resumed within the automatic-resume window"
+    ),
+    ("dispatch_failed", None): _STOP.format("automatic resume could not be started"),
+    ("ineligible", None): _STOP.format("it can no longer be resumed automatically"),
+    ("superseded", None): _STOP.format("it can no longer be resumed automatically"),
+    ("manual", None): _STOP.format("automatic resume will not continue it"),
+    ("manual", "auto_resume_disabled"): _STOP.format("automatic resume is disabled"),
+    ("manual", "new_turn"): NEW_TURN,
+}
+
+
+@pytest.mark.parametrize("row", sorted(_STOP_TEXTS, key=str))
 @pytest.mark.parametrize("path", ["attach_fast_path", "watchdog_after_stop"])
-async def test_stream_terminal_on_view(api_db, monkeypatch, path):
+async def test_stream_terminal_on_view(api_db, monkeypatch, path, row):
+    """The stream closes with the view's text, both when the task is stopped
+    at attach and when it stops while the stream is open, for every stop
+    state and ``manual`` detail."""
+    state, detail = row
     agent_id, full_key = _create_agent_with_key()
     task_id = _create_task(full_key, agent_id)
     principal = _principal_for(full_key)
     _fast_watchdog(monkeypatch)
     if path == "attach_fast_path":
-        _stop_in_db(task_id)
+        _stop_in_db(task_id, state=state, detail=detail)
     else:
         _set_task_status(
             task_id, TaskStatus.PAUSED, output="partial", control_state="paused"
@@ -430,7 +460,7 @@ async def test_stream_terminal_on_view(api_db, monkeypatch, path):
                 response.body_iterator.__anext__(), timeout=DB_PROGRESS_TIMEOUT
             )
             assert _frames(first) == [("task.status", {"status": "paused"})]
-            _stop_in_db(task_id)
+            _stop_in_db(task_id, state=state, detail=detail)
         seen = await _until_completed(response)
     finally:
         await response.body_iterator.aclose()
@@ -441,8 +471,163 @@ async def test_stream_terminal_on_view(api_db, monkeypatch, path):
         assert seen[0] == ("task.status", {"status": "failed"})
         assert ("task.status", {"status": "paused"}) not in seen
     completed = [data for event, data in seen if event == "task.completed"]
-    assert completed == [{"status": "failed", "output": None, "error": EXHAUSTED}]
+    assert completed == [
+        {"status": "failed", "output": None, "error": _STOP_TEXTS[row]}
+    ]
     assert es.count_task_sinks(task_id) == 0
+
+
+_SENTINEL_VIEW = TerminalView(
+    state="exhausted",
+    error="sentinel text",
+    stopped_at=datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc),
+    reason="llm_unavailable",
+)
+
+
+async def test_routes_read_through_the_view(api_db, monkeypatch):
+    """With the view replaced, the GET route and the events stream both
+    report what it returns."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    _set_task_status(
+        task_id, TaskStatus.PAUSED, output="partial", control_state="paused"
+    )
+    monkeypatch.setattr(
+        v1_tasks, "status_only_terminal_view", lambda _db, _task_id: _SENTINEL_VIEW
+    )
+
+    got = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert got.status_code == 200, got.text
+    assert (got.json()["status"], got.json()["error"]) == ("failed", "sentinel text")
+
+    response = await v1_tasks.stream_chat_task_events(task_id, principal)
+    try:
+        seen = await _until_completed(response)
+    finally:
+        await response.body_iterator.aclose()
+    assert [data for event, data in seen if event == "task.completed"] == [
+        {"status": "failed", "output": None, "error": "sentinel text"}
+    ]
+
+
+def _read_over_http(task_id: int, full_key: str) -> dict[str, Any]:
+    resp = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def _naive_utc(value: Any) -> datetime:
+    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(value)
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def test_get_route_serializes_the_overlay(api_db):
+    """The overlay survives ``response_model`` serialization field by field,
+    and the stored ``run_id`` and ``state_version`` stay."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    stored = _read_over_http(task_id, full_key)
+    _stop_in_db(task_id)
+
+    body = _read_over_http(task_id, full_key)
+
+    assert (body["status"], body["control_state"]) == ("failed", "failed")
+    assert body["output"] is None
+    assert body["error"] == EXHAUSTED
+    db = _direct_db_session()
+    try:
+        row = db.get(TaskAutoRecovery, task_id)
+        task = db.get(Task, task_id)
+        assert _naive_utc(body["completed_at"]) == _naive_utc(row.updated_at)
+        assert (body["run_id"], body["state_version"]) == (
+            task.run_id,
+            task.state_version,
+        )
+    finally:
+        db.close()
+    assert body["state_version"] == stored["state_version"]
+
+
+async def test_view_runs_only_for_a_paused_task(api_db, monkeypatch):
+    """Only a task loaded PAUSED with control state ``paused`` costs the view
+    statement; a COMPLETED task reads as stored."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    calls: list[int] = []
+    real = task_auto_resume._terminal_view_snapshot
+
+    def counting(db, tid):
+        calls.append(tid)
+        return real(db, tid)
+
+    monkeypatch.setattr(task_auto_resume, "_terminal_view_snapshot", counting)
+
+    observed: list[int] = []
+    for status, control, output in (
+        (TaskStatus.RUNNING, "running", None),
+        (TaskStatus.COMPLETED, "completed", "the answer"),
+        (TaskStatus.PAUSED, "resume_requested", None),
+        (TaskStatus.PAUSED, "paused", None),
+    ):
+        before = len(calls)
+        _set_task_status(task_id, status, output=output, control_state=control)
+        body = _read_over_http(task_id, full_key)
+        observed.append(len(calls) - before)
+        if status is TaskStatus.COMPLETED:
+            assert body["status"] == "completed"
+            assert body["output"] == "the answer"
+            db = _direct_db_session()
+            try:
+                assert _naive_utc(body["completed_at"]) == _naive_utc(
+                    db.get(Task, task_id).updated_at
+                )
+            finally:
+                db.close()
+    assert observed == [0, 0, 0, 1]
+
+
+@pytest.mark.parametrize("surface", ["get", "stream"])
+async def test_raising_view_reads_paused(api_db, monkeypatch, surface):
+    """A view whose statement fails reads as not terminal: the GET returns
+    the stored ``paused`` and the stream stays open without closing."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    _fast_watchdog(monkeypatch)
+    _stop_in_db(task_id)
+    reads: list[int] = []
+
+    def failing(_db, tid):
+        reads.append(tid)
+        raise RuntimeError("view statement failed")
+
+    monkeypatch.setattr(task_auto_resume, "_terminal_view_snapshot", failing)
+
+    if surface == "get":
+        assert _read_over_http(task_id, full_key)["status"] == "paused"
+        return
+    response = await v1_tasks.stream_chat_task_events(task_id, principal)
+    try:
+        first = await asyncio.wait_for(
+            response.body_iterator.__anext__(), timeout=DB_PROGRESS_TIMEOUT
+        )
+        assert _frames(first) == [("task.status", {"status": "paused"})]
+        pending = asyncio.ensure_future(response.body_iterator.__anext__())
+        deadline = asyncio.get_running_loop().time() + DB_PROGRESS_TIMEOUT
+        # The attach read plus several watchdog cycles, none of which closes it.
+        while len(reads) < 6 and asyncio.get_running_loop().time() < deadline:
+            done, _ = await asyncio.wait({pending}, timeout=0.05)
+            assert not done, "the stream sent a frame"
+        assert len(reads) >= 6
+        pending.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await pending
+    finally:
+        await response.body_iterator.aclose()
 
 
 # --------------------------------------------------------------------------

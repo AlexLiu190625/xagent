@@ -138,6 +138,7 @@ from xagent.web.services.task_auto_recovery import (
 from xagent.web.services.task_auto_resume import (
     TASK_AUTO_RESUME_EXHAUSTED_TRIGGER_ERROR,
     auto_resume_command_id,
+    status_only_terminal_view,
 )
 from xagent.web.services.task_execution import (
     _acquire_resume_task_lease,
@@ -1214,6 +1215,72 @@ def test_recording_failure_does_not_change_the_pause(
     assert left["status"] == TaskStatus.PAUSED
     assert left["trigger_run"][1] == TASK_INTERRUPTION_PAUSED_TRIGGER_ERROR
     assert _state(factory, unrecorded["task"])[1:] == (None, [])
+
+
+@PAUSE_CASES
+@pytest.mark.parametrize("failure", ["python", "database", "marker"])
+def test_status_only_recording_failure_reads_failed(
+    canonical, monkeypatch, path, reason, failure
+):
+    """When recording an SDK task's pause fails, a minimal ``manual`` row is
+    written in its place, so the task's ``/v1`` read reports ``failed``
+    instead of waiting on a run nothing will resume."""
+    monkeypatch.setenv(AUTO_RESUME_SWITCH, "true")
+    factory, _tid = canonical
+    ids = _projected_task(factory, source="sdk")
+    lease = _prepare_run(factory, ids)
+
+    with monkeypatch.context() as m:
+        _fail_recording(m, failure)
+        _settle_result(path, factory, ids, lease, RESULTS[reason])
+
+    task, row, _events = _state(factory, ids["task"])
+    assert (task.status, task.control_state) == (TaskStatus.PAUSED, "paused")
+    assert (row.reason, row.state, row.state_detail) == (reason, "manual", None)
+    assert (row.run_id, row.paused_state_version) == (task.run_id, task.state_version)
+    assert row.next_attempt_at is None
+    with factory() as db:
+        view = status_only_terminal_view(db, ids["task"])
+    assert view is not None
+    assert (view.state, view.error) == (
+        "manual",
+        "Task failed after a system interruption; "
+        f"automatic resume will not continue it (reason: {reason}).",
+    )
+
+
+@PAUSE_CASES
+def test_status_only_fallback_failure_settles_without_a_row(
+    canonical, monkeypatch, path, reason
+):
+    monkeypatch.setenv(AUTO_RESUME_SWITCH, "true")
+    factory, _tid = canonical
+    ids = _projected_task(factory, source="sdk")
+    lease = _prepare_run(factory, ids)
+    real = task_auto_recovery._record_status_only_fallback_no_commit
+
+    def fallback_with_a_broken_read(db, **kwargs):
+        def broken(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError("fallback row read failed")
+
+        db.get = broken  # type: ignore[method-assign]
+        try:
+            return real(db, **kwargs)
+        finally:
+            del db.get
+
+    with monkeypatch.context() as m:
+        _fail_recording(m, "python")
+        m.setattr(
+            task_auto_recovery,
+            "_record_status_only_fallback_no_commit",
+            fallback_with_a_broken_read,
+        )
+        _settle_result(path, factory, ids, lease, RESULTS[reason])
+
+    task, row, events = _state(factory, ids["task"])
+    assert (task.status, task.control_state) == (TaskStatus.PAUSED, "paused")
+    assert (row, events) == (None, [])
 
 
 @PAUSE_CASES

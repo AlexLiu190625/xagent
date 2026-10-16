@@ -49,48 +49,48 @@ from xagent.web.services.task_lease_service import utc_now
 engine = engine_fixture
 factory = factory_fixture
 
-# The client-visible texts, as the contract states them.
+# The client-visible texts, as the contract states them; a stop text ends with
+# the row's reason (see ``_text``).
 EXHAUSTED = (
     "Task failed after a system interruption; "
-    "automatic resume stopped after repeated attempts."
+    "automatic resume stopped after repeated attempts"
 )
 EXPIRED = (
     "Task failed after a system interruption; "
-    "it was not resumed within the automatic-resume window."
+    "it was not resumed within the automatic-resume window"
 )
 DISPATCH_FAILED = (
-    "Task failed after a system interruption; automatic resume could not be started."
+    "Task failed after a system interruption; automatic resume could not be started"
 )
 INELIGIBLE = (
-    "Task failed after a system interruption; "
-    "it can no longer be resumed automatically."
+    "Task failed after a system interruption; it can no longer be resumed automatically"
 )
-DISABLED = "Task failed after a system interruption; automatic resume is disabled."
+DISABLED = "Task failed after a system interruption; automatic resume is disabled"
 NEW_TURN = "Task failed: the new message could not be started."
 OTHER_MANUAL = (
-    "Task failed after a system interruption; automatic resume will not continue it."
+    "Task failed after a system interruption; automatic resume will not continue it"
 )
 
 STOPPED_AT = datetime(2026, 10, 1, 12, 0, 0, tzinfo=timezone.utc)
 LAST_COMMAND = auto_resume_command_id(PV, 1, RUN)
 
 
-def _text(state: str, detail: str | None) -> str:
+def _text(state: str, detail: str | None, reason: str) -> str:
     """The literal text table of the contract."""
-    if state == "exhausted":
-        return EXHAUSTED
-    if state == "expired":
-        return EXPIRED
-    if state == "dispatch_failed":
-        return DISPATCH_FAILED
-    if state in ("ineligible", "superseded"):
-        return INELIGIBLE
-    assert state == "manual"
-    if detail == "auto_resume_disabled":
-        return DISABLED
-    if detail == "new_turn":
+    if state == "manual" and detail == "new_turn":
         return NEW_TURN
-    return OTHER_MANUAL
+    if state == "exhausted":
+        body = EXHAUSTED
+    elif state == "expired":
+        body = EXPIRED
+    elif state == "dispatch_failed":
+        body = DISPATCH_FAILED
+    elif state in ("ineligible", "superseded"):
+        body = INELIGIBLE
+    else:
+        assert state == "manual"
+        body = DISABLED if detail == "auto_resume_disabled" else OTHER_MANUAL
+    return f"{body} (reason: {reason})."
 
 
 def _view(factory: sessionmaker, task_id: int):
@@ -127,6 +127,7 @@ def _expected(
     delta: int,
     last_command: bool,
     lost: bool = False,
+    rejected: str = "none",
     after: list[tuple[str, str, str]],
     queued: list[tuple[str, str]],
 ) -> str | None:
@@ -162,7 +163,9 @@ def _expected(
         for kind, status_ in queued
     ):
         return None
-    return _text(state, detail)
+    if rejected == "at_current":
+        return NEW_TURN
+    return _text(state, detail, reason)
 
 
 def _add_command(
@@ -173,6 +176,7 @@ def _add_command(
     status: str,
     command_id: str,
     target_run_id: str | None = RUN,
+    target_state_version: int | None = None,
 ) -> None:
     db.add(
         TaskExecutionCommand(
@@ -182,6 +186,7 @@ def _add_command(
             kind=kind,
             payload={},
             target_run_id=target_run_id,
+            target_state_version=target_state_version,
             status=status,
         )
     )
@@ -199,6 +204,7 @@ def _seed_cell(
     delta: int,
     last_command: bool,
     lost: bool = False,
+    rejected: str = "none",
     after: list[tuple[str, str, str]],
     queued: list[tuple[str, str]],
 ) -> int:
@@ -241,6 +247,26 @@ def _seed_cell(
                 kind=kind,
                 status=status,
                 command_id=f"queued-{index}-{uuid.uuid4().hex[:6]}",
+            )
+        if rejected != "none":
+            # A START the caller's append staged, rejected at the task's
+            # current version (``at_current``) or at an older one; or a
+            # failed RESUME at the current version (``resume_at_current``),
+            # which is not a rejected new message. Its id carries the
+            # sweeper's prefix so it is not a person's command.
+            resume = rejected == "resume_at_current"
+            _add_command(
+                db,
+                int(task.id),
+                kind="resume" if resume else "start",
+                status="failed",
+                command_id=(
+                    f"{'auto-resume:' if resume else ''}rejected-{uuid.uuid4().hex[:6]}"
+                ),
+                target_run_id="run-of-the-new-turn",
+                target_state_version=PV
+                + delta
+                - (0 if rejected in ("at_current", "resume_at_current") else 1),
             )
         if lost:
             # The dispatch command is gone while the row still names it.
@@ -349,6 +375,8 @@ def test_view_matrix(factory, state):
             return
         if (view.state, view.error) != (state, expected):
             mismatches.append(f"{label}: got {(view.state, view.error)}")
+        if view.reason != cell["reason"]:
+            mismatches.append(f"{label}: reason {view.reason}")
         if view.stopped_at != _stored_updated_at(factory, tid):
             mismatches.append(f"{label}: stopped_at {view.stopped_at}")
 
@@ -358,22 +386,30 @@ def test_view_matrix(factory, state):
                 (f, v, True) for f, v in _LOST_FENCES.items()
             ]
             for fence, (delta, last, after), lost in fences:
-                cell = dict(
-                    source="sdk",
-                    control="paused",
-                    detail=detail,
-                    reason=reason,
-                    delta=delta,
-                    last_command=last,
-                    lost=lost,
-                    after=after,
-                    queued=[],
-                )
-                check(
-                    f"{detail}/{reason}/{fence}",
-                    _expected(status="paused", state=state, **cell),
-                    **cell,
-                )
+                # A START rejected at the task's current version, or at an
+                # older one, changes the text of a terminal cell only.
+                for rejected in (
+                    ("none", "at_current", "at_older", "resume_at_current")
+                    if reason == "llm_unavailable"
+                    else ("none",)
+                ):
+                    cell = dict(
+                        source="sdk",
+                        control="paused",
+                        detail=detail,
+                        reason=reason,
+                        delta=delta,
+                        last_command=last,
+                        lost=lost,
+                        rejected=rejected,
+                        after=after,
+                        queued=[],
+                    )
+                    check(
+                        f"{detail}/{reason}/{fence}/{rejected}",
+                        _expected(status="paused", state=state, **cell),
+                        **cell,
+                    )
 
     for command, queued in _COMMANDS.items():
         for control in ("paused", "resume_requested"):
@@ -842,10 +878,15 @@ def test_every_exit_projects(factory, monkeypatch, exit_id):
     with factory() as db:
         row = db.get(TaskAutoRecovery, tid)
         assert row.state == state, (row.state, row.state_detail)
+        db.expunge(row)
     view = _view(factory, tid)
     if text is None:
         assert view is None
     else:
         assert view is not None
-        assert (view.state, view.error) == (state, text)
+        assert (view.state, view.error, view.reason) == (
+            state,
+            f"{text} (reason: {row.reason}).",
+            row.reason,
+        )
         assert view.stopped_at == _stored_updated_at(factory, tid)
