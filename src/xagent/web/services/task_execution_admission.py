@@ -633,23 +633,45 @@ def settle_cancelled_admissions(db: Session, command_id: int) -> None:
         )
 
 
-def settle_cap_held_commands_no_commit(db: Session, control_command_id: int) -> None:
-    """Fail the never-claimed commands a completed cancel passed while held.
+def cap_held_command_predicates(
+    task_id: int, control_db_id: int
+) -> tuple[ColumnElement[bool], ...]:
+    """Earlier commands of a task that a control may have passed while a
+    dispatch cap held them: pending, never claimed, opening an execution and
+    not waiting for an admission ticket (those stay with
+    ``settle_cancelled_admissions``)."""
+    from .task_dispatch_cap import EXECUTION_OPENING_KINDS
 
-    Runs in the control's terminal-write transaction, after
-    ``settle_cancelled_admissions``, and writes what that function writes:
-    the command row, the START follow-up and one terminal event per row. It
-    does not touch message delivery rows; a held message never ran, so it has
-    none of its own, and its terminal event tells the client. Rows matched:
-    same task, older than the control, still ``pending``, never claimed, a
-    kind in ``EXECUTION_OPENING_KINDS``, and recorded at a state version other
-    than the task's current one. Rows waiting for an admission ticket need no
-    exclusion: ``settle_cancelled_admissions`` has already failed every one
-    of them this would match. With the cap open such rows exist only when a
-    command inserted before the cancel committed after the cancel was
-    claimed. Only those committed before this UPDATE are failed; a later one
-    stays ``pending`` and is claimed after the cancel, where a start or a
-    reply is rejected by its state-version check and a message is not.
+    return (
+        TaskExecutionCommand.task_id == task_id,
+        TaskExecutionCommand.id < control_db_id,
+        TaskExecutionCommand.status == "pending",
+        TaskExecutionCommand.attempt_count == 0,
+        TaskExecutionCommand.kind.in_(sorted(EXECUTION_OPENING_KINDS)),
+        ~waiting_admission(TaskExecutionCommand.id),
+    )
+
+
+def settle_cap_held_commands_no_commit(db: Session, control_command_id: int) -> None:
+    """Fail the never-claimed commands a control passed while a cap held them.
+
+    Runs in the control's terminal-write transaction: after
+    ``settle_cancelled_admissions`` when the control completes, and when a
+    pause is rejected because nothing of its task runs. Writes what that
+    function writes: the command row, the START follow-up and one terminal
+    event per row. It does not touch message delivery rows; a held message
+    never ran, so it has none of its own, and its terminal event tells the
+    client. Rows matched: ``cap_held_command_predicates``, and for a cancel
+    only those recorded at a state version other than the task's current
+    one, because a cancel that stopped nothing leaves the version as it was.
+    A pause has no version condition: a pause that finds nothing running
+    leaves the version as it was and still stops what it passed. With the
+    cap open such rows exist only when a command inserted before the control
+    committed after the control was claimed. Only those committed before
+    this UPDATE are failed; a later one stays ``pending`` and is claimed
+    after the control, where a start or a reply is rejected by its
+    state-version check when the control moved the version, and a message
+    is not.
     """
     if not get_shared_task_execution_enabled():
         return
@@ -659,28 +681,24 @@ def settle_cap_held_commands_no_commit(db: Session, control_command_id: int) -> 
         TerminalTaskEventDraft,
         stage_terminal_event,
     )
-    from .task_dispatch_cap import EXECUTION_OPENING_KINDS
     from .task_start_consumer import settle_failed_start_no_commit
 
     control = db.get(TaskExecutionCommand, control_command_id)
-    # These selection rules are defined for a cancel only: the version
-    # condition below holds for a cancel, and a rejected cancel settles
-    # nothing. A kind added to CAP_OVERTAKING_CONTROL_KINDS needs its own rules.
-    if control is None or control.kind != "cancel":
+    # Each kind here has its own rule below; CAP_OVERTAKING_CONTROL_KINDS
+    # must not name a kind without one.
+    if control is None or control.kind not in ("cancel", "pause"):
         return
     task = db.get(Task, control.task_id, populate_existing=True)
     if task is None:
         return
+    predicates = list(cap_held_command_predicates(int(task.id), control_command_id))
+    if control.kind == "cancel":
+        predicates.append(
+            TaskExecutionCommand.target_state_version != task.state_version
+        )
     settled = db.scalars(
         update(TaskExecutionCommand)
-        .where(
-            TaskExecutionCommand.task_id == task.id,
-            TaskExecutionCommand.id < control_command_id,
-            TaskExecutionCommand.status == "pending",
-            TaskExecutionCommand.attempt_count == 0,
-            TaskExecutionCommand.kind.in_(sorted(EXECUTION_OPENING_KINDS)),
-            TaskExecutionCommand.target_state_version != task.state_version,
-        )
+        .where(*predicates)
         .values(
             status="failed",
             error=_CONTROL_STOPPED_COMMAND,
