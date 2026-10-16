@@ -3982,14 +3982,12 @@ describe("useWebSocket normalized connections", () => {
         ["a transport error", (socket: MockWebSocket) => socket.triggerError()],
         ["an abnormal closure", (socket: MockWebSocket) => socket.triggerClose(1006)],
         ["a handshake timeout", () => vi.advanceTimersByTime(10_000)],
-      ] as const)("gives a first connection lost to %s another try", (_name, fail) => {
+      ] as const)("retries a first connection lost to %s at once", (_name, fail) => {
         const hook = mountChat()
         act(() => {
           fail(socketAt(0))
         })
-        advance(60_000)
-        expect(MockWebSocket.instances).toHaveLength(1)
-        expect(hook.result.current.connectionPhase).toBe("lost")
+        expect(hook.result.current.connectionPhase).toBe("reconnecting")
 
         act(() => window.dispatchEvent(new Event("online")))
 
@@ -3997,24 +3995,17 @@ describe("useWebSocket normalized connections", () => {
         expect(hook.result.current.connectionPhase).toBe("reconnecting")
         act(() => socketAt(1).open())
         expect(hook.result.current.connectionPhase).toBe("connected")
-
-        // Once opened, the key gets the ordinary back-off.
-        act(() => socketAt(1).triggerClose(1006))
-        expectReconnectAfter(1_000)
       })
 
-      it("keeps a first connection lost again until the next event", () => {
-        const hook = mountChat()
+      it("continues a first connection's back-off after a failed early retry", () => {
+        mountChat()
         act(() => socketAt(0).triggerError())
 
         act(() => setVisibility("visible"))
-        act(() => socketAt(1).triggerError())
-        advance(60_000)
-
         expect(MockWebSocket.instances).toHaveLength(2)
-        expect(hook.result.current.connectionPhase).toBe("lost")
-        act(() => setVisibility("visible"))
-        expect(MockWebSocket.instances).toHaveLength(3)
+        act(() => socketAt(1).triggerError())
+
+        expectReconnectAfter(1_500)
       })
 
       it.each([
@@ -4023,6 +4014,7 @@ describe("useWebSocket normalized connections", () => {
       ] as const)("does not retry a first connection that %s", (_name, close) => {
         const hook = mountChat()
         act(() => close(socketAt(0)))
+        advance(RECONNECT_MAX_DELAY_MS * 2)
 
         act(() => setVisibility("visible"))
         act(() => window.dispatchEvent(new Event("online")))
@@ -4056,24 +4048,75 @@ describe("useWebSocket normalized connections", () => {
       })
     })
 
-    describe("first connection failures end in lost", () => {
+    describe("first connection failures", () => {
+      beforeEach(() => {
+        vi.spyOn(Math, "random").mockReturnValue(0.5)
+      })
+
       it.each([
         ["a transport error", (socket: MockWebSocket) => socket.triggerError()],
+        ["an abnormal closure", (socket: MockWebSocket) => socket.triggerClose(1006)],
+        ["a 1012 service restart", (socket: MockWebSocket) => socket.triggerClose(1012)],
         ["a handshake timeout", () => vi.advanceTimersByTime(10_000)],
-      ] as const)("does not retry a first connection that fails with %s", (_name, fail) => {
-        const hook = mountChat()
+      ] as const)("retries a first connection that fails with %s on the ordinary back-off", (_name, fail) => {
+        const onConnect = vi.fn()
+        const hook = mountChat({ onConnect })
         expect(hook.result.current.connectionPhase).toBe("connecting")
 
         act(() => {
           fail(socketAt(0))
         })
-        advance(60_000)
+
+        expect(hook.result.current.connectionPhase).toBe("reconnecting")
+        expectReconnectAfter(1_000)
+        act(() => socketAt(1).triggerError())
+        expectReconnectAfter(1_500)
+        act(() => socketAt(2).open())
+        expect(hook.result.current.connectionPhase).toBe("connected")
+        expect(onConnect).toHaveBeenCalledTimes(1)
+      })
+
+      it("connects a page loaded while the backend is down once it is back", () => {
+        const onConnect = vi.fn()
+        const hook = mountChat({ onConnect })
+
+        // Every upgrade fails for 130 s, starting with the first one.
+        const restartMs = 130_000
+        const downSince = Date.now()
+        act(() => socketAt(0).triggerError())
+        while (Date.now() - downSince < restartMs) {
+          const count = MockWebSocket.instances.length
+          advance(1_000)
+          if (MockWebSocket.instances.length > count) {
+            act(() => socketAt(count).triggerError())
+          }
+          expect(hook.result.current.connectionPhase).toBe("reconnecting")
+        }
+
+        const count = MockWebSocket.instances.length
+        const backSince = Date.now()
+        while (MockWebSocket.instances.length === count) advance(1_000)
+        expect(Date.now() - backSince).toBeLessThan(60_000)
+        act(() => socketAt(count).open())
+        expect(hook.result.current.connectionPhase).toBe("connected")
+        expect(onConnect).toHaveBeenCalledTimes(1)
+      })
+
+      it.each([
+        ["1000 normal closure", 1000, ""],
+        ["4003 access denied", 4003, "Access denied"],
+        ["1008 policy violation", 1008, ""],
+        ["an unknown application code", 4404, "Session not found"],
+      ] as const)("does not retry a first connection closed with %s", (_name, code, reason) => {
+        const hook = mountChat()
+        act(() => socketAt(0).triggerClose(code, reason))
+        advance(RECONNECT_MAX_DELAY_MS * 2)
 
         expect(MockWebSocket.instances).toHaveLength(1)
         expect(hook.result.current.connectionPhase).toBe("lost")
       })
 
-      it("does not carry the previous task's opened key to a newly selected task", () => {
+      it("starts a newly selected task's back-off from the first step", () => {
         const hook = mountChat()
         act(() => socketAt(0).open())
         act(() => socketAt(0).triggerClose(1006))
@@ -4082,10 +4125,8 @@ describe("useWebSocket normalized connections", () => {
         hook.rerender({ taskId: 8 })
         expect(MockWebSocket.instances).toHaveLength(2)
         act(() => socketAt(1).triggerError())
-        advance(60_000)
 
-        expect(MockWebSocket.instances).toHaveLength(2)
-        expect(hook.result.current.connectionPhase).toBe("lost")
+        expectReconnectAfter(1_000)
       })
 
       it("reconnects an opened connection that only reports a transport error", () => {
@@ -4175,17 +4216,17 @@ describe("useWebSocket normalized connections", () => {
         expect(deriveConnectionPhase({ ...base, ...facts })).toBe(expected)
       })
 
-      it("recomputes when a stale retry timer fires", () => {
+      it("drops a waiting retry when the caller connects again", () => {
         const hook = mountChat()
         act(() => socketAt(0).open())
         act(() => socketAt(0).triggerClose(1006))
         expect(hook.result.current.connectionPhase).toBe("reconnecting")
 
-        // A manual connect makes the waiting retry timer stale.
+        // A manual connect starts a new cycle; the old cycle's retry goes with it.
         act(() => hook.result.current.connect())
         expect(MockWebSocket.instances).toHaveLength(2)
         act(() => socketAt(1).triggerClose(1000))
-        expect(hook.result.current.connectionPhase).toBe("reconnecting")
+        expect(hook.result.current.connectionPhase).toBe("lost")
 
         advance(1_200)
 
@@ -4196,7 +4237,7 @@ describe("useWebSocket normalized connections", () => {
       it("reads connecting, not reconnecting, when the caller connects again after a failure", () => {
         const hook = mountChat()
         act(() => socketAt(0).triggerError())
-        expect(hook.result.current.connectionPhase).toBe("lost")
+        expect(hook.result.current.connectionPhase).toBe("reconnecting")
 
         // No disconnect() in between: the caller starts a new cycle directly.
         act(() => hook.result.current.connect())
@@ -4205,6 +4246,9 @@ describe("useWebSocket normalized connections", () => {
 
         act(() => socketAt(1).open())
         expect(hook.result.current.connectionPhase).toBe("connected")
+        // The retry the failure left waiting was dropped with the old cycle.
+        advance(RECONNECT_MAX_DELAY_MS)
+        expect(MockWebSocket.instances).toHaveLength(2)
       })
     })
 
@@ -4244,15 +4288,10 @@ describe("useWebSocket normalized connections", () => {
         authState.session = { ...authState.session, accessToken: "token-2", userId: "user-2" }
         hook.rerender({})
         expect(MockWebSocket.instances).toHaveLength(2)
+        // The old principal's key would wait 1.5 s; the new key starts over.
         act(() => socketAt(1).triggerError())
-        advance(60_000)
-        expect(MockWebSocket.instances).toHaveLength(2)
-        expect(hook.result.current.connectionPhase).toBe("lost")
-
-        act(() => hook.result.current.connect())
-        act(() => socketAt(2).open())
-        act(() => socketAt(2).triggerClose(1006))
         expectReconnectAfter(1_000)
+        expect(hook.result.current.connectionPhase).toBe("reconnecting")
       })
 
       it("shows connecting, not reconnecting, after a caller disconnect and connect", () => {
