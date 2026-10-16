@@ -105,11 +105,6 @@ export const deriveConnectionPhase = (facts: ConnectionPhaseFacts): ConnectionPh
 
 const MESSAGE_DUPLICATE_THRESHOLD = 2000 // Same message within 2 seconds is considered duplicate
 const HANDSHAKE_TIMEOUT_MS = 10_000
-// Longest span from the first lost connection to the last attempt giving up:
-// every delay at its jitter ceiling plus a full handshake wait per attempt.
-export const MAX_RECONNECT_CHAIN_MS =
-  RECONNECT_DELAYS_MS.reduce((sum, delay) => sum + delay, 0) * (1 + RECONNECT_JITTER)
-  + RECONNECT_DELAYS_MS.length * HANDSHAKE_TIMEOUT_MS
 const MAX_AUTH_REFRESH_RETRIES = 3
 const SESSION_BINDING_PROTOCOL = "xagent-session-binding-v1"
 const SESSION_TASK_PROTOCOL_PREFIX = "xagent-session-task."

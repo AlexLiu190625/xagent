@@ -168,7 +168,7 @@ import {
   useApp,
 } from "./app-context-chat"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
-import { MAX_RECONNECT_CHAIN_MS, MessageDeliveryError } from "@/hooks/use-websocket"
+import { MessageDeliveryError } from "@/hooks/use-websocket"
 import {
   RESEND_RECONNECT_DEADLINE_MS,
   ResendWaiters,
@@ -11325,13 +11325,13 @@ describe("resend after reconnect", () => {
     beforeEach(() => { vi.useFakeTimers() })
     afterEach(() => { vi.useRealTimers() })
 
-    it("ends at the deadline with the original error and leaves no timer", async () => {
+    it("ends at 90 seconds with the original error and leaves no timer", async () => {
       const lost = connectionLost("first")
       const send = vi.fn().mockRejectedValueOnce(lost)
       let outcome: unknown = "pending"
       void sendWithResend(send, new ResendWaiters(), () => true).then(() => { outcome = "ok" }, (error) => { outcome = error })
 
-      await vi.advanceTimersByTimeAsync(RESEND_RECONNECT_DEADLINE_MS - 1)
+      await vi.advanceTimersByTimeAsync(89_999)
       expect(outcome).toBe("pending")
       await vi.advanceTimersByTimeAsync(1)
 
@@ -11367,8 +11367,7 @@ describe("resend after reconnect", () => {
     expect(mayResend(first, now)).toBe(resends)
   })
 
-  it("keeps the resend window at 90 seconds and no shorter than the reconnect chain", () => {
+  it("keeps the resend window at a fixed 90 seconds", () => {
     expect(RESEND_RECONNECT_DEADLINE_MS).toBe(90_000)
-    expect(RESEND_RECONNECT_DEADLINE_MS).toBeGreaterThanOrEqual(MAX_RECONNECT_CHAIN_MS)
   })
 })

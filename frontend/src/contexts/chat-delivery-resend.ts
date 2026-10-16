@@ -1,9 +1,11 @@
-import { MAX_RECONNECT_CHAIN_MS, MessageDeliveryError } from "@/hooks/use-websocket"
+import { MessageDeliveryError } from "@/hooks/use-websocket"
 
-// How long a send that lost its connection waits for the next open: the hook's
-// reconnect chain plus slack for the open itself. The Session transport is
-// reconnected by its host page instead, so there it is only a fixed upper bound.
-export const RESEND_RECONNECT_DEADLINE_MS = MAX_RECONNECT_CHAIN_MS + 4_000
+// A fixed upper bound on how long a send that lost its connection waits for the
+// next open. The send button stays locked while the send waits, so the wait must
+// end even though reconnecting itself never gives up. A send that times out here
+// fails as it came; a manual retry reuses the same client_message_id, which the
+// server deduplicates.
+export const RESEND_RECONNECT_DEADLINE_MS = 90_000
 
 // Where a send was made from, captured with the first attempt.
 export interface ResendOwnership {
