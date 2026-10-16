@@ -174,7 +174,8 @@ def classify_command_no_commit(
 
     Classifier exceptions propagate to the acceptance transaction unchanged.
     A result of the wrong type, or an admission policy from a classifier that
-    declared ``admission_enabled=False``, is rejected before anything is staged.
+    declared ``admission_enabled=False``, is rejected before its admission
+    ticket is staged; the caller's rollback discards the flushed command row.
     """
     global _first_classification_logged
     result = _classifier(db, command)

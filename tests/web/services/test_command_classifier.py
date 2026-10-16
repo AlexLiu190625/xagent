@@ -146,14 +146,15 @@ def test_admission_refusals_still_propagate(host):
 
 
 @pytest.mark.parametrize(
-    "install",
+    "install, expected",
     [
-        pytest.param(lambda: None, id="unregistered"),
+        pytest.param(lambda: None, False, id="unregistered"),
         pytest.param(
             lambda: admission.set_command_classifier(
                 lambda db, command: admission.CommandClassification(),
                 admission_enabled=False,
             ),
+            False,
             id="declared-false",
         ),
         pytest.param(
@@ -161,10 +162,12 @@ def test_admission_refusals_still_propagate(host):
                 lambda db, command: admission.CommandClassification(),
                 admission_enabled=True,
             ),
+            True,
             id="declared-true",
         ),
         pytest.param(
             lambda: admission.set_task_admission_hook(lambda db, command: None),
+            True,
             id="legacy-hook",
         ),
         pytest.param(
@@ -172,21 +175,23 @@ def test_admission_refusals_still_propagate(host):
                 admission.set_task_admission_hook(lambda db, command: None),
                 admission.set_task_admission_hook(None),
             ),
+            False,
             id="legacy-hook-cleared",
         ),
     ],
 )
-def test_admission_enabled_reflects_declaration(host, monkeypatch, install, recwarn):
+def test_admission_enabled_reflects_declaration(
+    host, monkeypatch, install, expected, recwarn
+):
     install()
-    declared = admission._admission_declared
-    assert admission.admission_enabled() is declared
+    assert admission.admission_enabled() is expected
 
     # waiting_for_capacity: with every command treated as blocked, only a
     # declared admission host reports the wait.
     monkeypatch.setattr(admission, "admission_eligible", lambda: sa.false())
     command_id = host.enqueue().command_id
     with host.sessions() as db:
-        assert admission.waiting_for_capacity(db, command_id) is declared
+        assert admission.waiting_for_capacity(db, command_id) is expected
 
     # enqueue_resume_input acknowledges a queued reply under the same value.
     async def passthrough(call):
@@ -214,7 +219,7 @@ def test_admission_enabled_reflects_declaration(host, monkeypatch, install, recw
             reply, source="sdk", message_id="m"
         )
 
-    if declared:
+    if expected:
         assert asyncio.run(submit()).queued is True
     else:
         with pytest.raises(task_resume_command.TaskResumeOutcomeUnknownError):
