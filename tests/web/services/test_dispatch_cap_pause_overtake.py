@@ -101,15 +101,19 @@ def accept_start(host: CapHost, task_id: int) -> tuple[int, str, str]:
     )
 
 
-def assert_settled(host: CapHost, command_id: int) -> None:
-    assert state(host, command_id) == SETTLED
-    assert len(events_of(host, command_id)) == 1
+def assert_settled(host: CapHost, *command_ids: int) -> None:
+    for command_id in command_ids:
+        assert state(host, command_id) == SETTLED
+        assert len(events_of(host, command_id)) == 1
 
 
-def assert_pause_not_applicable(host: CapHost, pause_id: int, error: str) -> None:
+def assert_pause_not_applicable(
+    host: CapHost, pause_id: int, error: str, builds: int = 0
+) -> None:
     row = host.row(pause_id)
     assert (row.status, row.error, row.result) == ("failed", error, None)
     assert len(events_of(host, pause_id)) == 1
+    assert host.agent_builds.await_count == builds
 
 
 def assert_untouched(host: CapHost, command_id: int) -> None:
@@ -131,7 +135,6 @@ async def _new_task_start(host: CapHost) -> None:
     assert delivery_rows(host, task_id) == [(turn_id, "failed")]
     (event,) = events_of(host, start_id)
     assert event.include_command_identity is True
-    assert host.agent_builds.await_count == 0
 
 
 async def _appended_start(host: CapHost) -> None:
@@ -147,7 +150,6 @@ async def _appended_start(host: CapHost) -> None:
     assert_pause_not_applicable(host, pause_id, NO_EXECUTION)
     assert_settled(host, start_id)
     assert task_state(host, task_id) == (TaskStatus.COMPLETED, None, 4)
-    assert host.agent_builds.await_count == 0
 
 
 async def _paused_user_resume(host: CapHost) -> None:
@@ -160,7 +162,6 @@ async def _paused_user_resume(host: CapHost) -> None:
     assert_pause_not_applicable(host, pause_id, ALREADY_PAUSED)
     assert_settled(host, resume_id)
     assert task_state(host, task_id) == (TaskStatus.PAUSED, None, 3)
-    assert host.agent_builds.await_count == 0
 
 
 async def _waiting_reply(host: CapHost) -> None:
@@ -178,7 +179,6 @@ async def _waiting_reply(host: CapHost) -> None:
         "retry_with_new_id": True,
     }
     assert task_state(host, task_id) == (TaskStatus.WAITING_FOR_USER, None, 3)
-    assert host.agent_builds.await_count == 0
 
 
 async def _new_turn_message(host: CapHost) -> None:
@@ -195,7 +195,6 @@ async def _new_turn_message(host: CapHost) -> None:
     assert_settled(host, message_id)
     assert delivery_rows(host, task_id) == rows_before
     assert task_state(host, task_id) == (TaskStatus.PAUSED, None, 3)
-    assert host.agent_builds.await_count == 0
 
 
 async def _external_message(host: CapHost) -> None:
@@ -220,7 +219,6 @@ async def _external_message(host: CapHost) -> None:
     assert event.include_command_identity is False
     assert delivery_rows(host, task_id) == []
     assert task_state(host, task_id) == (TaskStatus.WAITING_FOR_USER, None, 5)
-    assert host.agent_builds.await_count == 0
 
 
 async def _two_held_rows(host: CapHost) -> None:
@@ -232,10 +230,8 @@ async def _two_held_rows(host: CapHost) -> None:
     assert await run() is True
 
     assert_pause_not_applicable(host, pause_id, NO_EXECUTION)
-    assert_settled(host, reply_id)
-    assert_settled(host, message_id)
+    assert_settled(host, reply_id, message_id)
     assert task_state(host, task_id) == (TaskStatus.WAITING_FOR_USER, None, 3)
-    assert host.agent_builds.await_count == 0
 
 
 async def _shared_channel_stop(host: CapHost) -> None:
@@ -248,10 +244,8 @@ async def _shared_channel_stop(host: CapHost) -> None:
     assert await run() is True
 
     assert_pause_not_applicable(host, pause_id, NO_EXECUTION)
-    assert_settled(host, start_id)
-    assert_settled(host, message_id)
+    assert_settled(host, start_id, message_id)
     assert task_state(host, task_id) == (TaskStatus.FAILED, STOPPED_BEFORE_START, 1)
-    assert host.agent_builds.await_count == 0
 
 
 async def _ticketed_start(host: CapHost) -> None:
@@ -263,9 +257,8 @@ async def _ticketed_start(host: CapHost) -> None:
 
     assert await run() is True
 
-    assert_pause_not_applicable(host, pause_id, NO_EXECUTION)
+    assert_pause_not_applicable(host, pause_id, NO_EXECUTION, builds=1)
     assert_untouched(host, start_id)
-    assert host.agent_builds.await_count == 1
 
 
 async def _ticketed_resume_beside_held_message(host: CapHost) -> None:
@@ -317,8 +310,7 @@ async def _running_row_nothing_live(host: CapHost) -> None:
 
     assert await run() is True
 
-    assert host.agent_builds.await_count == 1
-    assert_pause_not_applicable(host, pause_id, NO_EXECUTION)
+    assert_pause_not_applicable(host, pause_id, NO_EXECUTION, builds=1)
     assert_settled(host, message_id)
     assert task_state(host, task_id) == (TaskStatus.RUNNING, None, 3)
 
@@ -560,25 +552,23 @@ async def test_pause_precheck_leaves_other_cases_to_pause_task(
     reply.assert_not_awaited()
 
 
-def _selection_cases() -> dict[str, tuple[str, str, bool]]:
-    """Case -> (control kind, control status, whether the held row is settled)."""
-
-    return {
-        "pause_version_equal_row": ("pause", "completed", True),
-        "cancel_version_equal_row": ("cancel", "completed", False),
-        "pause_ticket_row": ("pause", "failed", False),
-        "pause_claimed_once": ("pause", "failed", False),
-        "pause_later_row": ("pause", "failed", False),
-        "pause_earlier_cancel_row": ("pause", "failed", False),
-        "pause_legacy": ("pause", "failed", False),
-    }
+# Case -> (control kind, control status, whether the held row is settled).
+SELECTION_CASES = {
+    "pause_version_equal_row": ("pause", "completed", True),
+    "cancel_version_equal_row": ("cancel", "completed", False),
+    "pause_ticket_row": ("pause", "failed", False),
+    "pause_claimed_once": ("pause", "failed", False),
+    "pause_later_row": ("pause", "failed", False),
+    "pause_earlier_cancel_row": ("pause", "failed", False),
+    "pause_legacy": ("pause", "failed", False),
+}
 
 
-@pytest.mark.parametrize("case", list(_selection_cases()))
+@pytest.mark.parametrize("case", list(SELECTION_CASES))
 async def test_settle_selection_by_control_kind(
     host: CapHost, monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
-    kind, control_status, settled = _selection_cases()[case]
+    kind, control_status, settled = SELECTION_CASES[case]
     if case == "pause_legacy":
         monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "false")
     task_id = host.new_task(status=TaskStatus.FAILED, state_version=1)
