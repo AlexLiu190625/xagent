@@ -117,7 +117,11 @@ class _Window:
 _window = _Window()
 
 
-def _resolve_role() -> str:
+def resolve_diagnostic_role() -> str:
+    """Return the configured execution role, or the unknown marker if it is invalid.
+
+    Never raises: diagnostic output must not fail its caller.
+    """
     from ...config import get_task_execution_role
 
     try:
@@ -147,7 +151,7 @@ def drain_execution_counters(now: float | None = None) -> ExecutionCounters:
     started, ok, failed, cancelled = background_task_manager.drain_window_counts()
     gate_held_s = min(background_task_manager.drain_gate_held_seconds(now), window_s)
     counters = ExecutionCounters(
-        role=_resolve_role(),
+        role=resolve_diagnostic_role(),
         pid=os.getpid(),
         window_s=window_s,
         inflight=inflight,

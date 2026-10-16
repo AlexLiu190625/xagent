@@ -297,6 +297,19 @@ def test_first_classification_logged_once(host, monkeypatch, caplog):
     assert "admission_enabled=False" in message
 
 
+def test_invalid_role_does_not_fail_acceptance(host, monkeypatch, caplog):
+    monkeypatch.setattr(admission, "_first_classification_logged", False)
+    monkeypatch.setenv("XAGENT_TASK_EXECUTION_ROLE", "scheduler")
+    admission.set_command_classifier(counting(), admission_enabled=False)
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=admission.logger.name):
+        host.enqueue()
+    assert host.commands() == 1
+    first = [r for r in caplog.records if "First classification" in r.getMessage()]
+    assert len(first) == 1
+    assert "role=unknown" in first[0].getMessage()
+
+
 def test_classifier_reset_fixture_isolates_tests_first():
     admission.set_command_classifier(counting(), admission_enabled=True)
     assert admission.admission_enabled() is True

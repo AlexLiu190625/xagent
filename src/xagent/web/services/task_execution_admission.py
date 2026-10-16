@@ -38,7 +38,7 @@ from sqlalchemy.orm import Session, aliased
 from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.sql.selectable import ScalarSelect
 
-from ...config import get_shared_task_execution_enabled, get_task_execution_role
+from ...config import get_shared_task_execution_enabled
 from ..models.task import Task, TaskStatus
 from ..models.task_admission import TaskAdmissionBucket, TaskAdmissionTicket
 from ..models.task_command import TaskExecutionCommand
@@ -177,6 +177,8 @@ def classify_command_no_commit(
     declared ``admission_enabled=False``, is rejected before its admission
     ticket is staged; the caller's rollback discards the flushed command row.
     """
+    from .process_diagnostics import resolve_diagnostic_role
+
     global _first_classification_logged
     result = _classifier(db, command)
     if not isinstance(result, CommandClassification):
@@ -191,7 +193,7 @@ def classify_command_no_commit(
         logger.info(
             "First classification: pid=%s role=%s classifier=%s admission_enabled=%s",
             os.getpid(),
-            get_task_execution_role(),
+            resolve_diagnostic_role(),
             _describe(_classifier),
             _admission_declared,
         )
