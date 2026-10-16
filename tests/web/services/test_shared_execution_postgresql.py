@@ -92,10 +92,10 @@ def _snap(row: TaskExecutionCommand) -> tuple[object, ...]:
 
 
 @pytest.mark.parametrize("case", ["claimed_once", "already_settled"])
-def test_cancel_settle_is_compare_and_set(monkeypatch, case):
+def test_cancel_settle_skips_claimed_or_settled_rows(monkeypatch, case):
     """The settlement writes a row only while it is still pending and never
-    claimed; a row another transaction changed, or an earlier cancel already
-    settled, is left exactly as it is."""
+    claimed; a row claimed once, or one an earlier cancel already settled, is
+    left exactly as it is."""
 
     monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
     with disposable_database_factory("cancel_settle") as make_database:

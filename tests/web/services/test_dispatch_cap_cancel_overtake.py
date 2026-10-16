@@ -317,7 +317,9 @@ async def test_cancel_overtake_matrix(
         assert layer2 is None
 
 
-@pytest.mark.parametrize("variant", ["overtakes", "claimed_between", "cap_reopened"])
+@pytest.mark.parametrize(
+    "variant", ["overtakes", "claimed_between", "cap_reopened", "task_became_active"]
+)
 async def test_claim_update_honours_cancel_overtake(
     host: CapHost, monkeypatch: pytest.MonkeyPatch, variant: str
 ) -> None:
@@ -334,6 +336,11 @@ async def test_claim_update_honours_cancel_overtake(
         finish.set()
         await host.held[-1]
         assert not host.manager.dispatch_cap_snapshot(1).closed
+    if variant == "task_became_active":
+        # Started outside the queue after the snapshot; the claim still
+        # decides by the snapshot it was given.
+        host.live(task_id)
+        assert task_id in host.manager.dispatch_cap_snapshot(1).active_ids
     if variant == "claimed_between":
         real_query = transport._claimable_query
 

@@ -836,9 +836,14 @@ def _unfinished_earlier_command(cap: DispatchCapSnapshot | None = None) -> Any:
     slot in this process: this process would not run it, so the control is
     applied first and its completion settles that command
     (``settle_cap_held_commands_no_commit``). Callers that claim must pass the
-    same snapshot to the candidate query and the claim UPDATE. Passing is safe
-    only because every shared-mode claim locks the task's owner lease first
-    (``claim_task_command``); the SQL alone does not keep two claimers apart.
+    same snapshot to the candidate query and the claim UPDATE. Neither this
+    SQL nor the owner lease keeps the passed command unclaimed while the
+    control is processing: the lease lock lasts only for the claim
+    transaction, and the lease owner is the process applying the control.
+    What does is that an owner applies one command of a task at a time
+    (``busy_command_tasks`` and ``_command_tasks`` in
+    ``dispatch_one_task_command``, ``_command_lock`` in ``execute_command``).
+    A claim path that bypasses the task coordinator must keep that rule.
     """
     from .task_execution_admission import waiting_admission
 

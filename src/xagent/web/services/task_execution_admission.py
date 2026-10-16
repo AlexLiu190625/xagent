@@ -57,6 +57,7 @@ logger = logging.getLogger(__name__)
 _EXECUTION_KINDS = frozenset({"start", "resume", "resume_input", "message"})
 _TERMINAL = ("completed", "failed")
 _STOPPED_BEFORE_START = "Task stopped before execution started."
+_CONTROL_STOPPED_COMMAND = "Task command stopped by a control request."
 
 
 @dataclass(frozen=True)
@@ -607,7 +608,7 @@ def settle_cancelled_admissions(db: Session, command_id: int) -> None:
         )
         .values(
             status="failed",
-            error="Task command stopped by a control request.",
+            error=_CONTROL_STOPPED_COMMAND,
             completed_at=func.now(),
             result={"rejection_reason": "cancelled_before_admission"},
         )
@@ -632,9 +633,6 @@ def settle_cancelled_admissions(db: Session, command_id: int) -> None:
         )
 
 
-_CONTROL_STOPPED_COMMAND = "Task command stopped by a control request."
-
-
 def settle_cap_held_commands_no_commit(db: Session, control_command_id: int) -> None:
     """Fail the never-claimed commands a completed cancel passed while held.
 
@@ -644,10 +642,14 @@ def settle_cap_held_commands_no_commit(db: Session, control_command_id: int) -> 
     does not touch message delivery rows; a held message never ran, so it has
     none of its own, and its terminal event tells the client. Rows matched:
     same task, older than the control, still ``pending``, never claimed, a
-    kind in ``EXECUTION_OPENING_KINDS``, not waiting for an admission ticket,
-    and recorded at a state version other than the task's current one. With
-    the cap open such rows exist only when a command inserted before the
-    cancel committed after the cancel was claimed; the cancel wins that race.
+    kind in ``EXECUTION_OPENING_KINDS``, and recorded at a state version other
+    than the task's current one. Rows waiting for an admission ticket need no
+    exclusion: ``settle_cancelled_admissions`` has already failed every one
+    of them this would match. With the cap open such rows exist only when a
+    command inserted before the cancel committed after the cancel was
+    claimed. Only those committed before this UPDATE are failed; a later one
+    stays ``pending`` and is claimed after the cancel, where a start or a
+    reply is rejected by its state-version check and a message is not.
     """
     if not get_shared_task_execution_enabled():
         return
@@ -677,7 +679,6 @@ def settle_cap_held_commands_no_commit(db: Session, control_command_id: int) -> 
             TaskExecutionCommand.status == "pending",
             TaskExecutionCommand.attempt_count == 0,
             TaskExecutionCommand.kind.in_(sorted(EXECUTION_OPENING_KINDS)),
-            ~waiting_admission(TaskExecutionCommand.id),
             TaskExecutionCommand.target_state_version != task.state_version,
         )
         .values(
