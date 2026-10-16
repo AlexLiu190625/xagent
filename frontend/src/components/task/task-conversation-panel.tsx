@@ -949,6 +949,7 @@ export function TaskConversationPanel({
                         failureTaskId={
                           failureReferenceItemIds.has(item.id) ? state.taskId : undefined
                         }
+                        connectionNotice={connectionNotice}
                       />
                     )
                   })}
@@ -975,6 +976,7 @@ export function TaskConversationPanel({
                           ? state.taskId
                           : undefined
                       }
+                      connectionNotice={connectionNotice}
                     />
                   )}
                 </>

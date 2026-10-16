@@ -2809,11 +2809,13 @@ export function AppProvider({
     }
   }, [dispatchSessionConversation, releaseStopControl, requireSessionReload, sessionConnectionIdentity])
 
-  // Tasks the socket has opened for since this provider mounted.
+  // Tasks a socket has opened for since this provider mounted, keyed by the
+  // opened socket's own task: during a task switch stateRef may already name
+  // the next task before the old socket is retired.
   const openedTaskIdsRef = useRef(new Set<typeof state.taskId>())
 
-  const onConnect = useCallback(() => {
-    openedTaskIdsRef.current.add(stateRef.current.taskId)
+  const onConnect = useCallback((openedTaskId: number | undefined) => {
+    openedTaskIdsRef.current.add(openedTaskId ?? null)
     if (sessionTransport?.history === "none") {
       const connectionIdentity = sessionConnectionIdentityRef.current
       if (connectionIdentity && connectionIdentity === sessionConnectionIdentity) {

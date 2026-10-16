@@ -755,13 +755,28 @@ describe("ChatMessage Session file capability", () => {
   it.each([
     ["reconnecting", "running", "clientErrors.connectionReconnecting", 3],
     ["reconnecting", "waiting_for_user", "common.waitingForUser", 0],
-    ["lost", "running", "clientErrors.connectionLost", 0],
+    ["reconnecting", "paused", "common.taskPaused", 0],
+    ["lost", "running", "clientErrors.connectionLostStatus", 0],
+    ["lost", "completed", "common.statusDone", 0],
   ] as const)("%s notice while %s shows its text", (notice, taskStatus, text, dots) => {
-    appContextMock.connectionNotice = notice
     const { container } = render(
-      <ChatMessage role="assistant" content={null} taskStatus={taskStatus} showProcessView={false} />,
+      <ChatMessage
+        role="assistant"
+        content={null}
+        taskStatus={taskStatus}
+        showProcessView={false}
+        connectionNotice={notice}
+      />,
     )
     expect(screen.getByText(text)).toBeInTheDocument()
     expect(container.querySelectorAll(".dot")).toHaveLength(dots)
+  })
+
+  it("ignores the app connection notice when the caller does not pass one", () => {
+    // The agent builder streams over its own socket while sharing AppProvider.
+    appContextMock.connectionNotice = "lost"
+    const { container } = render(<ChatMessage role="assistant" content="" />)
+    expect(screen.getByText("common.planning")).toBeInTheDocument()
+    expect(container.querySelectorAll(".dot")).toHaveLength(3)
   })
 })

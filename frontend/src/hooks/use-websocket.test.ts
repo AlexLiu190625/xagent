@@ -1401,6 +1401,16 @@ describe("useWebSocket normalized connections", () => {
     expect(onConnect).toHaveBeenCalledOnce()
   })
 
+  it("passes the opened socket's own task to onConnect", async () => {
+    const onConnect = vi.fn()
+    renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 7, onConnect }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    act(() => MockWebSocket.instances[0].open())
+    expect(onConnect).toHaveBeenCalledOnce()
+    expect(onConnect).toHaveBeenCalledWith(7)
+  })
+
   it("sanitizes a WebSocket constructor failure before logging or exposing it", async () => {
     const secret = "xagent-session-token.st_constructor_secret"
     MockWebSocket.constructorError = new Error(`constructor rejected ${secret}`)

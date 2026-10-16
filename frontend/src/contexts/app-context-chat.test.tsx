@@ -49,7 +49,7 @@ const webSocketOptions = vi.hoisted(() => ({
       error: Error
     }, connectionIdentity: string) => void
     onMessage?: (message: TestWebSocketMessage) => void
-    onConnect?: () => void
+    onConnect?: (openedTaskId?: number) => void
     uploadFiles?: unknown
     token?: string
   },
@@ -127,7 +127,7 @@ vi.mock("@/hooks/use-websocket", async (importOriginal) => ({
       error: Error
     }, connectionIdentity: string) => void
     onMessage?: (message: TestWebSocketMessage) => void
-    onConnect?: () => void
+    onConnect?: (openedTaskId?: number) => void
     uploadFiles?: unknown
     token?: string
   }) => {
@@ -2072,25 +2072,84 @@ describe("AppProvider websocket message routing", () => {
     expect(messages).toEqual([])
   })
 
-  it("shows the reconnecting notice for a task the socket opened earlier in this mount", () => {
+  describe("connection notice", () => {
     let setTask: ((id: number) => void) | undefined
     function NoticeProbe() {
       const { connectionNotice, setTaskId } = useApp()
       setTask = (id) => setTaskId(id, { navigate: false })
       return <span data-testid="notice">{connectionNotice ?? "none"}</span>
     }
-    render(
-      <AppProvider token="token">
-        <NoticeProbe />
-      </AppProvider>
-    )
-    for (const id of [1, 2]) {
-      act(() => setTask?.(id))
-      act(() => webSocketOptions.current?.onConnect?.())
-    }
-    wsHarness.connectionPhase = "reconnecting"
-    act(() => setTask?.(1))
-    expect(screen.getByTestId("notice").textContent).toBe("reconnecting")
+
+    it("shows the reconnecting notice only for a task the socket opened earlier in this mount", () => {
+      render(
+        <AppProvider token="token">
+          <NoticeProbe />
+        </AppProvider>
+      )
+      for (const id of [1, 2]) {
+        act(() => setTask?.(id))
+        act(() => webSocketOptions.current?.onConnect?.(id))
+      }
+      wsHarness.connectionPhase = "reconnecting"
+      act(() => setTask?.(1))
+      expect(screen.getByTestId("notice").textContent).toBe("reconnecting")
+      act(() => setTask?.(3))
+      expect(screen.getByTestId("notice").textContent).toBe("none")
+    })
+
+    it("credits an open that lands mid-switch to the socket's own task", () => {
+      const view = render(
+        <AppProvider token="token">
+          <NoticeProbe />
+        </AppProvider>
+      )
+      act(() => setTask?.(1))
+      // State already names task 2 when task 1's socket reports its open.
+      act(() => {
+        setTask?.(2)
+        webSocketOptions.current?.onConnect?.(1)
+      })
+      wsHarness.connectionPhase = "lost"
+      view.rerender(
+        <AppProvider token="token">
+          <NoticeProbe />
+        </AppProvider>
+      )
+      expect(screen.getByTestId("notice").textContent).toBe("none")
+      act(() => setTask?.(1))
+      expect(screen.getByTestId("notice").textContent).toBe("lost")
+    })
+
+    it("shows reconnecting on the Session transport after any open, even once a task is adopted", async () => {
+      const transport = makeSessionTransport()
+      wsHarness.isConnected = false
+      const view = render(
+        <AppProvider token="token" transport={transport}>
+          <NoticeProbe />
+          <StateProbe />
+        </AppProvider>
+      )
+      expect(screen.getByTestId("notice").textContent).toBe("none")
+
+      wsHarness.isConnected = true
+      act(() => webSocketOptions.current?.onConnect?.(undefined))
+      act(() => {
+        webSocketOptions.current?.onMessage?.(taskInfoMessage(1))
+      })
+      await waitFor(() => {
+        expect(screen.getByTestId("task-id").textContent).toBe("1")
+      })
+      expect(screen.getByTestId("notice").textContent).toBe("none")
+
+      wsHarness.isConnected = false
+      view.rerender(
+        <AppProvider token="token" transport={transport}>
+          <NoticeProbe />
+          <StateProbe />
+        </AppProvider>
+      )
+      expect(screen.getByTestId("notice").textContent).toBe("reconnecting")
+    })
   })
 
   it("does not retarget a different task's status when a failed-retry ack arrives after switching away", async () => {

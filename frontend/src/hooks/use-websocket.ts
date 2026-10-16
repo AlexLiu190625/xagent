@@ -269,7 +269,7 @@ interface WebSocketCallbacks {
     failure: WebSocketConnectionFailure,
     connectionIdentity: string,
   ) => void
-  onConnect?: () => void
+  onConnect?: (openedTaskId: number | undefined) => void
   onDisconnect?: () => void
   onError?: (error: Error) => void
   onMessage?: (message: WebSocketMessage) => void
@@ -361,7 +361,9 @@ export interface UseWebSocketOptions {
   ) => void
   autoConnect?: boolean
   onMessage?: (message: WebSocketMessage) => void
-  onConnect?: () => void
+  // Receives the task of the socket that opened, which can differ from the
+  // caller's current task while a task switch is still being rendered.
+  onConnect?: (openedTaskId: number | undefined) => void
   onDisconnect?: () => void
   onError?: (error: Error) => void
 }
@@ -1005,7 +1007,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         setIsConnected(true)
         setConnectionError(null)
         isConnectingRef.current = false
-        owner.callbacks.onConnect?.()
+        owner.callbacks.onConnect?.(owner.connection.taskId)
       })
 
       socket.onclose = withPhaseSync((event: CloseEvent) => {
