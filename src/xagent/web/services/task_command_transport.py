@@ -7,8 +7,8 @@ command into a larger transaction of its own. Every web worker runs the
 same dispatcher; a database claim chooses one consumer while per-task ordering
 keeps a later command behind an earlier unfinished one. Controls are the
 exception: a cancel or pause may pass a command that waits for an admission
-ticket, and a process at its dispatch cap lets a cancel pass a never-claimed
-command it holds for want of a slot (_unfinished_earlier_command).
+ticket, and a process at its dispatch cap lets a cancel or pause pass a
+never-claimed command it holds for want of a slot (_unfinished_earlier_command).
 """
 
 from __future__ import annotations
@@ -155,11 +155,23 @@ class TaskCommandDeferred(RuntimeError):
 
 
 class TaskCommandRejected(RuntimeError):
-    """The downstream handoff reached a durable failed state."""
+    """The downstream handoff reached a durable failed state.
 
-    def __init__(self, message: str, *, reason: str | None = None) -> None:
+    ``settle_cap_held`` asks the failing write to settle the commands this
+    control passed while a dispatch cap held them
+    (``settle_cap_held_commands_no_commit``); only a pause rejected because
+    nothing of its task runs sets it. Such a pause still ends ``failed``
+    although it stopped those commands; when the START it targets waits for
+    an admission ticket instead, ``settle_queued_start_for_pause`` fails that
+    START and completes the pause.
+    """
+
+    def __init__(
+        self, message: str, *, reason: str | None = None, settle_cap_held: bool = False
+    ) -> None:
         super().__init__(message)
         self.reason = reason
+        self.settle_cap_held = settle_cap_held
 
 
 @dataclass(frozen=True)
@@ -834,8 +846,11 @@ def _unfinished_earlier_command(cap: DispatchCapSnapshot | None = None) -> Any:
     ``CAP_OVERTAKING_CONTROL_KINDS`` may also pass an earlier pending command
     that would open an execution, was never claimed, and whose task holds no
     slot in this process: this process would not run it, so the control is
-    applied first and its completion settles that command
-    (``settle_cap_held_commands_no_commit``). Callers that claim must pass the
+    applied first and its completion, or a pause's rejection because nothing
+    of its task runs, settles that command
+    (``settle_cap_held_commands_no_commit``); a rejected cancel, or a pause
+    rejected for any other reason (for example access denied, ``stale_run``
+    or invalid data), settles nothing. Callers that claim must pass the
     same snapshot to the candidate query and the claim UPDATE. Neither this
     SQL nor the owner lease keeps the passed command unclaimed while the
     control is processing: the lease lock lasts only for the claim
@@ -1246,8 +1261,13 @@ def fail_task_command(
     expected_attempt_count: int | None = None,
     result: dict[str, Any] | None = None,
     terminal_event: TerminalTaskEventDraft | None = None,
+    settle_cap_held: bool = False,
 ) -> bool:
-    """Retry a failed claim, or make it terminal after bounded attempts."""
+    """Retry a failed claim, or make it terminal after bounded attempts.
+
+    ``settle_cap_held`` settles, in the same transaction as a terminal
+    failure, the commands the control passed while a dispatch cap held them.
+    """
 
     from ..models.database import get_session_local
 
@@ -1344,6 +1364,12 @@ def fail_task_command(
                     from .task_start_consumer import settle_failed_start_no_commit
 
                     settle_failed_start_no_commit(db, handoff)
+            if settle_cap_held:
+                from .task_execution_admission import (
+                    settle_cap_held_commands_no_commit,
+                )
+
+                settle_cap_held_commands_no_commit(db, command_db_id)
             stage_terminal_event(
                 db,
                 command_db_id=command_db_id,
@@ -1739,9 +1765,9 @@ def count_claimable_task_commands(db: Session, *, runner_id: str) -> int:
     The result is an upper bound on what a dispatcher in ``runner_id`` could
     claim now. Process-local state is not applied: the per-process dispatch
     cap (``DispatchCapSnapshot``), which while closed narrows the shared scan,
-    or within one task swaps a held command for a later cancel of that task
-    that this count does not include, and reserves a slot once a candidate
-    that opens an execution is picked; and the busy-task list.
+    or within one task swaps a held command for a later cancel or pause of
+    that task that this count does not include, and reserves a slot once a
+    candidate that opens an execution is picked; and the busy-task list.
     Neither are the checks made after a candidate is picked: whether the
     process consumes commands at all (``consumes_task_commands()``), task
     owner acquisition and lease checks, and the admission reservation that
@@ -1930,6 +1956,7 @@ async def _dispatch_task_command(
         rejection_result = (
             {"rejection_reason": exc.reason} if exc.reason is not None else None
         )
+        settle_cap_held = exc.settle_cap_held
 
         # An executor that bound its own presentation draft wins; the neutral
         # literal is only the fallback. The other two dispositions already
@@ -1950,6 +1977,7 @@ async def _dispatch_task_command(
                 expected_attempt_count=command.attempt_count,
                 result=rejection_result,
                 terminal_event=rejection_event,
+                settle_cap_held=settle_cap_held,
             )
 
         disposition_name = "fail_task_command"

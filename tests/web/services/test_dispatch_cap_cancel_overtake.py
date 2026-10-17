@@ -1,5 +1,7 @@
-"""A cancel claimed by a process at its dispatch cap passes the never-claimed
-commands that process holds for its task, and settles them when it completes."""
+"""A cancel or pause claimed by a process at its dispatch cap passes the
+never-claimed commands that process holds for its task. This module covers
+which commands either control may pass and how a completed cancel settles
+them, and holds the fixtures the pause settlement tests reuse."""
 
 from __future__ import annotations
 
@@ -12,7 +14,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
 import sqlalchemy as sa
@@ -35,6 +37,7 @@ from xagent.web.models.task_command_terminal_event import TaskCommandTerminalEve
 # not first load while a test has replaced it.
 from xagent.web.services import (  # noqa: F401
     a2a_task_cancel,
+    agent_service_manager,
     external_task_cancel,
     task_auto_resume,
     task_command_execution,
@@ -46,6 +49,7 @@ from xagent.web.services import (  # noqa: F401
     task_execution_admission,
     task_orchestrator,
     task_resume_command,
+    task_setup_snapshot,
 )
 from xagent.web.services.task_auto_resume import auto_resume_command_id
 from xagent.web.services.task_command_transport import TaskCommandKind
@@ -85,6 +89,27 @@ def host(
     )
     set_limit(monkeypatch, 1)
     return cap_host
+
+
+@pytest.fixture
+def pause_host(host: CapHost, monkeypatch: pytest.MonkeyPatch) -> CapHost:
+    """``host`` with what ``pause_task`` reaches for: the snapshot loader on the
+    test database, no execution scope, and an agent manager whose agent has
+    nothing to pause. ``agent_builds`` counts the agents it was asked to build."""
+
+    monkeypatch.setattr(task_setup_snapshot, "get_session_local", lambda: host.factory)
+    monkeypatch.setattr(
+        task_command_execution,
+        "resolve_execution_scope_off_turn",
+        lambda _task_id: None,
+    )
+    agent = MagicMock()
+    agent.pause_execution = AsyncMock(return_value=False)
+    manager = MagicMock()
+    manager.get_agent_for_task = AsyncMock(return_value=agent)
+    monkeypatch.setattr(agent_service_manager, "get_agent_manager", lambda: manager)
+    host.agent_builds = manager.get_agent_for_task  # type: ignore[attr-defined]
+    return host
 
 
 def make_agent(host: CapHost) -> int:
@@ -265,27 +290,33 @@ def _matrix_cases() -> list[Any]:
             ("cancel", "pause"), ("open", "closed_task_inactive")
         )
     ]
-    pause_between = pytest.param(
-        "start",
-        "cancel",
-        "closed_task_inactive",
-        "pause_between",
-        id="earlier-pause-blocks-cancel",
-    )
-    return [*held_first, *control_first, pause_between]
+    between = [
+        pytest.param(
+            "start",
+            control,
+            "closed_task_inactive",
+            order,
+            id=f"earlier-{other}-blocks-{control}",
+        )
+        for control, other, order in (
+            ("cancel", "pause", "pause_between"),
+            ("pause", "cancel", "cancel_between"),
+        )
+    ]
+    return [*held_first, *control_first, *between]
 
 
 @pytest.mark.parametrize("held_kind,control,cap_state,order", _matrix_cases())
-async def test_cancel_overtake_matrix(
+async def test_control_overtake_matrix(
     host: CapHost, held_kind: str, control: str, cap_state: str, order: str
 ) -> None:
     task_id = host.new_task(status=TaskStatus.PENDING)
     if order == "control_first":
         control_id = enqueue(host, task_id, control)
         held_id = enqueue(host, task_id, held_kind)
-    elif order == "pause_between":
+    elif order in ("pause_between", "cancel_between"):
         held_id = enqueue(host, task_id, held_kind)
-        enqueue(host, task_id, "pause")
+        first_id = enqueue(host, task_id, order.split("_")[0])
         control_id = enqueue(host, task_id, control)
     else:
         held_id = enqueue(host, task_id, held_kind)
@@ -302,16 +333,13 @@ async def test_cancel_overtake_matrix(
 
     control_candidate = (control_id, task_id, TaskCommandKind(control))
     held_candidate = (held_id, task_id, TaskCommandKind(held_kind))
-    if order == "control_first":
+    if order in ("pause_between", "cancel_between"):
+        # Only the earlier control is claimable; the later one waits behind it.
+        assert layer1 == (first_id, task_id, TaskCommandKind(order.split("_")[0]))
+        assert layer2 is None
+    elif order == "control_first" or cap_state == "closed_task_inactive":
         assert layer1 == control_candidate
         assert layer2 == control_candidate
-    elif order == "pause_between":
-        assert layer1 is None
-        assert layer2 is None
-    elif cap_state == "closed_task_inactive":
-        expected = control_candidate if control == "cancel" else None
-        assert layer1 == expected
-        assert layer2 == expected
     else:
         assert layer1 == held_candidate
         assert layer2 is None
@@ -415,24 +443,29 @@ def _claimed_rows() -> dict[str, dict[str, Any]]:
     }
 
 
+@pytest.mark.parametrize("control", ["cancel", "pause"])
 @pytest.mark.parametrize("name", list(_claimed_rows()))
-async def test_cancel_does_not_overtake_claimed_rows(host: CapHost, name: str) -> None:
+async def test_control_does_not_overtake_claimed_rows(
+    pause_host: CapHost, name: str, control: str
+) -> None:
+    host = pause_host
     fields = dict(_claimed_rows()[name])
     kind = fields.pop("kind")
     await hold_cap(host)
     task_id = host.new_task(status=TaskStatus.PENDING)
     held_id = enqueue(host, task_id, kind, **fields)
-    cancel_id = enqueue(host, task_id, "cancel")
+    control_id = enqueue(host, task_id, control)
     before = state(host, held_id)
     cap = host.manager.dispatch_cap_snapshot(1)
 
-    assert transport._find_command_candidate(cancel_id, (), cap) is None
-    assert await run(cancel_id) is False
+    assert transport._find_command_candidate(control_id, (), cap) is None
+    assert await run(control_id) is False
 
     assert host.claimed == []
+    assert host.agent_builds.await_count == 0
     assert state(host, held_id) == before
-    assert host.row(cancel_id).status == "pending"
-    assert host.row(cancel_id).attempt_count == 0
+    assert host.row(control_id).status == "pending"
+    assert host.row(control_id).attempt_count == 0
 
 
 async def _a2a_new_task_start(host: CapHost) -> None:
@@ -713,14 +746,12 @@ async def test_cancel_settles_overtaken_commands(
         assert records == []
 
 
-@pytest.mark.parametrize(
-    "case", ["legacy", "later_row", "pause_control", "earlier_pause_row"]
-)
+@pytest.mark.parametrize("case", ["legacy", "later_row", "earlier_pause_row"])
 async def test_completed_control_settles_nothing(
     host: CapHost, monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
-    """Settlement leaves a command alone unless a shared-mode cancel completed
-    after it was queued and the command is an execution-opening one."""
+    """Settlement leaves a command alone unless a shared-mode cancel or pause
+    completed after it was queued and the command is an execution-opening one."""
 
     if case == "legacy":
         monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "false")
@@ -729,9 +760,6 @@ async def test_completed_control_settles_nothing(
     if case == "later_row":
         control_id = enqueue(host, task_id, "cancel", **done)
         untouched_id = enqueue(host, task_id, "message")
-    elif case == "pause_control":
-        untouched_id = enqueue(host, task_id, "resume")
-        control_id = enqueue(host, task_id, "pause", **done)
     elif case == "earlier_pause_row":
         untouched_id = enqueue(host, task_id, "pause")
         control_id = enqueue(host, task_id, "cancel", **done)
@@ -797,7 +825,10 @@ async def test_ticketed_rows_keep_existing_settle_under_cancel(
 
 def test_cap_overtaking_kinds() -> None:
     overtaking = task_dispatch_cap.CAP_OVERTAKING_CONTROL_KINDS
-    assert overtaking == {"cancel"}
+    assert overtaking == {"cancel", "pause"}, (
+        "a control kind was added or removed: give it its own selection rule in "
+        "settle_cap_held_commands_no_commit"
+    )
     assert overtaking <= CONTROL_KINDS
     assert EXECUTION_OPENING_KINDS == {"start", "resume", "resume_input", "message"}, (
         "a kind that opens an execution was added: decide in "
