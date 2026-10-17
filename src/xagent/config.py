@@ -19,6 +19,7 @@ configuration management with validation, type safety, and better structure.
 
 from __future__ import annotations
 
+import base64
 import enum
 import json
 import logging
@@ -47,6 +48,7 @@ WORKER_COUNT = "XAGENT_WORKER_COUNT"
 CHANNEL_INGRESS_ENABLED = "XAGENT_CHANNEL_INGRESS_ENABLED"
 TASK_EVENT_CHANNEL_PREFIX = "XAGENT_TASK_EVENT_CHANNEL_PREFIX"
 ENCRYPTION_KEY = "ENCRYPTION_KEY"
+ENCRYPTION_MIGRATION_KEY = "XAGENT_ENCRYPTION_MIGRATION_KEY"
 # Public development fallback; runtime credential storage must reject it.
 DEV_FALLBACK_ENCRYPTION_KEY = "RQMpe38gK3m0szjpSmTNw_sP3Y54r6hDc6JewBoPKXc="
 INSECURE_SECRET_PLACEHOLDER = "your-secret-key-change-in-production"
@@ -2215,8 +2217,74 @@ def get_require_secure_secrets() -> bool:
     return _get_bool_env(REQUIRE_SECURE_SECRETS, False)
 
 
+TOOL_CREDENTIALS_ENCRYPTION_KEY = "XAGENT_SECRET_ENCRYPTION_KEY"
+LEGACY_TOOL_CREDENTIALS_KEY_ALIAS = "SECRET_KEY"
+TOOL_CREDENTIALS_MIGRATION_KEY = "XAGENT_TOOL_CREDENTIALS_MIGRATION_KEY"
+DEV_TOOL_CREDENTIALS_KEY = "xagent-dev-key"
+KNOWN_INSECURE_SECRETS = frozenset(
+    {
+        INSECURE_SECRET_PLACEHOLDER,
+        DEV_TOOL_CREDENTIALS_KEY,
+        "change-me",
+        "change-me-to-a-random-session-secret",
+        "replace-with-a-long-random-secret",
+        "secret",
+        "a-separate-private-32-or-more-character-tool-key",
+    }
+)
+
+
 def requires_secure_secrets() -> bool:
     return get_environment() != "development" or get_require_secure_secrets()
+
+
+def validate_tool_credentials_key(raw: str | None, *, setting: str) -> None:
+    if not raw or len(raw.strip()) < 32:
+        raise RuntimeError(f"{setting} must contain at least 32 secret characters")
+    if raw.strip().lower() in KNOWN_INSECURE_SECRETS:
+        raise RuntimeError(f"{setting} must not use a public placeholder")
+
+
+def get_tool_credentials_encryption_key() -> str:
+    """Keep the historical key derivation while refusing deployed defaults."""
+    setting = TOOL_CREDENTIALS_ENCRYPTION_KEY
+    raw = os.getenv(setting)
+    if not raw or not raw.strip():
+        setting = LEGACY_TOOL_CREDENTIALS_KEY_ALIAS
+        raw = os.getenv(setting)
+    if requires_secure_secrets():
+        if not raw or not raw.strip():
+            setting = TOOL_CREDENTIALS_ENCRYPTION_KEY
+        validate_tool_credentials_key(raw, setting=setting)
+    # Preserve historical derivation for explicitly configured keys, including
+    # surrounding whitespace; only blank values are ignored when selecting.
+    return raw if raw and raw.strip() else DEV_TOOL_CREDENTIALS_KEY
+
+
+def validate_private_encryption_key(key: str | None) -> None:
+    """Reject the public key by key material, not its Base64 spelling."""
+    from cryptography.fernet import Fernet
+
+    if not key:
+        raise RuntimeError("ENCRYPTION_KEY must provide a private Fernet key")
+    try:
+        Fernet(key.encode("ascii"))
+    except ValueError as exc:
+        raise RuntimeError("ENCRYPTION_KEY must provide a valid Fernet key") from exc
+    # Fernet accepts standard Base64, extra padding and embedded whitespace.
+    # All equivalent encodings of the published key are equally public.
+    if base64.urlsafe_b64decode(key) == base64.urlsafe_b64decode(
+        DEV_FALLBACK_ENCRYPTION_KEY
+    ):
+        raise RuntimeError("ENCRYPTION_KEY must provide a private Fernet key")
+
+
+def validate_encryption_config() -> None:
+    """Reject missing, public or malformed encryption keys before admission."""
+    if not requires_secure_secrets():
+        return
+    validate_private_encryption_key(os.getenv(ENCRYPTION_KEY))
+    get_tool_credentials_encryption_key()
 
 
 AUTH_RATE_LIMIT_WINDOW_SECONDS = "XAGENT_AUTH_RATE_LIMIT_WINDOW_SECONDS"

@@ -4057,6 +4057,58 @@ def test_blank_environment_override_falls_back_to_legacy_alias(monkeypatch):
     assert config.get_environment() == "production"
 
 
+@pytest.mark.parametrize("setting", ["XAGENT_SECRET_ENCRYPTION_KEY", "SECRET_KEY"])
+@pytest.mark.parametrize("length,valid", [(31, False), (32, True)])
+def test_tool_key_alias_and_boundary(monkeypatch, setting, length, valid):
+    monkeypatch.setenv("XAGENT_ENVIRONMENT", "production")
+    monkeypatch.setenv("XAGENT_SECRET_ENCRYPTION_KEY", "  ")
+    monkeypatch.delenv("SECRET_KEY", raising=False)
+    monkeypatch.setenv(setting, "s" * length)
+    if valid:
+        assert config.get_tool_credentials_encryption_key() == "s" * length
+    else:
+        with pytest.raises(RuntimeError, match=f"^{setting} must"):
+            config.get_tool_credentials_encryption_key()
+
+
+@pytest.mark.parametrize("setting", ["XAGENT_SECRET_ENCRYPTION_KEY", "SECRET_KEY"])
+@pytest.mark.parametrize(
+    "value",
+    sorted(value for value in config.KNOWN_INSECURE_SECRETS if len(value) >= 32),
+)
+def test_tool_key_rejects_known_public_values_including_alias(
+    monkeypatch, setting, value
+):
+    monkeypatch.setenv("XAGENT_ENVIRONMENT", "production")
+    monkeypatch.delenv("XAGENT_SECRET_ENCRYPTION_KEY", raising=False)
+    monkeypatch.delenv("SECRET_KEY", raising=False)
+    monkeypatch.setenv(setting, "  " + value.upper() + "  ")
+    with pytest.raises(
+        RuntimeError, match=f"^{setting} must not use a public placeholder"
+    ):
+        config.get_tool_credentials_encryption_key()
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        config.DEV_FALLBACK_ENCRYPTION_KEY,
+        config.DEV_FALLBACK_ENCRYPTION_KEY.replace("_", "/"),
+        config.DEV_FALLBACK_ENCRYPTION_KEY + "=",
+        config.DEV_FALLBACK_ENCRYPTION_KEY[:10]
+        + "\n"
+        + config.DEV_FALLBACK_ENCRYPTION_KEY[10:],
+    ],
+)
+def test_deployed_encryption_rejects_published_fernet_key(monkeypatch, key):
+    monkeypatch.setenv("XAGENT_ENVIRONMENT", "production")
+    monkeypatch.setenv("ENCRYPTION_KEY", key)
+    with pytest.raises(
+        RuntimeError, match="^ENCRYPTION_KEY must provide a private Fernet key$"
+    ):
+        config.validate_encryption_config()
+
+
 @pytest.mark.parametrize(
     "setting,getter,default",
     [

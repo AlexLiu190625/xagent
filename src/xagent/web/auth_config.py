@@ -4,6 +4,7 @@ from ..config import (
     INSECURE_SECRET_PLACEHOLDER,
     get_session_secret,
     requires_secure_secrets,
+    validate_encryption_config,
 )
 
 MIN_SECRET_LENGTH = 32
@@ -27,7 +28,7 @@ def _is_insecure_secret(value: str) -> bool:
 
 
 def validate_auth_config() -> None:
-    """Fail production startup when the JWT signing secret is not configured."""
+    """Validate deployed signing, session and encryption keys at startup."""
     requires_secure_secret = requires_secure_secrets()
     # Read the environment again here rather than trusting the import-time JWT
     # constant. Startup validation must catch a missing deployment setting even
@@ -43,6 +44,7 @@ def validate_auth_config() -> None:
             "XAGENT_SESSION_SECRET or XAGENT_JWT_SECRET must provide a unique "
             "session signing value"
         )
+    validate_encryption_config()
 
 
 def _get_positive_int_from_env(name: str, default: int) -> int:
