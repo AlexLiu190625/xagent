@@ -615,3 +615,26 @@ async def test_without_a_reserve_the_same_queue_is_claimed(
     assert await dispatch(host) is True
 
     assert host.claimed == [(batch_task, transport.TaskCommandKind.START)]
+
+
+# ---------------------------------------------------------------- documentation
+
+KEEP_AT_ZERO = (
+    "Keep this at 0. Between limit-R and limit the queue scan stops at the "
+    "oldest queued command it may not start, so commands queued after it wait "
+    "until fewer than limit-R tasks are active, except replies classified "
+    "interactive; this includes interactive starts and every cancel and pause. "
+    "A cancel or pause, even one dispatched by id, also waits behind an earlier "
+    "held batch command of its own task, so that task may start first and the "
+    "cancel or pause can then be rejected as stale."
+)
+
+
+def test_example_env_documents_the_reserve_and_the_known_stall() -> None:
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parents[3] / "example.env").read_text()
+    assert '# XAGENT_DISPATCHER_INTERACTIVE_RESERVE_PER_PROCESS="0"' in text
+    assert f"# {KEEP_AT_ZERO}\n" in text
+    assert "R (this value)" in text
+    assert "limit (XAGENT_DISPATCHER_MAX_INFLIGHT_PER_PROCESS)" in text
