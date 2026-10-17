@@ -64,6 +64,7 @@ const sendRawMessageMock = vi.hoisted(() => vi.fn())
 const wsHarness = vi.hoisted(() => ({
   isConnected: true,
   connectionPhase: "connected" as string,
+  loginIdentity: "auth:0" as string | null,
 }))
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const routerPushMock = vi.hoisted(() => vi.fn())
@@ -136,6 +137,7 @@ vi.mock("@/hooks/use-websocket", async (importOriginal) => ({
     return {
       isConnected: wsHarness.isConnected,
       connectionPhase: wsHarness.connectionPhase,
+      getLoginIdentity: () => wsHarness.loginIdentity,
       connectionError: null,
       sendMessage: sendRawMessageMock,
       sendChatMessage: sendChatMessageMock,
@@ -169,6 +171,13 @@ import {
 } from "./app-context-chat"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 import { MessageDeliveryError } from "@/hooks/use-websocket"
+import {
+  RESEND_RECONNECT_DEADLINE_MS,
+  ResendWaiters,
+  mayResend,
+  sendWithResend,
+  type ResendOwnership,
+} from "./chat-delivery-resend"
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer"
 import { TASK_ERROR_EVENT, type TaskErrorEventDetail } from "@/lib/task-error-events"
 import type { Translate } from "@/contexts/i18n-context"
@@ -11205,6 +11214,163 @@ describe("opens the first gate and the session check from one place each", () =>
 
   it("calls openSessionCheck only from the task page", () => {
     expect(callers(/\bopenSessionCheck\s*\(/g)).toEqual([{ file: "app/task/[id]/page-client.tsx", calls: 1 }])
+  })
+})
+
+describe("resend after reconnect", () => {
+  const ack = { client_message_id: "a", turn_id: "a" }
+  const connectionLost = (message: string) =>
+    new MessageDeliveryError(message, "outcome_unknown", { connectionLost: true })
+  const tree = (token = "token") => (
+    <AppProvider token={token}><SeedRunningTask /><SessionControlsProbe /></AppProvider>
+  )
+
+  beforeEach(() => {
+    sendChatMessageMock.mockReset()
+    sendChatMessageMock.mockResolvedValue(ack)
+    wsHarness.isConnected = true
+    wsHarness.connectionPhase = "connected"
+    wsHarness.loginIdentity = "auth:0"
+  })
+  afterEach(() => cleanup())
+
+  type Scene = { rerender: (ui: React.ReactElement) => void; unmount: () => void }
+  const sameLogin = ({ rerender }: Scene) => rerender(tree("token-2"))
+  const login = (identity: string | null) => () => { wsHarness.loginIdentity = identity }
+  const notSent = new MessageDeliveryError("not sent", "not_sent")
+  // [name, ids, rejections in call order (default: every first call is lost), change, wakes by reconnecting, ids sent, first call's rejection settles it]
+  it.each<[string, string[], Error[] | undefined, (scene: Scene) => void, boolean, string[], number | "ok"]>([
+    ["nothing changed, three messages", ["a", "b", "c"], undefined, () => {}, true, ["a", "b", "c", "a", "b", "c"], "ok"],
+    ["a token refresh of the same login", ["a"], undefined, sameLogin, true, ["a", "a"], "ok"],
+    ["a switch to another task", ["a"], undefined, () => act(() => getSessionControls().setTaskId(2, { navigate: false })), true, ["a"], 0],
+    ["another account", ["a"], undefined, login("auth:1"), true, ["a"], 0],
+    ["another guest token", ["a"], undefined, login("external:1"), true, ["a"], 0],
+    ["a login that cannot be read", ["a"], undefined, login(null), true, ["a"], 0],
+    ["a first failure that was not sent", ["a"], [notSent], () => {}, true, ["a"], 0],
+    ["two lost connections", ["a"], [connectionLost("first"), connectionLost("again")], () => {}, true, ["a", "a"], 1],
+    ["the phase turning lost", ["a"], undefined, ({ rerender }) => { wsHarness.connectionPhase = "lost"; rerender(tree()) }, false, ["a"], 0],
+    ["a switch to a view with no task", ["a"], undefined, ({ rerender }) => {
+      act(() => getSessionControls().setTaskId(null, { navigate: false }))
+      wsHarness.connectionPhase = "idle"
+      rerender(tree())
+    }, false, ["a"], 0],
+    ["an unmount", ["a"], undefined, ({ unmount }) => unmount(), false, ["a"], 0],
+    ["a phase that was already lost", ["a"], undefined, () => {}, false, ["a"], 0],
+  ])("resends after %s", async (_name, ids, rejections, change, reconnects, expectedIds, settlesWith) => {
+    const failures = rejections ?? ids.map(() => connectionLost("first"))
+    if (_name === "a phase that was already lost") wsHarness.connectionPhase = "lost"
+    failures.forEach(error => sendChatMessageMock.mockRejectedValueOnce(error))
+    const { rerender, unmount } = render(tree())
+    await act(async () => {})
+    const results = ids.map(id => getSessionControls()
+      .sendMessage(`m-${id}`, { clientMessageId: id }).then(() => "ok", (error: Error) => error))
+    await act(async () => {})
+
+    change({ rerender, unmount })
+    if (reconnects) act(() => webSocketOptions.current?.onConnect?.())
+    let settled: unknown[] = []
+    await act(async () => { settled = await Promise.all(results) })
+
+    expect(sendChatMessageMock.mock.calls.map(call => call[3])).toEqual(expectedIds)
+    expect(settled[0]).toBe(settlesWith === "ok" ? "ok" : failures[settlesWith])
+  })
+
+  it.each(["lost", "idle"] as const)("resends a Session send once on the new connection although its phase reads %s", async (phase) => {
+    wsHarness.connectionPhase = phase
+    sendChatMessageMock.mockRejectedValueOnce(connectionLost("first"))
+    const sessionTree = (identity: string) => (
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(identity))}>
+        <SessionControlsProbe /><StateProbe />
+      </AppProvider>
+    )
+    const { rerender } = render(sessionTree("session-one"))
+    const outcome = getSessionControls().sendMessage("Resent turn", { clientMessageId: "s-1" }).then(() => "ok", (error: Error) => error)
+    await act(async () => {})
+
+    rerender(sessionTree("session-two"))
+    act(() => webSocketOptions.current?.onConnect?.())
+    await act(async () => { expect(await outcome).toBe("ok") })
+
+    expect(sendChatMessageMock.mock.calls.map(call => call[3])).toEqual(["s-1", "s-1"])
+    // The bubble guard compares against the connection of the resend.
+    expect(screen.getByTestId("messages").textContent).toContain("Resent turn")
+  })
+
+  it("resends a queued first message once on the next connection", async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ task_id: 7, title: "queued", description: "queued", status: "pending" }),
+    })
+    sendChatMessageMock.mockRejectedValueOnce(connectionLost("first"))
+    // The new task's socket has not connected yet, so the message is queued.
+    wsHarness.isConnected = false
+    render(<AppProvider token="token"><SessionControlsProbe /></AppProvider>)
+    let delivery: Promise<unknown> | undefined
+    await act(async () => {
+      delivery = getSessionControls().sendMessage("queued", { clientMessageId: "q-1" })
+        .then(() => "ok", (error: Error) => error)
+      await new Promise(resolve => setTimeout(resolve, 0))
+    })
+
+    await act(async () => {
+      wsHarness.isConnected = true
+      webSocketOptions.current?.onConnect?.()
+      await new Promise(resolve => setTimeout(resolve, 0))
+    })
+    act(() => webSocketOptions.current?.onConnect?.())
+    await act(async () => { expect(await delivery).toBe("ok") })
+
+    expect(sendChatMessageMock.mock.calls.map(call => call[3])).toEqual(["q-1", "q-1"])
+  })
+
+  describe("a wait with no reconnect", () => {
+    beforeEach(() => { vi.useFakeTimers() })
+    afterEach(() => { vi.useRealTimers() })
+
+    it("ends at 90 seconds with the original error and leaves no timer", async () => {
+      const lost = connectionLost("first")
+      const send = vi.fn().mockRejectedValueOnce(lost)
+      let outcome: unknown = "pending"
+      void sendWithResend(send, new ResendWaiters(), () => true).then(() => { outcome = "ok" }, (error) => { outcome = error })
+
+      await vi.advanceTimersByTimeAsync(89_999)
+      expect(outcome).toBe("pending")
+      await vi.advanceTimersByTimeAsync(1)
+
+      expect(outcome).toBe(lost)
+      expect(send).toHaveBeenCalledOnce()
+      expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it("clears its deadline timer when the next open ends it", async () => {
+      const waiters = new ResendWaiters()
+      const send = vi.fn().mockRejectedValueOnce(connectionLost("first")).mockResolvedValueOnce("ok")
+      const outcome = sendWithResend(send, waiters, () => true)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(vi.getTimerCount()).toBe(1)
+
+      waiters.release(true)
+
+      expect(await outcome).toBe("ok")
+      expect(vi.getTimerCount()).toBe(0)
+    })
+  })
+
+  const bound = (taskId: number | null, deliveryGeneration = 0, phase = "bound"): ResendOwnership =>
+    ({ loginIdentity: "widget-session:0", boundTaskId: taskId, session: { deliveryGeneration, phase } })
+  it.each<[string, ResendOwnership, ResendOwnership, boolean]>([
+    ["nothing changed", bound(5), bound(5), true],
+    ["another delivery generation", bound(5), bound(5, 1), false],
+    ["a replacement conversation under way", bound(5), bound(5, 0, "replacement_sending"), false],
+    ["a task bound where there was none", bound(null, 0, "unbound"), bound(5), true],
+    ["another bound task", bound(5), bound(6), false],
+    ["a login that was never readable", { ...bound(5), loginIdentity: null }, { ...bound(5), loginIdentity: null }, false],
+  ])("a Session send after %s", (_name, first, now, resends) => {
+    expect(mayResend(first, now)).toBe(resends)
+  })
+
+  it("keeps the resend window at a fixed 90 seconds", () => {
+    expect(RESEND_RECONNECT_DEADLINE_MS).toBe(90_000)
   })
 })
 

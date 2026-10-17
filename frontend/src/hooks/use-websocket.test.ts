@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs"
 import { resolve } from "node:path"
-import { useLayoutEffect } from "react"
+import { StrictMode, useLayoutEffect } from "react"
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
@@ -815,6 +815,7 @@ describe("useWebSocket message delivery", () => {
       message: "Connection closed before the message was accepted.",
       disposition: "outcome_unknown",
       errorCode: "message_outcome_unknown",
+      connectionLost: true,
     })
   })
 
@@ -840,6 +841,7 @@ describe("useWebSocket message delivery", () => {
           : "Connection lost before the message was accepted.",
         disposition: "outcome_unknown",
         errorCode: "message_outcome_unknown",
+        connectionLost: !frameAfterSend,
       })
       if (frameAfterSend) act(() => socket.receive({ type: "heartbeat" }))
       await act(async () => {
@@ -3067,7 +3069,10 @@ describe("useWebSocket normalized connections", () => {
       false,
       "shared-id",
     )
-    const oldRejection = expect(oldDelivery).rejects.toThrow("replaced")
+    const oldRejection = expect(oldDelivery).rejects.toMatchObject({
+      message: expect.stringContaining("replaced"),
+      connectionLost: true,
+    })
 
     rerender({ connection: sessionConnection({ identity: "widget-session:2" }) })
     await oldRejection
@@ -3119,7 +3124,10 @@ describe("useWebSocket normalized connections", () => {
     socket.protocol = "xagent-session-v1"
     act(() => socket.open())
     const oldDelivery = result.current.sendChatMessage("same text")
-    const oldRejection = expect(oldDelivery).rejects.toThrow("generation")
+    const oldRejection = expect(oldDelivery).rejects.toMatchObject({
+      message: expect.stringContaining("generation"),
+      connectionLost: false,
+    })
 
     rerender({ deliveryGeneration: 1 })
     await oldRejection
@@ -3656,6 +3664,182 @@ describe("useWebSocket normalized connections", () => {
 
     expect(oldSocket.send).not.toHaveBeenCalled()
     await rejection
+  })
+
+  describe("resending after a lost connection", () => {
+    const mountOpen = () => {
+      const hook = renderHook(
+        ({ taskId }) => useWebSocket({ url: "ws://localhost", taskId }),
+        { initialProps: { taskId: 1 } },
+      )
+      act(() => MockWebSocket.instances[0].open())
+      return hook
+    }
+
+    it.each([
+      ["a transport error", true, () => MockWebSocket.instances[0].triggerError()],
+      ["a caller disconnect", false, (hook: ReturnType<typeof mountOpen>) => hook.result.current.disconnect()],
+      ["an unmount", false, (hook: ReturnType<typeof mountOpen>) => hook.unmount()],
+    ] as const)("marks a pending delivery ended by %s as connectionLost=%s", async (_name, connectionLost, end) => {
+      vi.spyOn(console, "error").mockImplementation(() => {})
+      const hook = mountOpen()
+      const outcome = expect(hook.result.current.sendChatMessage("hi")).rejects.toMatchObject({ connectionLost })
+
+      act(() => end(hook))
+
+      await outcome
+    })
+
+    it("replacing a closing owner rejects its pending delivery as connectionLost", async () => {
+      const hook = mountOpen()
+      const outcome = expect(hook.result.current.sendChatMessage("hi")).rejects.toMatchObject({ connectionLost: true })
+      // Closed from outside without an onclose event.
+      MockWebSocket.instances[0].readyState = MockWebSocket.CLOSED
+
+      act(() => hook.result.current.connect())
+
+      await outcome
+    })
+
+    it.each([
+      ["reuses the upload for the same task", 1, "t1", 1],
+      ["uploads again for another task", 2, "t1", 2],
+      ["uploads again for another login", 1, "t2", 2],
+    ] as const)("a same-id retry %s", async (_name, retryTaskId, retryToken, uploads) => {
+      const uploadFiles = vi.fn(async () => [{ file_id: "f1" }])
+      const files = [new File(["a"], "a.txt")]
+      const hook = renderHook(
+        ({ taskId, token }) => useWebSocket({ url: "ws://localhost", taskId, token, uploadFiles }),
+        { initialProps: { taskId: 1, token: "t1" } },
+      )
+      const [first] = MockWebSocket.instances
+      act(() => first.open())
+      const lost = hook.result.current.sendChatMessage("hi", files, false, "retry-id").catch(() => undefined)
+      await waitFor(() => expect(first.send).toHaveBeenCalledOnce())
+      // A clean close schedules no automatic reconnect, so only the explicit
+      // connect or descriptor change below creates the second socket.
+      act(() => first.triggerClose(1000))
+      await lost
+
+      if (retryTaskId === 1 && retryToken === "t1") act(() => hook.result.current.connect())
+      else hook.rerender({ taskId: retryTaskId, token: retryToken })
+      const second = MockWebSocket.instances[1]
+      act(() => second.open())
+      void hook.result.current.sendChatMessage("hi", files, false, "retry-id").catch(() => undefined)
+      await waitFor(() => expect(second.send).toHaveBeenCalledOnce())
+
+      expect(uploadFiles).toHaveBeenCalledTimes(uploads)
+      expect(second.send.mock.calls[0][0]).toBe(first.send.mock.calls[0][0].replace('"task_id":1', `"task_id":${retryTaskId}`))
+    })
+
+    it("keeps an earlier unknown-outcome attempt's upload when a later same-id attempt is not sent", async () => {
+      let uploadCount = 0
+      const uploadFiles = vi.fn(async () => [{ file_id: `f${++uploadCount}` }])
+      const files = [new File(["a"], "a.txt")]
+      const hook = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1, token: "t1", uploadFiles }))
+      const [first] = MockWebSocket.instances
+      act(() => first.open())
+      const lost = hook.result.current.sendChatMessage("hi", files, false, "retry-id").catch(() => undefined)
+      await waitFor(() => expect(first.send).toHaveBeenCalledOnce())
+      act(() => first.triggerClose(1000))
+      await lost
+      act(() => hook.result.current.connect())
+      const second = MockWebSocket.instances[1]
+      act(() => second.open())
+
+      second.send.mockImplementationOnce(() => { throw new Error("send failed") })
+      await expect(hook.result.current.sendChatMessage("hi", files, false, "retry-id"))
+        .rejects.toMatchObject({ disposition: "not_sent" })
+      void hook.result.current.sendChatMessage("hi", files, false, "retry-id").catch(() => undefined)
+      await waitFor(() => expect(second.send).toHaveBeenCalledTimes(2))
+
+      expect(uploadFiles).toHaveBeenCalledOnce()
+      expect(second.send.mock.calls[1][0]).toBe(first.send.mock.calls[0][0])
+    })
+
+    it("keeps an earlier unknown-outcome attempt's upload when a later same-id attempt fails while preparing", async () => {
+      let uploadCount = 0
+      const uploadFiles = vi.fn(async () => [{ file_id: `f${++uploadCount}` }])
+      const files = [new File(["a"], "a.txt")]
+      const hook = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1, token: "t1", uploadFiles }))
+      const [first] = MockWebSocket.instances
+      act(() => first.open())
+      const lost = hook.result.current.sendChatMessage("hi", files, false, "retry-id").catch(() => undefined)
+      await waitFor(() => expect(first.send).toHaveBeenCalledOnce())
+      act(() => first.triggerClose(1000))
+      await lost
+      act(() => hook.result.current.connect())
+      const second = MockWebSocket.instances[1]
+      act(() => second.open())
+
+      // The cached upload holds one file id for two files, so preparation fails.
+      const twoFiles = [new File(["a"], "a.txt"), new File(["b"], "b.txt")]
+      await expect(hook.result.current.sendChatMessage("hi", twoFiles, false, "retry-id"))
+        .rejects.toMatchObject({ disposition: "not_sent" })
+      void hook.result.current.sendChatMessage("hi", files, false, "retry-id").catch(() => undefined)
+      await waitFor(() => expect(second.send).toHaveBeenCalledOnce())
+
+      expect(uploadFiles).toHaveBeenCalledOnce()
+      expect(second.send.mock.calls[0][0]).toBe(first.send.mock.calls[0][0])
+    })
+
+    it.each([
+      ["an acceptance", true, { type: "message_accepted" }],
+      ["a rejection that was not accepted", true, { type: "message_rejected", rejection_outcome: "not_accepted" }],
+      ["a rejection with an unknown outcome", false, { type: "message_rejected" }],
+    ] as const)("a same-id send after %s uploads again: %s", async (_name, uploadsAgain, ack) => {
+      const uploadFiles = vi.fn(async () => [{ file_id: "f1" }])
+      const files = [new File(["a"], "a.txt")]
+      const hook = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1, token: "t1", uploadFiles }))
+      const [socket] = MockWebSocket.instances
+      act(() => socket.open())
+      const settled = hook.result.current.sendChatMessage("hi", files, false, "ack-id").catch(() => undefined)
+      await waitFor(() => expect(socket.send).toHaveBeenCalledOnce())
+      act(() => socket.receive({ ...ack, client_message_id: "ack-id" }))
+      await settled
+
+      void hook.result.current.sendChatMessage("hi", files, false, "ack-id").catch(() => undefined)
+      await waitFor(() => expect(socket.send).toHaveBeenCalledTimes(2))
+
+      expect(uploadFiles).toHaveBeenCalledTimes(uploadsAgain ? 2 : 1)
+    })
+
+    it("treats the same user with another session id as another login", () => {
+      const hook = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1 }))
+      const before = hook.result.current.getLoginIdentity()
+
+      authState.session = { ...authState.session, sessionId: "other-lineage" }
+      hook.rerender()
+
+      expect(hook.result.current.getLoginIdentity()).not.toBe(before)
+    })
+
+    it("login identity never carries credentials and moves only with the principal", () => {
+      const external = (token: string): WebSocketConnection => ({
+        identity: "legacy-task:7",
+        url: `ws://h/api/widget/chat/ws/7?token=${token}`,
+        taskId: 7,
+        chatTaskIdMode: "required",
+        credentialOwner: { kind: "external" },
+      })
+      const hook = renderHook(
+        ({ connection }) => useWebSocket({ connection }),
+        { initialProps: { connection: external("secret-abc") }, wrapper: StrictMode },
+      )
+      const identity = () => hook.result.current.getLoginIdentity()
+      const first = identity()
+      expect(first).toMatch(/^external:\d+$/)
+      expect(first).not.toMatch(/secret-abc|token|ws:\/\//)
+
+      hook.rerender({ connection: external("secret-xyz") })
+      const second = identity()
+      expect(second).not.toMatch(/secret|token|ws:\/\//)
+      // One credential change moves the generation by exactly one, even when React renders twice.
+      expect(Number(second?.split(":")[1]) - Number(first?.split(":")[1])).toBe(1)
+
+      hook.rerender({ connection: external("secret-xyz") })
+      expect(identity()).toBe(second)
+    })
   })
 
   describe("dead-connection detection and reconnect", () => {
