@@ -11,6 +11,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
+from starlette.websockets import WebSocketState
 
 from ...core.tools.core.RAG_tools.core.schemas import ProgressUpdateEvent
 from ...core.tools.core.RAG_tools.progress import (
@@ -22,6 +23,7 @@ from ..models.user import User
 from .websocket_auth import (
     _WebSocketAuthenticationTerminated,
     get_authenticated_user,
+    revalidate_websocket_session,
 )
 
 logger = logging.getLogger(__name__)
@@ -35,6 +37,7 @@ progress_ws_router = APIRouter()
 
 
 @progress_ws_router.websocket("/ws/progress/{task_id}")
+@revalidate_websocket_session
 async def progress_websocket_endpoint(
     websocket: WebSocket,
     task_id: str,
@@ -80,46 +83,44 @@ async def progress_websocket_endpoint(
                 await self.ws.send_text(data)
 
             def is_connected(self) -> bool:
-                # WebSocket doesn't have a direct is_connected method
-                # We'll assume it's connected until disconnect
-                return True
+                return self.ws.application_state is WebSocketState.CONNECTED
 
         adapter = WebSocketAdapter(websocket)
 
-        # Connect to progress broadcaster
-        await progress_broadcaster.connect(task_id, adapter)
-
-        # Send current task status if available
-        task_progress = get_progress_manager().get_task_progress(task_id)
-        if task_progress:
-            # Send initial status using proper JSON serialization
-            event = ProgressUpdateEvent(
-                task_id=task_progress.task_id,
-                task_type=task_progress.task_type,
-                status=task_progress.status,
-                current_step=task_progress.current_step,
-                overall_progress=task_progress.overall_progress or 0.0,
-                timestamp=task_progress.start_time or 0,
-                data={
-                    "start_time": task_progress.start_time,
-                    "end_time": task_progress.end_time,
-                    "metadata": task_progress.metadata,
-                },
-                event_type="progress_update",
-            )
-            await adapter.send_text(event.model_dump_json())
-
         try:
+            # Own registration and the initial send too: revocation/cancellation
+            # can arrive before the receive loop ever starts.
+            await progress_broadcaster.connect(task_id, adapter)
+            task_progress = get_progress_manager().get_task_progress(task_id)
+            if task_progress:
+                event = ProgressUpdateEvent(
+                    task_id=task_progress.task_id,
+                    task_type=task_progress.task_type,
+                    status=task_progress.status,
+                    current_step=task_progress.current_step,
+                    overall_progress=task_progress.overall_progress or 0.0,
+                    timestamp=task_progress.start_time or 0,
+                    data={
+                        "start_time": task_progress.start_time,
+                        "end_time": task_progress.end_time,
+                        "metadata": task_progress.metadata,
+                    },
+                    event_type="progress_update",
+                )
+                await adapter.send_text(event.model_dump_json())
+
             # Keep connection alive and listen for client messages
             while True:
                 # Wait for client messages (though we mainly send updates)
                 data = await websocket.receive_text()
+                if not await get_authenticated_user(websocket, token, revalidate=True):
+                    break
                 logger.debug(f"Received message from progress client: {data}")
 
                 # For now, we don't handle client messages
                 # Could be extended to handle commands like "cancel_task"
 
-        except WebSocketDisconnect:
+        except (WebSocketDisconnect, _WebSocketAuthenticationTerminated):
             logger.info(f"Progress WebSocket disconnected for task {task_id}")
         except Exception as e:
             logger.error(f"Progress WebSocket error for task {task_id}: {e}")

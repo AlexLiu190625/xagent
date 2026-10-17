@@ -83,10 +83,60 @@ def _callback_request(db, user) -> SimpleNamespace:
             "user_id": user.id,
             "provider": "slack",
             "app_id": "slack",
+            "session_epoch": user.session_epoch,
         },
         expires_delta=timedelta(minutes=10),
     )
     return SimpleNamespace(query_params={"code": "slack-code", "state": state})
+
+
+@pytest.mark.parametrize("phase", ["before-callback", "during-exchange"])
+def test_password_change_fences_pending_slack_connector_write(
+    db_session, monkeypatch, phase
+):
+    db, user = db_session
+    request = _callback_request(db, user)
+    user_id = user.id
+    bind = db.get_bind()
+
+    def rotate():
+        with sessionmaker(bind=bind)() as other:
+            other.query(User).filter(User.id == user_id).update(
+                {User.session_epoch: "revoked"}
+            )
+            other.commit()
+
+    def exchange(*args, **kwargs):
+        rotate()
+        return MockResponse(
+            {"ok": True, "access_token": "xoxb-token", "scope": "chat:write"}
+        )
+
+    post = Mock(side_effect=exchange)
+    monkeypatch.setattr(auth_api.requests, "post", post)
+    rejection = Mock()
+    monkeypatch.setattr(auth_api, "_log_oauth_callback_rejection", rejection)
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(return_value=MockResponse({"ok": True, "team_id": "T1", "team": "Acme"})),
+    )
+    if phase == "before-callback":
+        rotate()
+    response = generic_oauth_callback("slack", request, db, _slack_provider())
+    assert response.status_code == 400
+    assert "Invalid or expired state" in response.body.decode()
+    assert db.query(UserOAuth).count() == 0
+    assert post.call_count == (1 if phase == "during-exchange" else 0)
+    rejection.assert_called_once_with(
+        "slack",
+        "session_epoch_changed_after_exchange"
+        if phase == "during-exchange"
+        else "state_session_mismatch",
+        app_id="slack",
+        actor_flow=False,
+        provider_error=None,
+    )
 
 
 def test_slack_callback_persists_workspace_identity(db_session, monkeypatch):

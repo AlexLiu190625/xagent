@@ -7,11 +7,13 @@ import json
 import logging
 import threading
 from dataclasses import is_dataclass
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import WebSocket
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from starlette.websockets import WebSocketState
 
@@ -21,6 +23,7 @@ from tests.web.auth_token_cases import (
     RejectedAccessTokenCase,
     build_access_token,
 )
+from xagent.core.tools.core.RAG_tools.progress.realtime import ProgressBroadcaster
 from xagent.web.api import progress_ws
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api import websocket_auth
@@ -133,7 +136,7 @@ async def test_valid_token_returns_frozen_detached_principal_from_worker_session
         def __exit__(self, _exc_type: object, _exc: object, _traceback: object) -> None:
             closed.append(True)
 
-    def authenticate(_token: str, _db: object) -> SimpleNamespace:
+    def authenticate(_token: str, _db: object, **_options: object) -> SimpleNamespace:
         auth_threads.append(threading.get_ident())
         return SimpleNamespace(id=73, is_admin=True)
 
@@ -170,7 +173,7 @@ async def test_principal_reduces_voice_from_preferences_without_a_second_query(
     authenticates the token, not a second lookup against a session that
     may be closed by the time a system prompt is assembled."""
 
-    def authenticate(_token: str, _db: object) -> SimpleNamespace:
+    def authenticate(_token: str, _db: object, **_options: object) -> SimpleNamespace:
         return SimpleNamespace(id=73, is_admin=True, preferences=preferences)
 
     session = _BoundSQLiteSession()
@@ -557,3 +560,288 @@ async def test_progress_retains_invalid_credential_close_code(
     broadcaster.connect.assert_not_awaited()
     assert session.enter_count == 1
     assert session.exit_count == 1
+
+
+@pytest.mark.asyncio
+async def test_session_monitor_cancellation_drains_handler_cleanup(monkeypatch):
+    websocket, _ = _asgi_websocket(denial_extension=False)
+    started = asyncio.Event()
+    cleaning = asyncio.Event()
+    release = asyncio.Event()
+    cleaned = asyncio.Event()
+
+    @websocket_auth.revalidate_websocket_session
+    async def endpoint(websocket: WebSocket, token: str) -> None:
+        await websocket.accept()
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaning.set()
+            await release.wait()
+            cleaned.set()
+
+    monkeypatch.setattr(websocket_auth, "_SESSION_RECHECK_SECONDS", 3600)
+    task = asyncio.create_task(endpoint(websocket, "token"))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+        task.cancel()
+        await asyncio.wait_for(cleaning.wait(), timeout=5)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert cleaned.is_set()
+    assert not any(
+        task.get_name() == "websocket-session-monitor" for task in asyncio.all_tasks()
+    )
+
+
+@pytest.mark.asyncio
+async def test_open_session_monitor_fails_closed_on_database_outage(monkeypatch):
+    websocket, messages = _asgi_websocket(denial_extension=False)
+    cleaned = asyncio.Event()
+
+    @websocket_auth.revalidate_websocket_session
+    async def endpoint(websocket: WebSocket, token: str) -> None:
+        await websocket.accept()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaned.set()
+
+    def broken_loader(_token, **_options):
+        raise TimeoutError("database password=private")
+
+    monkeypatch.setattr(websocket_auth, "_SESSION_RECHECK_SECONDS", 0.01)
+    monkeypatch.setattr(websocket_auth, "_load_websocket_principal_sync", broken_loader)
+    await asyncio.wait_for(endpoint(websocket, "token"), timeout=5)
+    assert messages[-1] == {
+        "type": "websocket.close",
+        "code": 1011,
+        "reason": "Internal server error",
+    }
+    assert cleaned.is_set()
+    assert "private" not in str(messages)
+
+
+@pytest.mark.asyncio
+async def test_closed_transport_stops_monitor_and_drains_active_handler(monkeypatch):
+    websocket, messages = _asgi_websocket(denial_extension=False)
+    cleaned = asyncio.Event()
+    load = MagicMock(
+        side_effect=AssertionError("closed transport must not query users")
+    )
+
+    @websocket_auth.revalidate_websocket_session
+    async def endpoint(websocket: WebSocket, token: str) -> None:
+        await websocket.accept()
+        try:
+            await websocket.close(code=1000)
+            # A transport may close independently of work owned by the handler.
+            await asyncio.Event().wait()
+        finally:
+            cleaned.set()
+
+    monkeypatch.setattr(websocket_auth, "_SESSION_RECHECK_SECONDS", 0.001)
+    monkeypatch.setattr(websocket_auth, "_load_websocket_principal_sync", load)
+    await asyncio.wait_for(endpoint(websocket, "token"), timeout=5)
+    assert cleaned.is_set()
+    load.assert_not_called()
+    assert (
+        len([message for message in messages if message["type"] == "websocket.close"])
+        == 1
+    )
+    assert not any(
+        task.get_name() == "websocket-session-monitor" for task in asyncio.all_tasks()
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        SQLAlchemyTimeoutError("private"),
+        OperationalError("sql", {}, Exception("private")),
+    ],
+)
+async def test_poll_retries_transient_errors_but_closes_after_three_consecutive_failures(
+    monkeypatch, error
+):
+    websocket, messages = _asgi_websocket(denial_extension=False)
+    cleaned = asyncio.Event()
+    outcomes = [
+        error,
+        error,
+        websocket_auth.WebSocketPrincipal(id=1, is_admin=False),
+        error,
+        error,
+        error,
+    ]
+    calls = []
+
+    def load(_token, **_options):
+        outcome = outcomes[len(calls)]
+        calls.append(outcome)
+        assert websocket.application_state is WebSocketState.CONNECTED
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    @websocket_auth.revalidate_websocket_session
+    async def endpoint(websocket: WebSocket, token: str) -> None:
+        await websocket.accept()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaned.set()
+
+    monkeypatch.setattr(websocket_auth, "_SESSION_RECHECK_SECONDS", 0.001)
+    monkeypatch.setattr(websocket_auth, "_load_websocket_principal_sync", load)
+    await asyncio.wait_for(endpoint(websocket, "token"), timeout=5)
+    assert len(calls) == 6
+    assert cleaned.is_set()
+    assert [
+        message for message in messages if message["type"] == "websocket.close"
+    ] == [{"type": "websocket.close", "code": 1011, "reason": "Internal server error"}]
+    assert "private" not in str(messages)
+
+
+@pytest.mark.asyncio
+async def test_expiry_after_handshake_keeps_stream_and_commands_alive_until_revocation(
+    monkeypatch,
+):
+    from jose import jwt
+
+    websocket, messages = _asgi_websocket(denial_extension=False)
+    user = SimpleNamespace(
+        id=1, username="existing-user", is_admin=False, session_epoch=None
+    )
+    session = _BoundSQLiteSession()
+    monkeypatch.setattr(session, "first", lambda: user)
+    monkeypatch.setattr(websocket_auth, "get_session_local", lambda: lambda: session)
+    monkeypatch.setattr(websocket_auth, "_SESSION_RECHECK_SECONDS", 0.001)
+    token = build_access_token()
+    accepted, advance, command_checked, polled, cleaned = (
+        asyncio.Event() for _ in range(5)
+    )
+    original = websocket_auth._load_websocket_principal_sync
+    loop = asyncio.get_running_loop()
+    rechecks = []
+
+    def load(token, **options):
+        principal = original(token, **options)
+        if advance.is_set() and options.get("verify_exp") is False:
+            rechecks.append(principal)
+            if len(rechecks) >= 2:
+                loop.call_soon_threadsafe(polled.set)
+        return principal
+
+    @websocket_auth.revalidate_websocket_session
+    async def endpoint(websocket: WebSocket, token: str) -> None:
+        assert await websocket_auth.get_authenticated_user(websocket, token)
+        await websocket.accept()
+        accepted.set()
+        try:
+            await advance.wait()
+            assert await websocket_auth.get_authenticated_user(
+                websocket, token, revalidate=True
+            )
+            command_checked.set()
+            await asyncio.Event().wait()
+        finally:
+            cleaned.set()
+
+    class Later(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.now(tz) + timedelta(hours=1)
+
+    monkeypatch.setattr(websocket_auth, "_load_websocket_principal_sync", load)
+    task = asyncio.create_task(endpoint(websocket, token))
+    try:
+        await asyncio.wait_for(accepted.wait(), timeout=5)
+        monkeypatch.setattr(jwt, "datetime", Later)
+        # The same expired token still cannot establish a fresh connection.
+        assert original(token) is None
+        advance.set()
+        await asyncio.wait_for(command_checked.wait(), timeout=5)
+        await asyncio.wait_for(polled.wait(), timeout=5)
+        assert not task.done()
+        assert not cleaned.is_set()
+        assert not any(message["type"] == "websocket.close" for message in messages)
+        user.session_epoch = "revoked"
+        await asyncio.wait_for(task, timeout=5)
+        assert cleaned.is_set()
+        assert messages[-1]["code"] == 4001
+        # A competing per-message check after closure must not close twice.
+        assert (
+            await websocket_auth.get_authenticated_user(
+                websocket, token, revalidate=True
+            )
+            is None
+        )
+        assert (
+            len(
+                [
+                    message
+                    for message in messages
+                    if message["type"] == "websocket.close"
+                ]
+            )
+            == 1
+        )
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["connect", "initial-send"])
+async def test_progress_cancellation_before_receive_loop_unsubscribes(
+    monkeypatch, phase
+):
+    websocket, _ = _asgi_websocket(denial_extension=False)
+    started = asyncio.Event()
+    broadcaster = ProgressBroadcaster()
+    original_connect = broadcaster.connect
+
+    async def connect(task_id, connection):
+        await original_connect(task_id, connection)
+        if phase == "connect":
+            started.set()
+            await asyncio.Event().wait()
+
+    async def send_text(_data):
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(websocket, "send_text", send_text)
+    monkeypatch.setattr(broadcaster, "connect", connect)
+    monkeypatch.setattr(progress_ws, "progress_broadcaster", broadcaster)
+    monkeypatch.setattr(
+        progress_ws,
+        "get_authenticated_user",
+        AsyncMock(return_value=websocket_auth.WebSocketPrincipal(id=1, is_admin=False)),
+    )
+    manager = MagicMock()
+    manager.get_task_progress.return_value.user_id = 1
+    monkeypatch.setattr(progress_ws, "get_progress_manager", lambda: manager)
+    monkeypatch.setattr(progress_ws, "ProgressUpdateEvent", MagicMock())
+    monkeypatch.setattr(websocket_auth, "_SESSION_RECHECK_SECONDS", 3600)
+    task = asyncio.create_task(
+        progress_ws.progress_websocket_endpoint(websocket, "task", "token")
+    )
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert broadcaster._connections == {}

@@ -67,7 +67,14 @@ from ..auth_config import (
     PASSWORD_MIN_LENGTH,
     REFRESH_TOKEN_EXPIRE_DAYS,
 )
-from ..auth_dependencies import get_current_user
+from ..auth_dependencies import get_current_user, get_user_from_token
+from ..auth_sessions import (
+    commit_refresh_credentials,
+    lock_current_session_epoch,
+    matches_user_session,
+    new_session_epoch,
+    user_session_claims,
+)
 from ..builtin_mcp_registry import GOOGLE_RESTRICTED_SCOPES
 from ..first_admin_setup import FirstAdminIdentity, run_first_admin_setup_hook
 from ..mcp_apps import BuiltinOAuthServerDefinitionError, get_app_by_id
@@ -2050,7 +2057,7 @@ def _prepare_login_response(user: User | None, request: LoginRequest) -> Dict[st
     if needs_password_rehash(str(user.password_hash)):
         setattr(user, "password_hash", hash_password(request.password))
     with observe_duration("xagent.auth.login.token_creation.duration"):
-        identity = {"sub": user.username, "user_id": user.id}
+        identity = user_session_claims(user)
         access_token = create_access_token(
             data=identity,
             expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
@@ -2086,9 +2093,27 @@ def _login_in_worker(
             user = get_user_by_login_identifier(session, request.username)
         budgets = _login_budgets(client_host, request.username, user)
         _enforce_budgets("login", budgets[1:])
+        previous_hash = str(user.password_hash) if user is not None else ""
+        previous_epoch = (
+            cast(str | None, user.session_epoch) if user is not None else None
+        )
         response = _prepare_login_response(user, request)
+        assert user is not None  # The response builder rejects missing users.
+        upgraded_hash = str(user.password_hash)
+        expires_at = user.refresh_token_expires_at
+        assert expires_at is not None
         with observe_duration("xagent.auth.login.sync_commit.duration"):
-            session.commit()
+            commit_refresh_credentials(
+                session,
+                user_id=int(response["user_id"]),
+                password_hash=previous_hash,
+                session_epoch=previous_epoch,
+                refresh_token=response["refresh_token"],
+                expires_at=cast(datetime, expires_at),
+                upgraded_password_hash=(
+                    upgraded_hash if upgraded_hash != previous_hash else None
+                ),
+            )
         # Identity budgets are independent of the pre-DB source-IP admission.
         for key, _ in budgets[1:]:
             try:
@@ -2328,11 +2353,29 @@ async def reset_password(
                 success=False, message="Reset token has expired"
             )
 
-    setattr(user, "password_hash", await hash_password_async(request.new_password))
-    setattr(user, "password_reset_token_hash", None)
-    setattr(user, "password_reset_expires_at", None)
-    setattr(user, "refresh_token", None)
-    setattr(user, "refresh_token_expires_at", None)
+    new_hash = await hash_password_async(request.new_password)
+    changed = (
+        db.query(User)
+        .filter(
+            User.id == user.id,
+            User.password_reset_token_hash == token_hash,
+            User.password_reset_expires_at >= datetime.now(timezone.utc),
+        )
+        .update(
+            {
+                User.password_hash: new_hash,
+                User.password_reset_token_hash: None,
+                User.password_reset_expires_at: None,
+                User.refresh_token: None,
+                User.refresh_token_expires_at: None,
+                User.session_epoch: new_session_epoch(),
+            },
+            synchronize_session=False,
+        )
+    )
+    if changed != 1:
+        db.rollback()
+        return ResetPasswordResponse(success=False, message="Invalid reset token")
     db.commit()
 
     return ResetPasswordResponse(
@@ -2364,12 +2407,28 @@ async def change_password(
                 message=f"New password must be at least {PASSWORD_MIN_LENGTH} characters",
             )
 
-        # Update password
-        setattr(user, "password_hash", await hash_password_async(request.new_password))
-        # A password change invalidates every currently issued refresh
-        # session. Access tokens remain short-lived and will expire normally.
-        setattr(user, "refresh_token", None)
-        setattr(user, "refresh_token_expires_at", None)
+        previous_hash = str(user.password_hash)
+        new_hash = await hash_password_async(request.new_password)
+        changed = (
+            db.query(User)
+            .filter(User.id == user.id, User.password_hash == previous_hash)
+            .update(
+                {
+                    User.password_hash: new_hash,
+                    User.refresh_token: None,
+                    User.refresh_token_expires_at: None,
+                    User.password_reset_token_hash: None,
+                    User.password_reset_expires_at: None,
+                    User.session_epoch: new_session_epoch(),
+                },
+                synchronize_session=False,
+            )
+        )
+        if changed != 1:
+            db.rollback()
+            return ChangePasswordResponse(
+                success=False, message="Password changed; sign in again"
+            )
         db.commit()
 
         return ChangePasswordResponse(
@@ -2653,7 +2712,7 @@ def _prepare_refresh_response(
         now = now.replace(tzinfo=None)
     if expires < now:
         raise HTTPException(status_code=401, detail="Refresh token has expired")
-    identity = {"sub": user.username, "user_id": user.id}
+    identity = user_session_claims(user)
     access_token = create_access_token(
         data=identity, expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     )
@@ -2676,6 +2735,8 @@ def _refresh_in_worker(
     with session_factory() as session:
         user = session.query(User).filter(User.id == user_id).first()
         response = _prepare_refresh_response(user, request)
+        assert user is not None
+        previous_epoch = user.session_epoch
         # End the read snapshot before competing for a write. In SQLite this
         # avoids a deferred read-to-write lock upgrade; the conditional UPDATE
         # below, not the preceding SELECT, is the authority on token consumption.
@@ -2687,6 +2748,7 @@ def _refresh_in_worker(
                 User.id == user_id,
                 User.refresh_token == request.refresh_token,
                 User.refresh_token_expires_at >= now,
+                User.session_epoch == previous_epoch,
             )
             .update(
                 {
@@ -3619,13 +3681,12 @@ def _generic_oauth_login(
     redirect_uri = _resolve_oauth_redirect_uri(provider, db_provider)
 
     user_id = trusted_user_id
+    session_epoch: str | None = None
     if user_id is None and token:
-        payload = verify_token(token)
-        if payload and payload.get("type") == "access":
-            username = payload.get("sub")
-            user = db.query(User).filter(User.username == username).first()
-            if user:
-                user_id = int(user.id)
+        user = get_user_from_token(token, db)
+        if user:
+            user_id = int(user.id)
+            session_epoch = cast(str | None, user.session_epoch)
 
     if not user_id:
         return HTMLResponse(
@@ -3694,6 +3755,7 @@ def _generic_oauth_login(
         "provider": provider,
         "app_id": app_id,
         "redirect": redirect,
+        "session_epoch": session_epoch,
     }
     if browser_state_nonce is not None:
         browser_nonce_hash = hashlib.sha256(
@@ -3985,18 +4047,27 @@ def _ensure_user_mcp_server(
 
     mcp_server = db.query(MCPServer).filter(MCPServer.name == app_info["name"]).first()
     if not mcp_server:
-        mcp_server = MCPServer(
-            name=app_info["name"],
-            description=app_info["description"],
-            managed="external",
-            transport="oauth",
-            auth=_oauth_auth_metadata(),
-        )
-        db.add(mcp_server)
+        # Caller-flush failures are not catalog-insert races to recover from.
+        db.flush()
+        if db.get_bind().dialect.name == "sqlite":
+            # In legacy SQLite mode SELECT/SAVEPOINT do not issue BEGIN. A
+            # zero-row write keeps RELEASE from committing the outer operation.
+            db.execute(text("UPDATE users SET id = id WHERE 1 = 0"))
         try:
-            db.flush()
+            # A competing user's catalog insert must not roll back the caller's
+            # OAuth credential writes or release its session-generation lock.
+            # Add the candidate AFTER begin_nested's mandatory outer flush.
+            with db.begin_nested():
+                mcp_server = MCPServer(
+                    name=app_info["name"],
+                    description=app_info["description"],
+                    managed="external",
+                    transport="oauth",
+                    auth=_oauth_auth_metadata(),
+                )
+                db.add(mcp_server)
+                db.flush()
         except IntegrityError:
-            db.rollback()
             mcp_server = (
                 db.query(MCPServer).filter(MCPServer.name == app_info["name"]).first()
             )
@@ -4239,6 +4310,21 @@ def generic_oauth_callback(
             content="<h1>Error: Invalid or expired state</h1>", status_code=400
         )
     user_id = user_id_claim
+    if not is_actor_flow and user_id is not None:
+        state_user = (
+            db.query(User).filter(User.id == user_id).populate_existing().first()
+        )
+        if state_user is None or not matches_user_session(state_user, payload):
+            _log_oauth_callback_rejection(
+                provider,
+                "state_session_mismatch",
+                app_id=payload.get("app_id"),
+                actor_flow=is_actor_flow,
+                provider_error=provider_error,
+            )
+            return HTMLResponse(
+                content="<h1>Error: Invalid or expired state</h1>", status_code=400
+            )
     app_id = payload.get("app_id")
     if error_response := _google_gmail_error(provider, app_id):
         _log_oauth_callback_rejection(
@@ -5190,6 +5276,26 @@ def generic_oauth_callback(
                 # Serialize replacement in the stable user namespace.
                 db.query(User.id).filter(User.id == user_id).with_for_update().one()
 
+            # Provider I/O happened after the initial generation check. Lock
+            # only now, before credential writes, so a reset wins this race.
+            if (
+                not is_actor_flow
+                and user_id_claim is not None
+                and not lock_current_session_epoch(
+                    db, user_id_claim, payload.get("session_epoch")
+                )
+            ):
+                db.rollback()
+                _log_oauth_callback_rejection(
+                    provider,
+                    "session_epoch_changed_after_exchange",
+                    app_id=app_id,
+                    actor_flow=is_actor_flow,
+                    provider_error=provider_error,
+                )
+                return HTMLResponse(
+                    content="<h1>Error: Invalid or expired state</h1>", status_code=400
+                )
             connector_key = app_id or provider
             oauth_account = _matching_gmail_reconnect_tombstone(
                 db,

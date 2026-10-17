@@ -199,6 +199,7 @@ from .websocket_auth import (
     WebSocketPrincipal,
     _WebSocketAuthenticationTerminated,
     get_authenticated_user,
+    revalidate_websocket_session,
     send_websocket_authentication_infrastructure_failure,
 )
 
@@ -2976,6 +2977,7 @@ async def _run_chat_heartbeat(websocket: WebSocket, task_id: int) -> None:
 
 
 @ws_router.websocket("/ws/chat/{task_id}")
+@revalidate_websocket_session
 async def websocket_chat_endpoint(
     websocket: WebSocket,
     task_id: int,
@@ -3046,6 +3048,8 @@ async def websocket_chat_endpoint(
         while True:
             # Receive client message
             data = await websocket.receive_text()
+            if not await get_authenticated_user(websocket, token, revalidate=True):
+                break
             logger.info(
                 f"📨 Received WebSocket message for task {task_id}: {data[:200]}"
             )  # Log first 200 chars
@@ -3083,7 +3087,7 @@ async def websocket_chat_endpoint(
                     {"type": "error", "message": "Unknown message type"}, websocket
                 )
 
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, _WebSocketAuthenticationTerminated):
         pass
     except DurableObjectIntegrityError:
         # Precedes the parent arm: permanent corruption, already recorded at
@@ -3317,6 +3321,7 @@ async def handle_resume_task(
 
 
 @ws_router.websocket("/ws/build/chat")
+@revalidate_websocket_session
 async def websocket_builder_chat_endpoint(
     websocket: WebSocket,
     token: Optional[str] = Query(None, description="Authentication token"),
@@ -3337,6 +3342,8 @@ async def websocket_builder_chat_endpoint(
     try:
         while True:
             data = await websocket.receive_text()
+            if not await get_authenticated_user(websocket, token, revalidate=True):
+                break
             logger.info(f"📨 Received builder chat message: {data[:200]}")
 
             message_data = json.loads(data)
@@ -3350,7 +3357,7 @@ async def websocket_builder_chat_endpoint(
             )
             websocket.state.chat_task = active_chat_task
 
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, _WebSocketAuthenticationTerminated):
         logger.info(f"Builder chat WebSocket disconnected for user {user.id}")
     except (ConnectionError, RuntimeError) as e:
         logger.error(f"Connection error in builder chat WebSocket: {e}")
@@ -3786,6 +3793,7 @@ clarification questions as plain assistant text.
 
 
 @ws_router.websocket("/ws/build/preview")
+@revalidate_websocket_session
 async def websocket_build_preview_endpoint(
     websocket: WebSocket,
     token: Optional[str] = Query(None, description="Authentication token"),
@@ -3807,6 +3815,8 @@ async def websocket_build_preview_endpoint(
         while True:
             # Receive client message
             data = await websocket.receive_text()
+            if not await get_authenticated_user(websocket, token, revalidate=True):
+                break
             logger.info(f"📨 Received build preview WebSocket message: {data[:200]}")
 
             message_data = json.loads(data)
@@ -3872,7 +3882,7 @@ async def websocket_build_preview_endpoint(
                     )
                 )
 
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, _WebSocketAuthenticationTerminated):
         logger.info(f"Build preview WebSocket disconnected for user {user.id}")
     except (ConnectionError, RuntimeError) as e:
         logger.error(f"Connection error in build preview WebSocket: {e}")
