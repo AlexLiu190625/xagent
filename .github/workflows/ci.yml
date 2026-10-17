@@ -836,6 +836,7 @@ jobs:
               tests/e2e/test_shared_channel_auto_resume.py
               tests/e2e/test_shared_provider_outage.py
               tests/e2e/test_shared_database_outage.py
+              tests/e2e/test_shared_sdk_auto_resume.py
           - shard: rest
             paths: >-
               tests/e2e
@@ -847,6 +848,7 @@ jobs:
               --ignore=tests/e2e/test_shared_channel_auto_resume.py
               --ignore=tests/e2e/test_shared_provider_outage.py
               --ignore=tests/e2e/test_shared_database_outage.py
+              --ignore=tests/e2e/test_shared_sdk_auto_resume.py
 
     services:
       redis:
