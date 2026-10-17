@@ -59,6 +59,7 @@ from .task_dispatch_cap import (
     CONTROL_KINDS,
     EXECUTION_OPENING_KINDS,
     DispatchCapSnapshot,
+    DispatchClass,
     build_dispatch_cap_snapshot,
 )
 from .task_execution_host import consumes_task_commands
@@ -492,7 +493,9 @@ def stage_task_command(
        the unique constraint to reject it.
     6. Add and flush the new row last, so any remaining IntegrityError is
        attributable to the command insert itself. Classification runs once per
-       new execution command, after the row is flushed.
+       new execution command, after the row is flushed. The deployment
+       classifier's dispatch class is written to the row in the same
+       transaction, before the admission ticket is staged.
 
     Caller obligations:
 
@@ -537,6 +540,8 @@ def stage_task_command(
             Task.run_id,
             Task.state_version,
             Task.user_id,
+            Task.source,
+            Task.channel_name,
             User.id.label("task_owner_row_id"),
             User.actor_subject.label("task_owner_subject"),
         )
@@ -635,15 +640,51 @@ def stage_task_command(
             },
         )
     from .task_execution_admission import (
+        TaskClassificationView,
         classify_command_no_commit,
         stage_task_admission,
+        upstream_source_class,
     )
 
-    classification = (
-        classify_command_no_commit(db, command)
-        if command.kind in EXECUTION_OPENING_KINDS
-        else None
-    )
+    classification = None
+    if command.kind in EXECUTION_OPENING_KINDS:
+        # A background command is one the system stages itself (``reserved``).
+        # Its previous class matters only when the task source does not decide
+        # the upstream rule, so the lookup is skipped otherwise. The row just
+        # flushed is excluded: it exists with the default class.
+        previous_dispatch_class: DispatchClass | None = None
+        if reserved and upstream_source_class(snapshot.source) is None:
+            previous_dispatch_class = cast(
+                "DispatchClass | None",
+                db.execute(
+                    select(TaskExecutionCommand.dispatch_class)
+                    .where(
+                        TaskExecutionCommand.task_id == resolved_task_id,
+                        TaskExecutionCommand.kind.in_(EXECUTION_OPENING_KINDS),
+                        TaskExecutionCommand.id != command.id,
+                    )
+                    .order_by(TaskExecutionCommand.id.desc())
+                    .limit(1)
+                ).scalar_one_or_none(),
+            )
+        classification = classify_command_no_commit(
+            db,
+            command,
+            TaskClassificationView(
+                task_id=resolved_task_id,
+                source=snapshot.source,
+                channel_name=snapshot.channel_name,
+                owner_user_id=int(snapshot.user_id),
+                background=reserved,
+                previous_dispatch_class=previous_dispatch_class,
+            ),
+        )
+        if classification.dispatch_class != command.dispatch_class:
+            command.dispatch_class = classification.dispatch_class  # type: ignore[assignment]
+            # The session does not autoflush; write the class before anything
+            # else in the acceptance transaction can read the row, whatever the
+            # caller does next.
+            db.flush()
     stage_task_admission(
         db, command, classification.admission if classification else None
     )

@@ -38,9 +38,14 @@ def host(tmp_path, monkeypatch):
             self.sessions = sessions
             self.user = user_id
 
-        def task(self):
+        def task(self, source="internal"):
             with sessions() as db:
-                task = Task(user_id=user_id, title="Work", status=TaskStatus.PENDING)
+                task = Task(
+                    user_id=user_id,
+                    title="Work",
+                    status=TaskStatus.PENDING,
+                    source=source,
+                )
                 db.add(task)
                 db.commit()
                 return task.id
@@ -81,7 +86,7 @@ def policy(bucket="tenant:batch", capacity=1, max_pending=20):
 def counting(result=None):
     calls = []
 
-    def classify(db, command):
+    def classify(db, command, view):
         calls.append((command.task_id, command.kind))
         return result() if result else admission.CommandClassification()
 
@@ -120,7 +125,7 @@ def test_classifier_called_once_per_execution_command(host):
 
 def test_admission_refusals_still_propagate(host):
     admission.set_command_classifier(
-        lambda db, command: admission.CommandClassification(
+        lambda db, command, view: admission.CommandClassification(
             admission=policy(max_pending=1)
         ),
         admission_enabled=True,
@@ -134,7 +139,7 @@ def test_admission_refusals_still_propagate(host):
     class Refused(Exception):
         pass
 
-    def refuse(db, command):
+    def refuse(db, command, view):
         raise Refused
 
     admission.set_command_classifier(refuse, admission_enabled=True)
@@ -149,7 +154,7 @@ def test_admission_refusals_still_propagate(host):
         pytest.param(lambda: None, False, id="unregistered"),
         pytest.param(
             lambda: admission.set_command_classifier(
-                lambda db, command: admission.CommandClassification(),
+                lambda db, command, view: admission.CommandClassification(),
                 admission_enabled=False,
             ),
             False,
@@ -157,7 +162,7 @@ def test_admission_refusals_still_propagate(host):
         ),
         pytest.param(
             lambda: admission.set_command_classifier(
-                lambda db, command: admission.CommandClassification(),
+                lambda db, command, view: admission.CommandClassification(),
                 admission_enabled=True,
             ),
             True,
@@ -228,7 +233,7 @@ def test_admission_enabled_reflects_declaration(host, monkeypatch, install, expe
 def test_classifier_sees_flushed_command(host):
     seen = []
 
-    def classify(db, command):
+    def classify(db, command, view):
         seen.append((command.id is not None, command.kind, command.task_id))
         return admission.CommandClassification()
 
@@ -240,14 +245,14 @@ def test_classifier_sees_flushed_command(host):
 
 def test_classifier_result_shape_is_enforced(host):
     admission.set_command_classifier(
-        lambda db, command: policy(), admission_enabled=True
+        lambda db, command, view: policy(), admission_enabled=True
     )
     with pytest.raises(TypeError, match="must return CommandClassification"):
         host.enqueue(command_id="legacy-shape")
     assert host.commands() == 0
 
     admission.set_command_classifier(
-        lambda db, command: admission.CommandClassification(admission=policy()),
+        lambda db, command, view: admission.CommandClassification(admission=policy()),
         admission_enabled=False,
     )
     with pytest.raises(TypeError, match="admission_enabled=False"):
@@ -256,6 +261,12 @@ def test_classifier_result_shape_is_enforced(host):
 
     with pytest.raises(TypeError):
         admission.CommandClassification(policy())  # type: ignore[misc]
+
+    with pytest.raises(ValueError):
+        admission.CommandClassification(dispatch_class="urgent")  # type: ignore[arg-type]
+    assert admission.CommandClassification(admission=policy()).dispatch_class == (
+        "batch"
+    )
 
 
 def test_legacy_hook_wrapper_matches_old_behavior(host):
@@ -276,6 +287,17 @@ def test_legacy_hook_wrapper_matches_old_behavior(host):
     db, command = received[0]
     assert isinstance(db, sa.orm.Session)
     assert isinstance(command, TaskExecutionCommand)
+
+    # The class follows the upstream rule: a message of an internal task is
+    # interactive, a start of an sdk task is batch. The hook never sees a view.
+    with host.sessions() as db:
+        assert db.query(TaskExecutionCommand).one().dispatch_class == "interactive"
+    sdk_task = host.task(source="sdk")
+    host.enqueue(KINDS.START, task_id=sdk_task)
+    with host.sessions() as db:
+        sdk_row = db.query(TaskExecutionCommand).filter_by(task_id=sdk_task).one()
+        assert sdk_row.dispatch_class == "batch"
+    assert len(received) == 2
 
 
 def test_classifier_reset_fixture_isolates_tests_first():

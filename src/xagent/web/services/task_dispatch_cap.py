@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import Literal
 
 from ...config import (
     DISPATCHER_MAX_INFLIGHT_PER_PROCESS,
@@ -30,6 +31,13 @@ CONTROL_KINDS = frozenset({"pause", "cancel"})
 # commands for each kind here, including a pause rejected because nothing
 # of its task runs; a kind added here needs its own rules there.
 CAP_OVERTAKING_CONTROL_KINDS = frozenset({"cancel", "pause"})
+
+# What the deployment classifier decided for a command at acceptance. It is
+# stored on the command row; the dispatcher reads it, never recomputes it.
+DispatchClass = Literal["interactive", "batch"]
+DISPATCH_CLASS_INTERACTIVE: DispatchClass = "interactive"
+DISPATCH_CLASS_BATCH: DispatchClass = "batch"
+DISPATCH_CLASSES = frozenset({DISPATCH_CLASS_INTERACTIVE, DISPATCH_CLASS_BATCH})
 
 
 @dataclass(frozen=True)
