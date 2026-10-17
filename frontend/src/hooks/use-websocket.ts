@@ -557,10 +557,6 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
   const loginGenerationRef = useRef(0)
   const loginPrincipalRef = useRef<WebSocketConnection | null>(normalizedConnection)
   const lifecycleEndedRef = useRef(false)
-  // The cycle ended on a first connection that failed in transit. The back-off
-  // does not retry it, but the page becoming visible or the network coming
-  // back does.
-  const unopenedLossRef = useRef(false)
   const stoppedByCallerRef = useRef(false)
   const autoConnectRef = useRef(autoConnect)
   const connectRef = useRef<() => void>(() => undefined)
@@ -658,7 +654,6 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
   const invalidateLifecycle = useCallback(() => {
     lifecycleEpochRef.current++
     lifecycleEndedRef.current = false
-    unopenedLossRef.current = false
     clearRetryTimers()
   }, [clearRetryTimers])
 
@@ -832,16 +827,16 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     retryTimersRef.current.set(timer, { lifecycleEpoch, attemptEpoch, fire })
   }, [isCurrentLifecycle, syncPhase])
 
-  // Only a key that opened during this mount is retried on a timer. A first
-  // connection that failed in transit is only recorded, so that the page
-  // becoming visible or the network coming back can try it again.
+  // Every key is retried on a timer, including a first connection that failed
+  // in transit, so a chat page loaded while the backend is down connects once
+  // it is back. Before the socket opens, a 1006 can also be a rejected
+  // handshake, but /ws/chat accepts before denying task access (4003,
+  // permanent). What it still rejects before accepting is a missing or
+  // rejected credential and an authentication outage (503); retrying the
+  // former costs one handshake per back-off step until the page signs in again.
   const scheduleReconnect = useCallback((owner: SocketOwner) => {
     if (isSessionConnection(owner.connection) || !owner.connection.taskId) return
     if (!canApplyRetiredOwnerPolicy(owner)) return
-    if (!openedKeysRef.current.has(owner.connectionKey)) {
-      unopenedLossRef.current = true
-      return
-    }
     const attempt = ++reconnectAttemptsRef.current
     scheduleRetry(
       () => connectRef.current(),
@@ -893,9 +888,8 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
   }, [isCurrentOwner, retireDeadOwner, withPhaseSync])
 
   // A page that becomes visible again or a network that comes back online
-  // retries once now instead of waiting out a back-off of up to five minutes,
-  // and gives a first connection that failed in transit another try. A
-  // failure continues the back-off where it was.
+  // retries once now instead of waiting out a back-off of up to five minutes.
+  // A failure continues the back-off where it was.
   const retryNow = useCallback(() => {
     if (!mountedRef.current) return
     const owner = socketOwnerRef.current
@@ -920,14 +914,6 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       clearTimeout(timer)
       retry.fire()
       return
-    }
-    if (
-      unopenedLossRef.current
-      && lifecycleEndedRef.current
-      && !stoppedByCallerRef.current
-      && !socketOwnerRef.current
-    ) {
-      connectRef.current()
     }
   }, [retireDeadOwner])
 
@@ -1075,7 +1061,6 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     }
 
     isConnectingRef.current = true
-    unopenedLossRef.current = false
     try {
       // Test if the URL is valid before creating WebSocket
       if (!connection.url.startsWith('ws://') && !connection.url.startsWith('wss://')) {
@@ -1572,12 +1557,13 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
   }, [connect])
 
   // Timers and effects run `connect` and recompute the phase themselves. A
-  // caller's connect starts a new cycle, so an earlier failure no longer makes
-  // the new attempt read as reconnecting.
+  // caller's connect starts a new cycle, so an earlier failure, or a retry it
+  // left waiting, no longer makes the new attempt read as reconnecting.
   const connectFromCaller = useMemo(() => withPhaseSync(() => {
     lifecycleEndedRef.current = false
+    clearRetryTimers()
     connect()
-  }), [connect, withPhaseSync])
+  }), [clearRetryTimers, connect, withPhaseSync])
 
   const disconnect = useCallback(() => {
     const owner = socketOwnerRef.current

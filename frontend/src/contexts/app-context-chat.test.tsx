@@ -162,7 +162,9 @@ vi.mock("sonner", () => ({
 import {
   AppProvider,
   VERSIONED_TASK_EVENT_TYPES,
+  createInitialState,
   extractTaskControlEnvelope,
+  projectAppState,
   projectErrorFrameForDisplay,
   type AppProviderTransportConfig,
   useApp,
@@ -11369,5 +11371,158 @@ describe("resend after reconnect", () => {
 
   it("keeps the resend window at a fixed 90 seconds", () => {
     expect(RESEND_RECONNECT_DEADLINE_MS).toBe(90_000)
+  })
+})
+
+describe("projectAppState exact settlement routing", () => {
+  type ProjectAction = Parameters<typeof projectAppState>[1]
+  type TracePayload = Extract<ProjectAction, { type: "ADD_TRACE_EVENT" }>["payload"]
+  type ProjectState = ReturnType<typeof createInitialState>
+  const trace = (
+    eventType: string,
+    eventId: string,
+    stepId: string,
+    data: Record<string, unknown>,
+  ): TracePayload => ({
+    event_id: eventId,
+    event_type: eventType,
+    step_id: stepId,
+    timestamp: eventId,
+    data,
+  })
+  const apply = (state: ProjectState, action: ProjectAction) =>
+    projectAppState(state, action)
+  const dispatch = (state: ProjectState, payload: TracePayload) =>
+    apply(state, { type: "ADD_TRACE_EVENT", payload })
+  const seal = (
+    state: ProjectState,
+    id: string,
+    content: string,
+  ) => apply(state, {
+    type: "ADD_MESSAGE",
+    payload: {
+      id,
+      role: "assistant",
+      content,
+      timestamp: id,
+      isResult: true,
+    },
+  })
+  const addUser = (state: ProjectState, id: string) => apply(state, {
+    type: "ADD_MESSAGE",
+    payload: { id, role: "user", content: id, timestamp: id },
+  })
+
+  it("routes a settlement to the exact invocation when one step reuses a provider id", () => {
+    let state = createInitialState()
+    state = dispatch(state, trace("tool_execution_start", "a1", "same-step", {
+      tool_name: "approval_gate",
+      tool_call_id: "tool_call_0",
+      invocation_id: "invocation-a",
+    }))
+    state = seal(state, "message-a", "A")
+    state = addUser(state, "between")
+    state = dispatch(state, trace("tool_execution_start", "b1", "same-step", {
+      tool_name: "approval_gate",
+      tool_call_id: "tool_call_0",
+      invocation_id: "invocation-b",
+    }))
+    state = seal(state, "message-b", "B")
+    state = addUser(state, "reply")
+
+    state = dispatch(state, trace("tool_execution_end", "a2", "same-step", {
+      tool_name: "approval_gate",
+      tool_call_id: "tool_call_0",
+      invocation_id: "invocation-a",
+      settlement_delivery: true,
+      result: { output: "settled-a" },
+    }))
+
+    expect(state.messages.find(message => message.id === "message-a")?.traceEvents?.map(event => event.event_id))
+      .toEqual(["a1", "a2"])
+    expect(state.messages.find(message => message.id === "message-b")?.traceEvents?.map(event => event.event_id))
+      .toEqual(["b1"])
+    expect(state.traceEvents).toHaveLength(0)
+  })
+
+  it("routes an exact settlement across steps without consulting the provider id collision", () => {
+    let state = createInitialState()
+    state = dispatch(state, trace("tool_execution_start", "a1", "step-a", {
+      tool_call_id: "tool_call_0",
+      invocation_id: "invocation-a",
+    }))
+    state = seal(state, "message-a", "A")
+    state = addUser(state, "between")
+    state = dispatch(state, trace("tool_execution_start", "b1", "step-b", {
+      tool_call_id: "tool_call_0",
+      invocation_id: "invocation-b",
+    }))
+    state = seal(state, "message-b", "B")
+    state = addUser(state, "reply")
+
+    state = dispatch(state, trace("tool_execution_end", "a2", "new-resume-step", {
+      tool_call_id: "tool_call_0",
+      invocation_id: "invocation-a",
+      settlement_delivery: true,
+    }))
+
+    expect(state.messages.find(message => message.id === "message-a")?.traceEvents?.map(event => event.event_id))
+      .toEqual(["a1", "a2"])
+    expect(state.messages.find(message => message.id === "message-b")?.traceEvents?.map(event => event.event_id))
+      .toEqual(["b1"])
+  })
+
+  it("does not route an unknown exact invocation into a legacy owner", () => {
+    let state = createInitialState()
+    state = dispatch(state, trace("tool_execution_start", "legacy", "step-a", {
+      tool_call_id: "tool_call_0",
+    }))
+    state = seal(state, "legacy-message", "legacy")
+    state = addUser(state, "reply")
+
+    state = dispatch(state, trace("tool_execution_end", "exact", "step-a", {
+      tool_call_id: "tool_call_0",
+      invocation_id: "unknown-invocation",
+      settlement_delivery: true,
+    }))
+
+    expect(state.messages.find(message => message.id === "legacy-message")?.traceEvents?.map(event => event.event_id))
+      .toEqual(["legacy"])
+    expect(state.traceEvents.map(event => event.event_id)).toEqual(["exact"])
+  })
+
+  it("uses the original step to route an ambiguous legacy settlement", () => {
+    let state = createInitialState()
+    state = dispatch(state, trace("tool_execution_start", "a1", "step-a", {
+      tool_call_id: "tool_call_0",
+    }))
+    state = seal(state, "message-a", "A")
+    state = addUser(state, "between")
+    state = dispatch(state, trace("tool_execution_start", "b1", "step-b", {
+      tool_call_id: "tool_call_0",
+    }))
+    state = seal(state, "message-b", "B")
+    state = addUser(state, "reply")
+
+    state = dispatch(state, trace("tool_execution_end", "a2", "step-a", {
+      tool_call_id: "tool_call_0",
+      settlement_delivery: true,
+    }))
+
+    expect(state.messages.find(message => message.id === "message-a")?.traceEvents?.map(event => event.event_id))
+      .toEqual(["a1", "a2"])
+    expect(state.messages.find(message => message.id === "message-b")?.traceEvents?.map(event => event.event_id))
+      .toEqual(["b1"])
+  })
+
+  it("keeps an orphan settlement in the live buffer for truncated windows", () => {
+    const state = dispatch(createInitialState(), trace("tool_execution_end", "orphan", "old-step", {
+      tool_call_id: "tool_call_0",
+      invocation_id: "orphan-invocation",
+      settlement_delivery: true,
+    }))
+
+    expect(state.messages).toHaveLength(0)
+    expect(state.traceEvents.map(event => event.event_id)).toEqual(["orphan"])
   })
 })
