@@ -22,7 +22,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, cast
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, NamedTuple, cast
 
 from sqlalchemy import and_, exists, false, or_, select, true
 from sqlalchemy.exc import IntegrityError
@@ -57,6 +57,7 @@ from .task_command_terminal_events import (
 from .task_dispatch_cap import (
     CAP_OVERTAKING_CONTROL_KINDS,
     CONTROL_KINDS,
+    DISPATCH_CLASS_INTERACTIVE,
     EXECUTION_OPENING_KINDS,
     DispatchCapSnapshot,
     DispatchClass,
@@ -1756,11 +1757,20 @@ def _dispatcher_candidate_query(
     return query
 
 
+class CommandCandidate(NamedTuple):
+    """The command a dispatch scan picked and what its slot decision needs."""
+
+    id: int
+    task_id: int
+    kind: TaskCommandKind
+    interactive: bool
+
+
 def _find_command_candidate(
     command_db_id: int | None,
     busy_task_ids: tuple[int, ...] = (),
     cap: DispatchCapSnapshot | None = None,
-) -> tuple[int, int, TaskCommandKind] | None:
+) -> CommandCandidate | None:
     from ..models.database import get_session_local
 
     runner_id = get_runner_id()
@@ -1795,8 +1805,13 @@ def _find_command_candidate(
             row = first_candidate(TaskCommandKind.RESUME_INPUT)
         if row is None:
             row = first_candidate()
-        return (
-            (int(row.id), int(row.task_id), TaskCommandKind(row.kind)) if row else None
+        if row is None:
+            return None
+        return CommandCandidate(
+            int(row.id),
+            int(row.task_id),
+            TaskCommandKind(row.kind),
+            row.dispatch_class == DISPATCH_CLASS_INTERACTIVE,
         )
 
 
@@ -1883,18 +1898,20 @@ async def dispatch_one_task_command(
         )
         if candidate is None:
             return False
-        selected_id, task_id, kind = candidate
+        selected_id, task_id, kind, interactive = candidate
         reservation = None
         if kind.value in EXECUTION_OPENING_KINDS:
             reservation = background_task_manager.reserve_dispatch_slot(
-                task_id, limit=cap.limit
+                task_id, policy=cap.policy, interactive=interactive
             )
             if reservation is None:
-                # The cap filled after the snapshot. An execution end signals
-                # the dispatcher, which retries then. Releasing another
-                # attempt's reservation signals nothing, so when the slot was
-                # held by an attempt that ends without starting an execution,
-                # the retry waits for the idle interval or the next notify.
+                # The cap filled after the snapshot, or this process is on its
+                # batch line and the candidate is a batch command. An execution
+                # end signals the dispatcher, which retries then. Releasing
+                # another attempt's reservation signals nothing, so when the
+                # slot was held by an attempt that ends without starting an
+                # execution, the retry waits for the idle interval or the next
+                # notify.
                 return False
         try:
             coordinator = await registry.ensure(task_id)

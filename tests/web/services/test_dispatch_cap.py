@@ -47,6 +47,7 @@ from xagent.web.services.task_command_transport import (
 from xagent.web.services.task_dispatch_cap import (
     CONTROL_KINDS,
     EXECUTION_OPENING_KINDS,
+    DispatchPolicy,
     current_dispatch_limit,
 )
 from xagent.web.services.task_execution import BackgroundTaskManager
@@ -56,6 +57,11 @@ LIMIT_ENV = config.DISPATCHER_MAX_INFLIGHT_PER_PROCESS
 
 def set_limit(monkeypatch: pytest.MonkeyPatch, limit: int) -> None:
     monkeypatch.setenv(LIMIT_ENV, str(limit))
+
+
+def policy_of(limit: int) -> DispatchPolicy:
+    """A policy with no interactive reserve."""
+    return DispatchPolicy(limit=limit, interactive_reserve=0)
 
 
 # --- limit memo --------------------------------------------------------------
@@ -126,7 +132,7 @@ class CapHost:
             db.commit()
             return int(task.id)
 
-    def enqueue(self, task_id: int, kind: str) -> int:
+    def enqueue(self, task_id: int, kind: str, *, dispatch_class: str = "batch") -> int:
         self._identity += 1
         with self.factory() as db:
             row = TaskExecutionCommand(
@@ -134,6 +140,7 @@ class CapHost:
                 command_id=f"cmd-{self._identity}",
                 kind=kind,
                 payload={},
+                dispatch_class=dispatch_class,
             )
             db.add(row)
             db.commit()
@@ -373,7 +380,9 @@ async def test_one_notify_one_free_slot_admits_exactly_one(
             with lock:
                 command_id, task_id = next(handed_out)
             barrier.wait(10)
-            return (command_id, task_id, TaskCommandKind.START)
+            return transport.CommandCandidate(
+                command_id, task_id, TaskCommandKind.START, False
+            )
 
         monkeypatch.setattr(transport, "_find_command_candidate", find)
         before = len(host.claimed)
@@ -392,8 +401,8 @@ async def test_dispatch_reservation_tokens_count_per_attempt(
     cap_host: CapHost,
 ) -> None:
     manager = cap_host.manager
-    first = manager.reserve_dispatch_slot(7, limit=5)
-    second = manager.reserve_dispatch_slot(7, limit=5)
+    first = manager.reserve_dispatch_slot(7, policy=policy_of(5), interactive=False)
+    second = manager.reserve_dispatch_slot(7, policy=policy_of(5), interactive=False)
     assert first is not None and second is not None
     manager.release_dispatch_slot(first)
     assert 7 in manager._active_task_ids()
@@ -814,11 +823,14 @@ def take_last_slot_after_snapshot(
     real_reserve = host.manager.reserve_dispatch_slot
     calls: list[int] = []
 
-    def reserve(task_id: int, *, limit: int) -> Any:
+    def reserve(task_id: int, *, policy: DispatchPolicy, interactive: bool) -> Any:
         if not calls:
             calls.append(task_id)
-            assert real_reserve(other_task_id, limit=limit) is not None
-        return real_reserve(task_id, limit=limit)
+            assert (
+                real_reserve(other_task_id, policy=policy, interactive=interactive)
+                is not None
+            )
+        return real_reserve(task_id, policy=policy, interactive=interactive)
 
     monkeypatch.setattr(host.manager, "reserve_dispatch_slot", reserve)
 
@@ -892,7 +904,7 @@ async def test_closed_cap_claims_controls_and_active_task_commands(
         # An older held start of another task: FIFO would return it first.
         held_start = host.enqueue(host.new_task(), "start")
     command_id = host.enqueue(target, kind)
-    snapshot = host.manager.dispatch_cap_snapshot(1)
+    snapshot = host.manager.dispatch_cap_snapshot(policy_of(1))
     assert snapshot.closed
 
     with host.factory() as db:
@@ -907,9 +919,7 @@ async def test_closed_cap_claims_controls_and_active_task_commands(
 
     if held_start is not None:
         assert transport._find_command_candidate(None, (), snapshot) == (
-            command_id,
-            target,
-            TaskCommandKind(kind),
+            transport.CommandCandidate(command_id, target, TaskCommandKind(kind), False)
         )
     assert await dispatch(host) is True
     assert host.claimed == [(target, TaskCommandKind(kind))]
@@ -1068,7 +1078,7 @@ async def test_active_set_reductions_notify_dispatcher(
     elif row == "cancel_with_nothing_registered":
         await manager.cancel_task(4)
     else:
-        token = manager.reserve_dispatch_slot(5, limit=3)
+        token = manager.reserve_dispatch_slot(5, policy=policy_of(3), interactive=False)
         manager.release_dispatch_slot(token)
     for _ in range(3):
         await asyncio.sleep(0)
