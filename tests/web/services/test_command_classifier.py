@@ -1,8 +1,6 @@
 """The acceptance-time command classifier: one call per new execution command."""
 
 import asyncio
-import logging
-import os
 from unittest.mock import Mock
 
 import pytest
@@ -92,7 +90,7 @@ def counting(result=None):
 
 
 def test_default_classifier_stages_no_ticket(host):
-    assert admission._classifier is admission.upstream_command_classifier
+    assert admission._installed.classifier is admission.upstream_command_classifier
     assert admission.admission_enabled() is False
     host.enqueue()
     assert host.tickets() == []
@@ -180,9 +178,7 @@ def test_admission_refusals_still_propagate(host):
         ),
     ],
 )
-def test_admission_enabled_reflects_declaration(
-    host, monkeypatch, install, expected, recwarn
-):
+def test_admission_enabled_reflects_declaration(host, monkeypatch, install, expected):
     install()
     assert admission.admission_enabled() is expected
 
@@ -190,6 +186,7 @@ def test_admission_enabled_reflects_declaration(
     # declared admission host reports the wait.
     monkeypatch.setattr(admission, "admission_eligible", lambda: sa.false())
     command_id = host.enqueue().command_id
+    assert host.tickets() == []
     with host.sessions() as db:
         assert admission.waiting_for_capacity(db, command_id) is expected
 
@@ -200,11 +197,10 @@ def test_admission_enabled_reflects_declaration(
     monkeypatch.setattr(task_resume_command, "run_db_io_cancellation_safe", passthrough)
     monkeypatch.setattr(task_resume_command, "_admit_reply", lambda *a: 1)
     monkeypatch.setattr(task_resume_command, "_read_reply_outcome", lambda _id: None)
-    monkeypatch.setattr(
-        task_resume_command,
-        "_read_capacity_wait",
-        lambda _id: {"run_id": "r", "state_version": 1, "control_state": "waiting"},
+    capacity_wait = Mock(
+        return_value={"run_id": "r", "state_version": 1, "control_state": "waiting"}
     )
+    monkeypatch.setattr(task_resume_command, "_read_capacity_wait", capacity_wait)
     monkeypatch.setattr(task_resume_command, "notify_task_command_dispatcher", Mock())
     monkeypatch.setattr(
         task_resume_command, "get_task_reply_wait_timeout_seconds", lambda: 0
@@ -224,6 +220,9 @@ def test_admission_enabled_reflects_declaration(
     else:
         with pytest.raises(task_resume_command.TaskResumeOutcomeUnknownError):
             asyncio.run(submit())
+    # The acknowledge_queued gate: the capacity wait is read only when the
+    # installed classifier declared admission.
+    assert capacity_wait.called is expected
 
 
 def test_classifier_sees_flushed_command(host):
@@ -266,9 +265,11 @@ def test_legacy_hook_wrapper_matches_old_behavior(host):
         received.append((db, command))
         return policy("legacy:bucket")
 
-    with pytest.warns(DeprecationWarning, match="set_command_classifier"):
-        admission.set_task_admission_hook(hook)
+    admission.set_task_admission_hook(hook)
     assert admission.admission_enabled() is True
+    described = admission._describe(admission._installed.classifier)
+    assert hook.__qualname__ in described
+    assert "legacy_admission_hook" not in described
     host.enqueue()
     assert host.tickets() == ["legacy:bucket"]
     assert len(received) == 1
@@ -277,46 +278,13 @@ def test_legacy_hook_wrapper_matches_old_behavior(host):
     assert isinstance(command, TaskExecutionCommand)
 
 
-def test_first_classification_logged_once(host, monkeypatch, caplog):
-    monkeypatch.setattr(admission, "_first_classification_logged", False)
-
-    def named_classifier(db, command):
-        return admission.CommandClassification()
-
-    admission.set_command_classifier(named_classifier, admission_enabled=False)
-    caplog.clear()
-    with caplog.at_level(logging.INFO, logger=admission.logger.name):
-        host.enqueue()
-        host.enqueue()
-    first = [r for r in caplog.records if "First classification" in r.getMessage()]
-    assert len(first) == 1
-    message = first[0].getMessage()
-    assert str(os.getpid()) in message
-    assert "combined" in message
-    assert "named_classifier" in message
-    assert "admission_enabled=False" in message
-
-
-def test_invalid_role_does_not_fail_acceptance(host, monkeypatch, caplog):
-    monkeypatch.setattr(admission, "_first_classification_logged", False)
-    monkeypatch.setenv("XAGENT_TASK_EXECUTION_ROLE", "scheduler")
-    admission.set_command_classifier(counting(), admission_enabled=False)
-    caplog.clear()
-    with caplog.at_level(logging.INFO, logger=admission.logger.name):
-        host.enqueue()
-    assert host.commands() == 1
-    first = [r for r in caplog.records if "First classification" in r.getMessage()]
-    assert len(first) == 1
-    assert "role=unknown" in first[0].getMessage()
-
-
 def test_classifier_reset_fixture_isolates_tests_first():
     admission.set_command_classifier(counting(), admission_enabled=True)
     assert admission.admission_enabled() is True
 
 
 def test_classifier_reset_fixture_isolates_tests():
-    assert admission._classifier is admission.upstream_command_classifier
+    assert admission._installed.classifier is admission.upstream_command_classifier
     assert admission.admission_enabled() is False
 
 
@@ -324,4 +292,25 @@ def test_classifier_reset_fixture_isolates_tests():
 def test_set_command_classifier_rejects_non_callable(bad):
     with pytest.raises(TypeError):
         admission.set_command_classifier(bad, admission_enabled=False)
-    assert admission._classifier is admission.upstream_command_classifier
+    assert admission._installed.classifier is admission.upstream_command_classifier
+
+
+@pytest.mark.parametrize("bad", ["false", 1, None])
+def test_set_command_classifier_rejects_non_bool_declaration(bad):
+    before = admission._installed
+    with pytest.raises(TypeError, match="admission_enabled must be a bool"):
+        admission.set_command_classifier(counting(), admission_enabled=bad)
+    assert admission._installed is before
+    assert admission._installed.classifier is admission.upstream_command_classifier
+
+
+def test_legacy_clear_leaves_a_new_style_classifier_installed():
+    classify = counting()
+    admission.set_command_classifier(classify, admission_enabled=True)
+    admission.set_task_admission_hook(None)
+    assert admission._installed.classifier is classify
+    assert admission.admission_enabled() is True
+
+    admission.set_task_admission_hook(lambda db, command: None)
+    admission.set_task_admission_hook(None)
+    assert admission._installed.classifier is admission.upstream_command_classifier

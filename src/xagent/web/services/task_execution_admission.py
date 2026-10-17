@@ -27,9 +27,8 @@ held task, including the waiter's own; it is display only (#2700).
 
 from __future__ import annotations
 
+import functools
 import logging
-import os
-import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
@@ -99,13 +98,37 @@ def upstream_command_classifier(
     return CommandClassification()
 
 
-_classifier: CommandClassifier = upstream_command_classifier
-_admission_declared = False
-_first_classification_logged = False
+@dataclass(frozen=True)
+class _InstalledClassifier:
+    """The classifier and its admission declaration, replaced as one unit."""
+
+    classifier: CommandClassifier
+    admission_enabled: bool
+    legacy: bool = False
+
+
+_UPSTREAM = _InstalledClassifier(upstream_command_classifier, False)
+_installed = _UPSTREAM
 
 
 def _describe(classifier: CommandClassifier) -> str:
     return getattr(classifier, "__qualname__", None) or repr(classifier)
+
+
+def _install(
+    classifier: CommandClassifier, admission_enabled: bool, *, legacy: bool
+) -> None:
+    global _installed
+    if not callable(classifier):
+        raise TypeError("command classifier must be callable")
+    if not isinstance(admission_enabled, bool):
+        raise TypeError("admission_enabled must be a bool")
+    _installed = _InstalledClassifier(classifier, admission_enabled, legacy)
+    logger.info(
+        "Command classifier installed: %s admission_enabled=%s",
+        _describe(classifier),
+        admission_enabled,
+    )
 
 
 def set_command_classifier(
@@ -116,55 +139,48 @@ def set_command_classifier(
     Install it in every process that accepts commands and every process that
     executes them. It is called once per new execution command, after the
     command row is flushed and before the acceptance transaction commits.
+    The classifier runs inside the acceptance transaction: it must not commit
+    or roll back, and must not do slow I/O, because under SQLite that
+    transaction holds the database-wide writer lock.
     Construct every field of its return value by keyword.
-    ``admission_enabled`` declares whether it may return an admission policy.
+    ``admission_enabled`` (a ``bool``) declares whether it may return an
+    admission policy.
     """
-    global _classifier, _admission_declared
-    if not callable(classifier):
-        raise TypeError("command classifier must be callable")
-    _classifier = classifier
-    _admission_declared = admission_enabled
-    logger.info(
-        "Command classifier installed: %s admission_enabled=%s",
-        _describe(classifier),
-        admission_enabled,
-    )
+    _install(classifier, admission_enabled, legacy=False)
 
 
 def reset_command_classifier() -> None:
     """Restore the upstream classifier; for tests and for clearing a legacy hook."""
-    global _classifier, _admission_declared
-    _classifier = upstream_command_classifier
-    _admission_declared = False
+    global _installed
+    _installed = _UPSTREAM
     logger.info("Command classifier reset to the upstream default")
 
 
 def set_task_admission_hook(hook: AdmissionHook | None) -> None:
-    """Deprecated: install an admission-only classifier; use set_command_classifier.
+    """Legacy entry point: install an admission-only classifier.
 
-    Behaves as the earlier hook did: ``None`` clears it, otherwise the hook is
-    called with ``(db, command)`` and its policy is staged as the ticket.
+    ``None`` clears a classifier installed through this function; a classifier
+    installed with ``set_command_classifier`` is left in place. Otherwise the
+    hook is called with ``(db, command)`` and its policy is staged as the
+    ticket.
     """
-    warnings.warn(
-        "set_task_admission_hook is deprecated; use set_command_classifier",
-        DeprecationWarning,
-        stacklevel=2,
-    )
     if hook is None:
-        reset_command_classifier()
+        if _installed.legacy:
+            reset_command_classifier()
         return
 
+    @functools.wraps(hook)
     def legacy_admission_hook(
         db: Session, command: TaskExecutionCommand
     ) -> CommandClassification:
         return CommandClassification(admission=hook(db, command))
 
-    set_command_classifier(legacy_admission_hook, admission_enabled=True)
+    _install(legacy_admission_hook, True, legacy=True)
 
 
 def admission_enabled() -> bool:
     """Whether the installed classifier declared that it stages admission tickets."""
-    return _admission_declared
+    return _installed.admission_enabled
 
 
 def classify_command_no_commit(
@@ -177,25 +193,14 @@ def classify_command_no_commit(
     declared ``admission_enabled=False``, is rejected before its admission
     ticket is staged; the caller's rollback discards the flushed command row.
     """
-    from .process_diagnostics import resolve_diagnostic_role
-
-    global _first_classification_logged
-    result = _classifier(db, command)
+    installed = _installed
+    result = installed.classifier(db, command)
     if not isinstance(result, CommandClassification):
         raise TypeError("command classifier must return CommandClassification")
-    if not _admission_declared and result.admission is not None:
+    if not installed.admission_enabled and result.admission is not None:
         raise TypeError(
             "command classifier returned an admission policy but was installed "
             "with admission_enabled=False"
-        )
-    if not _first_classification_logged:
-        _first_classification_logged = True
-        logger.info(
-            "First classification: pid=%s role=%s classifier=%s admission_enabled=%s",
-            os.getpid(),
-            resolve_diagnostic_role(),
-            _describe(_classifier),
-            _admission_declared,
         )
     return result
 
