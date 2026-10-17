@@ -328,7 +328,10 @@ jobs:
   pytest-fast:
     name: Pytest Fast (${{ matrix.name }})
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # The web leg's test step alone takes about 35 minutes on a healthy run,
+    # and slow runners pushed it past a 40-minute limit near the end. Hung
+    # tests are cut by pytest-timeout (300 s per test), not by this limit.
+    timeout-minutes: 60
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     needs: [changes, pre-commit]
     strategy:
