@@ -160,7 +160,10 @@ class TaskCommandRejected(RuntimeError):
     ``settle_cap_held`` asks the failing write to settle the commands this
     control passed while a dispatch cap held them
     (``settle_cap_held_commands_no_commit``); only a pause rejected because
-    nothing of its task runs sets it.
+    nothing of its task runs sets it. Such a pause still ends ``failed``
+    although it stopped those commands, while a pause whose target START
+    waits for an admission ticket is completed by
+    ``settle_queued_start_for_pause``; both fail that START.
     """
 
     def __init__(

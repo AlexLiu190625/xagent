@@ -681,12 +681,11 @@ def settle_cap_held_commands_no_commit(db: Session, control_command_id: int) -> 
         TerminalTaskEventDraft,
         stage_terminal_event,
     )
+    from .task_dispatch_cap import CAP_OVERTAKING_CONTROL_KINDS
     from .task_start_consumer import settle_failed_start_no_commit
 
     control = db.get(TaskExecutionCommand, control_command_id)
-    # Each kind here has its own rule below; CAP_OVERTAKING_CONTROL_KINDS
-    # must not name a kind without one.
-    if control is None or control.kind not in ("cancel", "pause"):
+    if control is None or control.kind not in CAP_OVERTAKING_CONTROL_KINDS:
         return
     task = db.get(Task, control.task_id, populate_existing=True)
     if task is None:

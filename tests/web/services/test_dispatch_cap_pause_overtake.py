@@ -334,6 +334,49 @@ async def _error_payload_read_fails(host: CapHost) -> None:
     assert_untouched(host, message_id)
 
 
+async def _precheck_reply_fails(host: CapHost) -> None:
+    _, task_id = await cap_held_task(host, TaskStatus.PAUSED, control_state="paused")
+    resume_id = enqueue_at(host, task_id, "resume", 3)
+    pause_id = stage_pause(host, task_id)
+
+    with patch.object(
+        task_command_execution,
+        "_read_task_error_payload_offloop",
+        AsyncMock(side_effect=ValueError("payload data invalid")),
+    ):
+        assert await run() is True
+
+    # Unlike the same failure inside ``pause_task``, the pause is retried.
+    row = host.row(pause_id)
+    assert (row.status, row.failure_count) == ("pending", 1)
+    assert_untouched(host, resume_id)
+    assert host.agent_builds.await_count == 0
+
+
+async def _pause_task_other_rejection(host: CapHost, *, unsupported: bool) -> None:
+    _, task_id = await cap_held_task(host, TaskStatus.RUNNING)
+    message_id = enqueue_at(host, task_id, "message", 3)
+    pause_id = stage_pause(host, task_id)
+    if unsupported:
+        host.agent_builds.return_value = SimpleNamespace()
+        error = "Current agent does not support pause functionality"
+    else:
+        host.agent_builds.return_value.pause_execution.return_value = True
+        error = "Task finished before the pause request was applied"
+
+    with patch.object(
+        task_command_execution,
+        "_apply_pause_requested_isolated",
+        return_value=task_command_execution.PauseWriteOutcome.NOT_APPLIED,
+    ):
+        assert await run() is True
+
+    row = host.row(pause_id)
+    assert (row.status, row.error) == ("failed", error)
+    assert_untouched(host, message_id)
+    assert host.agent_builds.await_count == 1
+
+
 async def _retry_finds_run_paused(host: CapHost) -> None:
     _, task_id = await cap_held_task(host, TaskStatus.PAUSED, control_state="paused")
     resume_id = enqueue_at(host, task_id, "resume", 3)
@@ -430,13 +473,13 @@ async def _snapshot_data_invalid(host: CapHost, *, with_held_row: bool) -> None:
         assert_untouched(host, resume_id)
 
 
-async def _stale_web_pause(host: CapHost) -> None:
+async def _stale_web_pause(host: CapHost, *, held: str, held_run: str) -> None:
     await hold_cap(host)
     task_id = host.new_task(
         status=TaskStatus.COMPLETED, run_id="run-new", state_version=4
     )
-    message_id = enqueue(
-        host, task_id, "message", target_run_id="run-old", target_state_version=4
+    held_id = enqueue(
+        host, task_id, held, target_run_id=held_run, target_state_version=4
     )
     pause_id = stage_pause(host, task_id, "run-old")
 
@@ -445,7 +488,7 @@ async def _stale_web_pause(host: CapHost) -> None:
     row = host.row(pause_id)
     assert (row.status, row.result) == ("failed", {"rejection_reason": "stale_run"})
     assert len(events_of(host, pause_id)) == 1
-    assert_untouched(host, message_id)
+    assert_untouched(host, held_id)
     assert host.agent_builds.await_count == 0
 
 
@@ -487,6 +530,13 @@ PAUSE_SCENARIOS: dict[str, Any] = {
     "S11-other-users-pause": _other_users_pause,
     "S12-running-row-nothing-live": _running_row_nothing_live,
     "S12b-error-payload-read-fails": _error_payload_read_fails,
+    "S12c-precheck-reply-fails": _precheck_reply_fails,
+    "S12d-pause-not-supported": functools.partial(
+        _pause_task_other_rejection, unsupported=True
+    ),
+    "S12e-pause-write-not-applied": functools.partial(
+        _pause_task_other_rejection, unsupported=False
+    ),
     "S13-retry-finds-run-paused": _retry_finds_run_paused,
     "S14-settlement-failure": _settlement_failure,
     "S15-held-row-read-fails": _held_row_read_fails,
@@ -496,7 +546,13 @@ PAUSE_SCENARIOS: dict[str, Any] = {
     "S15b-snapshot-data-invalid-no-held": functools.partial(
         _snapshot_data_invalid, with_held_row=False
     ),
-    "S16-stale-web-pause": _stale_web_pause,
+    "S16-stale-web-pause": functools.partial(
+        _stale_web_pause, held="message", held_run="run-old"
+    ),
+    # A held start for a run other than the pause's target.
+    "S16b-stale-web-pause-other-start": functools.partial(
+        _stale_web_pause, held="start", held_run="run-next"
+    ),
     "S17-ticketed-start-stopped-by-channel": _ticketed_start_stopped_by_channel,
 }
 
@@ -518,7 +574,11 @@ async def test_pause_settles_overtaken_commands(
     elif scenario in (
         "S9-ticketed-start",
         "S11-other-users-pause",
+        "S12c-precheck-reply-fails",
+        "S12d-pause-not-supported",
+        "S12e-pause-write-not-applied",
         "S16-stale-web-pause",
+        "S16b-stale-web-pause-other-start",
     ):
         assert records == []
 
