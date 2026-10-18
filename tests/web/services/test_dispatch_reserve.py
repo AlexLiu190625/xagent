@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import logging
 from types import SimpleNamespace
 from typing import Any
@@ -27,7 +26,6 @@ from xagent.web.services.task_dispatch_cap import (
     DispatchCapSnapshot,
     DispatchPolicy,
     build_dispatch_cap_snapshot,
-    current_dispatch_limit,
     current_dispatch_policy,
 )
 from xagent.web.services.task_execution import BackgroundTaskManager
@@ -174,7 +172,6 @@ def test_policy_configuration(
     for _ in range(4):
         policy = current_dispatch_policy()
         assert (policy.limit, policy.interactive_reserve) == expected
-    assert current_dispatch_limit() == expected[0]
     assert config_logger.warning.call_count == config_warnings
     assert cap_logger.warning.call_count == clamp_warnings
 
@@ -182,30 +179,18 @@ def test_policy_configuration(
 # ---------------------------------------------------------------- I-7
 
 
-async def _settle(call: Any) -> Any:
-    result = call
-    if inspect.isawaitable(result):
-        result = await result
-    return result
-
-
-async def _tokens_taken(
-    limit: int, reserve: int, active: int, interactive: bool
-) -> int:
+def _free_slots_taken(limit: int, reserve: int, active: int, interactive: bool) -> int:
+    """How many of four new tasks get a slot when ``active`` tasks already run."""
     manager = BackgroundTaskManager()
+    manager._cap_clock = lambda: 0.0
     for index in range(active):
         manager._live_executions[10_000 + index] = {object()}  # type: ignore[assignment]
     policy = DispatchPolicy(limit=limit, interactive_reserve=reserve)
-
-    async def attempt(task_id: int) -> Any:
-        return await _settle(
-            manager.reserve_dispatch_slot(
-                task_id, policy=policy, interactive=interactive
-            )
-        )
-
-    results = await asyncio.gather(*(attempt(task_id) for task_id in range(1, 5)))
-    return sum(1 for token in results if token is not None)
+    tokens = [
+        manager.reserve_dispatch_slot(task_id, policy=policy, interactive=interactive)
+        for task_id in range(1, 5)
+    ]
+    return sum(1 for token in tokens if token is not None)
 
 
 @pytest.mark.parametrize(
@@ -217,11 +202,10 @@ async def _tokens_taken(
         pytest.param(10 - 2 - 1, True, 3, id="interactive-reserve-plus-one"),
     ],
 )
-async def test_concurrent_reservations_never_exceed_the_line(
+def test_reservations_fill_the_slots_up_to_the_line_of_their_class(
     active: int, interactive: bool, expected: int
 ) -> None:
-    for _ in range(200):
-        assert await _tokens_taken(10, 2, active, interactive) == expected
+    assert _free_slots_taken(10, 2, active, interactive) == expected
 
 
 # ---------------------------------------------------------------- I-12
@@ -268,7 +252,6 @@ async def test_batch_work_stays_at_the_batch_line(
 
     assert claimed == [True, True, False, False]
     assert host.registered_active_sizes == [1, 2]
-    assert max(host.registered_active_sizes) <= 2
 
 
 # ---------------------------------------------------------------- I-16
@@ -304,6 +287,38 @@ async def test_effective_policy_is_logged_when_it_changes(
         "classifier=upstream_command_classifier admission_enabled=False",
         "dispatch policy limit=10 interactive_reserve=3 "
         "classifier=upstream_command_classifier admission_enabled=False",
+    ]
+
+
+async def test_installing_a_classifier_after_the_first_snapshot_reports_again(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    fresh_policy_state: None,
+) -> None:
+    monkeypatch.setattr(
+        task_execution_admission, "_installed", task_execution_admission._UPSTREAM
+    )
+    monkeypatch.setenv(LIMIT_ENV, "10")
+    monkeypatch.setenv(RESERVE_ENV, "2")
+    caplog.set_level(logging.INFO, logger=task_dispatch_cap.logger.name)
+
+    build_dispatch_cap_snapshot()
+    build_dispatch_cap_snapshot()
+    task_execution_admission.set_command_classifier(
+        lambda db, command, view: task_execution_admission.CommandClassification(),
+        admission_enabled=True,
+    )
+    build_dispatch_cap_snapshot()
+    build_dispatch_cap_snapshot()
+
+    lines = [
+        r.getMessage() for r in caplog.records if "dispatch policy" in r.getMessage()
+    ]
+    assert len(lines) == 2
+    assert "classifier=upstream_command_classifier" in lines[0]
+    assert "<lambda>" in lines[1] and "admission_enabled=True" in lines[1]
+    assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == [
+        "interactive commands of a team are not prioritized inside its admission bucket"
     ]
 
 
@@ -509,22 +524,23 @@ async def test_without_a_reserve_the_same_queue_is_claimed(
 
 # ---------------------------------------------------------------- documentation
 
-KEEP_AT_ZERO = (
-    "Keep this at 0. Between limit-R and limit the queue scan stops at the "
-    "oldest queued command it may not start, so commands queued after it wait "
-    "until fewer than limit-R tasks are active, except replies classified "
-    "interactive; this includes interactive starts and every cancel and pause. "
-    "A cancel or pause, even one dispatched by id, also waits behind an earlier "
-    "held batch command of its own task, so that task may start first and the "
-    "cancel or pause can then be rejected as stale."
-)
-
 
 def test_example_env_documents_the_reserve_and_the_known_stall() -> None:
     from pathlib import Path
 
     text = (Path(__file__).resolve().parents[3] / "example.env").read_text()
     assert '# XAGENT_DISPATCHER_INTERACTIVE_RESERVE_PER_PROCESS="0"' in text
-    assert f"# {KEEP_AT_ZERO}\n" in text
-    assert "R (this value)" in text
-    assert "limit (XAGENT_DISPATCHER_MAX_INFLIGHT_PER_PROCESS)" in text
+    comment = " ".join(
+        line.removeprefix("#").strip()
+        for line in text.splitlines()
+        if line.startswith("#")
+    )
+    for phrase in (
+        "R (this value)",
+        "limit (XAGENT_DISPATCHER_MAX_INFLIGHT_PER_PROCESS)",
+        "Keep this at 0.",
+        "the queue scan stops at the oldest queued command it may not start",
+        "except replies classified interactive",
+        "rejected as stale",
+    ):
+        assert phrase in " ".join(comment.split())

@@ -644,17 +644,16 @@ def stage_task_command(
         TaskClassificationView,
         classify_command_no_commit,
         stage_task_admission,
-        upstream_source_class,
     )
 
     classification = None
     if command.kind in EXECUTION_OPENING_KINDS:
         # A background command is one the system stages itself (``reserved``).
-        # Its previous class matters only when the task source does not decide
-        # the upstream rule, so the lookup is skipped otherwise. The row just
+        # A classifier may use the class of the task's previous command, so it
+        # is read for every background command and for no other. The row just
         # flushed is excluded: it exists with the default class.
         previous_dispatch_class: DispatchClass | None = None
-        if reserved and upstream_source_class(snapshot.source) is None:
+        if reserved:
             previous_dispatch_class = cast(
                 "DispatchClass | None",
                 db.execute(

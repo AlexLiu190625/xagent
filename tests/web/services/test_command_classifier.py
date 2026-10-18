@@ -407,8 +407,8 @@ _SOURCE_CLASS = {
     "trigger": B,
     "a2a": B,
     "external": None,
-    None: None,
-    "": None,
+    None: I,
+    "": I,
     "SDK": None,
     "future_unknown": None,
 }
@@ -420,8 +420,8 @@ _FOREGROUND = {
     "trigger": {"resume_input": I, "other": B},
     "a2a": {"resume_input": I, "other": B},
     "external": {"resume_input": I, "other": B},
-    None: {"resume_input": I, "other": B},
-    "": {"resume_input": I, "other": B},
+    None: {"resume_input": I, "other": I},
+    "": {"resume_input": I, "other": I},
     "SDK": {"resume_input": I, "other": B},
     "future_unknown": {"resume_input": I, "other": B},
 }
@@ -497,7 +497,7 @@ def test_classifier_receives_the_task_view(host):
     ]
 
 
-def _previous_queries(engine):
+def _previous_queries():
     statements = []
 
     def record(_conn, _cursor, statement, *_args):
@@ -522,7 +522,7 @@ def test_background_resume_is_classified_by_source_not_by_the_previous_command(h
 
 
 def test_background_resume_inherits_interactive_only_for_an_unknown_source(host):
-    task_id = host.task(source="external")
+    task_id = host.task(source="custom")
     host.seed(task_id, "start", I)
     resume = host.stage(KINDS.RESUME, task_id=task_id, reserved=True)
     assert host.klass(resume.staged_db_id) == I
@@ -536,28 +536,58 @@ def test_background_resume_sees_the_previous_class_in_its_view(host):
         return admission.CommandClassification()
 
     admission.set_command_classifier(classify, admission_enabled=False)
-    task_id = host.task(source="external")
+    task_id = host.task(source="custom")
     host.seed(task_id, "start", I)
     host.seed(task_id, "message", B)
     host.stage(KINDS.RESUME, task_id=task_id, reserved=True)
     assert seen == [(True, B)]
 
 
-def test_the_previous_command_is_read_only_when_it_can_matter(host):
-    statements, record = _previous_queries(host.engine)
+def test_the_previous_command_is_read_only_for_background_commands(host):
+    statements, record = _previous_queries()
     sa.event.listen(host.engine, "before_cursor_execute", record)
     try:
         sdk = host.task(source="sdk")
         host.stage(KINDS.START, task_id=sdk)
+        host.stage(KINDS.RESUME_INPUT, task_id=sdk)
+        assert statements == []
         host.stage(KINDS.RESUME, task_id=sdk, reserved=True)
-        assert statements == []
-        external = host.task(source="external")
-        host.stage(KINDS.START, task_id=external)
-        assert statements == []
-        host.stage(KINDS.RESUME, task_id=external, reserved=True)
         assert len(statements) == 1
     finally:
         sa.event.remove(host.engine, "before_cursor_execute", record)
+
+
+def test_a_custom_classifier_sees_the_previous_class_of_a_known_source(host):
+    seen = []
+
+    def classify(db, command, view):
+        seen.append((view.source, view.background, view.previous_dispatch_class))
+        return admission.CommandClassification()
+
+    admission.set_command_classifier(classify, admission_enabled=False)
+    task_id = host.task(source="sdk")
+    host.seed(task_id, "message", I)
+    host.stage(KINDS.RESUME, task_id=task_id, reserved=True)
+    assert seen == [("sdk", True, I)]
+
+
+def test_a_classifier_with_the_old_signature_is_refused_at_install():
+    with pytest.raises(TypeError, match=r"accept \(db, command, view\)"):
+        admission.set_command_classifier(
+            lambda db, command: admission.CommandClassification(),
+            admission_enabled=False,
+        )
+    assert admission._installed.classifier is admission.upstream_command_classifier
+
+
+def test_a_classifier_without_an_inspectable_signature_is_installed(monkeypatch):
+    def no_signature(_callable, **_kwargs):
+        raise ValueError("no signature found")
+
+    monkeypatch.setattr(admission.inspect, "signature", no_signature)
+    classify = counting()
+    admission.set_command_classifier(classify, admission_enabled=False)
+    assert admission._installed.classifier is classify
 
 
 # ---------------------------------------------------------------- I-33

@@ -28,6 +28,7 @@ held task, including the waiter's own; it is display only (#2700).
 from __future__ import annotations
 
 import functools
+import inspect
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
@@ -106,8 +107,8 @@ class TaskClassificationView:
     ``background`` is true for a command the system stages on its own (the
     automatic resume sweeper) rather than one a caller asked for.
     ``previous_dispatch_class`` is the class of the task's latest earlier
-    execution-opening command; it is read only for a background command whose
-    task source the upstream rule does not recognize, and is otherwise None.
+    execution-opening command, or None when there is none. It is read for
+    every background command and is None for any other command.
     """
 
     task_id: int
@@ -130,8 +131,12 @@ _UPSTREAM_BATCH_SOURCES = frozenset({"sdk", "trigger", "a2a"})
 def upstream_source_class(source: str | None) -> DispatchClass | None:
     """The class the upstream rule gives a task source, or None if unrecognized.
 
-    The match is exact: no stripping and no case folding.
+    A missing source (None or the empty string) means ``internal``, as it does
+    for ``normalize_interaction_origin`` and automatic recovery. Any other match
+    is exact: no stripping and no case folding.
     """
+    if not source:
+        return DISPATCH_CLASS_INTERACTIVE
     if source in _UPSTREAM_INTERACTIVE_SOURCES:
         return DISPATCH_CLASS_INTERACTIVE
     if source in _UPSTREAM_BATCH_SOURCES:
@@ -184,12 +189,30 @@ def _describe(classifier: CommandClassifier) -> str:
     return getattr(classifier, "__qualname__", None) or repr(classifier)
 
 
+def describe_installed_classifier() -> tuple[str, bool]:
+    """The installed classifier's name and whether it declared admission."""
+    installed = _installed
+    return _describe(installed.classifier), installed.admission_enabled
+
+
 def _install(
     classifier: CommandClassifier, admission_enabled: bool, *, legacy: bool
 ) -> None:
     global _installed
     if not callable(classifier):
         raise TypeError("command classifier must be callable")
+    try:
+        # What is called is the callable itself, not a function it wraps.
+        signature = inspect.signature(classifier, follow_wrapped=False)
+    except (TypeError, ValueError):
+        signature = None
+    if signature is not None:
+        try:
+            signature.bind(None, None, None)
+        except TypeError:
+            raise TypeError(
+                "command classifier must accept (db, command, view)"
+            ) from None
     if not isinstance(admission_enabled, bool):
         raise TypeError("admission_enabled must be a bool")
     _installed = _InstalledClassifier(classifier, admission_enabled, legacy)
@@ -213,7 +236,9 @@ def set_command_classifier(
     transaction holds the database-wide writer lock.
     It receives the session, the flushed command and a read-only view of its
     task. Construct every field of its return value by keyword; the
-    ``dispatch_class`` field defaults to batch.
+    ``dispatch_class`` field defaults to batch, so a classifier that only sets
+    ``admission`` makes every command batch. To keep the upstream class it can
+    return ``dispatch_class=upstream_dispatch_class(view, command.kind)``.
     ``admission_enabled`` (a ``bool``) declares whether it may return an
     admission policy.
     """

@@ -227,6 +227,9 @@ def test_postgresql_lock_timeout_is_retried_then_reported(
     try:
         with engine.connect() as connection:
             _create_pg_table(connection)
+            lock_timeout_before = connection.execute(
+                text("SHOW lock_timeout")
+            ).scalar_one()
             holder.execute(text(f"LOCK TABLE {TABLE} IN ACCESS SHARE MODE"))
 
             attempts: list[str] = []
@@ -243,7 +246,9 @@ def test_postgresql_lock_timeout_is_retried_then_reported(
                 event.remove(engine, "before_cursor_execute", record)
 
             assert len(attempts) == 3
-            assert connection.execute(text("SHOW lock_timeout")).scalar_one() == "0"
+            assert connection.execute(text("SHOW lock_timeout")).scalar_one() == (
+                lock_timeout_before
+            )
             assert COLUMN not in _columns(connection)
 
             holder.rollback()
@@ -252,7 +257,9 @@ def test_postgresql_lock_timeout_is_retried_then_reported(
 
             _run(migration, connection, "upgrade")
             assert COLUMN in _columns(connection)
-            assert connection.execute(text("SHOW lock_timeout")).scalar_one() == "0"
+            assert connection.execute(text("SHOW lock_timeout")).scalar_one() == (
+                lock_timeout_before
+            )
     finally:
         if holder is not None:
             holder.rollback()
@@ -275,6 +282,7 @@ def test_postgresql_a_non_lock_error_is_not_retried(
     )
     with engine.connect() as connection:
         _create_pg_table(connection)
+        lock_timeout_before = connection.execute(text("SHOW lock_timeout")).scalar_one()
         attempts: list[str] = []
 
         def record(_conn, _cursor, statement, *_args) -> None:
@@ -289,4 +297,6 @@ def test_postgresql_a_non_lock_error_is_not_retried(
             event.remove(engine, "before_cursor_execute", record)
         assert not isinstance(caught.value, RuntimeError)
         assert len(attempts) == 1
-        assert connection.execute(text("SHOW lock_timeout")).scalar_one() == "0"
+        assert connection.execute(text("SHOW lock_timeout")).scalar_one() == (
+            lock_timeout_before
+        )

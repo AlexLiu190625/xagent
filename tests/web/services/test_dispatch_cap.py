@@ -48,7 +48,7 @@ from xagent.web.services.task_dispatch_cap import (
     CONTROL_KINDS,
     EXECUTION_OPENING_KINDS,
     DispatchPolicy,
-    current_dispatch_limit,
+    current_dispatch_policy,
 )
 from xagent.web.services.task_execution import BackgroundTaskManager
 
@@ -73,23 +73,23 @@ def test_dispatch_limit_memo_warns_once_per_raw_value(
     logger = Mock()
     monkeypatch.setattr(config, "logger", logger)
     monkeypatch.setenv(LIMIT_ENV, "9")
-    assert current_dispatch_limit() == 9
+    assert current_dispatch_policy().limit == 9
 
     monkeypatch.setenv(LIMIT_ENV, "abc")
     for _ in range(5):
-        assert current_dispatch_limit() == 80
+        assert current_dispatch_policy().limit == 80
     assert logger.warning.call_count == 1
 
     monkeypatch.setenv(LIMIT_ENV, "xyz")
-    assert current_dispatch_limit() == 80
+    assert current_dispatch_policy().limit == 80
     assert logger.warning.call_count == 2
 
     monkeypatch.setenv(LIMIT_ENV, "9")
-    assert current_dispatch_limit() == 9
+    assert current_dispatch_policy().limit == 9
     assert logger.warning.call_count == 2
 
     monkeypatch.setenv(LIMIT_ENV, "abc")
-    assert current_dispatch_limit() == 80
+    assert current_dispatch_policy().limit == 80
     assert logger.warning.call_count == 3
 
 

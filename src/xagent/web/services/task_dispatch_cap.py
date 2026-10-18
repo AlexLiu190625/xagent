@@ -83,16 +83,12 @@ class DispatchCapSnapshot:
         return self.policy.limit
 
     @property
-    def interactive_reserve(self) -> int:
-        return self.policy.interactive_reserve
-
-    @property
     def closed(self) -> bool:
         return len(self.active_ids) >= self.limit
 
     @property
     def batch_closed(self) -> bool:
-        return len(self.active_ids) >= self.limit - self.interactive_reserve
+        return len(self.active_ids) >= self.limit - self.policy.interactive_reserve
 
     def admits(self, task_id: int, *, interactive: bool) -> bool:
         """Whether a command of ``task_id`` may open an execution.
@@ -108,8 +104,9 @@ class DispatchCapSnapshot:
 # The last raw environment values and the policy parsed from them; the clamp
 # warning is logged once per parse. Event-loop thread only.
 _policy_memo: tuple[tuple[str | None, str | None], DispatchPolicy] | None = None
-# The policy the process last reported, so the report repeats only on a change.
-_logged_policy: DispatchPolicy | None = None
+# The policy, classifier name and admission declaration the process last
+# reported, so the report repeats only when one of them changes.
+_logged_policy: tuple[DispatchPolicy, str, bool] | None = None
 
 
 def current_dispatch_policy() -> DispatchPolicy:
@@ -146,17 +143,12 @@ def current_dispatch_policy() -> DispatchPolicy:
     return memo[1]
 
 
-def current_dispatch_limit() -> int:
-    """The configured limit; see ``current_dispatch_policy``."""
-
-    return current_dispatch_policy().limit
-
-
 def build_dispatch_cap_snapshot() -> DispatchCapSnapshot:
     """Snapshot the process's active task ids. Event-loop thread only.
 
     Reports the effective policy, with the installed classifier, the first time
-    a process builds a snapshot and whenever the policy changes.
+    a process builds a snapshot and whenever the policy, the classifier or its
+    admission declaration changes.
     """
 
     from .task_execution import background_task_manager
@@ -168,18 +160,20 @@ def build_dispatch_cap_snapshot() -> DispatchCapSnapshot:
 
 def _report_policy(policy: DispatchPolicy) -> None:
     global _logged_policy
-    from .task_execution_admission import _describe, _installed, admission_enabled
+    # Imported here: the admission module imports this one.
+    from .task_execution_admission import describe_installed_classifier
 
-    if policy == _logged_policy:
+    classifier, admission = describe_installed_classifier()
+    reported = (policy, classifier, admission)
+    if reported == _logged_policy:
         return
-    _logged_policy = policy
-    admission = admission_enabled()
+    _logged_policy = reported
     logger.info(
         "dispatch policy limit=%s interactive_reserve=%s classifier=%s "
         "admission_enabled=%s",
         policy.limit,
         policy.interactive_reserve,
-        _describe(_installed.classifier),
+        classifier,
         admission,
     )
     if admission and policy.interactive_reserve > 0:
