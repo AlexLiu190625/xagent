@@ -424,28 +424,29 @@ def _state(host: CapHost, command_id: int) -> tuple[str, int]:
     return row.status, row.attempt_count
 
 
-async def test_batch_line_scan_stops_at_held_batch_command(batch_line: CapHost) -> None:
-    """Known consequence of the reserve before the scan looks past held commands.
-
-    Between limit-R and limit the scan stops at the oldest command this process
-    may not start. Flip points: the scan-stops, reply-first-passes, by-id-passes
-    and batch-reply-blocks cases flip when the scan learns to look past held
-    batch commands; the by-id-cancel-blocked case flips when a control no longer
-    waits behind an earlier held command of its own task.
+async def test_batch_line_scan_takes_interactive_and_control_commands(
+    batch_line: CapHost,
+) -> None:
+    """Between limit-R and limit the scan looks past batch commands it may not
+    start and takes controls, commands of active tasks and interactive
+    commands, oldest first.
     """
     host = batch_line
     batch_task = host.new_task()
     interactive_task = host.new_task()
     control_task = host.new_task()
     b1 = host.enqueue(batch_task, "start")
-    i1 = host.enqueue(interactive_task, "start", dispatch_class="interactive")
-    x1 = host.enqueue(control_task, "cancel")
-    before = {c: _state(host, c) for c in (b1, i1, x1)}
+    host.enqueue(interactive_task, "start", dispatch_class="interactive")
+    host.enqueue(control_task, "cancel")
 
-    assert [await dispatch(host) for _ in range(3)] == [False, False, False]
+    # The interactive start takes the last free slot; the cancel then needs none.
+    assert [await dispatch(host) for _ in range(3)] == [True, True, False]
 
-    assert {c: _state(host, c) for c in (b1, i1, x1)} == before
-    assert host.claimed == []
+    assert host.claimed == [
+        (interactive_task, transport.TaskCommandKind.START),
+        (control_task, transport.TaskCommandKind.CANCEL),
+    ]
+    assert _state(host, b1) == ("pending", 0)
 
 
 async def test_reply_classified_interactive_passes_the_held_scan(
@@ -476,21 +477,7 @@ async def test_dispatch_by_id_is_not_stopped_by_the_held_scan(
     assert host.claimed == [(interactive_task, transport.TaskCommandKind.START)]
 
 
-async def test_cancel_by_id_waits_behind_a_held_batch_start_of_its_task(
-    batch_line: CapHost,
-) -> None:
-    host = batch_line
-    task = host.new_task()
-    host.enqueue(task, "start")
-    cancel = host.enqueue(task, "cancel")
-
-    assert await dispatch(host, command_db_id=cancel) is False
-
-    assert host.row(cancel).status == "pending"
-    assert host.claimed == []
-
-
-async def test_a_reply_classified_batch_blocks_the_whole_scan(
+async def test_a_reply_classified_batch_no_longer_blocks_the_scan(
     batch_line: CapHost,
 ) -> None:
     host = batch_line
@@ -499,11 +486,11 @@ async def test_a_reply_classified_batch_blocks_the_whole_scan(
     held = host.enqueue(first, "resume_input", dispatch_class="batch")
     answered = host.enqueue(second, "resume_input", dispatch_class="interactive")
 
-    assert [await dispatch(host) for _ in range(3)] == [False, False, False]
+    assert [await dispatch(host) for _ in range(3)] == [True, False, False]
 
-    assert host.row(held).status == "pending"
-    assert host.row(answered).status == "pending"
-    assert host.claimed == []
+    assert host.claimed == [(second, transport.TaskCommandKind.RESUME_INPUT)]
+    assert host.row(answered).status == "completed"
+    assert _state(host, held) == ("pending", 0)
 
 
 async def test_without_a_reserve_the_same_queue_is_claimed(
