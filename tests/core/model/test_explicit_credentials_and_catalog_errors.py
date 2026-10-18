@@ -15,6 +15,7 @@ synthetic.
 """
 
 import contextvars
+import socket
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -74,6 +75,14 @@ def wire(monkeypatch):
     monkeypatch.setattr(
         httpx.AsyncHTTPTransport, "handle_async_request", handle_async_request
     )
+    monkeypatch.setattr(
+        "xagent.core.model.network_policy.socket.getaddrinfo",
+        MagicMock(
+            return_value=[
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+            ]
+        ),
+    )
     return SimpleNamespace(sent=sent, state=state)
 
 
@@ -105,7 +114,9 @@ class TestAzureAuthentication:
         )
         assert len(wire.sent) == 2
         for request in wire.sent:
-            assert request.url.host == "my-team.openai.azure.com"
+            assert request.url.host == "93.184.216.34"
+            assert request.headers["Host"] == "my-team.openai.azure.com"
+            assert request.extensions["sni_hostname"] == "my-team.openai.azure.com"
             _assert_caller_key_only(request)
 
     async def test_default_azure_behavior_is_unchanged(self, wire, monkeypatch):

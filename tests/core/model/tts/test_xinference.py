@@ -6,25 +6,14 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
-# Handle optional xinference dependency
 try:
-    import xinference.client.restful.async_restful_client  # noqa: F401
-
-    _ASYNC_CLIENT_PATH = "xinference.client.restful.async_restful_client.AsyncClient"
+    import xinference_client  # noqa: F401
 except ImportError:
-    try:
-        import xinference_client.client.restful.async_restful_client  # noqa: F401
-
-        _ASYNC_CLIENT_PATH = (
-            "xinference_client.client.restful.async_restful_client.AsyncClient"
-        )
-    except ImportError:
-        pytest.skip(
-            "Neither xinference nor xinference_client is installed",
-            allow_module_level=True,
-        )
+    pytest.skip("xinference_client is not installed", allow_module_level=True)
 
 from xagent.core.model.tts import TTSResult, XinferenceTTS
+
+_ASYNC_CLIENT_PATH = "xagent.core.model.xinference_base.PublicAsyncXinferenceClient"
 
 
 class TestXinferenceTTS:
@@ -600,7 +589,7 @@ class TestXinferenceTTS:
         assert "pcm" in formats
         assert "opus" in formats
 
-    @patch("xinference_client.RESTfulClient")
+    @patch("xagent.core.model.public_xinference.PublicXinferenceClient")
     def test_list_available_models_success(self, mock_client_class: Mock) -> None:
         """Test listing available models successfully."""
         # Setup mock
@@ -642,7 +631,7 @@ class TestXinferenceTTS:
         assert models[1]["model_ability"] == ["tts"]
         mock_client.close.assert_called_once()
 
-    @patch("xinference_client.RESTfulClient")
+    @patch("xagent.core.model.public_xinference.PublicXinferenceClient")
     def test_list_available_models_empty(self, mock_client_class: Mock) -> None:
         """Test listing models when no TTS models available."""
         # Setup mock
@@ -662,7 +651,7 @@ class TestXinferenceTTS:
         assert len(models) == 0
         mock_client.close.assert_called_once()
 
-    @patch("xinference_client.RESTfulClient")
+    @patch("xagent.core.model.public_xinference.PublicXinferenceClient")
     def test_list_available_models_error_handling(
         self, mock_client_class: Mock
     ) -> None:
@@ -678,7 +667,7 @@ class TestXinferenceTTS:
         assert models == []
         mock_client.close.assert_called_once()
 
-    @patch("xinference_client.RESTfulClient")
+    @patch("xagent.core.model.public_xinference.PublicXinferenceClient")
     def test_list_available_models_with_speech_ability(
         self, mock_client_class: Mock
     ) -> None:

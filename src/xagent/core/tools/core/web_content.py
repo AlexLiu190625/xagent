@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import math
-import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -15,7 +14,8 @@ import html2text
 import httpx
 from bs4 import BeautifulSoup
 
-from ....config import get_trusted_egress_proxy_enabled
+from ...utils.egress_proxy import get_proxy_url as get_proxy_url
+from ...utils.egress_proxy import get_trusted_proxy_url as get_trusted_proxy_url
 from ...utils.public_network_proxy import PublicNetworkEgressProxy
 from ...utils.security import PrivateNetworkHostError, fetch_public_http_bytes
 
@@ -97,34 +97,6 @@ class WebContentFetchResult:
             "error": self.error,
             "assets": [asset.as_dict() for asset in self.assets],
         }
-
-
-def get_proxy_url() -> str | None:
-    """Get proxy URL from environment variables."""
-
-    https_proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
-    http_proxy = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
-    return https_proxy or http_proxy
-
-
-def get_trusted_proxy_url() -> str | None:
-    """Return the ambient proxy URL, requiring an explicit trust opt-in.
-
-    This checks operator trust, not the socket destination. Gated fetchers
-    use ``public_fetch_client`` so upstream CONNECT targets remain checked
-    literal IPs. Any other caller passing a logical hostname to the trusted
-    proxy still requires that proxy to enforce public-only connect-time DNS.
-    Never silently trust arbitrary ambient ``HTTP(S)_PROXY`` values.
-    """
-
-    proxy_url = get_proxy_url()
-    if proxy_url and not get_trusted_egress_proxy_enabled():
-        raise PrivateNetworkHostError(
-            "An HTTP(S) proxy is configured but not marked as trusted for "
-            "public-network egress; set XAGENT_TRUSTED_EGRESS_PROXY=1 only "
-            "if the proxy itself enforces private-range egress policy."
-        )
-    return proxy_url
 
 
 def build_isolated_httpx_client_kwargs(proxy_url: str | None) -> dict[str, Any]:

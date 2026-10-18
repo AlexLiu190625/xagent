@@ -24,8 +24,11 @@ from botocore.exceptions import (
 )
 
 from ....runtime_performance import run_in_thread_with_telemetry
+from ....utils.public_botocore import PublicBotocoreSession
 from ....utils.security import redact_sensitive_text
+from ...network_policy import ModelNetworkPolicy
 from ...providers import validate_bedrock_endpoint
+from ...public_http import get_model_proxy_url
 from ..error import matches_context_length_error
 from ..exceptions import LLMContextLengthError, LLMRetryableError
 from ..stream_deadline import await_before_deadline
@@ -370,6 +373,36 @@ class BedrockLLM(BaseLLM):
             endpoint_url=self.endpoint_url,
             config=config,
         )
+        previous_session = client._endpoint.http_session
+        try:
+            public_session = PublicBotocoreSession(
+                timeout=self.timeout,
+                verify=previous_session._verify,
+                proxy_url=get_model_proxy_url(),
+                _policy=ModelNetworkPolicy(),
+                max_pool_connections=getattr(
+                    previous_session, "_max_pool_connections", 10
+                ),
+                socket_options=getattr(previous_session, "_socket_options", None),
+                client_cert=(
+                    getattr(previous_session, "_cert_file", None),
+                    getattr(previous_session, "_key_file", None),
+                )
+                if getattr(previous_session, "_key_file", None)
+                else getattr(previous_session, "_cert_file", None),
+                proxies_config=getattr(
+                    getattr(previous_session, "_proxy_config", None), "settings", None
+                ),
+            )
+        except BaseException:
+            previous_session.close()
+            raise
+        try:
+            previous_session.close()
+        except BaseException:
+            public_session.close()
+            raise
+        client._endpoint.http_session = public_session
         if key_auth:
             api_key = self.api_key
             assert api_key is not None

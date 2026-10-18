@@ -9,6 +9,7 @@ from typing import Any, List, Optional
 import aiohttp
 
 from ..chat.token_context import MediaCallType
+from ..public_http import create_public_model_aiohttp_session
 from .base import (
     BaseImageModel,
     InvalidImageResponseError,
@@ -199,7 +200,7 @@ class DashScopeImageModel(BaseImageModel):
 
         try:
             # Make the API call
-            async with aiohttp.ClientSession(
+            async with create_public_model_aiohttp_session(
                 timeout=aiohttp.ClientTimeout(total=self.timeout)
             ) as session:
                 async with session.post(
@@ -452,7 +453,7 @@ class DashScopeImageModel(BaseImageModel):
 
         try:
             # Make the API call
-            async with aiohttp.ClientSession(
+            async with create_public_model_aiohttp_session(
                 timeout=aiohttp.ClientTimeout(total=self.timeout)
             ) as session:
                 async with session.post(

@@ -9,6 +9,9 @@ from typing import Any, Dict, List, Optional, cast
 
 import httpx
 
+from ...utils.public_http_transport import create_public_async_client
+from .web_content import get_trusted_proxy_url
+
 logger = logging.getLogger(__name__)
 
 
@@ -92,16 +95,10 @@ class ZhipuWebSearchCore:
             "Content-Type": "application/json",
         }
 
-        proxy_url = self._get_proxy_url()
-        if proxy_url:
-            logger.info("🌐 Using proxy: %s", proxy_url)
-
         try:
-            client_kwargs: Dict[str, Any] = {}
-            if proxy_url:
-                client_kwargs["proxy"] = proxy_url
-
-            async with httpx.AsyncClient(**client_kwargs) as client:
+            async with create_public_async_client(
+                proxy_url=get_trusted_proxy_url()
+            ) as client:
                 response = await client.post(
                     url, json=payload, headers=headers, timeout=15
                 )
@@ -148,10 +145,3 @@ class ZhipuWebSearchCore:
                 result["content"] = content
             results.append(result)
         return results
-
-    @staticmethod
-    def _get_proxy_url() -> Optional[str]:
-        """Get proxy URL from environment variables."""
-        https_proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
-        http_proxy = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
-        return https_proxy or http_proxy

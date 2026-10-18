@@ -20,6 +20,7 @@ from openai import AsyncOpenAI
 
 from ....runtime_performance import run_in_thread_with_telemetry
 from ....utils.security import redact_sensitive_text
+from ...public_http import create_owned_async_sdk_client
 from ..exceptions import (
     LLMEmptyContentError,
     LLMRetryableError,
@@ -548,7 +549,8 @@ class OpenAICompatibleLLM(BaseLLM):
     def _ensure_client(self) -> None:
         """Ensure the OpenAI client is initialized."""
         if self._client is None:
-            self._client = AsyncOpenAI(
+            self._client = create_owned_async_sdk_client(
+                AsyncOpenAI,
                 base_url=self.base_url
                 if self.base_url != "https://api.openai.com/v1"
                 else None,
@@ -2031,10 +2033,12 @@ class OpenAICompatibleLLM(BaseLLM):
             ... )
         """
         # Create a client using SDK
-        client = AsyncOpenAI(
+        client = create_owned_async_sdk_client(
+            AsyncOpenAI,
             base_url=base_url if base_url != "https://api.openai.com/v1" else None,
             api_key=api_key,
             timeout=30.0,
+            max_retries=0,
         )
 
         try:

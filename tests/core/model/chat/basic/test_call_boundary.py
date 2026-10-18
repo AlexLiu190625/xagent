@@ -9,6 +9,7 @@ import asyncio
 import contextvars
 import json
 import logging
+import socket
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any, AsyncIterator, List
@@ -1242,6 +1243,12 @@ class TestRealOpenAIPath:
 
         monkeypatch.setattr(
             httpx.AsyncHTTPTransport, "handle_async_request", handle_async_request
+        )
+        monkeypatch.setattr(
+            "xagent.core.model.network_policy.socket.getaddrinfo",
+            lambda *args: [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+            ],
         )
         for name in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE"):
             monkeypatch.delenv(name, raising=False)
