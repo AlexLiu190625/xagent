@@ -57,85 +57,55 @@ def found(host: CapHost, cap: Any, command_db_id: int | None = None) -> Any:
 TIERS = {"open": 1, "batch-line": 2, "closed": 3}
 
 
-def scenario_batch_then_interactive(host: CapHost) -> dict[str, int]:
-    return {
-        "batch": host.enqueue(host.new_task(), "start"),
-        "interactive": host.enqueue(
-            host.new_task(), "start", dispatch_class="interactive"
-        ),
-    }
+# One queued command: (label, kind, dispatch class). Each command belongs to a
+# task of its own that this process does not run; an answer's task waits for it.
+Spec = tuple[str, str, str]
 
 
-def scenario_batch_then_answer(host: CapHost) -> dict[str, int]:
-    return {
-        "batch": host.enqueue(host.new_task(), "start"),
-        "answer": host.enqueue(
-            host.new_task(status=TaskStatus.WAITING_FOR_USER),
-            "resume_input",
-            dispatch_class="interactive",
-        ),
-    }
-
-
-def scenario_only_batch(host: CapHost) -> dict[str, int]:
-    return {"batch": host.enqueue(host.new_task(), "start")}
-
-
-def scenario_batch_then_pause(host: CapHost) -> dict[str, int]:
-    return {
-        "batch": host.enqueue(host.new_task(), "start"),
-        "pause": host.enqueue(host.new_task(), "pause"),
-    }
-
-
-def scenario_interactive_then_cancel(host: CapHost) -> dict[str, int]:
-    return {
-        "interactive": host.enqueue(
-            host.new_task(), "start", dispatch_class="interactive"
-        ),
-        "cancel": host.enqueue(host.new_task(), "cancel"),
-    }
-
-
-def scenario_cancel_then_interactive(host: CapHost) -> dict[str, int]:
-    return {
-        "cancel": host.enqueue(host.new_task(), "cancel"),
-        "interactive": host.enqueue(
-            host.new_task(), "start", dispatch_class="interactive"
-        ),
-    }
+def enqueue_queue(host: CapHost, queue: list[Spec]) -> dict[str, int]:
+    ids = {}
+    for label, kind, dispatch_class in queue:
+        status = (
+            TaskStatus.WAITING_FOR_USER
+            if kind == "resume_input"
+            else TaskStatus.PENDING
+        )
+        ids[label] = host.enqueue(
+            host.new_task(status=status), kind, dispatch_class=dispatch_class
+        )
+    return ids
 
 
 # scenario, expected command per tier (None: no candidate). The expectations
 # are written out, not derived.
 SCENARIOS = [
     pytest.param(
-        scenario_batch_then_interactive,
+        [("batch", "start", "batch"), ("interactive", "start", "interactive")],
         {"open": "batch", "batch-line": "interactive", "closed": None},
         id="older-batch-newer-interactive-start",
     ),
     pytest.param(
-        scenario_batch_then_answer,
+        [("batch", "start", "batch"), ("answer", "resume_input", "interactive")],
         {"open": "answer", "batch-line": "answer", "closed": None},
         id="older-batch-newer-answer",
     ),
     pytest.param(
-        scenario_only_batch,
+        [("batch", "start", "batch")],
         {"open": "batch", "batch-line": None, "closed": None},
         id="only-batch",
     ),
     pytest.param(
-        scenario_batch_then_pause,
+        [("batch", "start", "batch"), ("pause", "pause", "batch")],
         {"open": "batch", "batch-line": "pause", "closed": "pause"},
         id="older-batch-newer-pause",
     ),
     pytest.param(
-        scenario_interactive_then_cancel,
+        [("interactive", "start", "interactive"), ("cancel", "cancel", "batch")],
         {"open": "interactive", "batch-line": "interactive", "closed": "cancel"},
         id="older-interactive-newer-cancel",
     ),
     pytest.param(
-        scenario_cancel_then_interactive,
+        [("cancel", "cancel", "batch"), ("interactive", "start", "interactive")],
         {"open": "cancel", "batch-line": "cancel", "closed": "cancel"},
         id="older-cancel-newer-interactive",
     ),
@@ -143,33 +113,19 @@ SCENARIOS = [
 
 
 @pytest.mark.parametrize("tier", list(TIERS))
-@pytest.mark.parametrize(("scenario", "expected"), SCENARIOS)
+@pytest.mark.parametrize(("queue", "expected"), SCENARIOS)
 async def test_scan_takes_the_oldest_command_the_tier_allows(
-    cap_host: CapHost, scenario: Any, expected: dict[str, str | None], tier: str
+    cap_host: CapHost, queue: list[Spec], expected: dict[str, str | None], tier: str
 ) -> None:
     host = cap_host
     fill(host, TIERS[tier])
-    ids = scenario(host)
+    ids = enqueue_queue(host, queue)
     cap = cap_of(host)
 
     candidate = found(host, cap)
 
     want = expected[tier]
     assert (candidate.id if candidate else None) == (ids[want] if want else None)
-
-
-async def test_a_pause_of_any_class_is_taken_on_the_batch_line(
-    cap_host: CapHost,
-) -> None:
-    host = cap_host
-    fill(host, TIERS["batch-line"])
-    host.enqueue(host.new_task(), "start")
-    pause = host.enqueue(host.new_task(), "pause", dispatch_class="batch")
-
-    candidate = found(host, cap_of(host))
-
-    assert candidate is not None and candidate.id == pause
-    assert candidate.interactive is False
 
 
 @pytest.mark.parametrize("tier", ["batch-line", "closed"])
@@ -207,21 +163,7 @@ class Clock:
         return value
 
 
-async def test_one_scan_reads_the_clock_once(
-    cap_host: CapHost, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    host = cap_host
-    fill(host, TIERS["batch-line"])
-    host.enqueue(host.new_task(), "start")
-    clock = Clock()
-    monkeypatch.setattr(transport, "_utc_now", clock)
-
-    assert found(host, cap_of(host)) is None
-
-    assert clock.calls == 1
-
-
-async def test_every_query_of_a_scan_judges_availability_at_one_time(
+async def test_every_query_of_a_scan_judges_availability_at_one_time_read_once(
     cap_host: CapHost, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     host = cap_host
@@ -237,6 +179,7 @@ async def test_every_query_of_a_scan_judges_availability_at_one_time(
     # Not yet available at the one time every query uses. With a clock read per
     # query the later queries would see it as due and return it.
     assert found(host, cap_of(host)) is None
+    assert clock.calls == 1
 
 
 async def test_the_count_reads_the_clock_once(
@@ -254,40 +197,6 @@ async def test_the_count_reads_the_clock_once(
 
 
 # ---------------------------------------------------------------- replies
-
-
-async def test_an_answer_goes_before_an_older_start_when_the_cap_is_open(
-    cap_host: CapHost,
-) -> None:
-    host = cap_host
-    fill(host, TIERS["open"])
-    host.enqueue(host.new_task(), "start", dispatch_class="interactive")
-    answer = host.enqueue(
-        host.new_task(status=TaskStatus.WAITING_FOR_USER),
-        "resume_input",
-        dispatch_class="interactive",
-    )
-
-    candidate = found(host, cap_of(host))
-
-    assert candidate is not None and candidate.id == answer
-
-
-async def test_a_batch_answer_is_left_for_the_interactive_start_on_the_batch_line(
-    cap_host: CapHost,
-) -> None:
-    host = cap_host
-    fill(host, TIERS["batch-line"])
-    host.enqueue(
-        host.new_task(status=TaskStatus.WAITING_FOR_USER),
-        "resume_input",
-        dispatch_class="batch",
-    )
-    start = host.enqueue(host.new_task(), "start", dispatch_class="interactive")
-
-    candidate = found(host, cap_of(host))
-
-    assert candidate is not None and candidate.id == start
 
 
 async def test_an_interactive_answer_goes_before_an_older_start_on_the_batch_line(
@@ -310,12 +219,13 @@ async def test_an_interactive_answer_goes_before_an_older_start_on_the_batch_lin
 # ---------------------------------------------------------------- dispatch
 
 
-async def test_interactive_start_gets_the_reserve_behind_a_batch_backlog(
-    cap_host: CapHost, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("reserve", [1, 0])
+async def test_a_batch_backlog_leaves_the_reserve_to_an_interactive_start(
+    cap_host: CapHost, monkeypatch: pytest.MonkeyPatch, reserve: int
 ) -> None:
     host = cap_host
     set_limit(monkeypatch, LIMIT)
-    set_reserve(monkeypatch, RESERVE)
+    set_reserve(monkeypatch, reserve)
     batch_tasks = [host.new_task() for _ in range(5)]
     for task in batch_tasks:
         host.enqueue(task, "start")
@@ -325,28 +235,14 @@ async def test_interactive_start_gets_the_reserve_behind_a_batch_backlog(
     results = [await dispatch(host) for _ in range(6)]
 
     assert results == [True, True, True, False, False, False]
-    assert host.claimed == [
-        (batch_tasks[0], KIND.START),
-        (batch_tasks[1], KIND.START),
-        (interactive_task, KIND.START),
-    ]
-
-
-async def test_without_a_reserve_a_batch_backlog_fills_the_limit(
-    cap_host: CapHost, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    host = cap_host
-    set_limit(monkeypatch, LIMIT)
-    monkeypatch.delenv(RESERVE_ENV, raising=False)
-    batch_tasks = [host.new_task() for _ in range(5)]
-    for task in batch_tasks:
-        host.enqueue(task, "start")
-    host.enqueue(host.new_task(), "start", dispatch_class="interactive")
-
-    results = [await dispatch(host) for _ in range(6)]
-
-    assert results == [True, True, True, False, False, False]
-    assert [task for task, _ in host.claimed] == batch_tasks[:3]
+    if reserve:
+        assert host.claimed == [
+            (batch_tasks[0], KIND.START),
+            (batch_tasks[1], KIND.START),
+            (interactive_task, KIND.START),
+        ]
+    else:
+        assert host.claimed == [(task, KIND.START) for task in batch_tasks[:3]]
 
 
 # ---------------------------------------------------------------- the claim
@@ -415,6 +311,7 @@ async def test_with_no_reserve_an_open_snapshot_adds_no_filter(
     host = cap_host
     cap = r0_cap(host, 1)
     assert claimable_where(host, cap) == claimable_where(host, None)
+    assert "dispatch_class" not in claimable_where(host, cap)
 
 
 async def test_with_no_reserve_the_closed_filter_is_the_one_a_reserve_adds(
@@ -426,15 +323,7 @@ async def test_with_no_reserve_the_closed_filter_is_the_one_a_reserve_adds(
     with_reserve = cap_of(host, DispatchPolicy(limit=3, interactive_reserve=1))
     assert no_reserve.closed and with_reserve.closed
     assert claimable_where(host, no_reserve) == claimable_where(host, with_reserve)
-
-
-@pytest.mark.parametrize("active", [0, 2, 3])
-async def test_with_no_reserve_no_filter_looks_at_the_class(
-    cap_host: CapHost, active: int
-) -> None:
-    host = cap_host
-    cap = r0_cap(host, active)
-    assert "dispatch_class" not in claimable_where(host, cap)
+    assert "dispatch_class" not in claimable_where(host, no_reserve)
 
 
 def select_count(host: CapHost, cap: Any) -> int:

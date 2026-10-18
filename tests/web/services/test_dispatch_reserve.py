@@ -449,7 +449,7 @@ async def test_batch_line_scan_takes_interactive_and_control_commands(
     assert _state(host, b1) == ("pending", 0)
 
 
-async def test_reply_classified_interactive_passes_the_held_scan(
+async def test_an_interactive_reply_is_taken_on_the_batch_line(
     batch_line: CapHost,
 ) -> None:
     host = batch_line
@@ -464,7 +464,7 @@ async def test_reply_classified_interactive_passes_the_held_scan(
     assert host.row(reply).status == "completed"
 
 
-async def test_dispatch_by_id_is_not_stopped_by_the_held_scan(
+async def test_dispatch_by_id_takes_an_interactive_start_on_the_batch_line(
     batch_line: CapHost,
 ) -> None:
     host = batch_line

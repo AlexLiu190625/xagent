@@ -1830,16 +1830,17 @@ def _find_command_candidate(
 ) -> CommandCandidate | None:
     """The oldest command this process could claim now, or None.
 
-    Every query reads one time and one dispatch-cap snapshot, taken once here
-    and passed to all of them; they are separate SELECTs, so they do not share
-    one database snapshot. What the process may select depends on ``cap``:
-    with room, everything claimable; between its batch line and its limit,
-    controls, commands of tasks it already runs, and interactive commands;
-    at its limit, controls and commands of tasks it already runs. The batch
-    line case runs two queries, one for the first two kinds and one for the
-    interactive commands, and takes the older result, so the interactive one
-    can later be served by a dedicated partial index. A reply to a waiting
-    task is looked for first whenever the process is not at its limit.
+    Every query here judges availability at one time, read once at the start,
+    and narrows by the dispatch-cap snapshot ``cap`` the caller took; they are
+    separate SELECTs, so they do not share one database snapshot. What the
+    process may select depends on ``cap``: with room, everything claimable;
+    between its batch line and its limit, controls, commands of tasks it
+    already runs, and interactive commands; at its limit, controls and commands
+    of tasks it already runs. Without ``command_db_id``, a reply to a waiting
+    task is looked for first whenever the process is not at its limit, and the
+    batch line case runs two queries, one for the first two kinds and one for
+    the interactive commands, and takes the older result, so the interactive
+    one can later be served by a dedicated partial index.
     """
     from ..models.database import get_session_local
 
@@ -1876,9 +1877,9 @@ def _find_command_candidate(
             # still enforces each task's own order. This order applies to the
             # scan only: an admission ticket can still keep a reply behind
             # older work waiting in the same bucket. On the batch line a reply
-            # classified batch is left out, like any batch command. At the
-            # limit a reply that needs a new slot is not claimable, so the
-            # narrow query decides.
+            # classified batch is left out unless its task already runs here,
+            # like any batch command. At the limit a reply that needs a new
+            # slot is not claimable, so the narrow query decides.
             row = first_candidate(TaskCommandKind.RESUME_INPUT)
         if row is None:
             if (
@@ -1927,10 +1928,11 @@ def count_claimable_task_commands(db: Session, *, runner_id: str) -> int:
 
     The result is an upper bound on what a dispatcher in ``runner_id`` could
     claim now. Process-local state is not applied: the per-process dispatch
-    cap (``DispatchCapSnapshot``), which at the cap, or for batch commands at its batch line, narrows the shared scan,
-    or within one task swaps a held command for a later cancel or pause of
-    that task that this count does not include, and reserves a slot once a
-    candidate that opens an execution is picked; and the busy-task list.
+    cap (``DispatchCapSnapshot``), which at the cap, or for batch commands at
+    its batch line, narrows the shared scan, or within one task swaps a held
+    command for a later cancel or pause of that task that this count does not
+    include, and reserves a slot once a candidate that opens an execution is
+    picked; and the busy-task list.
     Neither are the checks made after a candidate is picked: whether the
     process consumes commands at all (``consumes_task_commands()``), task
     owner acquisition and lease checks, and the admission reservation that
