@@ -74,7 +74,7 @@ class PublicHttpTransport(httpx.AsyncBaseTransport):
             trust_env=False,
             http2=False,
             verify=ssl_context,
-            limits=httpx.Limits(max_keepalive_connections=0),
+            limits=self.connection_limits(),
             proxy=proxy,
         )
 
@@ -118,6 +118,10 @@ class PublicHttpTransport(httpx.AsyncBaseTransport):
                 if index == len(targets) - 1:
                     raise
         raise httpx.ConnectError("Public API host did not resolve", request=request)
+
+    def connection_limits(self) -> httpx.Limits:
+        """Only origin-bound, server-owned subclasses may enable keep-alive."""
+        return httpx.Limits(max_keepalive_connections=0)
 
     async def aclose(self) -> None:
         await self._transport.aclose()
