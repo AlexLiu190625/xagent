@@ -113,11 +113,14 @@ _logged_policy: DispatchPolicy | None = None
 
 
 def current_dispatch_policy() -> DispatchPolicy:
-    """The configured policy, parsed once per distinct raw environment values.
+    """The configured policy, parsed again only when a raw value changes.
 
-    An invalid value is reported once and then its default applies. A reserve
-    that leaves no slot for batch commands is lowered to ``limit - 1`` and
-    reported once. A changed value is picked up on the next call. Never raises.
+    Only the last parse is kept, with the raw (limit, reserve) pair it came
+    from. A call that sees the same pair returns that policy without parsing
+    or reporting anything. A call that sees a different pair parses both
+    values again: an invalid value is reported and its default applies, and a
+    reserve that leaves no slot for batch commands is lowered to
+    ``limit - 1`` and reported. Never raises.
     """
 
     global _policy_memo

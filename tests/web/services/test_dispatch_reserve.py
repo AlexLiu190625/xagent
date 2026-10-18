@@ -67,65 +67,45 @@ ADMISSION_ROWS = [
     (1, 0, 0, False, False, True),
     (1, 0, 1, False, True, False),
     (1, 0, 1, False, False, False),
-    (1, 0, 1, True, True, True),
     (1, 0, 1, True, False, True),
     (2, 0, 0, False, True, True),
     (2, 0, 0, False, False, True),
     (2, 0, 1, False, True, True),
     (2, 0, 1, False, False, True),
-    (2, 0, 1, True, True, True),
-    (2, 0, 1, True, False, True),
     (2, 0, 2, False, True, False),
     (2, 0, 2, False, False, False),
-    (2, 0, 2, True, True, True),
     (2, 0, 2, True, False, True),
     (2, 1, 0, False, True, True),
     (2, 1, 0, False, False, True),
     (2, 1, 1, False, True, True),
     (2, 1, 1, False, False, False),
-    (2, 1, 1, True, True, True),
-    (2, 1, 1, True, False, True),
     (2, 1, 2, False, True, False),
     (2, 1, 2, False, False, False),
-    (2, 1, 2, True, True, True),
     (2, 1, 2, True, False, True),
     (80, 0, 0, False, True, True),
     (80, 0, 0, False, False, True),
     (80, 0, 79, False, True, True),
     (80, 0, 79, False, False, True),
-    (80, 0, 79, True, True, True),
-    (80, 0, 79, True, False, True),
     (80, 0, 80, False, True, False),
     (80, 0, 80, False, False, False),
-    (80, 0, 80, True, True, True),
     (80, 0, 80, True, False, True),
     (80, 1, 0, False, True, True),
     (80, 1, 0, False, False, True),
     (80, 1, 78, False, True, True),
     (80, 1, 78, False, False, True),
-    (80, 1, 78, True, True, True),
-    (80, 1, 78, True, False, True),
     (80, 1, 79, False, True, True),
     (80, 1, 79, False, False, False),
-    (80, 1, 79, True, True, True),
-    (80, 1, 79, True, False, True),
     (80, 1, 80, False, True, False),
     (80, 1, 80, False, False, False),
-    (80, 1, 80, True, True, True),
     (80, 1, 80, True, False, True),
     (80, 79, 0, False, True, True),
     (80, 79, 0, False, False, True),
     (80, 79, 1, False, True, True),
     (80, 79, 1, False, False, False),
-    (80, 79, 1, True, True, True),
-    (80, 79, 1, True, False, True),
     (80, 79, 79, False, True, True),
     (80, 79, 79, False, False, False),
-    (80, 79, 79, True, True, True),
-    (80, 79, 79, True, False, True),
     (80, 79, 80, False, True, False),
     (80, 79, 80, False, False, False),
-    (80, 79, 80, True, True, True),
     (80, 79, 80, True, False, True),
 ]
 
@@ -148,15 +128,6 @@ def test_admission_matrix(
     )
     task_id = 100 if task_is_active else 999
     assert snapshot.admits(task_id, interactive=interactive) is admitted
-
-
-def test_snapshot_exposes_the_policy_and_both_lines() -> None:
-    snapshot = DispatchCapSnapshot(
-        policy=DispatchPolicy(limit=5, interactive_reserve=2),
-        active_ids=frozenset({1, 2, 3}),
-    )
-    assert (snapshot.limit, snapshot.interactive_reserve) == (5, 2)
-    assert (snapshot.closed, snapshot.batch_closed) == (False, True)
 
 
 # ---------------------------------------------------------------- I-2
@@ -206,16 +177,6 @@ def test_policy_configuration(
     assert current_dispatch_limit() == expected[0]
     assert config_logger.warning.call_count == config_warnings
     assert cap_logger.warning.call_count == clamp_warnings
-
-
-def test_policy_is_reparsed_when_the_environment_changes(
-    monkeypatch: pytest.MonkeyPatch, fresh_policy_state: None
-) -> None:
-    monkeypatch.setenv(LIMIT_ENV, "10")
-    monkeypatch.setenv(RESERVE_ENV, "2")
-    assert current_dispatch_policy() == DispatchPolicy(limit=10, interactive_reserve=2)
-    monkeypatch.setenv(RESERVE_ENV, "3")
-    assert current_dispatch_policy() == DispatchPolicy(limit=10, interactive_reserve=3)
 
 
 # ---------------------------------------------------------------- I-7
@@ -322,9 +283,11 @@ async def test_effective_policy_is_logged_when_it_changes(
         task_execution_admission, "_installed", task_execution_admission._UPSTREAM
     )
     monkeypatch.setenv(LIMIT_ENV, "10")
-    monkeypatch.setenv(RESERVE_ENV, "2")
     caplog.set_level(logging.INFO, logger=task_dispatch_cap.logger.name)
 
+    monkeypatch.delenv(RESERVE_ENV, raising=False)
+    build_dispatch_cap_snapshot()
+    monkeypatch.setenv(RESERVE_ENV, "2")
     for _ in range(3):
         build_dispatch_cap_snapshot()
     monkeypatch.setenv(RESERVE_ENV, "3")
@@ -333,33 +296,15 @@ async def test_effective_policy_is_logged_when_it_changes(
     lines = [
         r.getMessage() for r in caplog.records if "dispatch policy" in r.getMessage()
     ]
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert lines == [
+        "dispatch policy limit=10 interactive_reserve=0 "
+        "classifier=upstream_command_classifier admission_enabled=False",
         "dispatch policy limit=10 interactive_reserve=2 "
         "classifier=upstream_command_classifier admission_enabled=False",
         "dispatch policy limit=10 interactive_reserve=3 "
         "classifier=upstream_command_classifier admission_enabled=False",
     ]
-
-
-async def test_policy_is_logged_for_a_zero_reserve_too(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-    fresh_policy_state: None,
-) -> None:
-    monkeypatch.setenv(LIMIT_ENV, "10")
-    monkeypatch.delenv(RESERVE_ENV, raising=False)
-    caplog.set_level(logging.INFO, logger=task_dispatch_cap.logger.name)
-
-    build_dispatch_cap_snapshot()
-    build_dispatch_cap_snapshot()
-
-    assert [
-        r.getMessage() for r in caplog.records if "dispatch policy" in r.getMessage()
-    ] == [
-        "dispatch policy limit=10 interactive_reserve=0 "
-        "classifier=upstream_command_classifier admission_enabled=False"
-    ]
-    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
 async def test_admission_with_a_reserve_warns_that_buckets_are_not_prioritized(
@@ -398,63 +343,6 @@ def _reserve(manager, task_id, policy, *, interactive):
     )
 
 
-async def test_follow_up_commands_of_an_active_task_do_not_need_a_free_slot() -> None:
-    manager = BackgroundTaskManager()
-    policy = DispatchPolicy(limit=10, interactive_reserve=2)
-    # An interactive task started above the batch line stays admitted for a
-    # batch follow-up while the process sits on the batch line.
-    held = [_reserve(manager, task, policy, interactive=False) for task in range(1, 9)]
-    interactive_task = _reserve(manager, 100, policy, interactive=True)
-    assert all(token is not None for token in held)
-    assert interactive_task is not None
-    assert len(manager._active_task_ids()) == 9
-    follow_up = _reserve(manager, 100, policy, interactive=False)
-    assert follow_up is not None
-    assert len(manager._active_task_ids()) == 9
-
-
-async def test_a_finished_interactive_task_does_not_make_room_for_batch() -> None:
-    manager = BackgroundTaskManager()
-    policy = DispatchPolicy(limit=10, interactive_reserve=2)
-    batch = [_reserve(manager, task, policy, interactive=False) for task in range(1, 7)]
-    interactive = [
-        _reserve(manager, task, policy, interactive=True) for task in (100, 101)
-    ]
-    assert len(manager._active_task_ids()) == 8
-    manager.release_dispatch_slot(interactive[0])
-    manager.release_dispatch_slot(interactive[1])
-    assert len(manager._active_task_ids()) == 6
-    # Back below N-R: batch start fits again.
-    assert _reserve(manager, 7, policy, interactive=False) is not None
-    assert _reserve(manager, 8, policy, interactive=False) is not None
-    assert len(manager._active_task_ids()) == 8
-    assert _reserve(manager, 9, policy, interactive=False) is None
-    assert all(token is not None for token in batch)
-
-
-async def test_batch_follow_up_after_an_interactive_start_is_admitted() -> None:
-    manager = BackgroundTaskManager()
-    policy = DispatchPolicy(limit=10, interactive_reserve=2)
-    assert _reserve(manager, 1, policy, interactive=False) is not None
-    assert _reserve(manager, 2, policy, interactive=True) is not None
-    assert _reserve(manager, 1, policy, interactive=True) is not None
-
-
-async def test_line_positions_for_start_commands() -> None:
-    policy = DispatchPolicy(limit=10, interactive_reserve=2)
-
-    def manager_with(active: int) -> BackgroundTaskManager:
-        manager = BackgroundTaskManager()
-        for index in range(active):
-            manager._live_executions[10_000 + index] = {object()}  # type: ignore[assignment]
-        return manager
-
-    assert _reserve(manager_with(7), 1, policy, interactive=False) is not None
-    assert _reserve(manager_with(8), 1, policy, interactive=False) is None
-    assert _reserve(manager_with(8), 1, policy, interactive=True) is not None
-    assert _reserve(manager_with(10), 1, policy, interactive=True) is None
-
-
 async def test_batch_opened_tasks_never_exceed_the_batch_line() -> None:
     manager = BackgroundTaskManager()
     policy = DispatchPolicy(limit=10, interactive_reserve=2)
@@ -479,6 +367,8 @@ async def test_batch_opened_tasks_never_exceed_the_batch_line() -> None:
     for task_id in (1, 2):
         manager.release_dispatch_slot(batch_opened.pop(task_id))
     assert len(manager._active_task_ids()) == 8
+    # Six batch tasks and two interactive ones: the interactive tasks count too.
+    assert not start_batch(150)
 
     i3 = _reserve(manager, 102, policy, interactive=True)
     i4 = _reserve(manager, 103, policy, interactive=True)

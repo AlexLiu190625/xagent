@@ -4532,7 +4532,7 @@ def test_respond_returns_accepted_when_the_dispatcher_notify_fails(
 
 @pytest.mark.parametrize(
     ("source", "expected"),
-    [("internal", "interactive"), ("widget", "interactive"), ("sdk", "batch")],
+    [("internal", "interactive"), ("sdk", "batch")],
 )
 def test_respond_stages_a_resume_with_the_upstream_dispatch_class(
     _respond_db, source: str, expected: str

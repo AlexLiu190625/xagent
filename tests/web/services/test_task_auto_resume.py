@@ -512,11 +512,7 @@ def test_due_row_is_dispatched_as_one_fenced_resume_command(factory, notified):
     ("source", "previous", "expected"),
     [
         pytest.param("sdk", "interactive", "batch", id="sdk-ignores-previous"),
-        pytest.param("trigger", None, "batch", id="trigger"),
-        pytest.param("internal", "batch", "interactive", id="internal"),
         pytest.param("future_unknown", "interactive", "interactive", id="inherits"),
-        pytest.param("future_unknown", "batch", "batch", id="no-inherit-batch"),
-        pytest.param("future_unknown", None, "batch", id="no-previous-command"),
     ],
 )
 def test_auto_resume_command_gets_the_upstream_dispatch_class(

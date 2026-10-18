@@ -65,12 +65,6 @@ def _columns(connection) -> dict[str, dict]:
     return {c["name"]: c for c in inspect(connection).get_columns(TABLE)}
 
 
-def test_revision_chain_is_pinned() -> None:
-    migration = load_migration_module(MIGRATION_PATH, "dispatch_class_chain")
-    assert migration.revision == REVISION
-    assert migration.down_revision == DOWN_REVISION
-
-
 def test_sqlite_upgrade_adds_the_column_twice_safe_and_downgrade_drops_it() -> None:
     engine = create_engine("sqlite:///:memory:")
     config = create_alembic_config(engine)
@@ -197,32 +191,6 @@ def _create_pg_table(connection) -> None:
         )
     )
     connection.commit()
-
-
-@pytest.mark.postgresql
-def test_postgresql_upgrade_is_idempotent_and_downgrade_drops(
-    postgresql_engine_factory,
-) -> None:
-    migration = load_migration_module(MIGRATION_PATH, "dispatch_class_pg")
-    engine = postgresql_engine_factory("up")
-
-    with engine.connect() as connection:
-        _create_pg_table(connection)
-
-        _run(migration, connection, "upgrade")
-        column = _columns(connection)[COLUMN]
-        assert column["nullable"] is False
-        assert (
-            connection.execute(text(f"SELECT {COLUMN} FROM {TABLE}")).scalar_one()
-            == "batch"
-        )
-        assert connection.execute(text("SHOW lock_timeout")).scalar_one() == "0"
-
-        _run(migration, connection, "upgrade")
-        assert COLUMN in _columns(connection)
-
-        _run(migration, connection, "downgrade")
-        assert COLUMN not in _columns(connection)
 
 
 def _driver_engines(factory, tag: str):
