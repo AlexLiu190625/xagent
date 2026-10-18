@@ -512,22 +512,26 @@ async def test_without_a_reserve_the_same_queue_is_claimed(
 # ---------------------------------------------------------------- documentation
 
 
-def test_example_env_documents_the_reserve_and_the_known_stall() -> None:
+def test_example_env_documents_the_reserve_and_the_known_cancel_delay() -> None:
     from pathlib import Path
 
     text = (Path(__file__).resolve().parents[3] / "example.env").read_text()
     assert '# XAGENT_DISPATCHER_INTERACTIVE_RESERVE_PER_PROCESS="0"' in text
     comment = " ".join(
-        line.removeprefix("#").strip()
-        for line in text.splitlines()
-        if line.startswith("#")
+        " ".join(
+            line.removeprefix("#").strip()
+            for line in text.splitlines()
+            if line.startswith("#")
+        ).split()
     )
     for phrase in (
         "R (this value)",
         "limit (XAGENT_DISPATCHER_MAX_INFLIGHT_PER_PROCESS)",
         "Keep this at 0.",
-        "the queue scan stops at the oldest queued command it may not start",
-        "except replies classified interactive",
+        "a cancel or pause does not pass the held batch commands queued before it "
+        "for its task",
         "rejected as stale",
+        "is rejected as stale when the run it targets is no longer the task's run",
     ):
-        assert phrase in " ".join(comment.split())
+        assert phrase in comment
+    assert "the queue scan stops at the oldest queued command" not in comment

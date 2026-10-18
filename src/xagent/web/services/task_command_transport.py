@@ -2001,13 +2001,15 @@ async def dispatch_one_task_command(
                 task_id, policy=cap.policy, interactive=interactive
             )
             if reservation is None:
-                # The cap filled after the snapshot, or this process is on its
-                # batch line and the candidate is a batch command. An execution
-                # end signals the dispatcher, which retries then. Releasing
-                # another attempt's reservation signals nothing, so when the
-                # slot was held by an attempt that ends without starting an
-                # execution, the retry waits for the idle interval or the next
-                # notify.
+                # A candidate picked under a snapshot is one this process could
+                # start, so the slot is refused only when the state changed
+                # since: more tasks became active (to the batch line for a batch
+                # command, to the limit for any), or the candidate's task left
+                # the active set. An execution end signals the dispatcher, which
+                # retries then. Releasing another attempt's reservation signals
+                # nothing, so when the slot was held by an attempt that ends
+                # without starting an execution, the retry waits for the idle
+                # interval or the next notify.
                 return False
         try:
             coordinator = await registry.ensure(task_id)
