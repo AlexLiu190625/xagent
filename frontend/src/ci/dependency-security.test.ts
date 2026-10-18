@@ -12,7 +12,6 @@ describe("patched dependency resolution", () => {
     ["form-data", "4.0.6"],
     ["image-size", "2.0.3"],
     ["postcss-selector-parser", "7.1.6"],
-    ["tinypool", "2.1.2"],
   ])("pins every transitive %s copy to its verified patch", (name, version) => {
     expect(manifest.overrides[name]).toBe(version)
     const copies = Object.entries(lock.packages).filter(([location]) =>
@@ -23,11 +22,15 @@ describe("patched dependency resolution", () => {
   })
 
   it("keeps the verified test runner, coverage provider and Vite in the lockfile", () => {
-    for (const name of ["vitest", "@vitest/coverage-v8"]) {
-      expect(manifest.devDependencies[name]).toBe("3.2.6")
-      expect(lock.packages[`node_modules/${name}`].version).toBe("3.2.6")
+    for (const name of ["vitest", "@vitest/coverage-istanbul"]) {
+      expect(manifest.devDependencies[name]).toBe("4.1.12")
+      expect(lock.packages[`node_modules/${name}`].version).toBe("4.1.12")
     }
     expect(lock.packages["node_modules/vite"].version).toBe("7.3.7")
+    expect(Object.keys(lock.packages).some(location => location.endsWith("node_modules/tinypool"))).toBe(false)
+    for (const orphan of ["@bcoe/v8-coverage", "ast-v8-to-istanbul", "ast-v8-to-istanbul/node_modules/js-tokens"]) {
+      expect(lock.packages[`node_modules/${orphan}`]).toBeUndefined()
+    }
   })
 
   it("preserves Tailwind variant CSS across the selector-parser major override", async () => {
@@ -51,7 +54,9 @@ describe("patched dependency resolution", () => {
       const assert = require('node:assert/strict');
       const PptxGenJS = require('pptxgenjs');
       const JSZip = require('jszip');
+      const { imageSize } = require('image-size');
       const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZKxkAAAAASUVORK5CYII=', 'base64');
+      assert.equal(imageSize(png).width, 1);
       const presentation = new PptxGenJS();
       presentation.addSlide().addImage({ data: 'image/png;base64,' + png.toString('base64'), x: 1, y: 1, w: 1, h: 1 });
       (async () => {
