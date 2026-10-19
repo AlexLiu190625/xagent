@@ -4874,6 +4874,8 @@ def generic_oauth_callback(
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         if requires_json_accept_header(provider):
             headers["Accept"] = "application/json"
+        if account_host is not None:
+            headers.update(account_host.request_headers())
         auth: tuple[str, str] | None = None
         if provider.lower() == "zoom":
             # Zoom's token endpoint requires HTTP Basic Auth for client
@@ -5341,6 +5343,8 @@ def generic_oauth_callback(
                 )
         elif userinfo_url and access_token:
             info_headers = {"Authorization": f"Bearer {access_token}"}
+            if account_host is not None:
+                info_headers.update(account_host.request_headers())
             # Replace {{access_token}} placeholder if present
             actual_url = userinfo_url.replace("{{access_token}}", access_token)
             info_get_kwargs: dict[str, Any] = {}

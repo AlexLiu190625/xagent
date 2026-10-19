@@ -59,6 +59,14 @@ class MockResponse:
 def _credentials(monkeypatch):
     monkeypatch.setenv("ZENDESK_SUBDOMAIN", "acme")
     monkeypatch.setenv("ZENDESK_ACCESS_TOKEN", "test-token")
+    # Unconfigured by default, so the exact-header assertions below also
+    # cover a deployment without the Marketplace settings.
+    for name in (
+        "ZENDESK_MARKETPLACE_NAME",
+        "ZENDESK_MARKETPLACE_ORGANIZATION_ID",
+        "ZENDESK_MARKETPLACE_APP_ID",
+    ):
+        monkeypatch.delenv(name, raising=False)
     # _base_url() resolves DNS to catch a hostname that rebinds to a private
     # address; tests must not depend on real network/DNS, so every test gets
     # a fake resolver returning an unambiguously public IP by default.
@@ -81,6 +89,29 @@ def test_headers_treat_a_whitespace_only_access_token_as_missing(monkeypatch):
 
 def test_headers_send_the_access_token_as_a_bearer_credential():
     assert zendesk._headers() == {"Authorization": "Bearer test-token"}
+
+
+def test_headers_carry_the_configured_marketplace_headers(monkeypatch):
+    monkeypatch.setenv("ZENDESK_MARKETPLACE_NAME", "Xagent")
+    monkeypatch.setenv("ZENDESK_MARKETPLACE_ORGANIZATION_ID", "12345")
+    monkeypatch.setenv("ZENDESK_MARKETPLACE_APP_ID", "67890")
+
+    assert zendesk._headers() == {
+        "Authorization": "Bearer test-token",
+        "X-Zendesk-Marketplace-Name": "Xagent",
+        "X-Zendesk-Marketplace-Organization-Id": "12345",
+        "X-Zendesk-Marketplace-App-Id": "67890",
+    }
+
+
+def test_headers_drop_an_invalid_marketplace_value(monkeypatch):
+    monkeypatch.setenv("ZENDESK_MARKETPLACE_NAME", "Xagent\r\nX-Injected: 1")
+    monkeypatch.setenv("ZENDESK_MARKETPLACE_ORGANIZATION_ID", "12345")
+
+    assert zendesk._headers() == {
+        "Authorization": "Bearer test-token",
+        "X-Zendesk-Marketplace-Organization-Id": "12345",
+    }
 
 
 def test_legacy_api_token_credentials_are_ignored(monkeypatch):
@@ -489,6 +520,29 @@ def test_request_uses_configured_host_and_auth(monkeypatch):
     }
     assert "auth" not in mock_request.call_args.kwargs
     assert mock_request.call_args.kwargs["allow_redirects"] is False
+
+
+def test_request_and_its_429_retry_carry_the_marketplace_headers(monkeypatch):
+    monkeypatch.setenv("ZENDESK_MARKETPLACE_NAME", "Xagent")
+    monkeypatch.setenv("ZENDESK_MARKETPLACE_ORGANIZATION_ID", "12345")
+    monkeypatch.setattr(zendesk.time, "sleep", lambda _seconds: None)
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(status_code=429, headers={"Retry-After": "1"}),
+            MockResponse(json_data={"ok": True}),
+        ]
+    )
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    assert zendesk._request("GET", "/tickets.json") == {"ok": True}
+
+    assert mock_request.call_count == 2
+    for call in mock_request.call_args_list:
+        assert call.kwargs["headers"] == {
+            "Authorization": "Bearer test-token",
+            "X-Zendesk-Marketplace-Name": "Xagent",
+            "X-Zendesk-Marketplace-Organization-Id": "12345",
+        }
 
 
 @pytest.mark.parametrize("status_code", [301, 302, 303, 307, 308])

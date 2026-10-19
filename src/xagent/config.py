@@ -4320,3 +4320,62 @@ def get_retention_batch_pause_seconds() -> float:
     """
     value = _get_positive_float_env(RETENTION_BATCH_PAUSE_SECONDS, None)
     return 5.0 if value is None else value
+
+
+# Zendesk Marketplace request headers (#3222). Unprefixed so they sit with the
+# ZENDESK_CLIENT_ID/ZENDESK_CLIENT_SECRET settings of the same OAuth client.
+ZENDESK_MARKETPLACE_NAME = "ZENDESK_MARKETPLACE_NAME"
+ZENDESK_MARKETPLACE_ORGANIZATION_ID = "ZENDESK_MARKETPLACE_ORGANIZATION_ID"
+ZENDESK_MARKETPLACE_APP_ID = "ZENDESK_MARKETPLACE_APP_ID"
+ZENDESK_MARKETPLACE_HEADER_ENV_VARS: tuple[tuple[str, str], ...] = (
+    ("X-Zendesk-Marketplace-Name", ZENDESK_MARKETPLACE_NAME),
+    ("X-Zendesk-Marketplace-Organization-Id", ZENDESK_MARKETPLACE_ORGANIZATION_ID),
+    ("X-Zendesk-Marketplace-App-Id", ZENDESK_MARKETPLACE_APP_ID),
+)
+ZENDESK_MARKETPLACE_HEADER_MAX_LENGTH = 256
+# Printable ASCII only: CR/LF would split the header, and both HTTP clients
+# fail on other characters (httpx rejects non-ASCII values outright, and
+# http.client cannot encode text outside latin-1).
+_ZENDESK_MARKETPLACE_HEADER_VALUE_PATTERN = re.compile(r"[\x20-\x7e]+")
+
+
+def get_zendesk_marketplace_headers() -> dict[str, str]:
+    """Get the Zendesk Marketplace headers for requests to a Zendesk account.
+
+    Priority:
+        1. ZENDESK_MARKETPLACE_NAME, ZENDESK_MARKETPLACE_ORGANIZATION_ID and
+           ZENDESK_MARKETPLACE_APP_ID environment variables
+        2. No headers
+
+    Zendesk requires these on every API request from a Marketplace
+    integration app. Each header is sent when its variable is set, so name
+    and organization ID can go out before the app ID has been assigned. A
+    deployment with its own OAuth client leaves all three unset and sends
+    nothing new. A value that is not printable ASCII or is longer than
+    ZENDESK_MARKETPLACE_HEADER_MAX_LENGTH is ignored with a warning, so a
+    bad setting never breaks or splits the request.
+
+    Returns:
+        Header name to value, for the configured and valid settings only.
+    """
+    headers: dict[str, str] = {}
+    for header, env_var in ZENDESK_MARKETPLACE_HEADER_ENV_VARS:
+        value = (os.getenv(env_var) or "").strip()
+        if not value:
+            continue
+        if (
+            len(value) > ZENDESK_MARKETPLACE_HEADER_MAX_LENGTH
+            or not _ZENDESK_MARKETPLACE_HEADER_VALUE_PATTERN.fullmatch(value)
+        ):
+            # The value is not logged: it may hold the characters that make
+            # it unsafe to send.
+            logger.warning(
+                "Ignoring %s: it must be printable ASCII and at most %d "
+                "characters; %s is not sent",
+                env_var,
+                ZENDESK_MARKETPLACE_HEADER_MAX_LENGTH,
+                header,
+            )
+            continue
+        headers[header] = value
+    return headers

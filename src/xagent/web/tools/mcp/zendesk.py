@@ -9,7 +9,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from ....config import get_tool_max_output_length
+from ....config import get_tool_max_output_length, get_zendesk_marketplace_headers
 from ....core.tools.core.web_content import get_trusted_proxy_url
 from ....core.utils import public_requests as requests
 from ....core.utils.security import (
@@ -124,7 +124,12 @@ def _access_token() -> str:
 
 
 def _headers() -> dict[str, str]:
-    return {"Authorization": f"Bearer {_access_token()}"}
+    # The Marketplace settings reach this subprocess through the catalog
+    # row's launch_config.static_env; unset, they add nothing.
+    return {
+        "Authorization": f"Bearer {_access_token()}",
+        **get_zendesk_marketplace_headers(),
+    }
 
 
 def _base_url() -> str:

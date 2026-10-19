@@ -75,6 +75,30 @@ def _public_dns(monkeypatch):
     )
 
 
+MARKETPLACE_ENV = {
+    "ZENDESK_MARKETPLACE_NAME": "Xagent",
+    "ZENDESK_MARKETPLACE_ORGANIZATION_ID": "12345",
+    "ZENDESK_MARKETPLACE_APP_ID": "67890",
+}
+MARKETPLACE_HEADERS = {
+    "X-Zendesk-Marketplace-Name": "Xagent",
+    "X-Zendesk-Marketplace-Organization-Id": "12345",
+    "X-Zendesk-Marketplace-App-Id": "67890",
+}
+
+
+@pytest.fixture(autouse=True)
+def _marketplace_unset(monkeypatch):
+    for name in MARKETPLACE_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture()
+def marketplace_configured(monkeypatch):
+    for name, value in MARKETPLACE_ENV.items():
+        monkeypatch.setenv(name, value)
+
+
 @pytest.fixture()
 def session_factory(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'zendesk-oauth.db'}")
@@ -294,6 +318,43 @@ def test_code_exchange_requests_the_maximum_token_lifetimes(zendesk_db, monkeypa
         assert sent[name] == value
 
 
+def test_callback_sends_the_marketplace_headers_to_the_account(
+    zendesk_db, monkeypatch, marketplace_configured
+):
+    db, user = zendesk_db
+    post, get = _mock_provider_http(
+        monkeypatch, {"user": {"id": 1, "email": "agent@acme.example"}}
+    )
+
+    state, cookies = _login_state(db, user)
+    assert _callback(db, state, cookies).status_code == 200
+
+    exchange_headers = post.call_args.kwargs["headers"]
+    for name, value in MARKETPLACE_HEADERS.items():
+        assert exchange_headers[name] == value
+    assert get.call_args.kwargs["headers"] == {
+        "Authorization": "Bearer new-access",
+        **MARKETPLACE_HEADERS,
+    }
+
+
+def test_callback_without_marketplace_settings_sends_no_new_headers(
+    zendesk_db, monkeypatch
+):
+    db, user = zendesk_db
+    post, get = _mock_provider_http(
+        monkeypatch, {"user": {"id": 1, "email": "agent@acme.example"}}
+    )
+
+    state, cookies = _login_state(db, user)
+    _callback(db, state, cookies)
+
+    assert post.call_args.kwargs["headers"] == {
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+    assert get.call_args.kwargs["headers"] == {"Authorization": "Bearer new-access"}
+
+
 @pytest.mark.parametrize(
     "userinfo",
     [
@@ -371,6 +432,27 @@ async def test_refresh_requests_the_maximum_token_lifetimes_again(
         assert kwargs["data"][name] == value
     assert grant.access_token == "rotated-access"
     assert grant.refresh_token == "rotated-refresh"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("configured", [True, False])
+async def test_refresh_sends_the_marketplace_headers_only_when_configured(
+    zendesk_db, monkeypatch, configured
+):
+    if configured:
+        for name, value in MARKETPLACE_ENV.items():
+            monkeypatch.setenv(name, value)
+    db, user = zendesk_db
+    grant = _expired_grant(db, user)
+    posted = _fake_token_endpoint(
+        monkeypatch,
+        {"access_token": "rotated-access", "refresh_token": "rotated-refresh"},
+    )
+
+    assert await tool_config.refresh_oauth_token_if_needed(db, grant, "zendesk")
+
+    _url, kwargs = posted[0]
+    assert kwargs["headers"] == (MARKETPLACE_HEADERS if configured else {})
 
 
 @pytest.mark.asyncio
@@ -591,9 +673,7 @@ def test_gmail_tombstone_takes_no_database_write_lock_before_its_own_lock(
 # ---------- connector launch -------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_connector_gets_the_token_and_the_grants_subdomain(zendesk_db):
-    db, user = zendesk_db
+async def _connector_env(db, user) -> dict[str, str]:
     app = mcp_apps.get_app_by_id(db, "zendesk")
     assert app is not None
     server = MCPServer(
@@ -637,7 +717,24 @@ async def test_connector_gets_the_token_and_the_grants_subdomain(zendesk_db):
 
     zendesk = next(config for config in configs if config["name"] == "Zendesk")
     assert zendesk["config"]["args"] == ["-m", "xagent.web.tools.mcp.zendesk"]
-    env = zendesk["config"]["env"]
+    return zendesk["config"]["env"]
+
+
+@pytest.mark.asyncio
+async def test_connector_gets_the_token_and_the_grants_subdomain(zendesk_db):
+    env = await _connector_env(*zendesk_db)
+
     assert env["ZENDESK_ACCESS_TOKEN"] == "live-access"
     assert env["ZENDESK_SUBDOMAIN"] == "acme"
     assert "ZENDESK_API_TOKEN" not in env
+    assert not set(MARKETPLACE_ENV).intersection(env)
+
+
+@pytest.mark.asyncio
+async def test_connector_gets_the_marketplace_settings(
+    zendesk_db, marketplace_configured
+):
+    env = await _connector_env(*zendesk_db)
+
+    for name, value in MARKETPLACE_ENV.items():
+        assert env[name] == value

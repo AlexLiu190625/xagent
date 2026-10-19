@@ -1605,6 +1605,17 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                     "ZENDESK_ACCESS_TOKEN": "access_token",
                     "ZENDESK_SUBDOMAIN": "instance_url",
                 },
+                # The deployment's Zendesk Marketplace identity (#3222),
+                # forwarded from this process's env; an unset variable is
+                # not forwarded. Existing rows get it from the
+                # 20261019_zendesk_marketplace migration.
+                "static_env": {
+                    "ZENDESK_MARKETPLACE_NAME": "ZENDESK_MARKETPLACE_NAME",
+                    "ZENDESK_MARKETPLACE_ORGANIZATION_ID": (
+                        "ZENDESK_MARKETPLACE_ORGANIZATION_ID"
+                    ),
+                    "ZENDESK_MARKETPLACE_APP_ID": "ZENDESK_MARKETPLACE_APP_ID",
+                },
                 "builtin_provenance": {
                     "registry": "xagent",
                     "app_id": "zendesk",

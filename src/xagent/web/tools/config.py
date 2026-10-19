@@ -1117,6 +1117,8 @@ async def refresh_oauth_token_if_needed(
             headers["Content-Type"] = "application/x-www-form-urlencoded"
         if requires_json_accept_header(normalized_provider):
             headers["Accept"] = "application/json"
+        if account_host is not None:
+            headers.update(account_host.request_headers())
 
         from ..api.auth import _is_employment_hero_token_url
         from ..oauth_provider_quirks import matches_provider_family

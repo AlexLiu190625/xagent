@@ -4313,3 +4313,77 @@ def test_private_model_config_is_default_empty_and_environment_only(monkeypatch)
     monkeypatch.setenv("XAGENT_MODEL_PRIVATE_CIDRS", " 127.0.0.1/32,::1/128 ")
     assert config.get_model_private_endpoints() == ["http://localhost:9997"]
     assert config.get_model_private_cidrs() == ["127.0.0.1/32", "::1/128"]
+
+
+class TestZendeskMarketplaceHeaders:
+    """#3222: Zendesk Marketplace review checks these headers on API calls."""
+
+    ENV_VARS = (
+        "ZENDESK_MARKETPLACE_NAME",
+        "ZENDESK_MARKETPLACE_ORGANIZATION_ID",
+        "ZENDESK_MARKETPLACE_APP_ID",
+    )
+
+    @pytest.fixture(autouse=True)
+    def _unset(self, monkeypatch):
+        for name in self.ENV_VARS:
+            monkeypatch.delenv(name, raising=False)
+
+    def test_unconfigured_sends_no_headers(self, monkeypatch):
+        assert config.get_zendesk_marketplace_headers() == {}
+        for name in self.ENV_VARS:
+            monkeypatch.setenv(name, "  ")
+        assert config.get_zendesk_marketplace_headers() == {}
+
+    def test_all_three_settings_map_to_their_headers(self, monkeypatch):
+        monkeypatch.setenv("ZENDESK_MARKETPLACE_NAME", " Xagent for Zendesk ")
+        monkeypatch.setenv("ZENDESK_MARKETPLACE_ORGANIZATION_ID", "12345")
+        monkeypatch.setenv("ZENDESK_MARKETPLACE_APP_ID", "67890")
+
+        assert config.get_zendesk_marketplace_headers() == {
+            "X-Zendesk-Marketplace-Name": "Xagent for Zendesk",
+            "X-Zendesk-Marketplace-Organization-Id": "12345",
+            "X-Zendesk-Marketplace-App-Id": "67890",
+        }
+
+    def test_a_partial_configuration_sends_the_headers_that_are_set(self, monkeypatch):
+        # The app ID is only assigned once the app is submitted, while review
+        # already checks for the headers.
+        monkeypatch.setenv("ZENDESK_MARKETPLACE_NAME", "Xagent")
+        monkeypatch.setenv("ZENDESK_MARKETPLACE_ORGANIZATION_ID", "12345")
+
+        assert config.get_zendesk_marketplace_headers() == {
+            "X-Zendesk-Marketplace-Name": "Xagent",
+            "X-Zendesk-Marketplace-Organization-Id": "12345",
+        }
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "Xagent\r\nX-Injected: 1",
+            "Xagent\nfor Zendesk",
+            "Xagent\tfor Zendesk",
+            "Xagent für Zendesk",
+            "x" * 257,
+        ],
+    )
+    def test_an_invalid_value_is_ignored_with_a_warning(
+        self, monkeypatch, caplog, value
+    ):
+        monkeypatch.setenv("ZENDESK_MARKETPLACE_NAME", value)
+        monkeypatch.setenv("ZENDESK_MARKETPLACE_ORGANIZATION_ID", "12345")
+
+        with caplog.at_level(logging.WARNING, logger="xagent.config"):
+            headers = config.get_zendesk_marketplace_headers()
+
+        assert headers == {"X-Zendesk-Marketplace-Organization-Id": "12345"}
+        assert "ZENDESK_MARKETPLACE_NAME" in caplog.text
+        # The rejected value itself is never echoed into the logs.
+        assert value.strip() not in caplog.text
+
+    def test_the_maximum_length_is_accepted(self, monkeypatch):
+        monkeypatch.setenv("ZENDESK_MARKETPLACE_APP_ID", "1" * 256)
+
+        assert config.get_zendesk_marketplace_headers() == {
+            "X-Zendesk-Marketplace-App-Id": "1" * 256
+        }

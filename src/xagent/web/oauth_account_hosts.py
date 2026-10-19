@@ -25,9 +25,10 @@ registry can only ever produce ``https://<label>.<host_suffix>``.
 
 import re
 import socket
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
+from ..config import get_zendesk_marketplace_headers
 from ..core.utils.security import PrivateNetworkHostError, reject_private_network_host
 from .oauth_provider_quirks import matches_provider_family
 
@@ -51,6 +52,10 @@ _RESERVED_TOKEN_PARAMS = frozenset(
 _ACCOUNT_LABEL_PATTERN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 
 
+def _no_request_headers() -> Mapping[str, str]:
+    return {}
+
+
 @dataclass(frozen=True)
 class OAuthAccountHost:
     """How one provider's endpoints are derived from an account label."""
@@ -69,6 +74,9 @@ class OAuthAccountHost:
     userinfo_envelope: str | None = None
     # Extra form fields sent on both the code exchange and every refresh.
     token_params: Mapping[str, str] = field(default_factory=dict)
+    # Extra headers for the code exchange, the identity lookup, and every
+    # refresh. Called per request, so it reads the current settings.
+    request_headers: Callable[[], Mapping[str, str]] = _no_request_headers
 
     def __post_init__(self) -> None:
         reserved = sorted(_RESERVED_TOKEN_PARAMS.intersection(self.token_params))
@@ -125,6 +133,9 @@ OAUTH_ACCOUNT_HOSTS: dict[str, OAuthAccountHost] = {
             "expires_in": "172800",
             "refresh_token_expires_in": "7776000",
         },
+        # Marketplace integration apps must identify themselves on every
+        # request to the account (#3222); unconfigured, this adds nothing.
+        request_headers=get_zendesk_marketplace_headers,
     ),
 }
 
