@@ -13,10 +13,14 @@ import aiohttp
 
 from ....config import get_media_download_max_bytes
 from ...utils.public_download import download_public_input
+from ..chat.token_context import MediaCallType
+from ..media_metering import record_provider_usage
 from ..public_http import create_public_model_aiohttp_session
-from .base import BaseVideoModel
+from .base import BaseVideoModel, BilledVideoTaskError
 
 logger = logging.getLogger(__name__)
+# "No response body yet", distinct from anything a server could return.
+_NOT_RECEIVED: Any = object()
 REFERENCE_MEDIA_FETCH_TIMEOUT = 60.0
 
 
@@ -106,8 +110,11 @@ class XinferenceVideoModel(BaseVideoModel):
         api_key: Optional[str] = None,
         timeout: float = 3600.0,
         abilities: Optional[List[str]] = None,
+        model_id: str = "",
     ) -> None:
         self.model_name = model_name
+        # The configured row id usage is billed under; see media_metering.
+        self.model_id = model_id
         self._model_uid = model_uid or model_name
         self.base_url = (base_url or "http://localhost:9997").rstrip("/")
         self.api_key = api_key
@@ -133,22 +140,42 @@ class XinferenceVideoModel(BaseVideoModel):
         **kwargs: Any,
     ) -> Any:
         url = f"{self.base_url}{path}"
-        async with session.request(
-            method, url, headers=self._headers(), **kwargs
-        ) as response:
-            if response.status != 200:
+        accepted = False
+        try:
+            async with session.request(
+                method, url, headers=self._headers(), **kwargs
+            ) as response:
+                if response.status != 200:
+                    try:
+                        detail = await response.json()
+                    except Exception:
+                        detail = await response.text()
+                    raise aiohttp.ClientResponseError(
+                        response.request_info,
+                        response.history,
+                        status=response.status,
+                        message=f"Xinference video request failed: detail: {detail}",
+                        headers=response.headers,
+                    )
+                # The server answered 200, so the generation already ran. A
+                # body that will not decode is a billed response, not a
+                # retryable failure: retrying would generate (and pay for) it
+                # again.
+                accepted = True
                 try:
-                    detail = await response.json()
-                except Exception:
-                    detail = await response.text()
-                raise aiohttp.ClientResponseError(
-                    response.request_info,
-                    response.history,
-                    status=response.status,
-                    message=f"Xinference video request failed: detail: {detail}",
-                    headers=response.headers,
-                )
-            return await response.json()
+                    return await response.json()
+                except Exception as exc:  # noqa: BLE001 - positional classification
+                    raise BilledVideoTaskError(
+                        f"Xinference video response could not be decoded: {exc}"
+                    ) from exc
+        except asyncio.CancelledError:
+            # Cancelled after the 200 but before the caller got the body: the
+            # render happened and is billed, but its duration never arrives.
+            # The caller only records once it holds the body, so this is the
+            # row for this call.
+            if accepted:
+                record_provider_usage(self, MediaCallType.VIDEO, 0)
+            raise
 
     async def _post_video_json(
         self,
@@ -303,6 +330,34 @@ class XinferenceVideoModel(BaseVideoModel):
             "raw_response": {},
         }
 
+    def _record_response_usage(
+        self, result: Any, requested_seconds: Any, resolution: Optional[str]
+    ) -> tuple[Any, Optional[dict[str, Any]]]:
+        """Record the one usage row of a received response; never raises.
+
+        Returns ``(data, item)``, with ``item`` None when the body is too
+        malformed to read -- recorded as an unmeasured call, since the video
+        was rendered either way. Recorded before the response is validated.
+        The server's own duration wins; the requested length is the fallback,
+        since a server that reports none rendered what was asked.
+        """
+        try:
+            data = _to_plain_data(result)
+            item = _first_video_item(data)
+            reported_seconds = item.get("duration") or item.get("seconds")
+            item_resolution = str(item.get("resolution") or resolution or "")
+        except Exception as exc:  # noqa: BLE001 - positional classification
+            logger.warning("Xinference video response was malformed: %s", exc)
+            record_provider_usage(self, MediaCallType.VIDEO, 0)
+            return result, None
+        record_provider_usage(
+            self,
+            MediaCallType.VIDEO,
+            reported_seconds if reported_seconds is not None else requested_seconds,
+            resolution=item_resolution,
+        )
+        return data, item
+
     async def generate_video(
         self,
         prompt: str = "",
@@ -328,6 +383,13 @@ class XinferenceVideoModel(BaseVideoModel):
         _ = wait_for_result, poll_interval
         if not self.has_ability("generate"):
             raise RuntimeError("This model doesn't support video generation")
+        if n not in (None, 1, "1"):
+            # Only the first video of a batch is ever returned to the caller,
+            # yet the server renders all of them; reject rather than bill for
+            # videos nobody receives.
+            raise ValueError(
+                "Xinference video generation supports one video per request"
+            )
 
         if content:
             for item in content:
@@ -358,6 +420,7 @@ class XinferenceVideoModel(BaseVideoModel):
 
         reference_image = input_reference or image_url or image or first_frame_image_url
 
+        result: Any = _NOT_RECEIVED
         try:
             timeout_obj = aiohttp.ClientTimeout(total=effective_timeout)
             async with create_public_model_aiohttp_session(
@@ -415,30 +478,42 @@ class XinferenceVideoModel(BaseVideoModel):
                             "kwargs": json.dumps(kwargs),
                         },
                     )
+        except asyncio.CancelledError:
+            # Cancelled while the session closed, after the body arrived: the
+            # body is in hand, so this call is recorded from it.
+            if result is not _NOT_RECEIVED:
+                self._record_response_usage(result, effective_seconds, resolution)
+            raise
+        except BilledVideoTaskError:
+            record_provider_usage(self, MediaCallType.VIDEO, 0)
+            raise
         except Exception as exc:
             logger.error("Xinference video generation failed: %s", exc)
             raise RuntimeError(f"Xinference video generation failed: {exc}") from exc
 
-        data = _to_plain_data(result)
-        item = _first_video_item(data)
-        video_url = _video_url_from_item(item)
+        data, video_item = self._record_response_usage(
+            result, effective_seconds, resolution
+        )
+        if video_item is None:
+            raise BilledVideoTaskError("Xinference video response was malformed")
+        video_url = _video_url_from_item(video_item)
         if not video_url:
-            raise RuntimeError(
+            raise BilledVideoTaskError(
                 "Xinference video generation response did not include "
                 "url, video_url, or b64_json"
             )
         return {
-            "task_id": item.get("id") or item.get("task_id"),
+            "task_id": video_item.get("id") or video_item.get("task_id"),
             "model": self.model_name,
             "status": "succeeded",
             "video_url": video_url,
-            "last_frame_url": item.get("last_frame_url"),
-            "seed": item.get("seed"),
-            "resolution": item.get("resolution") or resolution,
-            "ratio": item.get("ratio") or ratio,
-            "duration": item.get("duration")
-            or item.get("seconds")
+            "last_frame_url": video_item.get("last_frame_url"),
+            "seed": video_item.get("seed"),
+            "resolution": video_item.get("resolution") or resolution,
+            "ratio": video_item.get("ratio") or ratio,
+            "duration": video_item.get("duration")
+            or video_item.get("seconds")
             or effective_seconds,
-            "frames": item.get("frames"),
+            "frames": video_item.get("frames"),
             "raw_response": data,
         }
