@@ -893,11 +893,13 @@ def _command_routing_predicate(runner_id: str, now: datetime) -> Any:
 
 
 def _held_below_cap(earlier: Any) -> Any:
-    """Whether this process will not start ``earlier`` while below its limit.
+    """Whether this process, at the batch line, will not start ``earlier``.
 
-    That is a never-claimed batch command, or a never-claimed command that
-    waits behind one of its task: commands of a task run in order, so it does
-    not start either. ``earlier`` is an alias of ``TaskExecutionCommand``.
+    That is a batch command, or a command that waits behind a pending,
+    never-claimed batch command of its task that would open an execution:
+    commands of a task run in order. ``earlier`` is an alias of
+    ``TaskExecutionCommand``; callers add the never-claimed condition for
+    ``earlier`` itself.
     """
 
     head = aliased(TaskExecutionCommand)
@@ -924,7 +926,7 @@ def _unfinished_earlier_command(cap: DispatchCapSnapshot | None = None) -> Any:
     execution) or batch-closed (it starts no batch command), a control in
     ``CAP_OVERTAKING_CONTROL_KINDS`` may also pass an earlier pending command
     that would open an execution, was never claimed, and whose task holds no
-    slot in this process, when this process would not run it either. At the
+    slot in this process, when this process would not start it now. At the
     cap that is every such command. Below the cap a command counts as held
     when it is a batch command, or when it waits behind a held batch command
     of its task, because this process will not start it either; a control
@@ -934,15 +936,15 @@ def _unfinished_earlier_command(cap: DispatchCapSnapshot | None = None) -> Any:
     the snapshot; a rejected cancel, or a pause rejected for any other reason
     (for example access denied, ``stale_run`` or invalid data), settles
     nothing. A command already claimed once and back in pending is not
-    passed (xagent#2649). Callers that claim must pass the same snapshot to
-    the candidate query and the claim UPDATE. Neither this SQL nor the owner
-    lease keeps the passed command unclaimed while the control is
-    processing: the lease lock lasts only for the claim transaction, and the
-    lease owner is the process applying the control. What does is that an
-    owner applies one command of a task at a time (``busy_command_tasks`` and
-    ``_command_tasks`` in ``dispatch_one_task_command``, ``_command_lock`` in
-    ``execute_command``). A claim path that bypasses the task coordinator
-    must keep that rule.
+    passed: it may already have had an effect. Callers that claim must pass
+    the same snapshot to the candidate query and the claim UPDATE. Neither
+    this SQL nor the owner lease keeps the passed command unclaimed while the
+    control is processing: the lease lock lasts only for the claim
+    transaction, and the lease owner is the process applying the control.
+    What does is that an owner applies one command of a task at a time
+    (``busy_command_tasks`` and ``_command_tasks`` in
+    ``dispatch_one_task_command``, ``_command_lock`` in ``execute_command``).
+    A claim path that bypasses the task coordinator must keep that rule.
     """
     from .task_execution_admission import waiting_admission
 

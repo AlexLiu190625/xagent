@@ -4,7 +4,7 @@ handled and settled as it is at the cap: the pause scenarios of
 limit-R and limit."""
 
 # Pytest fixture imports are intentionally shadowed by test parameters.
-# ruff: noqa: F811, F401
+# ruff: noqa: F811
 
 from __future__ import annotations
 
@@ -13,15 +13,20 @@ from typing import Any
 
 import pytest
 
-from tests.web.services.test_dispatch_cap import CapHost, cap_host, set_limit
-from tests.web.services.test_dispatch_cap_cancel_overtake import (
+from tests.web.services.test_dispatch_cap import (  # noqa: F401
+    CapHost,
+    cap_host,
+    set_limit,
+)
+from tests.web.services.test_dispatch_cap_cancel_overtake import host  # noqa: F401
+from tests.web.services.test_dispatch_cap_cancel_overtake import (  # noqa: F401
     SETTLE_LOGGER,
-    host,
     pause_host,
 )
 from tests.web.services.test_dispatch_cap_pause_overtake import (
     PAUSE_SCENARIOS,
     accept_start,
+    assert_settle_log,
     stage_pause,
 )
 from tests.web.services.test_dispatch_reserve import dispatch, set_reserve
@@ -78,31 +83,16 @@ async def test_pause_settles_held_batch_commands_below_cap(
     )
     assert cap.batch_closed and not cap.closed
 
-    records = [r for r in caplog.records if "dispatch-cap" in r.getMessage()]
-    if scenario == "S7-two-held-rows":
-        (record,) = records
-        assert record.levelno == logging.INFO
-        message = record.getMessage()
-        assert "control=pause" in message and "settled_commands=2" in message
-        assert "'resume_input': 1" in message and "'message': 1" in message
-    elif scenario in (
-        "S9-ticketed-start",
-        "S11-other-users-pause",
-        "S12c-precheck-reply-fails",
-        "S16b-stale-web-pause-other-start",
-    ):
-        assert records == []
-
-
-async def test_a_start_staged_for_a_batch_source_is_classified_batch(
-    batch_line_pause_host: CapHost,
-) -> None:
-    host = batch_line_pause_host
-    task_id = host.new_task(status=TaskStatus.PENDING, run_id=None, state_version=0)
-
-    start_id, _, _ = accept_start(host, task_id)
-
-    assert host.row(start_id).dispatch_class == "batch"
+    assert_settle_log(
+        caplog,
+        scenario,
+        silent=(
+            "S9-ticketed-start",
+            "S11-other-users-pause",
+            "S12c-precheck-reply-fails",
+            "S16b-stale-web-pause-other-start",
+        ),
+    )
 
 
 async def test_a_pause_does_not_pass_an_interactive_start_on_the_batch_line(
@@ -119,6 +109,10 @@ async def test_a_pause_does_not_pass_an_interactive_start_on_the_batch_line(
     start_id, _, _ = accept_start(host, task_id)
     pause_id = stage_pause(host, task_id)
     assert host.row(start_id).dispatch_class == "interactive"
+    cap = host.manager.dispatch_cap_snapshot(
+        DispatchPolicy(limit=2, interactive_reserve=1)
+    )
+    assert transport._find_command_candidate(pause_id, (), cap) is None
 
     assert await dispatch(host) is True
     assert host.claimed[-1] == (task_id, transport.TaskCommandKind.START)
