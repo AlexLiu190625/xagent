@@ -491,6 +491,7 @@ def test_agent_share_task_create_ignores_client_injected_entity_markers() -> Non
                 "widget_agent_id": 777777,
                 "widget_workforce_id": 666666,
                 "widget_client_ip": "1.2.3.4",
+                "prompt_context": {"data": {"forged": "yes"}, "signed": True},
                 "keep_me": "client value",
             },
         },
@@ -521,6 +522,7 @@ def test_agent_share_task_create_ignores_client_injected_entity_markers() -> Non
         assert "widget_agent_id" not in cfg
         assert "widget_workforce_id" not in cfg
         assert "widget_client_ip" not in cfg
+        assert "prompt_context" not in cfg
         # Non-reserved client keys still ride through this path (unlike the
         # workforce branch below, which never reads the client body at all).
         assert cfg.get("keep_me") == "client value"

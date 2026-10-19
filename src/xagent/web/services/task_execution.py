@@ -159,7 +159,10 @@ from .file_reference_output_service import (
     reconcile_assistant_file_references,
 )
 from .file_turn import (
+    append_prompt_context_block,
+    build_prompt_context_block,
     normalize_filename,
+    prompt_context_from_agent_config,
 )
 from .mcp_runtime import (
     MCPActorExecutionIdentity,
@@ -2426,6 +2429,16 @@ def _finalize_task_execution_result_isolated(
             )
 
 
+def _has_display_message_override(context: Dict[str, Any]) -> bool:
+    if "display_message" in context or "display_user_message" in context:
+        return True
+    request_context = context.get("request_context")
+    return isinstance(request_context, dict) and (
+        "display_message" in request_context
+        or "display_user_message" in request_context
+    )
+
+
 async def execute_task_background(
     task_id: int,
     user_message: str,
@@ -2573,7 +2586,12 @@ async def execute_task_background(
 
             # Execute the next turn under the same task/thread id.
             actual_task_id = str(task_id)
-            task_for_agent = llm_user_message or user_message
+            prompt_context = prompt_context_from_agent_config(
+                getattr(snapshot.task, "agent_config", None)
+            )
+            task_for_agent = append_prompt_context_block(
+                llm_user_message or user_message, prompt_context
+            )
             # ``task_source`` and ``run_id`` are server-owned execution
             # identities: the first selects the MCP approval registration,
             # the second names the lease an approval is recorded under. This
@@ -2597,6 +2615,10 @@ async def execute_task_background(
             else:
                 agent_context.pop("task_source", None)
                 agent_context.pop("run_id", None)
+            if build_prompt_context_block(
+                prompt_context
+            ) is not None and not _has_display_message_override(agent_context):
+                agent_context["display_message"] = user_message
             result = await agent_manager.execute_task(
                 agent_service=agent_service,
                 task=task_for_agent,

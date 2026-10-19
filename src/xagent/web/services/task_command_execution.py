@@ -118,6 +118,9 @@ from .external_task_input import (
     external_input_terminal_message,
 )
 from .file_turn import (
+    append_prompt_context_block as _append_prompt_context_block_to_message,
+)
+from .file_turn import (
     append_uploaded_files_context as _append_uploaded_files_context_to_message,
 )
 from .file_turn import (
@@ -126,6 +129,9 @@ from .file_turn import (
 from .file_turn import build_uploaded_files_context as _build_uploaded_files_context
 from .file_turn import (
     normalize_attachments_for_persistence as _normalize_attachments_for_persistence,
+)
+from .file_turn import (
+    prompt_context_from_agent_config as _prompt_context_from_agent_config,
 )
 from .file_turn import (
     resolve_turn_file_infos,
@@ -1223,6 +1229,11 @@ def _prepare_task_message_sync(
         user_message_for_llm = _append_uploaded_files_context_to_message(
             user_message,
             uploaded_files_context,
+        )
+        task_agent_config = task.agent_config if task is not None else None
+        user_message_for_llm = _append_prompt_context_block_to_message(
+            user_message_for_llm,
+            _prompt_context_from_agent_config(task_agent_config),
         )
         display_user_message = _display_message_for_user(
             user_message,

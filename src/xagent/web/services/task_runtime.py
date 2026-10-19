@@ -84,6 +84,9 @@ TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY = "runtime_extension_bindings"
 # constant names the key so the sanitizer and both boundaries refer to the
 # same string.
 SELECTED_FILE_IDS_AGENT_CONFIG_KEY = "selected_file_ids"
+# Reserved server-owned ``tasks.agent_config`` key whose reference data is added
+# to orchestrated-run and websocket execution messages, never to the transcript.
+PROMPT_CONTEXT_AGENT_CONFIG_KEY = "prompt_context"
 # Durable server-owned marker for tasks whose MCP tool set must be built with a
 # trusted actor credential namespace. Only the literal boolean ``True`` marks a
 # task; false, malformed, and historical values preserve ordinary behavior.
@@ -231,6 +234,7 @@ CLIENT_RESERVED_AGENT_CONFIG_KEYS: frozenset[str] = frozenset(
         MCP_RUNTIME_AUTHORIZATION_POLICY_IDENTITY_KEY,
         MCP_RUNTIME_AUTHORIZATION_POLICY_STDIO_KEY,
         SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
+        PROMPT_CONTEXT_AGENT_CONFIG_KEY,
         FILE_OPERATION_ACCESS_VERSION_KEY,
         "auth_mode",
         "guest_id",

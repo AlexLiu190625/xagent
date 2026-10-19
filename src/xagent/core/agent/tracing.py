@@ -71,10 +71,13 @@ class TraceEventCallback:
             # "" → "Uploaded file(s)" frontend fallback in the bubble.
             if not task and not files:
                 return
+            display = get_display_user_message(context, task or "")
+            if not display and not files:
+                return
             await self._emit_user_message_trace(
                 tracer=tracer,
                 context=context,
-                message=get_display_user_message(context, task or ""),
+                message=display,
                 files=files,
                 turn_id=self._message_turn_id(self._latest_user_message(context)),
             )
@@ -127,7 +130,8 @@ class TraceEventCallback:
         # render the user-typed string instead, so prefer
         # ``metadata['display_message']`` when the runner stashed one.
         content = getattr(message, "content", None) or ""
-        bubble_text = self._display_message_from(message) or content
+        display = self._display_message_from(message)
+        bubble_text = content if display is None else display
         resolved_files = files or self._files_from_message(message)
         # File-only continuation: user uploaded files without typing.
         # ``inject_user_message`` still added the (empty-content) Message
@@ -292,7 +296,8 @@ class TraceEventCallback:
             content = getattr(message, "content", None) or ""
             # Same display vs execution split as on_user_message_posted —
             # see the comment there.
-            bubble_text = self._display_message_from(message) or content
+            display = self._display_message_from(message)
+            bubble_text = content if display is None else display
             turn_id = self._message_turn_id(message)
             if turn_id and turn_id in traced_turn_ids:
                 continue
@@ -430,16 +435,16 @@ class TraceEventCallback:
 
     @staticmethod
     def _display_message_from(message: Any) -> str | None:
-        """Return ``Message.metadata['display_message']`` if it's a non-empty
-        string, else None. The runner sets it when the LLM-facing execution
-        text differs from the user-typed bubble text (see
-        ``runner.inject_user_message``).
+        """Return ``Message.metadata['display_message']`` when it's a string
+        (a present empty string is authoritative), else None. The runner sets
+        it when the LLM-facing execution text differs from the user-typed
+        bubble text (see ``runner.inject_user_message``).
         """
         metadata = getattr(message, "metadata", None)
         if not isinstance(metadata, dict):
             return None
         value = metadata.get("display_message")
-        return value if isinstance(value, str) and value else None
+        return value if isinstance(value, str) else None
 
     def _context_payload(self, context: Any) -> dict[str, Any] | None:
         to_dict = getattr(context, "to_dict", None)

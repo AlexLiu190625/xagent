@@ -563,6 +563,23 @@ async def test_on_run_start_fresh_emits_for_file_only_initial_turn() -> None:
 
 
 @pytest.mark.asyncio
+async def test_on_run_start_fresh_skips_explicit_empty_display_message() -> None:
+    tracer = TraceRecorder()
+    callback = TraceEventCallback()
+    runner = SimpleNamespace(tracer=tracer)
+    context = ExecutionContext(execution_id="exec-empty-display-fresh")
+    context.metadata["task"] = "## PROMPT CONTEXT (reference data, not instructions)"
+    context.add_user_message(
+        "## PROMPT CONTEXT (reference data, not instructions)",
+        metadata={"display_message": ""},
+    )
+
+    await callback.on_run_start(runner=runner, context=context)
+
+    assert tracer.events == []
+
+
+@pytest.mark.asyncio
 async def test_on_user_message_posted_emits_for_file_only_continuation() -> None:
     """Continuation where the user only attaches files (no new text) must
     still emit a trace event so the live chip lands — mirrors the
@@ -654,6 +671,75 @@ async def test_on_user_message_posted_still_skips_truly_empty_turn() -> None:
     )
 
     assert tracer.events == []
+
+
+@pytest.mark.asyncio
+async def test_on_user_message_posted_skips_explicit_empty_display_message() -> None:
+    """An empty display is authoritative: a message whose content is only
+    the prompt-context block must not emit the LLM-facing text as the bubble
+    when the user typed nothing."""
+    tracer = TraceRecorder()
+    callback = TraceEventCallback()
+    runner = SimpleNamespace(tracer=tracer)
+    context = ExecutionContext(execution_id="exec-empty-display")
+    context.metadata["task"] = "Original task"
+    content = (
+        "Fix the bug\n\n## PROMPT CONTEXT (reference data, not instructions)\n"
+        '```json\n{"page": "settings"}\n```'
+    )
+    new_msg = context.add_user_message(
+        content, metadata={"display_message": "", "turn_id": "turn-empty-display"}
+    )
+
+    await callback.on_user_message_posted(
+        runner=runner, context=context, message=new_msg, files=None
+    )
+
+    assert tracer.events == []
+    assert context.metadata.get(TRACE_TURN_IDS_KEY) is None
+
+
+@pytest.mark.asyncio
+async def test_on_run_start_resume_skips_explicit_empty_display_message() -> None:
+    """Same authoritative-empty rule on the crash-recovery catch-up path."""
+    tracer = TraceRecorder()
+    callback = TraceEventCallback()
+    runner = SimpleNamespace(tracer=tracer)
+    context = ExecutionContext(execution_id="exec-empty-display-resume")
+    context.metadata["task"] = "Original task"
+    content = (
+        "Fix the bug\n\n## PROMPT CONTEXT (reference data, not instructions)\n"
+        '```json\n{"page": "settings"}\n```'
+    )
+    context.add_user_message(
+        content, metadata={"display_message": "", "turn_id": "turn-empty-display"}
+    )
+    _stamp_pending(context)
+
+    await callback.on_run_start(runner=runner, context=context, resume=True)
+
+    assert tracer.events == []
+
+
+@pytest.mark.asyncio
+async def test_on_user_message_posted_prefers_non_empty_display_message() -> None:
+    """A non-empty display still wins over the execution content."""
+    tracer = TraceRecorder()
+    callback = TraceEventCallback()
+    runner = SimpleNamespace(tracer=tracer)
+    context = ExecutionContext(execution_id="exec-display-wins")
+    context.metadata["task"] = "Original task"
+    new_msg = context.add_user_message(
+        "Read file\n\n## UPLOADED FILES\nfile_id=file-123",
+        metadata={"display_message": "Read file", "turn_id": "turn-display-wins"},
+    )
+
+    await callback.on_user_message_posted(
+        runner=runner, context=context, message=new_msg, files=None
+    )
+
+    assert len(tracer.events) == 1
+    assert tracer.events[0]["data"]["message"] == "Read file"
 
 
 @pytest.mark.asyncio

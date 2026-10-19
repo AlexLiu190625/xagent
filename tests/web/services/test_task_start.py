@@ -14,6 +14,42 @@ import pytest
 from tests.web.pool_contention_shared import GUARD_TIMEOUT
 from xagent.web.models.task import TaskStatus
 from xagent.web.services import task_start
+from xagent.web.services.file_turn import prompt_context_from_agent_config
+from xagent.web.services.task_runtime import PROMPT_CONTEXT_AGENT_CONFIG_KEY
+
+_PROMPT_CONTEXT = {"data": {"tier": "pro"}, "signed": True}
+_FILE_INFOS = [{"file_id": "file-1", "name": "faq.txt"}]
+
+
+def test_turn_payload_without_files_has_no_execution_message():
+    payload = task_start._turn_payload("Hello", [])
+
+    assert payload.transcript_message == "Hello"
+    assert payload.execution_message is None
+    assert payload.attachments is None
+
+
+def test_turn_payload_keeps_file_context_without_prompt_context():
+    payload = task_start._turn_payload("Hello", _FILE_INFOS)
+
+    assert payload.transcript_message == "Hello"
+    assert payload.execution_message is not None
+    assert payload.execution_message.startswith("Hello\n\n## UPLOADED FILES")
+    assert "## PROMPT CONTEXT" not in payload.execution_message
+
+
+def test_prompt_context_from_agent_config_reads_the_reserved_key():
+    assert (
+        prompt_context_from_agent_config(
+            {PROMPT_CONTEXT_AGENT_CONFIG_KEY: _PROMPT_CONTEXT}
+        )
+        == _PROMPT_CONTEXT
+    )
+
+
+@pytest.mark.parametrize("agent_config", [None, [], {"tools": ["search"]}])
+def test_prompt_context_from_agent_config_without_the_key_is_none(agent_config):
+    assert prompt_context_from_agent_config(agent_config) is None
 
 
 def test_task_starts_execute_without_api_routes() -> None:

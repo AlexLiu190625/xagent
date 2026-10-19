@@ -294,6 +294,7 @@ def test_widget_task_create_ignores_client_injected_entity_markers() -> None:
             "guest_id": "injected-guest",
             "share_agent_id": 777777,
             "share_token": "forged",
+            "prompt_context": {"data": {"forged": "yes"}, "signed": True},
         },
     }
     resp = client.post("/api/widget/chat/task/create", headers=guest, json=forged)
@@ -318,6 +319,7 @@ def test_widget_task_create_ignores_client_injected_entity_markers() -> None:
         assert cfg.get("widget_client_ip") == "testclient"
         assert "share_agent_id" not in cfg
         assert "share_token" not in cfg
+        assert "prompt_context" not in cfg
     finally:
         db.close()
 
