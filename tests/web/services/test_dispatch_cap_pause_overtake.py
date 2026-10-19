@@ -557,12 +557,11 @@ PAUSE_SCENARIOS: dict[str, Any] = {
 }
 
 
-@pytest.mark.parametrize("scenario", list(PAUSE_SCENARIOS))
-async def test_pause_settles_overtaken_commands(
-    pause_host: CapHost, caplog: pytest.LogCaptureFixture, scenario: str
+def assert_settle_log(
+    caplog: pytest.LogCaptureFixture, scenario: str, silent: tuple[str, ...]
 ) -> None:
-    with caplog.at_level(logging.INFO, logger=SETTLE_LOGGER):
-        await PAUSE_SCENARIOS[scenario](pause_host)
+    """The dispatch-cap settlement log of a pause scenario: one INFO record for
+    the two-row scenario, none for the scenarios in ``silent``."""
 
     records = [r for r in caplog.records if "dispatch-cap" in r.getMessage()]
     if scenario == "S7-two-held-rows":
@@ -571,16 +570,30 @@ async def test_pause_settles_overtaken_commands(
         message = record.getMessage()
         assert "control=pause" in message and "settled_commands=2" in message
         assert "'resume_input': 1" in message and "'message': 1" in message
-    elif scenario in (
-        "S9-ticketed-start",
-        "S11-other-users-pause",
-        "S12c-precheck-reply-fails",
-        "S12d-pause-not-supported",
-        "S12e-pause-write-not-applied",
-        "S16-stale-web-pause",
-        "S16b-stale-web-pause-other-start",
-    ):
+    elif scenario in silent:
         assert records == []
+
+
+@pytest.mark.parametrize("scenario", list(PAUSE_SCENARIOS))
+async def test_pause_settles_overtaken_commands(
+    pause_host: CapHost, caplog: pytest.LogCaptureFixture, scenario: str
+) -> None:
+    with caplog.at_level(logging.INFO, logger=SETTLE_LOGGER):
+        await PAUSE_SCENARIOS[scenario](pause_host)
+
+    assert_settle_log(
+        caplog,
+        scenario,
+        silent=(
+            "S9-ticketed-start",
+            "S11-other-users-pause",
+            "S12c-precheck-reply-fails",
+            "S12d-pause-not-supported",
+            "S12e-pause-write-not-applied",
+            "S16-stale-web-pause",
+            "S16b-stale-web-pause-other-start",
+        ),
+    )
 
 
 @pytest.mark.parametrize("case", ["legacy", "task_active"])

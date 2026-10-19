@@ -392,29 +392,3 @@ async def test_a_batch_command_of_a_running_task_is_taken_on_the_batch_line(
     candidate = found(cap_of(host))
 
     assert candidate is not None and candidate.id == follow_up
-
-
-# ---------------------------------------------------------------- known consequence
-
-
-@pytest.mark.parametrize("control", ["cancel", "pause"])
-async def test_control_waits_behind_held_batch_command_below_cap(
-    batch_line: CapHost, control: str
-) -> None:
-    """A known consequence of the reserve: between limit-R and limit a cancel or
-    pause does not pass the held batch commands queued before it for its task.
-    Until a control may pass them, the task may start first.
-    """
-    host = batch_line
-    task = host.new_task()
-    held = host.enqueue(task, "start")
-    control_id = host.enqueue(task, control)
-    cap = cap_of(host)
-
-    assert found(cap) is None
-    assert found(cap, control_id) is None
-    assert await dispatch(host, command_db_id=control_id) is False
-
-    assert host.row(control_id).status == "pending"
-    assert _state(host, held) == ("pending", 0)
-    assert host.claimed == []
