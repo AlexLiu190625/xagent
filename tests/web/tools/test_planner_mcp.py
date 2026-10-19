@@ -1446,6 +1446,219 @@ def test_delete_task_returns_conflict_on_stale_etag(monkeypatch):
     assert result["status"] == "conflict_stale_version"
 
 
+def _delete_plan(**kwargs):
+    return planner.planner_delete_plan("plan-1", **kwargs)
+
+
+def _delete_bucket(**kwargs):
+    return planner.planner_delete_bucket("plan-1", "bucket-1", **kwargs)
+
+
+_DELETE_TOOLS = [
+    pytest.param(_delete_plan, "/planner/plans/plan-1", id="plan"),
+    pytest.param(_delete_bucket, "/planner/buckets/bucket-1", id="bucket"),
+]
+
+
+@pytest.mark.parametrize("tool_name", ["planner_delete_plan", "planner_delete_bucket"])
+def test_delete_container_declares_destructive_idempotent_annotation(tool_name):
+    tool = planner.mcp._tool_manager.get_tool(tool_name)
+
+    assert tool.annotations is not None
+    assert tool.annotations.destructiveHint is True
+    assert tool.annotations.idempotentHint is True
+
+
+@pytest.mark.parametrize(("delete", "path"), _DELETE_TOOLS)
+def test_delete_container_fetches_etag_and_sends_if_match(monkeypatch, delete, path):
+    responses = iter(
+        [
+            MockResponse({"id": "x", "@odata.etag": 'W/"etag-1"'}),
+            MockResponse({}, status_code=204, content=b""),
+        ]
+    )
+    mock_request = Mock(side_effect=lambda *a, **k: next(responses))
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+
+    result = json.loads(delete())
+
+    assert result["status"] == "success"
+    get_call, delete_call = mock_request.call_args_list
+    assert get_call.kwargs["method"] == "GET"
+    assert get_call.kwargs["url"] == f"{planner.GRAPH_BASE_URL}{path}"
+    assert delete_call.kwargs["method"] == "DELETE"
+    assert delete_call.kwargs["url"] == f"{planner.GRAPH_BASE_URL}{path}"
+    assert delete_call.kwargs["headers"]["If-Match"] == 'W/"etag-1"'
+
+
+@pytest.mark.parametrize(("delete", "path"), _DELETE_TOOLS)
+def test_delete_container_uses_supplied_etag(monkeypatch, delete, path):
+    mock_request = Mock(return_value=MockResponse({}, status_code=204, content=b""))
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+
+    result = json.loads(delete(etag='W/"supplied"'))
+
+    assert result["status"] == "success"
+    mock_request.assert_called_once()
+    assert mock_request.call_args.kwargs["method"] == "DELETE"
+    assert mock_request.call_args.kwargs["url"] == f"{planner.GRAPH_BASE_URL}{path}"
+    assert mock_request.call_args.kwargs["headers"]["If-Match"] == 'W/"supplied"'
+
+
+@pytest.mark.parametrize("status_code", [409, 412])
+@pytest.mark.parametrize(("delete", "path"), _DELETE_TOOLS)
+def test_delete_container_returns_conflict_on_stale_etag(
+    monkeypatch, delete, path, status_code
+):
+    mock_request = Mock(return_value=MockResponse({}, status_code=status_code))
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+
+    result = json.loads(delete(etag='W/"stale"'))
+
+    assert result["status"] == "conflict_stale_version"
+    assert "not deleted" in result["message"]
+    assert "confirm with the user" in result["message"]
+    mock_request.assert_called_once()
+    assert mock_request.call_args.kwargs["url"] == f"{planner.GRAPH_BASE_URL}{path}"
+
+
+@pytest.mark.parametrize(
+    ("etag", "failing_method"),
+    [(None, "GET"), ('W/"etag-1"', "DELETE")],
+    ids=["on-etag-read", "on-delete"],
+)
+@pytest.mark.parametrize(("delete", "path"), _DELETE_TOOLS)
+def test_delete_container_403_names_group_membership(
+    monkeypatch, delete, path, etag, failing_method
+):
+    mock_request = Mock(
+        return_value=MockResponse(
+            {
+                "error": {
+                    "code": "Forbidden",
+                    "message": "You do not have the required permissions.",
+                }
+            },
+            status_code=403,
+        )
+    )
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+
+    result = json.loads(delete(etag=etag))
+
+    assert result["status"] == "error"
+    assert "member of the Microsoft 365 group" in result["message"]
+    assert "Forbidden" in result["message"]
+    assert "disconnect Planner" not in result["message"]
+    mock_request.assert_called_once()
+    assert mock_request.call_args.kwargs["method"] == failing_method
+    assert mock_request.call_args.kwargs["url"] == f"{planner.GRAPH_BASE_URL}{path}"
+
+
+@pytest.mark.parametrize(
+    ("etag", "failing_method"),
+    [(None, "GET"), ('W/"etag-1"', "DELETE")],
+    ids=["on-etag-read", "on-delete"],
+)
+@pytest.mark.parametrize(("delete", "path"), _DELETE_TOOLS)
+def test_delete_container_missing_scope_asks_for_reconnect(
+    monkeypatch, delete, path, etag, failing_method
+):
+    mock_request = Mock(
+        return_value=MockResponse(
+            {
+                "error": {
+                    "code": "Authorization_RequestDenied",
+                    "message": "Insufficient privileges to complete the operation.",
+                }
+            },
+            status_code=403,
+        )
+    )
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+
+    result = json.loads(delete(etag=etag))
+
+    assert result["status"] == "error"
+    assert "disconnect Planner" in result["message"]
+    assert "Tasks.ReadWrite" in result["message"]
+    assert "member of the Microsoft 365 group" not in result["message"]
+    mock_request.assert_called_once()
+    assert mock_request.call_args.kwargs["method"] == failing_method
+    assert mock_request.call_args.kwargs["url"] == f"{planner.GRAPH_BASE_URL}{path}"
+
+
+@pytest.mark.parametrize(
+    ("etag", "failing_method"),
+    [(None, "GET"), ('W/"etag-1"', "DELETE")],
+    ids=["on-etag-read", "on-delete"],
+)
+@pytest.mark.parametrize(("delete", "path"), _DELETE_TOOLS)
+def test_delete_container_404_reports_possibly_already_deleted(
+    monkeypatch, delete, path, etag, failing_method
+):
+    mock_request = Mock(
+        return_value=MockResponse(
+            {"error": {"code": "NotFound", "message": "Not found."}},
+            status_code=404,
+        )
+    )
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+
+    result = json.loads(delete(etag=etag))
+
+    assert result["status"] == "error"
+    assert "not found" in result["message"]
+    assert "already been deleted" in result["message"]
+    mock_request.assert_called_once()
+    assert mock_request.call_args.kwargs["method"] == failing_method
+    assert mock_request.call_args.kwargs["url"] == f"{planner.GRAPH_BASE_URL}{path}"
+
+
+@pytest.mark.parametrize(
+    ("delete", "reconciliation"),
+    [
+        pytest.param(
+            _delete_plan,
+            {"read_tool": "planner_get_plan", "plan_id": "plan-1"},
+            id="plan",
+        ),
+        pytest.param(
+            _delete_bucket,
+            {
+                "read_tool": "planner_list_buckets",
+                "plan_id": "plan-1",
+                "bucket_id": "bucket-1",
+            },
+            id="bucket",
+        ),
+    ],
+)
+def test_delete_container_transport_failure_is_indeterminate(
+    monkeypatch, delete, reconciliation
+):
+    monkeypatch.setattr(
+        planner.requests, "request", Mock(side_effect=requests.Timeout("timed out"))
+    )
+
+    result = json.loads(delete(etag='W/"etag-1"'))
+
+    assert result["status"] == "indeterminate"
+    assert result["retryable"] is False
+    assert result["reconciliation"] == reconciliation
+
+
+def test_delete_bucket_rejects_malformed_plan_id(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+
+    result = json.loads(planner.planner_delete_bucket(" plan-1 ", "bucket-1"))
+
+    assert result["status"] == "error"
+    assert "plan_id" in result["message"]
+    mock_request.assert_not_called()
+
+
 def test_update_task_returns_conflict_on_stale_etag(monkeypatch):
     responses = iter(
         [

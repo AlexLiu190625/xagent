@@ -8,6 +8,7 @@ from typing import Any
 from urllib.parse import unquote
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from ....config import TOOL_MAX_OUTPUT_LENGTH, get_tool_max_output_length
 from ....core.utils import public_requests as requests
@@ -1146,6 +1147,101 @@ def planner_delete_task(task_id: str, etag: str | None = None) -> str:
         return _conflict(str(e))
     except Exception as e:
         logger.error("Error deleting Planner task %s: %s", task_id, e)
+        return _error(str(e))
+
+
+def _delete_conflict(resource_name: str) -> str:
+    # The resource changed after its etag was read -- when the caller passed
+    # the etag from the read the user confirmed, that is the version they
+    # agreed to delete -- so it needs a fresh confirmation, not a silent retry.
+    return _conflict(
+        f"This {resource_name} changed after it was read, so it was not "
+        "deleted. Read it again and confirm with the user before retrying."
+    )
+
+
+def _delete_error(resource_name: str, exc: _GraphRequestError) -> str:
+    """Explain a 403/404 from a plan or bucket delete (or its etag read)."""
+    if _is_insufficient_privileges_error(exc):
+        return _error(
+            f"Planner cannot delete this {resource_name}. Open Connectors, "
+            "disconnect Planner, then connect it again to grant "
+            f"Tasks.ReadWrite. Graph response: {exc}"
+        )
+    if exc.status_code == 403:
+        return _error(
+            f"Planner could not delete this {resource_name}: Graph returned 403. "
+            "Confirm that the signed-in user is a member of the Microsoft 365 "
+            f"group that owns the plan. Graph response: {exc}"
+        )
+    if exc.status_code == 404:
+        return _error(
+            f"Planner {resource_name} not found; it may have already been "
+            f"deleted. Graph response: {exc}"
+        )
+    return _error(str(exc))
+
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=True))
+def planner_delete_plan(plan_id: str, etag: str | None = None) -> str:
+    """Permanently delete a Planner plan, including all of its buckets and
+    tasks. Confirm with the user before calling this; it cannot be undone.
+
+    Pass the @odata.etag from the planner_get_plan read you showed the user
+    as etag, so the delete only applies to the version they confirmed. If
+    that read did not include one, omit etag and the current one is fetched
+    just before deleting."""
+    try:
+        plan_path = f"/planner/plans/{url_path_id(plan_id, 'plan_id')}"
+        _etag_guarded_write(plan_path, "DELETE", etag=etag)
+        return _success(message="Plan deleted successfully")
+    except _MutationOutcomeIndeterminate as e:
+        return _indeterminate(
+            str(e),
+            reconciliation={"read_tool": "planner_get_plan", "plan_id": plan_id},
+        )
+    except _EtagConflictError:
+        return _delete_conflict("plan")
+    except _GraphRequestError as e:
+        logger.error("Error deleting Planner plan %s: %s", plan_id, e)
+        return _delete_error("plan", e)
+    except Exception as e:
+        logger.error("Error deleting Planner plan %s: %s", plan_id, e)
+        return _error(str(e))
+
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=True))
+def planner_delete_bucket(plan_id: str, bucket_id: str, etag: str | None = None) -> str:
+    """Permanently delete a bucket from a Planner plan, including every task
+    in it. Confirm with the user before calling this; it cannot be undone.
+
+    plan_id is the plan that contains the bucket; it is only used to say
+    where to check (planner_list_buckets) when the outcome is unknown.
+    Pass the bucket's @odata.etag from the planner_list_buckets read you
+    showed the user as etag, so the delete only applies to the version they
+    confirmed. If that read did not include one, omit etag and the current
+    one is fetched just before deleting."""
+    try:
+        require_clean_identifier(plan_id, "plan_id")
+        bucket_path = f"/planner/buckets/{url_path_id(bucket_id, 'bucket_id')}"
+        _etag_guarded_write(bucket_path, "DELETE", etag=etag)
+        return _success(message="Bucket deleted successfully")
+    except _MutationOutcomeIndeterminate as e:
+        return _indeterminate(
+            str(e),
+            reconciliation={
+                "read_tool": "planner_list_buckets",
+                "plan_id": plan_id,
+                "bucket_id": bucket_id,
+            },
+        )
+    except _EtagConflictError:
+        return _delete_conflict("bucket")
+    except _GraphRequestError as e:
+        logger.error("Error deleting Planner bucket %s: %s", bucket_id, e)
+        return _delete_error("bucket", e)
+    except Exception as e:
+        logger.error("Error deleting Planner bucket %s: %s", bucket_id, e)
         return _error(str(e))
 
 
