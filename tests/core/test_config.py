@@ -4219,6 +4219,75 @@ def test_media_download_size_rejects_invalid_limits(monkeypatch, value):
         config.get_media_download_max_bytes("image")
 
 
+def test_sql_worker_url_and_token_configuration(monkeypatch):
+    monkeypatch.setenv("XAGENT_SQL_WORKER_URL", " http://sql-worker:8090/ ")
+    monkeypatch.setenv("XAGENT_SQL_WORKER_TOKEN", " worker-secret ")
+    assert config.get_sql_worker_url() == "http://sql-worker:8090"
+    assert config.get_sql_worker_token() == "worker-secret"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "sql-worker:8090",
+        "ftp://sql-worker",
+        "http://sql-worker/path?token=secret",
+        "http://user:password@sql-worker:8090",
+    ],
+)
+def test_sql_worker_url_rejects_unsafe_values(monkeypatch, value):
+    monkeypatch.setenv("XAGENT_SQL_WORKER_URL", value)
+    with pytest.raises(ValueError, match="XAGENT_SQL_WORKER_URL"):
+        config.get_sql_worker_url()
+
+
+@pytest.mark.parametrize(
+    "setting,getter,default",
+    [
+        (
+            "XAGENT_SQL_WORKER_QUERY_TIMEOUT_SECONDS",
+            config.get_sql_worker_query_timeout_seconds,
+            30,
+        ),
+        ("XAGENT_SQL_WORKER_MAX_ROWS", config.get_sql_worker_max_rows, 10_000),
+        (
+            "XAGENT_SQL_WORKER_MAX_RESULT_BYTES",
+            config.get_sql_worker_max_result_bytes,
+            8 * 1024 * 1024,
+        ),
+        (
+            "XAGENT_SQL_WORKER_MAX_QUERY_BYTES",
+            config.get_sql_worker_max_query_bytes,
+            1024 * 1024,
+        ),
+        (
+            "XAGENT_SQL_WORKER_MAX_CONCURRENCY",
+            config.get_sql_worker_max_concurrency,
+            4,
+        ),
+    ],
+)
+def test_sql_worker_limits(monkeypatch, setting, getter, default):
+    monkeypatch.delenv(setting, raising=False)
+    assert getter() == default
+    monkeypatch.setenv(setting, "7")
+    assert getter() == 7
+
+
+def test_sql_worker_host_and_port(monkeypatch):
+    monkeypatch.delenv("XAGENT_SQL_WORKER_HOST", raising=False)
+    monkeypatch.delenv("XAGENT_SQL_WORKER_PORT", raising=False)
+    assert config.get_sql_worker_host() == "0.0.0.0"
+    assert config.get_sql_worker_port() == 8090
+    monkeypatch.setenv("XAGENT_SQL_WORKER_HOST", "127.0.0.1")
+    monkeypatch.setenv("XAGENT_SQL_WORKER_PORT", "18090")
+    assert config.get_sql_worker_host() == "127.0.0.1"
+    assert config.get_sql_worker_port() == 18090
+    monkeypatch.setenv("XAGENT_SQL_WORKER_PORT", "70000")
+    with pytest.raises(ValueError, match="XAGENT_SQL_WORKER_PORT"):
+        config.get_sql_worker_port()
+
+
 def test_remote_json_download_size_default_and_override(monkeypatch):
     monkeypatch.delenv("XAGENT_REMOTE_JSON_DOWNLOAD_MAX_BYTES", raising=False)
     assert config.get_remote_json_download_max_bytes() == 10 * 1024 * 1024
