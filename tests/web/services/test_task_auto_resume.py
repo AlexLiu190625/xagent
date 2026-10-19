@@ -877,6 +877,21 @@ def test_max_inflight_counts_running_and_queued_resumes(
     assert sum(_row(factory, i).state == "dispatched" for i in ids) == 3 - expected
 
 
+def _add_completed_command(db: Session, task_id: int, command_id: str) -> None:
+    """A completed command of the task's owner, flushed so ids follow call order."""
+    db.add(
+        TaskExecutionCommand(
+            task_id=task_id,
+            actor_user_id=db.get(Task, task_id).user_id,
+            command_id=command_id,
+            kind="message" if command_id.startswith("message") else "resume",
+            payload={},
+            status="completed",
+        )
+    )
+    db.flush()
+
+
 @pytest.mark.parametrize(
     ("later_command", "counted"),
     [
@@ -908,25 +923,74 @@ def test_inflight_running_excludes_runs_a_person_resumed(
             paused_state_version=PV,
             last_command_id=dispatch_id,
         )
-        user_id = db.get(Task, task_id).user_id
         for command_id in (dispatch_id, later_command):
-            if command_id is None:
-                continue
-            db.add(
-                TaskExecutionCommand(
-                    task_id=task_id,
-                    actor_user_id=user_id,
-                    command_id=command_id,
-                    kind="message" if command_id.startswith("message") else "resume",
-                    payload={},
-                    status="completed",
-                )
-            )
-            db.flush()
+            if command_id is not None:
+                _add_completed_command(db, task_id, command_id)
         db.commit()
 
     with factory() as db:
         assert task_auto_resume.count_inflight(db) == (1 if counted else 0)
+
+
+def test_inflight_running_checks_each_run_against_its_own_dispatch(factory):
+    # Two auto-resumed runs RUNNING at once. Each run's "a person acted since"
+    # check must compare against that run's own dispatch: on PostgreSQL a
+    # check that sees every dispatch fails outright once there are two.
+    now = utc_now()
+    with factory() as db:
+        tasks = {}
+        for run_id in ("run-a", "run-b"):
+            tasks[run_id] = _seed(
+                db,
+                now,
+                state="dispatched",
+                due_in=None,
+                status=TaskStatus.RUNNING,
+                control_state="running",
+                run_id=run_id,
+                state_version=PV + 4,
+                paused_state_version=PV,
+                last_command_id=auto_resume_command_id(PV, 1, run_id),
+            )
+        # run-b's dispatch is the oldest command, and run-a has a message a
+        # person sent before run-a's own dispatch: run-a is still automatic.
+        for run_id, command_id in (
+            ("run-b", auto_resume_command_id(PV, 1, "run-b")),
+            ("run-a", "message-before-dispatch"),
+            ("run-a", auto_resume_command_id(PV, 1, "run-a")),
+        ):
+            _add_completed_command(db, tasks[run_id], command_id)
+        db.commit()
+
+    with factory() as db:
+        assert task_auto_resume.count_inflight(db) == 2
+
+
+def test_tick_dispatches_while_an_auto_resumed_run_is_running(factory, notified):
+    # The sweeper keeps filling free slots while earlier resumes still run,
+    # instead of waiting for every one of them to stop.
+    now = utc_now()
+    with factory() as db:
+        # A running resumed run whose dispatch command has completed, next to
+        # one whose dispatch is still queued.
+        _dispatched(
+            db,
+            now,
+            command_status="completed",
+            due_in=None,
+            status=TaskStatus.RUNNING,
+            control_state="running",
+            run_id="run-a",
+            state_version=PV + 2,
+        )
+        _inflight_queued(db, now)
+        due = _seed(db, now, due_in=-10)
+        db.commit()
+
+    report = run_auto_resume_tick(now=now)
+
+    assert (report.inflight, report.dispatched) == (2, 1)
+    assert _row(factory, due).state == "dispatched"
 
 
 def test_give_ups_still_advance_when_no_dispatch_budget_is_left(

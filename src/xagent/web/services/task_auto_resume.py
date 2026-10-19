@@ -1508,6 +1508,9 @@ def count_inflight(db: Session) -> int:
             dispatch.task_id == Task.id,
             dispatch.command_id == TaskAutoRecovery.last_command_id,
         )
+        # Nested in ``exists()``, so it does not correlate on its own; without
+        # this it reads every task's dispatch and PostgreSQL rejects the rows.
+        .correlate(Task, TaskAutoRecovery)
         .scalar_subquery(),
         # Exact, case-sensitive prefix, as the transport reserves it.
         ~and_(
