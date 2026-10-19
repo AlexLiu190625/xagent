@@ -1,14 +1,18 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import React from "react"
 import { renderToString } from "react-dom/server"
-import { cleanup, render, screen, waitFor } from "@testing-library/react"
-import { afterEach, describe, expect, it, vi } from "vitest"
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+
+import { createPublicFileAccessPolicy, FileAccessProvider } from "@/contexts/file-access-context"
+
+const apiConfig = vi.hoisted(() => ({ origin: "http://api.local" }))
 
 vi.mock("@/lib/utils", async () => {
   const actual = await vi.importActual<typeof import("@/lib/utils")>("@/lib/utils")
   return {
     ...actual,
-    getApiUrl: () => "http://api.local",
+    getApiUrl: () => apiConfig.origin,
   }
 })
 
@@ -21,9 +25,52 @@ vi.mock("@/contexts/i18n-context", () => ({
 import { FileViewer } from "./file-viewer"
 
 describe("FileViewer HTML preview", () => {
+  beforeEach(() => {
+    vi.stubEnv("NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN", "")
+  })
   afterEach(() => {
     cleanup()
     vi.clearAllMocks()
+    vi.restoreAllMocks()
+    vi.unstubAllEnvs()
+    apiConfig.origin = "http://api.local"
+  })
+
+  it("delivers absolute app-origin assets to the runner with an empty API URL", () => {
+    apiConfig.origin = ""
+    vi.stubEnv("NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN", "https://preview.example.test")
+    const { rerender } = render(<FileViewer fileName="gallery.html" fileId="html-id"
+      content={'<img src="file:image-id"><link href="./style.css"><script src="./app.js"></script>'}
+      isLoading={false} error={null} viewMode="preview" />)
+    const frame = screen.getByTitle("gallery.html") as HTMLIFrameElement
+    const post = vi.spyOn(frame.contentWindow!, "postMessage")
+    act(() => window.dispatchEvent(new MessageEvent("message", {
+      source: frame.contentWindow, origin: "null", data: { type: "xagent-html-preview-ready", version: 1 },
+    })))
+    const html = post.mock.calls[0][0].html as string
+    expect(html).toContain(`${window.location.origin}/api/files/public/preview/image-id`)
+    expect(html).toContain(`${window.location.origin}/api/files/public/preview/html-id?relative_path=.%2Fstyle.css`)
+    expect(html).toContain(`${window.location.origin}/api/files/public/preview/html-id?relative_path=.%2Fapp.js`)
+    rerender(<FileViewer fileName="next.html" fileId="next-id" content=""
+      isLoading={false} error={null} viewMode="preview" />)
+    expect(screen.queryByTitle("next.html")).toBeNull()
+  })
+
+  it("keeps a public file token scoped to absolute managed-file URLs", () => {
+    apiConfig.origin = ""
+    vi.stubEnv("NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN", "https://preview.example.test")
+    render(<FileAccessProvider policy={createPublicFileAccessPolicy("guest-token")}>
+      <FileViewer fileName="gallery.html" fileId="html-id" content={'<img src="file:image-id">'}
+        isLoading={false} error={null} viewMode="preview" />
+    </FileAccessProvider>)
+    const frame = screen.getByTitle("gallery.html") as HTMLIFrameElement
+    const post = vi.spyOn(frame.contentWindow!, "postMessage")
+    act(() => window.dispatchEvent(new MessageEvent("message", {
+      source: frame.contentWindow, origin: "null", data: { type: "xagent-html-preview-ready", version: 1 },
+    })))
+    expect((post.mock.calls[0][0].html as string)).toContain(
+      `${window.location.origin}/api/files/public/preview/image-id?token=guest-token`,
+    )
   })
 
   it("declares the scripts-only opaque-origin sandbox contract", () => {
