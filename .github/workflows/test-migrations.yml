@@ -182,6 +182,8 @@ on:
       - 'tests/web/services/test_unknown_delivery_postgresql.py'
       - 'src/xagent/web/services/task_execution_controller.py'
       - 'tests/web/services/test_pause_lease_fence_postgresql.py'
+      - 'src/xagent/web/services/task_auto_resume.py'
+      - 'tests/web/services/test_task_auto_resume.py'
       - 'src/xagent/web/services/task_execution.py'
       - 'tests/web/api/test_recovered_delivery_failed_run.py'
       - 'tests/web/api/test_fresh_message_ended_run.py'
@@ -403,6 +405,8 @@ jobs:
             tests/web/services/test_unknown_delivery_postgresql.py
             src/xagent/web/services/task_execution_controller.py
             tests/web/services/test_pause_lease_fence_postgresql.py
+            src/xagent/web/services/task_auto_resume.py
+            tests/web/services/test_task_auto_resume.py
             src/xagent/web/services/task_execution.py
             tests/web/api/test_recovered_delivery_failed_run.py
             tests/web/api/test_fresh_message_ended_run.py
@@ -949,6 +953,15 @@ jobs:
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           pytest tests/web/services/test_pause_lease_fence_postgresql.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      # The sweeper's in-flight count nests scalar subqueries; PostgreSQL
+      # rejects one that returns several rows, SQLite returns the first.
+      - name: Test task auto-resume sweeper against PostgreSQL (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/services/test_task_auto_resume.py -m postgresql -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
