@@ -877,6 +877,21 @@ def test_max_inflight_counts_running_and_queued_resumes(
     assert sum(_row(factory, i).state == "dispatched" for i in ids) == 3 - expected
 
 
+def _add_completed_command(db: Session, task_id: int, command_id: str) -> None:
+    """A completed command of the task's owner, flushed so ids follow call order."""
+    db.add(
+        TaskExecutionCommand(
+            task_id=task_id,
+            actor_user_id=db.get(Task, task_id).user_id,
+            command_id=command_id,
+            kind="message" if command_id.startswith("message") else "resume",
+            payload={},
+            status="completed",
+        )
+    )
+    db.flush()
+
+
 @pytest.mark.parametrize(
     ("later_command", "counted"),
     [
@@ -908,21 +923,9 @@ def test_inflight_running_excludes_runs_a_person_resumed(
             paused_state_version=PV,
             last_command_id=dispatch_id,
         )
-        user_id = db.get(Task, task_id).user_id
         for command_id in (dispatch_id, later_command):
-            if command_id is None:
-                continue
-            db.add(
-                TaskExecutionCommand(
-                    task_id=task_id,
-                    actor_user_id=user_id,
-                    command_id=command_id,
-                    kind="message" if command_id.startswith("message") else "resume",
-                    payload={},
-                    status="completed",
-                )
-            )
-            db.flush()
+            if command_id is not None:
+                _add_completed_command(db, task_id, command_id)
         db.commit()
 
     with factory() as db:
@@ -956,18 +959,7 @@ def test_inflight_running_checks_each_run_against_its_own_dispatch(factory):
             ("run-a", "message-before-dispatch"),
             ("run-a", auto_resume_command_id(PV, 1, "run-a")),
         ):
-            task = db.get(Task, tasks[run_id])
-            db.add(
-                TaskExecutionCommand(
-                    task_id=task.id,
-                    actor_user_id=task.user_id,
-                    command_id=command_id,
-                    kind="message" if command_id.startswith("message") else "resume",
-                    payload={},
-                    status="completed",
-                )
-            )
-            db.flush()
+            _add_completed_command(db, tasks[run_id], command_id)
         db.commit()
 
     with factory() as db:
