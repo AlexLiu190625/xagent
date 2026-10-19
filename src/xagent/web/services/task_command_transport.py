@@ -57,6 +57,7 @@ from .task_command_terminal_events import (
 from .task_dispatch_cap import (
     CAP_OVERTAKING_CONTROL_KINDS,
     CONTROL_KINDS,
+    DISPATCH_CLASS_BATCH,
     DISPATCH_CLASS_INTERACTIVE,
     EXECUTION_OPENING_KINDS,
     DispatchCapSnapshot,
@@ -890,27 +891,57 @@ def _command_routing_predicate(runner_id: str, now: datetime) -> Any:
     )
 
 
+def _held_below_cap(earlier: Any) -> Any:
+    """Whether this process will not start ``earlier`` while below its limit.
+
+    That is a never-claimed batch command, or a never-claimed command that
+    waits behind one of its task: commands of a task run in order, so it does
+    not start either. ``earlier`` is an alias of ``TaskExecutionCommand``.
+    """
+
+    head = aliased(TaskExecutionCommand)
+    return or_(
+        earlier.dispatch_class == DISPATCH_CLASS_BATCH,
+        exists(
+            select(1).where(
+                head.task_id == earlier.task_id,
+                head.id <= earlier.id,
+                head.status == COMMAND_PENDING,
+                head.attempt_count == 0,
+                head.kind.in_(sorted(EXECUTION_OPENING_KINDS)),
+                head.dispatch_class == DISPATCH_CLASS_BATCH,
+            )
+        ),
+    )
+
+
 def _unfinished_earlier_command(cap: DispatchCapSnapshot | None = None) -> Any:
     """An earlier command of the same task that still blocks this one.
 
     A cancel or pause may pass an earlier command that waits for an
-    admission ticket. While ``cap`` is closed, a control in
+    admission ticket. While ``cap`` is closed (the process starts no new
+    execution) or batch-closed (it starts no batch command), a control in
     ``CAP_OVERTAKING_CONTROL_KINDS`` may also pass an earlier pending command
     that would open an execution, was never claimed, and whose task holds no
-    slot in this process: this process would not run it, so the control is
-    applied first and its completion, or a pause's rejection because nothing
-    of its task runs, settles that command
-    (``settle_cap_held_commands_no_commit``); a rejected cancel, or a pause
-    rejected for any other reason (for example access denied, ``stale_run``
-    or invalid data), settles nothing. Callers that claim must pass the
-    same snapshot to the candidate query and the claim UPDATE. Neither this
-    SQL nor the owner lease keeps the passed command unclaimed while the
-    control is processing: the lease lock lasts only for the claim
-    transaction, and the lease owner is the process applying the control.
-    What does is that an owner applies one command of a task at a time
-    (``busy_command_tasks`` and ``_command_tasks`` in
-    ``dispatch_one_task_command``, ``_command_lock`` in ``execute_command``).
-    A claim path that bypasses the task coordinator must keep that rule.
+    slot in this process, when this process would not run it either. At the
+    cap that is every such command. Below the cap a command counts as held
+    when it is a batch command, or when it waits behind a held batch command
+    of its task, because this process will not start it either; a control
+    passes both. The control is applied first and its completion, or a
+    pause's rejection because nothing of its task runs, settles the passed
+    commands (``settle_cap_held_commands_no_commit``), which does not read
+    the snapshot; a rejected cancel, or a pause rejected for any other reason
+    (for example access denied, ``stale_run`` or invalid data), settles
+    nothing. A command already claimed once and back in pending is not
+    passed (xagent#2649). Callers that claim must pass the same snapshot to
+    the candidate query and the claim UPDATE. Neither this SQL nor the owner
+    lease keeps the passed command unclaimed while the control is
+    processing: the lease lock lasts only for the claim transaction, and the
+    lease owner is the process applying the control. What does is that an
+    owner applies one command of a task at a time (``busy_command_tasks`` and
+    ``_command_tasks`` in ``dispatch_one_task_command``, ``_command_lock`` in
+    ``execute_command``). A claim path that bypasses the task coordinator
+    must keep that rule.
     """
     from .task_execution_admission import waiting_admission
 
@@ -925,13 +956,15 @@ def _unfinished_earlier_command(cap: DispatchCapSnapshot | None = None) -> Any:
             waiting_admission(earlier.id),
         ),
     ]
-    if cap is not None and cap.closed:
+    if cap is not None and cap.batch_closed:
+        held = true() if cap.closed else _held_below_cap(earlier)
         clauses.append(
             ~and_(
                 TaskExecutionCommand.kind.in_(sorted(CAP_OVERTAKING_CONTROL_KINDS)),
                 earlier.status == COMMAND_PENDING,
                 earlier.kind.in_(sorted(EXECUTION_OPENING_KINDS)),
                 earlier.attempt_count == 0,
+                held,
                 TaskExecutionCommand.task_id.notin_(sorted(cap.active_ids)),
             )
         )
