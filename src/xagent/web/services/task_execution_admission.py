@@ -875,8 +875,10 @@ def settle_cap_held_commands_no_commit(db: Session, control_command_id: int) -> 
     only those recorded at a state version other than the task's current
     one, because a cancel that stopped nothing leaves the version as it was.
     A pause has no version condition: a pause that finds nothing running
-    leaves the version as it was and still stops what it passed. With the
-    cap open such rows exist only when a command inserted before the control
+    leaves the version as it was and still stops what it passed. A control
+    passes such rows only at the cap or on the batch line; in every other case,
+    and for an interactive row on the batch line that does not wait behind a
+    held batch row, they exist only when a command inserted before the control
     committed after the control was claimed. Only those committed before
     this UPDATE are failed; a later one stays ``pending`` and is claimed
     after the control, where a start or a reply is rejected by its

@@ -30,8 +30,9 @@ logger = logging.getLogger(__name__)
 # exists (or to none) and never take one.
 EXECUTION_OPENING_KINDS = frozenset({"start", "resume", "resume_input", "message"})
 CONTROL_KINDS = frozenset({"pause", "cancel"})
-# Controls a process at its dispatch cap claims ahead of the never-claimed
-# commands it holds for their task (``_unfinished_earlier_command``).
+# Controls a process at its dispatch cap or its batch line claims ahead of the
+# never-claimed commands it holds for their task
+# (``_unfinished_earlier_command``).
 # ``settle_cap_held_commands_no_commit`` defines what happens to the passed
 # commands for each kind here, including a pause rejected because nothing
 # of its task runs; a kind added here needs its own rules there.

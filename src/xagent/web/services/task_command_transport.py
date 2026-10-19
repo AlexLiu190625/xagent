@@ -8,7 +8,8 @@ same dispatcher; a database claim chooses one consumer while per-task ordering
 keeps a later command behind an earlier unfinished one. Controls are the
 exception: a cancel or pause may pass a command that waits for an admission
 ticket, and a process at its dispatch cap lets a cancel or pause pass a
-never-claimed command it holds for want of a slot (_unfinished_earlier_command).
+never-claimed command it holds for want of a slot, or a never-claimed batch
+command it holds at its batch line (_unfinished_earlier_command).
 """
 
 from __future__ import annotations
@@ -1913,10 +1914,10 @@ def count_claimable_task_commands(db: Session, *, runner_id: str) -> int:
     The result is an upper bound on what a dispatcher in ``runner_id`` could
     claim now. Process-local state is not applied: the per-process dispatch
     cap (``DispatchCapSnapshot``), which at the cap, or for batch commands at
-    its batch line, narrows the shared scan, or at the cap swaps a held command
-    within one task for a later cancel or pause of that task that this count
-    does not include, and reserves a slot once a candidate that opens an
-    execution is picked; and the busy-task list.
+    its batch line, narrows the shared scan, or at the cap or on the batch line
+    swaps a held command within one task for a later cancel or pause of that
+    task that this count does not include, and reserves a slot once a
+    candidate that opens an execution is picked; and the busy-task list.
     Neither are the checks made after a candidate is picked: whether the
     process consumes commands at all (``consumes_task_commands()``), task
     owner acquisition and lease checks, and the admission reservation that

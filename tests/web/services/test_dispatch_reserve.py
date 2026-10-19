@@ -513,7 +513,7 @@ async def test_without_a_reserve_the_same_queue_is_claimed(
 # ---------------------------------------------------------------- documentation
 
 
-def test_example_env_documents_the_reserve_and_the_known_cancel_delay() -> None:
+def test_example_env_documents_the_reserve() -> None:
     from pathlib import Path
 
     text = (Path(__file__).resolve().parents[3] / "example.env").read_text()
@@ -528,13 +528,13 @@ def test_example_env_documents_the_reserve_and_the_known_cancel_delay() -> None:
     for phrase in (
         "R (this value)",
         "limit (XAGENT_DISPATCHER_MAX_INFLIGHT_PER_PROCESS)",
-        "Keep this at 0.",
-        "a cancel or pause does not pass the held batch commands queued before it "
-        "for its task",
-        "rejected as stale",
-        "is rejected as stale when the run it targets is no longer the task's run",
+        "Between limit-R and limit a cancel or pause also passes the "
+        "never-claimed batch commands of its task held at that line, and the "
+        "commands queued behind them, and settles them as it does at the cap; "
+        "a command already picked up once keeps its place.",
         "cannot use the reserve either; commands of one task still run in order",
         "no interactive command reads the whole claimable backlog",
     ):
         assert phrase in comment
     assert "the queue scan stops at the oldest queued command" not in comment
+    assert "Keep this at 0." not in comment
