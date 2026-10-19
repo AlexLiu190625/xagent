@@ -436,15 +436,16 @@ async def test_batch_line_scan_takes_interactive_and_control_commands(
     interactive_task = host.new_task()
     control_task = host.new_task()
     b1 = host.enqueue(batch_task, "start")
-    host.enqueue(interactive_task, "start", dispatch_class="interactive")
     host.enqueue(control_task, "cancel")
+    host.enqueue(interactive_task, "start", dispatch_class="interactive")
 
-    # The interactive start takes the last free slot; the cancel then needs none.
+    # The older cancel needs no slot and is taken on the batch line; the
+    # interactive start then takes the last free slot.
     assert [await dispatch(host) for _ in range(3)] == [True, True, False]
 
     assert host.claimed == [
-        (interactive_task, transport.TaskCommandKind.START),
         (control_task, transport.TaskCommandKind.CANCEL),
+        (interactive_task, transport.TaskCommandKind.START),
     ]
     assert _state(host, b1) == ("pending", 0)
 
@@ -532,6 +533,8 @@ def test_example_env_documents_the_reserve_and_the_known_cancel_delay() -> None:
         "for its task",
         "rejected as stale",
         "is rejected as stale when the run it targets is no longer the task's run",
+        "cannot use the reserve either; commands of one task still run in order",
+        "no interactive command reads the whole claimable backlog",
     ):
         assert phrase in comment
     assert "the queue scan stops at the oldest queued command" not in comment

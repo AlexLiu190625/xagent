@@ -938,20 +938,6 @@ def _unfinished_earlier_command(cap: DispatchCapSnapshot | None = None) -> Any:
     return exists(select(1).where(*clauses))
 
 
-class _BatchClosedArm(enum.Enum):
-    """Which part of the batch-line filter a candidate query applies.
-
-    Between a process's batch line and its limit it may start only commands
-    that need no new slot or are interactive. ``UNION`` selects all of them in
-    one query; the two arms select them separately, so the interactive one can
-    later be served by a dedicated partial index.
-    """
-
-    UNION = "union"
-    CONTROLS_OR_ACTIVE = "controls_or_active"
-    INTERACTIVE = "interactive"
-
-
 def _claimable_query(
     db: Session,
     *,
@@ -959,17 +945,16 @@ def _claimable_query(
     command_db_id: int | None,
     cap: DispatchCapSnapshot | None = None,
     now: datetime | None = None,
-    arm: _BatchClosedArm = _BatchClosedArm.UNION,
 ) -> Query[Any]:
     """The commands this process could claim, oldest first.
 
     ``now`` is the time the availability and routing checks are judged at; a
     caller running several queries for one decision passes the same value to
-    all of them. ``cap`` narrows the result to what the process can start:
-    at its limit, controls and commands of tasks it already runs; between its
-    batch line and its limit, those plus interactive commands (``arm`` picks
-    which part). Callers that claim must pass the same snapshot to the
-    candidate query and the claim UPDATE.
+    all of them. ``cap`` narrows the result to what the process can start: at
+    its limit, controls and commands of tasks it already runs; between its
+    batch line and its limit, those plus interactive commands. Callers that
+    claim must pass the same snapshot to the candidate query and the claim
+    UPDATE.
     """
     from .task_execution_admission import admission_eligible
 
@@ -993,30 +978,25 @@ def _claimable_query(
             _command_routing_predicate(runner_id, now),
         )
     )
-    if cap is not None and cap.closed:
-        # Without a free slot only what needs none is worth claiming: a
-        # control of any task, or a command of a task that already holds a slot.
-        query = query.filter(
-            or_(
-                TaskExecutionCommand.kind.in_(sorted(CONTROL_KINDS)),
-                TaskExecutionCommand.task_id.in_(sorted(cap.active_ids)),
-            )
-        )
-    elif cap is not None and cap.batch_closed:
-        # On the batch line only interactive commands may take a new slot, so
-        # a batch command of a task this process does not run is left for a
-        # process with room.
+    if cap is not None and cap.batch_closed:
+        # A control of any task, or a command of a task that already holds a
+        # slot, needs no new slot; at the limit only those are worth claiming.
         controls_or_active = or_(
             TaskExecutionCommand.kind.in_(sorted(CONTROL_KINDS)),
             TaskExecutionCommand.task_id.in_(sorted(cap.active_ids)),
         )
-        interactive = TaskExecutionCommand.dispatch_class == DISPATCH_CLASS_INTERACTIVE
-        if arm is _BatchClosedArm.CONTROLS_OR_ACTIVE:
+        if cap.closed:
             query = query.filter(controls_or_active)
-        elif arm is _BatchClosedArm.INTERACTIVE:
-            query = query.filter(interactive)
         else:
-            query = query.filter(or_(controls_or_active, interactive))
+            # On the batch line only interactive commands may also take a new
+            # slot, so a batch command of a task this process does not run is
+            # left for a process with room.
+            query = query.filter(
+                or_(
+                    controls_or_active,
+                    TaskExecutionCommand.dispatch_class == DISPATCH_CLASS_INTERACTIVE,
+                )
+            )
     if command_db_id is not None:
         query = query.filter(TaskExecutionCommand.id == command_db_id)
     return query.order_by(TaskExecutionCommand.id.asc())
@@ -1080,7 +1060,7 @@ def claim_task_command(
     """Atomically claim the oldest eligible command for this worker.
 
     ``cap`` is the snapshot the candidate was picked under; the lookup applies
-    the same narrowing to it, both arms of the batch-line filter together.
+    the same narrowing to it.
     """
 
     if not consumes_task_commands():
@@ -1091,7 +1071,6 @@ def claim_task_command(
         runner_id=resolved_runner_id,
         command_db_id=command_db_id,
         cap=cap,
-        arm=_BatchClosedArm.UNION,
     ).first()
     if candidate is None:
         return None
@@ -1783,7 +1762,6 @@ def _dispatcher_candidate_query(
     shared: bool,
     cap: DispatchCapSnapshot | None = None,
     now: datetime | None = None,
-    arm: _BatchClosedArm = _BatchClosedArm.UNION,
 ) -> Query[Any]:
     """The database part of the dispatcher's candidate selection.
 
@@ -1807,7 +1785,6 @@ def _dispatcher_candidate_query(
         command_db_id=command_db_id,
         cap=cap,
         now=now,
-        arm=arm,
     )
     if shared:
         query = query.filter(_owner_lease_recovery_settled(runner_id, now))
@@ -1828,19 +1805,16 @@ def _find_command_candidate(
     busy_task_ids: tuple[int, ...] = (),
     cap: DispatchCapSnapshot | None = None,
 ) -> CommandCandidate | None:
-    """The oldest command this process could claim now, or None.
+    """A reply to a waiting task, else the oldest command this process could claim now.
 
-    Every query here judges availability at one time, read once at the start,
-    and narrows by the dispatch-cap snapshot ``cap`` the caller took; they are
-    separate SELECTs, so they do not share one database snapshot. What the
-    process may select depends on ``cap``: with room, everything claimable;
-    between its batch line and its limit, controls, commands of tasks it
-    already runs, and interactive commands; at its limit, controls and commands
-    of tasks it already runs. Without ``command_db_id``, a reply to a waiting
-    task is looked for first whenever the process is not at its limit, and the
-    batch line case runs two queries, one for the first two kinds and one for
-    the interactive commands, and takes the older result, so the interactive
-    one can later be served by a dedicated partial index.
+    Returns None when there is none. Every query here judges availability at
+    one time, read once at the start, and narrows by the dispatch-cap snapshot
+    ``cap`` the caller took; they are separate SELECTs, so they do not share
+    one database snapshot. What the process may select depends on ``cap``: with
+    room, everything claimable; between its batch line and its limit, controls,
+    commands of tasks it already runs, and interactive commands; at its limit,
+    controls and commands of tasks it already runs. Without ``command_db_id``,
+    a reply is looked for first whenever the process is not at its limit.
     """
     from ..models.database import get_session_local
 
@@ -1848,10 +1822,7 @@ def _find_command_candidate(
     now = _utc_now()
     with get_session_local()() as db:
 
-        def first_candidate(
-            kind: TaskCommandKind | None = None,
-            arm: _BatchClosedArm = _BatchClosedArm.UNION,
-        ) -> Any:
+        def first_candidate(kind: TaskCommandKind | None = None) -> Any:
             # This scan serves only shared execution (dispatch_one_task_command).
             query = _dispatcher_candidate_query(
                 db,
@@ -1860,7 +1831,6 @@ def _find_command_candidate(
                 shared=True,
                 cap=cap,
                 now=now,
-                arm=arm,
             )
             if kind is not None:
                 query = query.filter(TaskExecutionCommand.kind == kind.value)
@@ -1882,26 +1852,7 @@ def _find_command_candidate(
             # slot is not claimable, so the narrow query decides.
             row = first_candidate(TaskCommandKind.RESUME_INPUT)
         if row is None:
-            if (
-                command_db_id is None
-                and cap is not None
-                and cap.batch_closed
-                and not cap.closed
-            ):
-                row = min(
-                    (
-                        found
-                        for found in (
-                            first_candidate(arm=_BatchClosedArm.CONTROLS_OR_ACTIVE),
-                            first_candidate(arm=_BatchClosedArm.INTERACTIVE),
-                        )
-                        if found is not None
-                    ),
-                    key=lambda found: int(found.id),
-                    default=None,
-                )
-            else:
-                row = first_candidate()
+            row = first_candidate()
         if row is None:
             return None
         return CommandCandidate(
@@ -1929,10 +1880,10 @@ def count_claimable_task_commands(db: Session, *, runner_id: str) -> int:
     The result is an upper bound on what a dispatcher in ``runner_id`` could
     claim now. Process-local state is not applied: the per-process dispatch
     cap (``DispatchCapSnapshot``), which at the cap, or for batch commands at
-    its batch line, narrows the shared scan, or within one task swaps a held
-    command for a later cancel or pause of that task that this count does not
-    include, and reserves a slot once a candidate that opens an execution is
-    picked; and the busy-task list.
+    its batch line, narrows the shared scan, or at the cap swaps a held command
+    within one task for a later cancel or pause of that task that this count
+    does not include, and reserves a slot once a candidate that opens an
+    execution is picked; and the busy-task list.
     Neither are the checks made after a candidate is picked: whether the
     process consumes commands at all (``consumes_task_commands()``), task
     owner acquisition and lease checks, and the admission reservation that

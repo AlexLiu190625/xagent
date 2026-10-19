@@ -48,7 +48,7 @@ def fill(host: CapHost, active: int) -> None:
         host.live(host.new_task())
 
 
-def found(host: CapHost, cap: Any, command_db_id: int | None = None) -> Any:
+def found(cap: Any, command_db_id: int | None = None) -> Any:
     return transport._find_command_candidate(command_db_id, (), cap)
 
 
@@ -122,7 +122,7 @@ async def test_scan_takes_the_oldest_command_the_tier_allows(
     ids = enqueue_queue(host, queue)
     cap = cap_of(host)
 
-    candidate = found(host, cap)
+    candidate = found(cap)
 
     want = expected[tier]
     assert (candidate.id if candidate else None) == (ids[want] if want else None)
@@ -142,7 +142,7 @@ async def test_a_control_passes_a_command_waiting_for_admission(
         db.add(TaskAdmissionTicket(command_id=start, task_id=task, bucket_key="b"))
         db.commit()
 
-    candidate = found(host, cap_of(host))
+    candidate = found(cap_of(host))
 
     assert candidate is not None and candidate.id == cancel
 
@@ -178,7 +178,7 @@ async def test_every_query_of_a_scan_judges_availability_at_one_time_read_once(
 
     # Not yet available at the one time every query uses. With a clock read per
     # query the later queries would see it as due and return it.
-    assert found(host, cap_of(host)) is None
+    assert found(cap_of(host)) is None
     assert clock.calls == 1
 
 
@@ -211,7 +211,7 @@ async def test_an_interactive_answer_goes_before_an_older_start_on_the_batch_lin
         dispatch_class="interactive",
     )
 
-    candidate = found(host, cap_of(host))
+    candidate = found(cap_of(host))
 
     assert candidate is not None and candidate.id == answer
 
@@ -338,7 +338,7 @@ def select_count(host: CapHost, cap: Any) -> int:
 
     event.listen(engine, "before_cursor_execute", record)
     try:
-        found(host, cap)
+        found(cap)
     finally:
         event.remove(engine, "before_cursor_execute", record)
     return len(statements)
@@ -360,13 +360,38 @@ async def test_with_no_reserve_a_scan_runs_the_same_number_of_queries(
     assert select_count(host, closed) == 1
 
 
-async def test_on_the_batch_line_a_scan_with_no_reply_runs_three_queries(
+async def test_on_the_batch_line_a_scan_runs_the_open_cap_number_of_queries(
     cap_host: CapHost,
 ) -> None:
     host = cap_host
-    host.enqueue(host.new_task(), "start")
+    host.enqueue(host.new_task(), "start", dispatch_class="interactive")
     fill(host, 2)
-    assert select_count(host, cap_of(host)) == 3
+    batch_line = cap_of(host)
+    assert batch_line.batch_closed and not batch_line.closed
+    # A reply lookup, then the general lookup.
+    assert select_count(host, batch_line) == 2
+    host.enqueue(
+        host.new_task(status=TaskStatus.WAITING_FOR_USER),
+        "resume_input",
+        dispatch_class="interactive",
+    )
+    # The reply lookup finds one and ends the scan.
+    assert select_count(host, batch_line) == 1
+
+
+async def test_a_batch_command_of_a_running_task_is_taken_on_the_batch_line(
+    cap_host: CapHost,
+) -> None:
+    host = cap_host
+    running = host.new_task()
+    host.live(running)
+    fill(host, 1)
+    follow_up = host.enqueue(running, "message")
+    host.enqueue(host.new_task(), "start", dispatch_class="interactive")
+
+    candidate = found(cap_of(host))
+
+    assert candidate is not None and candidate.id == follow_up
 
 
 # ---------------------------------------------------------------- known consequence
@@ -386,8 +411,8 @@ async def test_control_waits_behind_held_batch_command_below_cap(
     control_id = host.enqueue(task, control)
     cap = cap_of(host)
 
-    assert found(host, cap) is None
-    assert found(host, cap, control_id) is None
+    assert found(cap) is None
+    assert found(cap, control_id) is None
     assert await dispatch(host, command_db_id=control_id) is False
 
     assert host.row(control_id).status == "pending"
