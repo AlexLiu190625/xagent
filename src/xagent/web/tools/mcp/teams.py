@@ -130,14 +130,18 @@ def get_current_user() -> str:
 
 @mcp.tool()
 def list_teams(top: int = 25) -> str:
-    """List the Microsoft Teams that the current user has joined."""
+    """List the Microsoft Teams that the current user has joined.
+
+    top is accepted but ignored: Graph does not let this list be limited.
+    """
     try:
-        result = _graph_request(
-            "GET",
-            "/me/joinedTeams",
-            params={"$top": max(1, min(top, 100))},
+        # /me/joinedTeams supports no OData query options; Graph answers
+        # $top with 400 "Query option 'Top' is not allowed".
+        result = _graph_request("GET", "/me/joinedTeams")
+        return _success(
+            teams=result.get("value", []),
+            next_link=result.get("@odata.nextLink"),
         )
-        return _success(teams=result.get("value", []))
     except Exception as e:
         logger.error("Error listing Teams: %s", e)
         return _error(str(e))
@@ -145,14 +149,20 @@ def list_teams(top: int = 25) -> str:
 
 @mcp.tool()
 def list_channels(team_id: str, top: int = 50) -> str:
-    """List channels for a Microsoft Team by team_id."""
+    """List channels for a Microsoft Team by team_id.
+
+    top is accepted but ignored: Graph does not let this list be limited.
+    """
     try:
+        # The channel list supports only $filter and $select, not $top.
         result = _graph_request(
             "GET",
             f"/teams/{quote(team_id, safe='')}/channels",
-            params={"$top": max(1, min(top, 200))},
         )
-        return _success(channels=result.get("value", []))
+        return _success(
+            channels=result.get("value", []),
+            next_link=result.get("@odata.nextLink"),
+        )
     except Exception as e:
         logger.error("Error listing channels for team %s: %s", team_id, e)
         return _error(str(e))
@@ -234,7 +244,8 @@ def list_chats(top: int = 20) -> str:
         result = _graph_request(
             "GET",
             "/me/chats",
-            params={"$top": max(1, min(top, 100))},
+            # Graph caps $top at 50 for /me/chats.
+            params={"$top": max(1, min(top, 50))},
         )
         return _success(chats=result.get("value", []))
     except Exception as e:
