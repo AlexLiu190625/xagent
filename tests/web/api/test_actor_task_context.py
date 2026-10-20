@@ -43,6 +43,7 @@ def _snapshot(
     task_agent_config: dict[str, Any] | None = None,
     runtime_agent: Any = None,
     task_llm: Any = None,
+    run_id: str | None = None,
 ) -> TaskSetupSnapshot:
     return TaskSetupSnapshot(
         task=_TaskFields(
@@ -67,6 +68,7 @@ def _snapshot(
             compact_model_name=None,
             execution_mode="flash",
             agent_type="standard",
+            run_id=run_id,
         ),
         runtime_user=RuntimeUserFields(id=1, is_admin=False),
         has_reconstructable_history=has_reconstructable_history,
@@ -487,6 +489,26 @@ def _seed_manager_maps(manager: AgentServiceManager, agent: Any) -> None:
     )
 
 
+def _acquire_stubbed_agent(manager: AgentServiceManager, agent: Any) -> int:
+    async def build(*_args: Any, **_kwargs: Any) -> Any:
+        _seed_manager_maps(manager, agent)
+        return agent
+
+    async def acquire() -> int:
+        with patch.object(manager, "_get_agent_for_task_unlocked", side_effect=build):
+            await manager.get_agent_for_task(
+                42,
+                task_setup_snapshot=_snapshot(marker=object(), run_id="current-run"),
+                task_owner_user_id=1,
+                resolved_execution_scope=None,
+            )
+        generation = manager.current_run_generation(42)
+        assert generation is not None
+        return generation
+
+    return asyncio.run(acquire())
+
+
 def test_remove_agent_ignores_stale_cleanup_within_the_same_run() -> None:
     """A resume re-claims its own run, so the run id cannot date a cleanup.
 
@@ -548,10 +570,79 @@ def test_get_agent_for_task_bumps_the_run_generation() -> None:
     asyncio.run(acquire())
     second = manager.current_run_generation(42)
 
-    assert first == 1
+    assert first is not None
     # The snapshot carries one run id, so only the generation distinguishes
     # these two acquisitions -- which is the whole point of having it.
-    assert second == 2
+    assert second == first + 1
+
+
+def test_run_generation_is_not_reused_after_runtime_eviction() -> None:
+    """An old cleanup token cannot become current again after eviction."""
+    manager = AgentServiceManager()
+    first_agent = MagicMock()
+    replacement_agent = MagicMock()
+
+    first = _acquire_stubbed_agent(manager, first_agent)
+    second = _acquire_stubbed_agent(manager, first_agent)
+    manager.remove_agent(
+        42,
+        expected_run_id="current-run",
+        expected_run_generation=second,
+    )
+    third = _acquire_stubbed_agent(manager, replacement_agent)
+
+    assert len({first, second, third}) == 3
+
+    manager.remove_agent(
+        42,
+        expected_run_id="current-run",
+        expected_run_generation=first,
+    )
+
+    assert manager._agents[42] is replacement_agent
+    assert manager.current_run_generation(42) == third
+    replacement_agent.cleanup_workspace.assert_not_called()
+
+    manager.remove_agent(
+        42,
+        expected_run_id="current-run",
+        expected_run_generation=third,
+    )
+
+    assert 42 not in manager._agents
+    assert manager.current_run_generation(42) is None
+    replacement_agent.cleanup_workspace.assert_called_once()
+
+
+def test_run_generation_is_not_reused_after_manager_replacement() -> None:
+    """A delayed cleanup stays stale if the global manager is replaced."""
+    original_manager = AgentServiceManager()
+    replacement_manager = AgentServiceManager()
+    original_agent = MagicMock()
+    replacement_agent = MagicMock()
+
+    original = _acquire_stubbed_agent(original_manager, original_agent)
+    replacement = _acquire_stubbed_agent(replacement_manager, replacement_agent)
+
+    assert replacement != original
+
+    replacement_manager.remove_agent(
+        42,
+        expected_run_id="current-run",
+        expected_run_generation=original,
+    )
+
+    assert replacement_manager._agents[42] is replacement_agent
+    replacement_agent.cleanup_workspace.assert_not_called()
+
+    replacement_manager.remove_agent(
+        42,
+        expected_run_id="current-run",
+        expected_run_generation=replacement,
+    )
+
+    assert 42 not in replacement_manager._agents
+    replacement_agent.cleanup_workspace.assert_called_once()
 
 
 def test_remove_agent_ignores_stale_run_cleanup() -> None:

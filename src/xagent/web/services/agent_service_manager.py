@@ -5,6 +5,7 @@ import logging
 import os
 from collections import deque
 from dataclasses import dataclass
+from itertools import count
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, TypeVar, Union, cast
 
@@ -1224,6 +1225,12 @@ async def _load_task_setup_snapshot_for_agent(
 # Bound invalidation waits for an unlocked but FIFO-queued build lock.
 _INVALIDATION_LOCK_ACQUIRE_TIMEOUT = 0.05
 
+# Process-local acquisition identity. This intentionally outlives individual
+# manager instances: a delayed cleanup may resolve the current global manager
+# only after its original manager was replaced. Reusing a token then would
+# recreate the same ABA hazard as removing and rebuilding one task entry.
+_agent_run_generation_counter = count(1)
+
 
 class AgentServiceManager:
     """Manage AgentService instances for different tasks"""
@@ -1248,7 +1255,9 @@ class AgentServiceManager:
         # one run indistinguishable by id. A previous turn's late cleanup then
         # matched the resume's runtime and evicted it mid-execution. Bumped on
         # every acquisition, so a cleanup scheduled by an earlier one no longer
-        # recognizes the runtime and correctly does nothing.
+        # recognizes the runtime and correctly does nothing. Tokens come from
+        # a process-local sequence rather than this removable per-task map, so
+        # eviction and manager replacement cannot make an old token current.
         self._agent_run_generations: Dict[int, int] = {}
         # Keep only the owner needed to retry a failed workspace cleanup.
         self._agent_cleanup_owner_ids: Dict[int, int] = {}
@@ -2155,9 +2164,7 @@ class AgentServiceManager:
             )
             if task_setup_snapshot is not None and task_setup_snapshot.task.run_id:
                 self._agent_run_ids[task_id] = task_setup_snapshot.task.run_id
-            self._agent_run_generations[task_id] = (
-                self._agent_run_generations.get(task_id, 0) + 1
-            )
+            self._agent_run_generations[task_id] = next(_agent_run_generation_counter)
             return agent
 
     async def _get_agent_for_task_unlocked(
