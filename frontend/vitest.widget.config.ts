@@ -216,6 +216,7 @@ export default defineConfig({
       "src/lib/connector-runtime-api.test.ts",
       "src/lib/files-disabled-presentation.test.ts",
       "src/lib/remark-currency-safe-math.test.ts",
+      "src/lib/widget-parent-message.test.ts",
     ],
   },
 })
