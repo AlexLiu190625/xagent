@@ -1,6 +1,7 @@
 import json
 import math
 import multiprocessing
+import multiprocessing.connection
 import time
 from pathlib import Path
 
@@ -88,7 +89,7 @@ def _admit(connection, **kwargs):
     )
 
 
-def _admit_after_lock_attempt(database_path, attempted, results):
+def _admit_after_lock_attempt(database_path, events):
     original_lock = storage_admission.FileLock
 
     class SignalingLock:
@@ -96,14 +97,25 @@ def _admit_after_lock_attempt(database_path, attempted, results):
             self._lock = original_lock(*args, **kwargs)
 
         def __enter__(self):
-            attempted.set()
-            return self._lock.__enter__()
+            # Probe before blocking so the parent learns whether admission
+            # actually contends for the lock it holds, rather than inferring
+            # it from how long the child took to get here.
+            try:
+                self._lock.acquire(timeout=0)
+            except Timeout:
+                events.send("contended")
+                return self._lock.__enter__()
+            events.send("uncontended")
+            return self._lock
 
         def __exit__(self, *args):
             return self._lock.__exit__(*args)
 
     storage_admission.FileLock = SignalingLock
-    results.put(_admit(lancedb.connect(database_path)).state.value)
+    # Generous enough that a loaded runner cannot exhaust it while the parent
+    # creates the table; the parent releases the lock on every path.
+    outcome = _admit(lancedb.connect(database_path), lock_timeout=300)
+    events.send(outcome.state.value)
 
 
 def test_supported_version_atomic_null_vectors_marker_and_bounded_scan(
@@ -349,27 +361,33 @@ def test_absent_admission_waits_for_lifecycle_lock(tmp_path):
     connection = lancedb.connect(database_path)
     admission_path = lancedb_lock_path(connection, "memories", "admission")
     context = multiprocessing.get_context("spawn")
-    attempted = context.Event()
-    results = context.Queue()
+    events, child_events = context.Pipe(duplex=False)
     process = context.Process(
         target=_admit_after_lock_attempt,
-        args=(str(database_path), attempted, results),
+        args=(str(database_path), child_events),
     )
 
-    with FileLock(admission_path):
-        process.start()
-        assert attempted.wait(10)
-        table = connection.create_table(
-            "memories",
-            pa.table({"id": ["created"], "text": ["text"], "metadata": ["{}"]}),
-        )
-        _safe_close_table(table)
-    process.join(20)
-    if process.is_alive():
-        process.terminate()
-        process.join(5)
-    assert process.exitcode == 0
-    assert results.get(timeout=5) == StorageAdmissionState.ADMITTED.value
+    try:
+        with FileLock(admission_path):
+            process.start()
+            child_events.close()
+            # Wake on the child's lock probe or on its exit, whichever comes
+            # first, so a slow spawn under parallel load only delays the test.
+            # The timeout is a hang guard, not a speed budget.
+            multiprocessing.connection.wait([events, process.sentinel], timeout=300)
+            assert events.poll() and events.recv() == "contended"
+            table = connection.create_table(
+                "memories",
+                pa.table({"id": ["created"], "text": ["text"], "metadata": ["{}"]}),
+            )
+            _safe_close_table(table)
+        process.join(300)
+        assert process.exitcode == 0
+        assert events.recv() == StorageAdmissionState.ADMITTED.value
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(5)
 
 
 def test_typed_unavailable_states_and_safe_details(tmp_path, monkeypatch):
