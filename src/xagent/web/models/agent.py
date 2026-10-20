@@ -112,6 +112,10 @@ class Agent(Base):  # type: ignore
     suggested_prompts = Column(
         JSON, nullable=True, default=list
     )  # List of suggested prompt examples for users
+    # Fields the unsigned widget entry may pass to prompt_context:
+    # [{"name": str, "max_length": int, "description": str | null}]. Signed
+    # values; signed grants carry their own field set.
+    prompt_context_fields = Column(JSON, nullable=True, default=list)
 
     # Visual
     logo_url = Column(String(500), nullable=True)

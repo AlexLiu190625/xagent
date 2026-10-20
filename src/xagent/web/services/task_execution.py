@@ -2589,9 +2589,18 @@ async def execute_task_background(
             prompt_context = prompt_context_from_agent_config(
                 getattr(snapshot.task, "agent_config", None)
             )
+            prompt_context_block = build_prompt_context_block(prompt_context)
             task_for_agent = append_prompt_context_block(
                 llm_user_message or user_message, prompt_context
             )
+            if prompt_context_block is not None:
+                # Field names and trust level only; values stay out of logs.
+                logger.info(
+                    "task %s prompt_context fields=%s signed=%s",
+                    task_id,
+                    sorted(prompt_context["data"]),
+                    prompt_context["signed"],
+                )
             # ``task_source`` and ``run_id`` are server-owned execution
             # identities: the first selects the MCP approval registration,
             # the second names the lease an approval is recorded under. This
@@ -2615,9 +2624,9 @@ async def execute_task_background(
             else:
                 agent_context.pop("task_source", None)
                 agent_context.pop("run_id", None)
-            if build_prompt_context_block(
-                prompt_context
-            ) is not None and not _has_display_message_override(agent_context):
+            if prompt_context_block is not None and not _has_display_message_override(
+                agent_context
+            ):
                 agent_context["display_message"] = user_message
             result = await agent_manager.execute_task(
                 agent_service=agent_service,

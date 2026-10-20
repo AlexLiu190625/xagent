@@ -94,6 +94,10 @@ async def create_agent(
                 skills=request.skills,
                 tool_categories=request.tool_categories,
                 suggested_prompts=request.suggested_prompts,
+                prompt_context_fields=[
+                    declaration.model_dump()
+                    for declaration in request.prompt_context_fields
+                ],
                 generate_runtime_key=request.generate_runtime_key,
             ),
         )

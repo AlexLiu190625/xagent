@@ -29,6 +29,8 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .agent import PromptContextFieldDeclaration, PromptContextFieldList
+
 
 class MessageBody(BaseModel):
     """One chat message in the SDK request body.
@@ -167,6 +169,7 @@ class V1AgentCreateRequest(BaseModel):
     skills: list[str] = Field(default_factory=list)
     tool_categories: list[str] = Field(default_factory=list)
     suggested_prompts: list[str] = Field(default_factory=list)
+    prompt_context_fields: PromptContextFieldList = Field(default_factory=list)
     generate_runtime_key: bool = True
 
 
@@ -212,6 +215,7 @@ class V1AgentResponse(BaseModel):
     skills: list[str]
     tool_categories: list[str]
     suggested_prompts: list[str]
+    prompt_context_fields: list[PromptContextFieldDeclaration]
     logo_url: Optional[str] = None
     status: str
     published_at: Optional[str] = None

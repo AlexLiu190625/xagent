@@ -189,6 +189,40 @@ def test_v1_rotate_agent_runtime_key_returns_one_shot_key():
     assert response.json()["created_at"]
 
 
+@pytest.mark.parametrize("max_length", ["8", True, 8.0])
+def test_v1_create_agent_rejects_non_strict_max_length(max_length):
+    key = _personal_key()
+    resp = client.post(
+        "/v1/agents",
+        headers=_bearer(key),
+        json={
+            "name": f"strict max_length {max_length!r}",
+            "prompt_context_fields": [{"name": "tier", "max_length": max_length}],
+        },
+    )
+
+    assert resp.status_code == 422, resp.text
+
+
+def test_v1_create_agent_echoes_prompt_context_description():
+    key = _personal_key()
+    resp = client.post(
+        "/v1/agents",
+        headers=_bearer(key),
+        json={
+            "name": "described via SDK",
+            "prompt_context_fields": [
+                {"name": "tier", "max_length": 8, "description": " Customer tier "}
+            ],
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["agent"]["prompt_context_fields"] == [
+        {"name": "tier", "max_length": 8, "description": "Customer tier"}
+    ]
+
+
 def test_v1_create_agent_rolls_back_agent_when_key_step_fails():
     """Agent + first runtime key commit atomically: if the key step
     fails, the agent row must not persist, so a client retry with the

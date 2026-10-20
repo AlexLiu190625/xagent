@@ -89,6 +89,7 @@ def _create_spec(
         skills=(),
         tool_categories=tool_categories,
         suggested_prompts=(),
+        prompt_context_fields=(),
         generate_runtime_key=generate_runtime_key,
     )
 

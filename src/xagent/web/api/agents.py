@@ -31,6 +31,7 @@ from ..models.database import get_db, release_db_connection_if_clean
 from ..models.model import Model as DBModel
 from ..models.task import Task
 from ..models.user import User
+from ..schemas.agent import PromptContextFieldDeclaration, PromptContextFieldList
 from ..schemas.agent_api_key import (
     APIKeyGenerateResponse,
     APIKeyMetadataResponse,
@@ -103,6 +104,10 @@ class AgentCreateRequest(BaseModel):
     suggested_prompts: List[str] = Field(
         default_factory=list, description="Suggested prompt examples for users"
     )
+    prompt_context_fields: PromptContextFieldList = Field(
+        default_factory=list,
+        description="Fields the unsigned widget entry may pass to prompt context",
+    )
     logo_base64: Optional[str] = Field(
         None, description="Logo image as base64 data URL"
     )
@@ -124,6 +129,9 @@ class AgentUpdateRequest(BaseModel):
     tool_categories: Optional[List[str]] = None
     suggested_prompts: Optional[List[str]] = Field(
         None, description="Suggested prompt examples for users"
+    )
+    prompt_context_fields: Optional[PromptContextFieldList] = Field(
+        None, description="None leaves the current declarations unchanged"
     )
     logo_base64: Optional[str] = None
     widget_enabled: Optional[bool] = None
@@ -149,6 +157,7 @@ class AgentResponse(BaseModel):
     skills: List[str]
     tool_categories: List[str]
     suggested_prompts: List[str]
+    prompt_context_fields: List[PromptContextFieldDeclaration]
     logo_url: Optional[str]
     status: str
     visibility: str
@@ -738,6 +747,10 @@ async def create_agent(
                 skills=agent_data.skills,
                 tool_categories=agent_data.tool_categories,
                 suggested_prompts=agent_data.suggested_prompts,
+                prompt_context_fields=[
+                    declaration.model_dump()
+                    for declaration in agent_data.prompt_context_fields
+                ],
                 visibility=agent_data.visibility,
             )
         except IntegrityError as exc:
@@ -999,6 +1012,11 @@ async def update_agent(
             updates["execution_mode"] = agent_data.execution_mode
         if agent_data.suggested_prompts is not None:
             updates["suggested_prompts"] = agent_data.suggested_prompts
+        if agent_data.prompt_context_fields is not None:
+            updates["prompt_context_fields"] = [
+                declaration.model_dump()
+                for declaration in agent_data.prompt_context_fields
+            ]
         if agent_data.widget_enabled is not None:
             updates["widget_enabled"] = agent_data.widget_enabled
             # Widget-enabled agents always carry an embed credential; heal

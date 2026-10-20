@@ -303,6 +303,45 @@ def test_detail_cache_does_not_leak_admins_only_to_member(db, team_of_admin_and_
         set_cache_backend_for_testing(None)
 
 
+def test_detail_cache_without_prompt_context_fields_reloads_from_db(db):
+    """A detail entry cached before prompt_context_fields shipped must not
+    500 the response model; it reloads the DB row (declarations included)."""
+    from xagent.web.models.user import User
+    from xagent.web.services.agent_store import AgentStore
+    from xagent.web.services.hot_path_cache import (
+        InMemoryTTLCache,
+        agent_detail_key,
+        cache_set,
+        set_cache_backend_for_testing,
+    )
+
+    set_cache_backend_for_testing(InMemoryTTLCache())
+    try:
+        u = User(username="stale-cache", password_hash="h", is_admin=False)
+        db.add(u)
+        db.flush()
+        store = AgentStore(db)
+        agent = store.create_agent(
+            user_id=int(u.id),
+            name="Stale",
+            description=None,
+            instructions=None,
+            prompt_context_fields=[{"name": "tier", "max_length": 8}],
+        )
+        stale = store.agent_to_response_dict(agent)
+        stale.pop("prompt_context_fields")
+        cache_set(agent_detail_key(int(u.id), int(agent.id)), stale)
+
+        fresh = store.get_agent_response(int(u.id), int(agent.id))
+
+        assert fresh is not None
+        assert fresh["prompt_context_fields"] == [
+            {"name": "tier", "max_length": 8, "description": None}
+        ]
+    finally:
+        set_cache_backend_for_testing(None)
+
+
 def test_list_accessible_agents_hides_published_admins_only_from_member(
     db, team_of_admin_and_member
 ):

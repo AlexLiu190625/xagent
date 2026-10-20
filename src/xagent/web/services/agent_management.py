@@ -126,6 +126,7 @@ class AgentCreateSpec:
     skills: tuple[str, ...]
     tool_categories: tuple[str, ...]
     suggested_prompts: tuple[str, ...]
+    prompt_context_fields: tuple[dict[str, Any], ...]
     generate_runtime_key: bool
     template_id: str | None = None
 
@@ -142,6 +143,7 @@ class AgentCreateSpec:
         skills: list[str] | tuple[str, ...] | None,
         tool_categories: list[str] | tuple[str, ...] | None,
         suggested_prompts: list[str] | tuple[str, ...] | None,
+        prompt_context_fields: list[dict[str, Any]] | None = None,
         generate_runtime_key: bool,
         template_id: str | None = None,
     ) -> AgentCreateSpec:
@@ -161,6 +163,9 @@ class AgentCreateSpec:
             skills=tuple(skills or ()),
             tool_categories=tuple(tool_categories or ()),
             suggested_prompts=tuple(suggested_prompts or ()),
+            prompt_context_fields=tuple(
+                dict(item) for item in prompt_context_fields or ()
+            ),
             template_id=template_id,
             generate_runtime_key=generate_runtime_key,
         )
@@ -202,6 +207,7 @@ class AgentResponseSnapshot:
     skills: tuple[str, ...]
     tool_categories: tuple[str, ...]
     suggested_prompts: tuple[str, ...]
+    prompt_context_fields: tuple[dict[str, Any], ...]
     logo_url: str | None
     status: str
     visibility: str
@@ -233,6 +239,9 @@ class AgentResponseSnapshot:
             "skills": list(self.skills),
             "tool_categories": list(self.tool_categories),
             "suggested_prompts": list(self.suggested_prompts),
+            "prompt_context_fields": [
+                dict(item) for item in self.prompt_context_fields
+            ],
             "logo_url": self.logo_url,
             "status": self.status,
             "visibility": self.visibility,
@@ -585,6 +594,7 @@ class AgentManagementService:
         skills: list[str] | None = None,
         tool_categories: list[str] | None = None,
         suggested_prompts: list[str] | None = None,
+        prompt_context_fields: list[dict[str, Any]] | None = None,
         generate_runtime_key: bool = True,
         template_id: str | None = None,
     ) -> tuple[Agent, APIKeyGenerateResponse | None]:
@@ -610,6 +620,7 @@ class AgentManagementService:
             skills=skills,
             tool_categories=tool_categories,
             suggested_prompts=suggested_prompts,
+            prompt_context_fields=prompt_context_fields,
             generate_runtime_key=generate_runtime_key,
             template_id=template_id,
         )
@@ -627,6 +638,7 @@ class AgentManagementService:
         skills: list[str] | None = None,
         tool_categories: list[str] | None = None,
         suggested_prompts: list[str] | None = None,
+        prompt_context_fields: list[dict[str, Any]] | None = None,
         generate_runtime_key: bool = True,
         runtime_key_candidate: ApiKeyCandidate | None = None,
         template_id: str | None = None,
@@ -692,6 +704,7 @@ class AgentManagementService:
                 skills=skills or [],
                 tool_categories=tool_categories or [],
                 suggested_prompts=suggested_prompts or [],
+                prompt_context_fields=prompt_context_fields or [],
                 template_id=template_id,
                 origin=origin,
             )
@@ -922,6 +935,7 @@ def _agent_response_snapshot(payload: dict[str, Any]) -> AgentResponseSnapshot:
         skills=tuple(payload.get("skills") or ()),
         tool_categories=tuple(payload.get("tool_categories") or ()),
         suggested_prompts=tuple(payload.get("suggested_prompts") or ()),
+        prompt_context_fields=tuple(payload.get("prompt_context_fields") or ()),
         logo_url=cast("str | None", payload.get("logo_url")),
         status=str(payload["status"]),
         visibility=str(payload["visibility"]),
@@ -1213,6 +1227,9 @@ class AgentManagementRuntime:
                     skills=list(spec.skills),
                     tool_categories=list(spec.tool_categories),
                     suggested_prompts=list(spec.suggested_prompts),
+                    prompt_context_fields=[
+                        dict(item) for item in spec.prompt_context_fields
+                    ],
                     generate_runtime_key=spec.generate_runtime_key,
                     runtime_key_candidate=candidate,
                     template_id=spec.template_id,
