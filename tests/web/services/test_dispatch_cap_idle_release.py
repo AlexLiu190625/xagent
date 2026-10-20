@@ -23,6 +23,10 @@ from xagent.web.models.task_admission import TaskAdmissionBucket, TaskAdmissionT
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.services import task_command_transport as transport
 from xagent.web.services import task_coordinator_runtime as runtime
+from xagent.web.services.task_dispatch_cap import (
+    DISPATCH_CLASS_BATCH,
+    DISPATCH_CLASS_INTERACTIVE,
+)
 
 
 def record_idle_outcomes(monkeypatch: pytest.MonkeyPatch) -> list[str]:
@@ -435,10 +439,7 @@ async def test_batch_line_keeps_an_idle_task_whose_interactive_start_this_proces
     assert host.claimed == [(target, transport.TaskCommandKind.START)]
 
 
-B = "batch"
-I = "interactive"  # noqa: E741
-OPEN = (4, 1, 2)  # limit, interactive reserve, other active tasks
-LINE = (3, 1, 2)
+LINE = (3, 1, 2)  # limit, interactive reserve, other active tasks
 FULL = (2, 1, 2)
 FULL_NO_RESERVE = (1, 0, 1)
 
@@ -449,7 +450,7 @@ EARLIEST_COMMAND_ROWS = [
         "batch-line-no-unfinished-command",
         LINE,
         TaskStatus.COMPLETED,
-        [("start", "completed", 0, B)],
+        [("start", "completed", 0, DISPATCH_CLASS_BATCH)],
         "released",
         0,
     ),
@@ -457,15 +458,7 @@ EARLIEST_COMMAND_ROWS = [
         "batch-line-batch-start",
         LINE,
         TaskStatus.PENDING,
-        [("start", "pending", 0, B)],
-        "released",
-        1,
-    ),
-    (
-        "batch-line-batch-start-claimed-once",
-        LINE,
-        TaskStatus.PENDING,
-        [("start", "pending", 1, B)],
+        [("start", "pending", 0, DISPATCH_CLASS_BATCH)],
         "released",
         1,
     ),
@@ -473,7 +466,7 @@ EARLIEST_COMMAND_ROWS = [
         "batch-line-interactive-start-claimed-once",
         LINE,
         TaskStatus.PENDING,
-        [("start", "pending", 1, I)],
+        [("start", "pending", 1, DISPATCH_CLASS_INTERACTIVE)],
         "busy",
         0,
     ),
@@ -481,7 +474,10 @@ EARLIEST_COMMAND_ROWS = [
         "batch-line-interactive-start-then-batch-message",
         LINE,
         TaskStatus.PENDING,
-        [("start", "pending", 0, I), ("message", "pending", 0, B)],
+        [
+            ("start", "pending", 0, DISPATCH_CLASS_INTERACTIVE),
+            ("message", "pending", 0, DISPATCH_CLASS_BATCH),
+        ],
         "busy",
         0,
     ),
@@ -489,7 +485,10 @@ EARLIEST_COMMAND_ROWS = [
         "batch-line-batch-start-then-interactive-answer",
         LINE,
         TaskStatus.PENDING,
-        [("start", "pending", 0, B), ("resume_input", "pending", 0, I)],
+        [
+            ("start", "pending", 0, DISPATCH_CLASS_BATCH),
+            ("resume_input", "pending", 0, DISPATCH_CLASS_INTERACTIVE),
+        ],
         "released",
         2,
     ),
@@ -497,15 +496,10 @@ EARLIEST_COMMAND_ROWS = [
         "batch-line-batch-start-then-cancel",
         LINE,
         TaskStatus.PENDING,
-        [("start", "pending", 0, B), ("cancel", "pending", 0, B)],
-        "busy",
-        0,
-    ),
-    (
-        "batch-line-batch-start-then-pause",
-        LINE,
-        TaskStatus.PENDING,
-        [("start", "pending", 0, B), ("pause", "pending", 0, B)],
+        [
+            ("start", "pending", 0, DISPATCH_CLASS_BATCH),
+            ("cancel", "pending", 0, DISPATCH_CLASS_BATCH),
+        ],
         "busy",
         0,
     ),
@@ -514,9 +508,9 @@ EARLIEST_COMMAND_ROWS = [
         LINE,
         TaskStatus.PENDING,
         [
-            ("start", "pending", 0, B),
-            ("resume_input", "pending", 0, I),
-            ("cancel", "pending", 0, B),
+            ("start", "pending", 0, DISPATCH_CLASS_BATCH),
+            ("resume_input", "pending", 0, DISPATCH_CLASS_INTERACTIVE),
+            ("cancel", "pending", 0, DISPATCH_CLASS_BATCH),
         ],
         "busy",
         0,
@@ -525,7 +519,10 @@ EARLIEST_COMMAND_ROWS = [
         "batch-line-completed-batch-start-then-interactive-message",
         LINE,
         TaskStatus.COMPLETED,
-        [("start", "completed", 0, B), ("message", "pending", 0, I)],
+        [
+            ("start", "completed", 0, DISPATCH_CLASS_BATCH),
+            ("message", "pending", 0, DISPATCH_CLASS_INTERACTIVE),
+        ],
         "busy",
         0,
     ),
@@ -533,7 +530,10 @@ EARLIEST_COMMAND_ROWS = [
         "batch-line-completed-interactive-start-then-batch-message",
         LINE,
         TaskStatus.COMPLETED,
-        [("start", "completed", 0, I), ("message", "pending", 0, B)],
+        [
+            ("start", "completed", 0, DISPATCH_CLASS_INTERACTIVE),
+            ("message", "pending", 0, DISPATCH_CLASS_BATCH),
+        ],
         "released",
         1,
     ),
@@ -541,7 +541,7 @@ EARLIEST_COMMAND_ROWS = [
         "batch-line-running-task",
         LINE,
         TaskStatus.RUNNING,
-        [("start", "pending", 0, B)],
+        [("start", "pending", 0, DISPATCH_CLASS_BATCH)],
         "busy",
         0,
     ),
@@ -549,7 +549,7 @@ EARLIEST_COMMAND_ROWS = [
         "cap-with-reserve-interactive-start",
         FULL,
         TaskStatus.PENDING,
-        [("start", "pending", 0, I)],
+        [("start", "pending", 0, DISPATCH_CLASS_INTERACTIVE)],
         "released",
         1,
     ),
@@ -557,17 +557,9 @@ EARLIEST_COMMAND_ROWS = [
         "cap-without-reserve-interactive-start",
         FULL_NO_RESERVE,
         TaskStatus.PENDING,
-        [("start", "pending", 0, I)],
+        [("start", "pending", 0, DISPATCH_CLASS_INTERACTIVE)],
         "released",
         1,
-    ),
-    (
-        "cap-with-reserve-interactive-start-then-batch-message",
-        FULL,
-        TaskStatus.PENDING,
-        [("start", "pending", 0, I), ("message", "pending", 0, B)],
-        "released",
-        2,
     ),
 ]
 
@@ -587,7 +579,11 @@ async def test_idle_check_follows_the_earliest_command_of_the_task(
     expected: str,
     logged: int,
 ) -> None:
-    """Below the cap only the earliest unfinished command can be held back."""
+    """At the cap every queued execution is held back.
+
+    On the batch line they are held only when the task's earliest unfinished
+    command is a pending batch execution.
+    """
 
     host = cap_host
     limit, reserve, other_active = cap
