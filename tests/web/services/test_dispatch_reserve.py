@@ -538,3 +538,4 @@ def test_example_env_documents_the_reserve() -> None:
         assert phrase in comment
     assert "the queue scan stops at the oldest queued command" not in comment
     assert "Keep this at 0." not in comment
+    assert "until the interactive lookup is indexed" not in comment
