@@ -411,7 +411,9 @@ async def test_public_access_websocket_infrastructure_failure_closes_with_1011(
         connection_manager.register_connection.assert_not_called()
         connection_manager.disconnect.assert_not_called()
     else:
-        connection_manager.register_connection.assert_called_once_with(websocket, 42)
+        connection_manager.register_connection.assert_called_once_with(
+            websocket, 42, public_audience=True
+        )
         connection_manager.disconnect.assert_called_once_with(websocket)
 
 

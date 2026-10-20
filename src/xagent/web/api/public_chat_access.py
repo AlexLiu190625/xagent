@@ -1487,7 +1487,7 @@ async def public_chat_websocket_endpoint(
         return
 
     # Already accepted above; register the live socket without re-accepting.
-    manager.register_connection(websocket, task_id)
+    manager.register_connection(websocket, task_id, public_audience=True)
 
     try:
         await handle_status_request(websocket, task_id, principal)
@@ -1594,7 +1594,7 @@ async def share_chat_websocket_endpoint(
         return
 
     # Already accepted above; register the live socket without re-accepting.
-    manager.register_connection(websocket, task_id)
+    manager.register_connection(websocket, task_id, public_audience=True)
 
     try:
         await handle_status_request(websocket, task_id, principal)

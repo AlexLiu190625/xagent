@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import uuid
+import weakref
 from collections import OrderedDict
 from copy import deepcopy
 from dataclasses import dataclass
@@ -124,6 +125,7 @@ from ..services.mcp_runtime import (
 from ..services.public_trace_events import (
     is_audit_only_trace_data,
     normalize_public_trace_event,
+    public_audience_frame,
     public_task_trace_filter,
 )
 from ..services.task_auto_recovery import (
@@ -1135,13 +1137,24 @@ class ConnectionManager:
         self._stream_reconciler: asyncio.Task[None] | None = None
         # WebSocket -> current task_id
         self._connection_task_ids: Dict[WebSocket, int] = {}
+        # Never cleared on disconnect: a guest socket stays projected even
+        # after it leaves the task registry.
+        self._public_sockets: weakref.WeakSet[WebSocket] = weakref.WeakSet()
 
     async def connect(self, websocket: WebSocket, task_id: int) -> None:
         await websocket.accept()
         self.register_connection(websocket, task_id)
 
-    def register_connection(self, websocket: WebSocket, task_id: int) -> None:
-        """Register an already-accepted websocket for task broadcasts."""
+    def register_connection(
+        self, websocket: WebSocket, task_id: int, *, public_audience: bool = False
+    ) -> None:
+        """Register an already-accepted websocket for task broadcasts.
+
+        ``public_audience`` marks a widget / share guest socket: every frame
+        this manager sends to it goes through ``public_audience_frame``.
+        """
+        if public_audience:
+            self._public_sockets.add(websocket)
         current_task_id = self._connection_task_ids.get(websocket)
         if current_task_id is not None and current_task_id != task_id:
             self._remove_from_task(websocket, current_task_id)
@@ -1212,8 +1225,20 @@ class ConnectionManager:
             f"Moved WebSocket connection from task {old_task_id} to {new_task_id}"
         )
 
+    def _is_public_audience(self, websocket: WebSocket) -> bool:
+        return websocket in self._public_sockets
+
+    def _public_encoding(
+        self, message: dict[str, Any], encoded: str, connections: List[WebSocket]
+    ) -> str:
+        if any(self._is_public_audience(c) for c in connections):
+            return json.dumps(public_audience_frame(message))
+        return encoded
+
     async def send_personal_message(self, message: dict, websocket: WebSocket) -> None:
         versioned_message = await _with_current_task_control_state(message)
+        if self._is_public_audience(websocket):
+            versioned_message = public_audience_frame(versioned_message)
         writer = self._writers.get(websocket)
         if writer is not None:
             delivery = writer.enqueue(json.dumps(versioned_message), acknowledge=True)
@@ -1223,7 +1248,9 @@ class ConnectionManager:
 
     async def deliver_shared_event(self, message: dict[str, Any], task_id: int) -> None:
         encoded = json.dumps(message)
-        for connection in self.connections_for_task(task_id):
+        connections = self.connections_for_task(task_id)
+        public_encoded = self._public_encoding(message, encoded, connections)
+        for connection in connections:
             writer = self._writers.get(connection)
             if writer is None:
                 logger.warning(
@@ -1232,7 +1259,11 @@ class ConnectionManager:
                 )
             else:
                 try:
-                    writer.enqueue(encoded)
+                    writer.enqueue(
+                        public_encoded
+                        if self._is_public_audience(connection)
+                        else encoded
+                    )
                 except ConnectionError:
                     self.disconnect(connection)
 
@@ -1309,11 +1340,18 @@ class ConnectionManager:
                 len(encoded_message),
                 unit="By",
             )
+            public_encoded_message = self._public_encoding(
+                versioned_message, encoded_message, connections
+            )
             for connection in connections:
                 if not self.is_connection_registered(connection, task_id):
                     continue
                 try:
-                    await connection.send_text(encoded_message)
+                    await connection.send_text(
+                        public_encoded_message
+                        if self._is_public_audience(connection)
+                        else encoded_message
+                    )
                     increment_performance_counter("xagent.websocket.messages.sent")
                 except (
                     BrokenResourceError,

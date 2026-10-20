@@ -74,6 +74,85 @@ WORKFORCE_DELEGATION_PUBLIC_FIELDS = (
 )
 
 
+# What a guest (widget / share) socket keeps from an LLM trace event: metadata
+# and model output. The request messages sent to the model are never forwarded.
+PUBLIC_AUDIENCE_LLM_FIELDS = frozenset(
+    {
+        "model_name",
+        "selected_model",
+        "task_type",
+        "step_id",
+        "step_name",
+        "dag_step_id",
+        "phase",
+        "iteration",
+        "task_id",
+        "execution_id",
+        "turn_id",
+        "stream_message_id",
+        "pattern",
+        "status",
+        "success",
+        "context_messages_count",
+        "tools_count",
+        "context_tokens",
+        "context_threshold",
+        "context_window",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "cached_input_tokens",
+        "finish_reason",
+        "usage_missing",
+        "response",
+        "error",
+        "error_message",
+        "error_type",
+        # Delegated child-agent attribution: the widget routes child LLM
+        # events into the delegated step by these.
+        "source",
+        "worker_task_id",
+        "parent_task_id",
+        "agent_id",
+        "agent_name",
+        "workforce_run_id",
+        "workforce_id",
+        "workforce_name",
+        "worker_member_id",
+        "worker_alias",
+    }
+)
+
+
+def _is_llm_event_type(event_type: Any) -> bool:
+    return isinstance(event_type, str) and (
+        event_type.startswith("llm_") or event_type.endswith("_llm")
+    )
+
+
+def _public_audience_trace_data(event_type: Any, data: Any) -> Any:
+    if not _is_llm_event_type(event_type):
+        return data
+    if not isinstance(data, dict):
+        return {}
+    return {
+        key: value for key, value in data.items() if key in PUBLIC_AUDIENCE_LLM_FIELDS
+    }
+
+
+def public_audience_frame(frame: Any) -> Any:
+    """Project an outbound websocket frame for a widget / share guest socket.
+
+    Never mutates ``frame``: other audiences receive it unchanged.
+    """
+    if not isinstance(frame, dict) or frame.get("type") != "trace_event":
+        return frame
+    return {
+        **frame,
+        "data": _public_audience_trace_data(frame.get("event_type"), frame.get("data")),
+    }
+
+
 def public_task_trace_filter(trace_model: Any) -> Any:
     """Include top-level task traces and delegated child-agent traces."""
     return or_(
