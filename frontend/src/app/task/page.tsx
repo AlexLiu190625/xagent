@@ -1,10 +1,11 @@
 "use client";
 
-import React, { useState, useEffect, useMemo, useRef } from "react";
+import React, { useState, useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import Image from "next/image";
 import { Bot, CalendarDays, PenLine } from "lucide-react";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
+import { useAuth } from "@/contexts/auth-context";
 import { ChatStartScreen, AgentCard } from "@/components/chat/ChatStartScreen";
 import { FilePreviewDialog } from "@/components/file/file-preview-dialog";
 import { getBrandingFromEnv } from "@/lib/branding";
@@ -25,6 +26,13 @@ function firstNonBlankPrompt(prompts?: Array<string | undefined | null>): string
 }
 
 function TaskHomePageContent() {
+  // Each keyed draft owns its create until it is replaced or left. Revoke
+  // synchronously at commit, before a pending response can adopt its task.
+  const ownsTaskCreation = useRef(false);
+  useLayoutEffect(() => {
+    ownsTaskCreation.current = true;
+    return () => { ownsTaskCreation.current = false; };
+  }, []);
   const { t, locale } = useI18n();
   const { sendMessage, state, dispatch, closeFilePreview } = useApp();
   const searchParams = useSearchParams();
@@ -325,7 +333,7 @@ function TaskHomePageContent() {
     }
   }, [resolvedSelectedAgents, inputValue]);
 
-  const handleSend = async (message: string, filesToSend: File[], config?: any) => {
+  const handleSend = async (message: string, filesToSend: File[], config?: Parameters<React.ComponentProps<typeof ChatStartScreen>["onSend"]>[2]) => {
     if (state.isProcessing) return;
 
     const agentId = toAgentId(selectedAgents[0]);
@@ -333,10 +341,14 @@ function TaskHomePageContent() {
       ...config,
       agentId: agentId ?? undefined,
     };
+    if (agentId === null) delete nextConfig.agentId;
 
     try {
       // Use sendMessage from AppContext - it will create task and send files via WebSocket
-      await sendMessage(message, nextConfig, filesToSend || files);
+      await sendMessage(message, nextConfig, filesToSend || files, {
+        canAdoptCreatedTask: () => ownsTaskCreation.current,
+      });
+      if (!ownsTaskCreation.current) return;
 
       setFiles([]);
       setInputValue("");
@@ -481,4 +493,11 @@ function TaskHomePageContent() {
   );
 }
 
-export default TaskHomePageContent;
+export default function TaskHomePage() {
+  const { user } = useAuth();
+  const searchParams = useSearchParams();
+  // A route change can keep /task mounted. Scope the entire draft (including
+  // pending config reads and the applied-query latch) to this task intent.
+  const intent = JSON.stringify([user?.id, searchParams.get("agent"), searchParams.get("new")]);
+  return <TaskHomePageContent key={intent} />;
+}
