@@ -1,6 +1,7 @@
 """The tenant key written to each task command row and used to account for dispatch slots."""
 
 import asyncio
+import contextlib
 import itertools
 from types import SimpleNamespace
 
@@ -90,19 +91,18 @@ def host(tmp_path, monkeypatch):
                 )
                 db.commit()
 
-        def command_updates(self):
-            updates: list[str] = []
+        @contextlib.contextmanager
+        def statements(self):
+            seen: list[str] = []
 
             def record(_conn, _cursor, statement, *_args):
-                if statement.lstrip().startswith("UPDATE task_execution_commands"):
-                    updates.append(statement)
+                seen.append(" ".join(statement.split()))
 
             sa.event.listen(engine, "before_cursor_execute", record)
-            self._listener = record
-            return updates
-
-        def stop_recording(self):
-            sa.event.remove(engine, "before_cursor_execute", self._listener)
+            try:
+                yield seen
+            finally:
+                sa.event.remove(engine, "before_cursor_execute", record)
 
     try:
         yield Host()
@@ -123,31 +123,67 @@ def test_a_new_execution_command_defaults_to_the_owner_key(host):
     assert host.key(staged.staged_db_id) == f"user:{host.user}"
 
 
-def test_a_classifier_key_is_written_with_the_class_in_one_flush(host):
-    admission.set_command_classifier(
-        classifier_returning(
-            dispatch_class=DISPATCH_CLASS_INTERACTIVE, fairness_key="team:7"
+@pytest.mark.parametrize(
+    "result,updates",
+    [
+        ({"fairness_key": "team:7"}, 1),
+        (
+            {"dispatch_class": DISPATCH_CLASS_INTERACTIVE, "fairness_key": "team:7"},
+            1,
         ),
-        admission_enabled=False,
+        ({"fairness_key": "owner"}, 0),
+    ],
+    ids=["key_only", "key_and_class", "key_equals_default"],
+)
+def test_a_classifier_key_is_written_in_the_flush_that_writes_the_class(
+    host, result, updates
+):
+    expected = result["fairness_key"]
+    if expected == "owner":
+        expected = result["fairness_key"] = f"user:{host.user}"
+    admission.set_command_classifier(
+        classifier_returning(**result), admission_enabled=False
     )
     task_id = host.task()
-    updates = host.command_updates()
-    try:
-        staged = host.stage(KINDS.START, task_id=task_id)
-    finally:
-        host.stop_recording()
-    assert host.key(staged.staged_db_id) == "team:7"
-    assert len(updates) == 1
-    assert "fairness_key" in updates[0] and "dispatch_class" in updates[0]
+    with host.sessions() as db, db.no_autoflush, host.statements() as seen:
+        staged = transport.stage_task_command(
+            db,
+            task_id=task_id,
+            actor_user_id=host.user,
+            command_id="start-1",
+            kind=KINDS.START,
+            payload={},
+        )
+        # Read before the commit and without autoflush: only a row the
+        # acceptance step flushed shows the key.
+        written = db.execute(
+            sa.select(TaskExecutionCommand.fairness_key).where(
+                TaskExecutionCommand.id == staged.staged_db_id
+            )
+        ).scalar_one()
+        db.commit()
+    assert written == expected
+    changes = [s for s in seen if s.startswith("UPDATE task_execution_commands")]
+    assert len(changes) == updates
+    if "dispatch_class" in result:
+        assert "fairness_key" in changes[0] and "dispatch_class" in changes[0]
 
 
-@pytest.mark.parametrize("bad", ["", "x" * 65, 5])
-def test_an_invalid_key_is_refused_and_the_enqueue_leaves_no_row(host, bad):
+@pytest.mark.parametrize(
+    "key,valid",
+    [("x", True), ("x" * 64, True), ("", False), ("x" * 65, False), (5, False)],
+    ids=["one", "longest", "empty", "too_long", "not_text"],
+)
+def test_only_a_text_key_of_one_to_sixty_four_characters_is_accepted(host, key, valid):
+    if valid:
+        assert admission.CommandClassification(fairness_key=key).fairness_key == key
+        return
     with pytest.raises(ValueError, match="Invalid fairness key"):
-        admission.CommandClassification(fairness_key=bad)
+        admission.CommandClassification(fairness_key=key)
 
+    # An enqueue whose classifier returns it leaves no row behind.
     def classify(db, command, view):
-        return admission.CommandClassification(fairness_key=bad)
+        return admission.CommandClassification(fairness_key=key)
 
     admission.set_command_classifier(classify, admission_enabled=False)
     task_id = host.task()
@@ -165,56 +201,45 @@ def test_an_invalid_key_is_refused_and_the_enqueue_leaves_no_row(host, bad):
         assert db.query(TaskExecutionCommand).count() == 0
 
 
-def test_the_longest_valid_key_is_accepted():
-    assert admission.CommandClassification(fairness_key="x" * 64).fairness_key == (
-        "x" * 64
-    )
-    assert admission.CommandClassification(fairness_key="x").fairness_key == "x"
-
-
-def test_a_control_command_takes_the_key_of_the_latest_command_of_its_task(host):
-    admission.set_command_classifier(
-        classifier_returning(fairness_key="team:7"), admission_enabled=False
-    )
-    task_id = host.task()
-    host.stage(KINDS.START, task_id=task_id)
-    cancel = host.stage(KINDS.CANCEL, task_id=task_id)
-    assert host.key(cancel.staged_db_id) == "team:7"
-
-
-def test_a_control_command_after_pre_migration_rows_takes_the_empty_key(host):
-    task_id = host.task()
-    host.seed(task_id, "start", "")
-    cancel = host.stage(KINDS.CANCEL, task_id=task_id)
-    assert host.key(cancel.staged_db_id) == ""
-
-
-def test_a_control_command_of_a_task_without_commands_takes_the_owner_key(host):
-    task_id = host.task()
-    pause = host.stage(KINDS.PAUSE, task_id=task_id)
-    assert host.key(pause.staged_db_id) == f"user:{host.user}"
+# Earlier commands as (task, key), oldest first; task 1 is another task.
+@pytest.mark.parametrize(
+    "earlier,expected",
+    [
+        ([], "owner"),
+        ([(0, "")], ""),
+        ([(0, "team:7")], "team:7"),
+        ([(0, "team:1"), (0, "team:7")], "team:7"),
+        ([(0, "team:7"), (1, "team:9")], "team:7"),
+    ],
+    ids=["none", "pre_migration", "one", "latest_of_two", "other_task_newer"],
+)
+def test_a_control_command_takes_the_key_of_the_latest_command_of_its_task(
+    host, earlier, expected
+):
+    tasks = [host.task(), host.task()]
+    for task_index, key in earlier:
+        host.seed(tasks[task_index], "start", key)
+    cancel = host.stage(KINDS.CANCEL, task_id=tasks[0])
+    expected = f"user:{host.user}" if expected == "owner" else expected
+    assert host.key(cancel.staged_db_id) == expected
 
 
 def test_a_repeated_command_id_changes_nothing(host):
     task_id = host.task()
     first = host.stage(KINDS.START, task_id=task_id, command_id="same")
-    updates = host.command_updates()
-    try:
+    with host.statements() as seen:
         replay = host.stage(KINDS.START, task_id=task_id, command_id="same")
-    finally:
-        host.stop_recording()
     assert replay.created is False
     assert replay.staged_db_id == first.staged_db_id
     assert host.key(first.staged_db_id) == f"user:{host.user}"
-    assert updates == []
+    assert not [s for s in seen if s.startswith("UPDATE task_execution_commands")]
 
 
 # --- dispatch candidate and claim statements ----------------------------------
 
 CLAIM_STATEMENTS = 4  # statements one claim issues
 POLICY = DispatchPolicy(limit=2, interactive_reserve=1)
-# (name, tasks already active besides the candidate's, the candidate's task is
-# active too, expected statements, a candidate is found)
+# (name, other active tasks, candidate's task active too, statements, found)
 CAP_STATES = [
     ("open", frozenset(), False, 2, True),
     ("batch_line", frozenset({9001}), False, 2, True),
@@ -224,17 +249,9 @@ CAP_STATES = [
 
 
 def captured_statements(host, action):
-    statements: list[str] = []
-
-    def record(_conn, _cursor, statement, *_args):
-        statements.append(" ".join(statement.split()))
-
-    sa.event.listen(host.engine, "before_cursor_execute", record)
-    try:
+    with host.statements() as seen:
         result = action()
-    finally:
-        sa.event.remove(host.engine, "before_cursor_execute", record)
-    return result, statements
+    return result, seen
 
 
 def assert_key_only_in_the_select_list(statements):
@@ -348,11 +365,10 @@ def reserve(manager, task_id, key):
     return token
 
 
-async def test_slots_are_counted_per_tenant_and_a_task_already_active_keeps_its_key():
+async def test_a_task_already_active_keeps_its_key():
     manager = BackgroundTaskManager()
     reserve(manager, 7, "team:1")
     reserve(manager, 8, "team:1")
-    assert manager.slot_tenant_counts() == (1, 2)
 
     reserve(manager, 7, "team:2")
 
@@ -360,28 +376,24 @@ async def test_slots_are_counted_per_tenant_and_a_task_already_active_keeps_its_
     assert manager._slot_keys == {7: "team:1", 8: "team:1"}
 
 
-async def test_the_tenant_with_most_slots_sets_the_top_count():
+@pytest.mark.parametrize(
+    "reservations,expected",
+    [
+        ([(7, "team:1"), (8, "team:1")], (1, 2)),
+        ([(1, "a"), (2, "a"), (3, "a"), (4, "b"), (5, "c")], (3, 3)),
+        # The empty key of a pre-migration row is an ordinary tenant.
+        ([(3, "")], (1, 1)),
+        # A reservation without a key records nothing.
+        ([(3, None)], (0, 0)),
+    ],
+    ids=["one_tenant", "largest_of_three", "empty_key", "no_key"],
+)
+async def test_slots_are_counted_per_tenant(reservations, expected):
     manager = BackgroundTaskManager()
-    for task_id, key in ((1, "a"), (2, "a"), (3, "a"), (4, "b"), (5, "c")):
+    for task_id, key in reservations:
         reserve(manager, task_id, key)
-    assert manager.slot_tenant_counts() == (3, 3)
-
-
-async def test_a_manager_without_slots_reports_zero():
-    assert BackgroundTaskManager().slot_tenant_counts() == (0, 0)
-
-
-async def test_the_empty_key_of_a_pre_migration_row_is_an_ordinary_tenant():
-    manager = BackgroundTaskManager()
-    reserve(manager, 3, "")
-    assert manager.slot_tenant_counts() == (1, 1)
-
-
-async def test_a_reservation_without_a_key_records_nothing():
-    manager = BackgroundTaskManager()
-    assert manager.reserve_dispatch_slot(3, policy=LARGE, interactive=False)
-    assert manager._slot_keys == {}
-    assert manager.slot_tenant_counts() == (0, 0)
+    assert manager.slot_tenant_counts() == expected
+    assert manager._slot_keys == {t: k for t, k in reservations if k is not None}
 
 
 async def test_an_execution_registered_outside_the_dispatcher_counts_for_no_tenant():
@@ -426,15 +438,13 @@ async def test_the_key_map_is_cleaned_only_by_the_cap_snapshot():
     assert manager._slot_keys == {}
 
 
-async def test_shutdown_clears_the_key_map():
-    manager = BackgroundTaskManager()
-    reserve(manager, 7, "team:1")
-    await manager.shutdown()
-    assert manager._slot_keys == {}
-
-
-async def test_start_accepting_clears_a_stale_key_map_and_does_not_count_it_as_work():
+@pytest.mark.parametrize("ending", ["shutdown", "start_accepting"])
+async def test_the_key_map_is_cleared_with_the_other_tables(ending):
     manager = BackgroundTaskManager()
     manager._slot_keys[7] = "team:1"
-    manager.start_accepting()
+    if ending == "shutdown":
+        await manager.shutdown()
+    else:
+        # Leftover keys are derived accounting, not background work: no refusal.
+        manager.start_accepting()
     assert manager._slot_keys == {}
