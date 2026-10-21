@@ -558,3 +558,60 @@ async def test_gate_held_after_shutdown_and_new_lifespan(manager, monkeypatch, r
         clock.now = 6.0
         manager.start_accepting()
         assert drain(10) == 0.0
+
+
+def _counters(**overrides) -> process_diagnostics.ExecutionCounters:
+    fields = {
+        "role": "combined",
+        "pid": 1,
+        "window_s": 60.0,
+        "inflight": 0,
+        "resume_inflight": 0,
+        "started": 0,
+        "finished_ok": 0,
+        "finished_failed": 0,
+        "finished_cancelled": 0,
+        "gate_held_s": 0.0,
+        "slot_tenants": 0,
+        "slot_top": 0,
+        "loop_lag_max_ms": 0.0,
+        "loop_lag_samples": 0,
+    }
+    fields.update(overrides)
+    return process_diagnostics.ExecutionCounters(**fields)
+
+
+def test_the_line_reports_slot_tenants_between_the_gate_and_the_loop_lag():
+    line = _counters(slot_tenants=2, slot_top=3).format_line()
+    assert " gate_held_s=0.0 slot_tenants=2 slot_top=3 loop_lag_max_ms=0.0 " in line
+
+
+@pytest.mark.asyncio
+async def test_drain_reads_the_slot_tenant_counts_from_the_manager(
+    manager, monkeypatch
+):
+    monkeypatch.setenv("XAGENT_TASK_EXECUTION_ROLE", "combined")
+    monkeypatch.setattr(process_diagnostics._window, "started_at", 0.0)
+    policy = DispatchPolicy(limit=10, interactive_reserve=0)
+    for task_id, key in ((1, "team:1"), (2, "team:1"), (3, "team:2")):
+        assert manager.reserve_dispatch_slot(
+            task_id, policy=policy, interactive=False, fairness_key=key
+        )
+
+    counters = process_diagnostics.drain_execution_counters(now=10.0)
+
+    assert (counters.slot_tenants, counters.slot_top) == (2, 2)
+    assert " slot_tenants=2 slot_top=2 " in counters.format_line()
+
+
+@pytest.mark.asyncio
+async def test_a_process_that_dispatches_nothing_reports_no_slot_tenants(
+    manager, monkeypatch
+):
+    monkeypatch.setenv("XAGENT_TASK_EXECUTION_ROLE", "combined")
+    monkeypatch.setattr(process_diagnostics._window, "started_at", 0.0)
+
+    counters = process_diagnostics.drain_execution_counters(now=10.0)
+
+    assert (counters.slot_tenants, counters.slot_top) == (0, 0)
+    assert " slot_tenants=0 slot_top=0 " in counters.format_line()

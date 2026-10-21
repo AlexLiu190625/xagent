@@ -5,7 +5,8 @@ INFO line per window, whether or not anything happened::
 
     runtime diagnostics role=worker pid=4242 window_s=60.0 inflight=1
     resume_inflight=0 started_1m=2 finished_1m=1 ok=1 failed=0 cancelled=0
-    gate_held_s=0.0 loop_lag_max_ms=12.3 loop_lag_samples=0
+    gate_held_s=0.0 slot_tenants=1 slot_top=1 loop_lag_max_ms=12.3
+    loop_lag_samples=0
 
 The line is unconditional and has no switch: a process whose pid stops
 appearing for two windows is gone or has a blocked event loop, and an idle
@@ -48,6 +49,13 @@ Field meanings:
   at each dispatch attempt and at the flush, so each change
   is late by at most the gap between attempts (0.5 s while the dispatcher is
   idle). Always ``0.0`` in a process that does not dispatch task commands.
+- ``slot_tenants``: how many tenant keys the tasks hold that this process
+  started through its dispatcher and that are still active. Executions
+  started outside the dispatcher are not counted.
+- ``slot_top``: how many of those tasks the largest tenant holds. Both values
+  are read at the flush, like ``inflight``, not summed over the window. They
+  are ``0`` in a process that does not dispatch task commands, and without
+  shared execution, where dispatch takes no slot reservation.
 - ``loop_lag_max_ms`` / ``loop_lag_samples``: largest event-loop scheduling
   delay seen by a 1-second sampler, and the number of samples delayed by at
   least 500 ms.
@@ -81,6 +89,8 @@ class ExecutionCounters:
     finished_failed: int
     finished_cancelled: int
     gate_held_s: float
+    slot_tenants: int
+    slot_top: int
     loop_lag_max_ms: float
     loop_lag_samples: int
 
@@ -97,6 +107,7 @@ class ExecutionCounters:
             f"ok={self.finished_ok} failed={self.finished_failed} "
             f"cancelled={self.finished_cancelled} "
             f"gate_held_s={self.gate_held_s:.1f} "
+            f"slot_tenants={self.slot_tenants} slot_top={self.slot_top} "
             f"loop_lag_max_ms={self.loop_lag_max_ms:.1f} "
             f"loop_lag_samples={self.loop_lag_samples}"
         )
@@ -149,6 +160,7 @@ def drain_execution_counters(now: float | None = None) -> ExecutionCounters:
     inflight, resume_inflight = background_task_manager.inflight_counts()
     started, ok, failed, cancelled = background_task_manager.drain_window_counts()
     gate_held_s = min(background_task_manager.drain_gate_held_seconds(now), window_s)
+    slot_tenants, slot_top = background_task_manager.slot_tenant_counts()
     counters = ExecutionCounters(
         role=_resolve_role(),
         pid=os.getpid(),
@@ -160,6 +172,8 @@ def drain_execution_counters(now: float | None = None) -> ExecutionCounters:
         finished_failed=failed,
         finished_cancelled=cancelled,
         gate_held_s=gate_held_s,
+        slot_tenants=slot_tenants,
+        slot_top=slot_top,
         loop_lag_max_ms=_window.lag_max_ms,
         loop_lag_samples=_window.lag_samples,
     )
