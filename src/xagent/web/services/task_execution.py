@@ -4790,6 +4790,14 @@ class BackgroundTaskManager:
         # One entry per in-flight dispatch attempt that took a slot for a task
         # and has not yet seen its execution registered or the attempt end.
         self._dispatch_reservations: Counter[int] = Counter()
+        # The tenant key of each task that took its slot from the dispatcher,
+        # read and written on the event-loop thread only. The cap snapshot is
+        # the one place that drops entries: a task that has left the active set
+        # is removed at the next snapshot. A task that releases its slot and
+        # re-enters the active set outside the dispatcher before that snapshot
+        # keeps its old key; that only affects the per-tenant counts of the
+        # diagnostics line.
+        self._slot_keys: dict[int, str] = {}
         # Time this process spent at its dispatch cap, for the diagnostics
         # line's ``gate_held_s``. Observed at every cap snapshot and at each
         # drain; between two observations the earlier one's state is assumed.
@@ -4843,16 +4851,43 @@ class BackgroundTaskManager:
             now,
         )
 
-    def dispatch_cap_snapshot(self, policy: DispatchPolicy) -> DispatchCapSnapshot:
-        snapshot = DispatchCapSnapshot(
-            policy=policy, active_ids=self._active_task_ids()
+    def _tenant_occupancy(self, active: frozenset[int]) -> Counter[str]:
+        """The active tasks that took their slot from the dispatcher, per tenant key.
+
+        Read-only. A task started outside the dispatcher has no key and counts
+        for no tenant.
+        """
+        return Counter(
+            key for task_id, key in self._slot_keys.items() if task_id in active
         )
+
+    def slot_tenant_counts(self) -> tuple[int, int]:
+        """How many tenants hold dispatcher slots, and the most slots one holds.
+
+        Reads the active set without taking a cap snapshot, so it does not
+        move the cap clock, and never changes ``_slot_keys``.
+        """
+        occupancy = self._tenant_occupancy(self._active_task_ids())
+        if not occupancy:
+            return (0, 0)
+        return (len(occupancy), max(occupancy.values()))
+
+    def dispatch_cap_snapshot(self, policy: DispatchPolicy) -> DispatchCapSnapshot:
+        active = self._active_task_ids()
+        for task_id in [t for t in self._slot_keys if t not in active]:
+            del self._slot_keys[task_id]
+        snapshot = DispatchCapSnapshot(policy=policy, active_ids=active)
         self._cap_last_policy = policy
         self._record_cap_state(snapshot.closed, self._cap_clock())
         return snapshot
 
     def reserve_dispatch_slot(
-        self, task_id: int, *, policy: DispatchPolicy, interactive: bool
+        self,
+        task_id: int,
+        *,
+        policy: DispatchPolicy,
+        interactive: bool,
+        fairness_key: str | None = None,
     ) -> DispatchReservation | None:
         """Take a slot for ``task_id`` unless the policy keeps it from this command.
 
@@ -4860,13 +4895,15 @@ class BackgroundTaskManager:
         batch command is refused from the batch line on, an interactive one
         only at the limit. Reads the active set and adds the token with no
         await in between, so concurrent dispatch attempts cannot both take
-        the last slot.
+        the last slot. Records ``fairness_key`` for a task that was not yet
+        active; a task already in the active set keeps its recorded key.
         """
 
-        if not self.dispatch_cap_snapshot(policy).admits(
-            task_id, interactive=interactive
-        ):
+        snapshot = self.dispatch_cap_snapshot(policy)
+        if not snapshot.admits(task_id, interactive=interactive):
             return None
+        if fairness_key is not None and task_id not in snapshot.active_ids:
+            self._slot_keys[task_id] = fairness_key
         self._dispatch_reservations[task_id] += 1
         return DispatchReservation(task_id)
 
@@ -4899,6 +4936,7 @@ class BackgroundTaskManager:
         # so an idle manager must not retain the previous lifespan's lock.
         self._shutdown_lock = asyncio.Lock()
         self._shutting_down = False
+        self._slot_keys.clear()
         self.drain_window_counts()
         self._cap_last_policy = None
         self._cap_closed_since = None
@@ -5336,6 +5374,7 @@ class BackgroundTaskManager:
                 self._resume_owner_started_at.clear()
                 self._live_executions.clear()
                 self._dispatch_reservations.clear()
+                self._slot_keys.clear()
                 # The tables are empty now; close any cap interval here so
                 # the final diagnostics line does not count later shutdown
                 # steps as time at the cap.

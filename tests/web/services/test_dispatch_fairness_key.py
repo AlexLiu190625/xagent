@@ -1,6 +1,8 @@
 """The tenant key written to each task command row and used to account for dispatch slots."""
 
+import asyncio
 import itertools
+from types import SimpleNamespace
 
 import pytest
 import sqlalchemy as sa
@@ -12,8 +14,15 @@ from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.user import User
 from xagent.web.services import task_command_transport as transport
+from xagent.web.services import task_coordinator_runtime as runtime
+from xagent.web.services import task_execution
 from xagent.web.services import task_execution_admission as admission
-from xagent.web.services.task_dispatch_cap import DISPATCH_CLASS_INTERACTIVE
+from xagent.web.services.task_dispatch_cap import (
+    DISPATCH_CLASS_INTERACTIVE,
+    DispatchCapSnapshot,
+    DispatchPolicy,
+)
+from xagent.web.services.task_execution import BackgroundTaskManager
 
 KINDS = transport.TaskCommandKind
 
@@ -198,3 +207,234 @@ def test_a_repeated_command_id_changes_nothing(host):
     assert replay.staged_db_id == first.staged_db_id
     assert host.key(first.staged_db_id) == f"user:{host.user}"
     assert updates == []
+
+
+# --- dispatch candidate and claim statements ----------------------------------
+
+CLAIM_STATEMENTS = 4  # statements one claim issues
+POLICY = DispatchPolicy(limit=2, interactive_reserve=1)
+# (name, tasks already active besides the candidate's, the candidate's task is
+# active too, expected statements, a candidate is found)
+CAP_STATES = [
+    ("open", frozenset(), False, 2, True),
+    ("batch_line", frozenset({9001}), False, 2, True),
+    ("full", frozenset({9001, 9002}), False, 1, False),
+    ("full_task_active", frozenset({9001}), True, 1, True),
+]
+
+
+def captured_statements(host, action):
+    statements: list[str] = []
+
+    def record(_conn, _cursor, statement, *_args):
+        statements.append(" ".join(statement.split()))
+
+    sa.event.listen(host.engine, "before_cursor_execute", record)
+    try:
+        result = action()
+    finally:
+        sa.event.remove(host.engine, "before_cursor_execute", record)
+    return result, statements
+
+
+def assert_key_only_in_the_select_list(statements):
+    for statement in statements:
+        head, _, rest = statement.partition(" FROM ")
+        assert "fairness_key" not in rest, statement
+
+
+def staged_interactive_start(host, kind=KINDS.START):
+    admission.set_command_classifier(
+        classifier_returning(
+            dispatch_class=DISPATCH_CLASS_INTERACTIVE, fairness_key="team:7"
+        ),
+        admission_enabled=False,
+    )
+    task_id = host.task()
+    return task_id, host.stage(kind, task_id=task_id)
+
+
+@pytest.mark.parametrize(
+    "state,others,task_active,expected_statements,found", CAP_STATES
+)
+def test_the_candidate_scan_carries_the_row_key_and_adds_no_statement(
+    host, state, others, task_active, expected_statements, found
+):
+    task_id, staged = staged_interactive_start(host)
+    active = others | ({task_id} if task_active else frozenset())
+    cap = DispatchCapSnapshot(policy=POLICY, active_ids=frozenset(active))
+
+    candidate, statements = captured_statements(
+        host, lambda: transport._find_command_candidate(None, (), cap)
+    )
+
+    assert len(statements) == expected_statements
+    assert_key_only_in_the_select_list(statements)
+    if found:
+        assert candidate is not None
+        assert candidate.id == staged.staged_db_id
+        assert candidate.fairness_key == "team:7"
+    else:
+        assert candidate is None
+
+
+def test_the_claim_lookup_adds_no_statement_and_keeps_the_key_in_the_select_list(
+    host, monkeypatch
+):
+    # Without shared execution the claim is a plain lookup and update, with no
+    # task lease to hold; START stays dormant there, so claim a message.
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "false")
+    task_id, staged = staged_interactive_start(host, KINDS.MESSAGE)
+    cap = DispatchCapSnapshot(policy=POLICY, active_ids=frozenset())
+
+    def claim():
+        with host.sessions() as db:
+            claimed = transport.claim_task_command(
+                db, runner_id="worker", command_db_id=staged.staged_db_id, cap=cap
+            )
+            db.commit()
+            return claimed
+
+    claimed, statements = captured_statements(host, claim)
+
+    assert claimed is not None
+    assert len(statements) == CLAIM_STATEMENTS
+    assert_key_only_in_the_select_list(statements)
+
+
+async def test_dispatch_passes_the_candidate_key_to_the_slot_reservation(
+    host, monkeypatch
+):
+    manager = BackgroundTaskManager()
+    monkeypatch.setattr(task_execution, "background_task_manager", manager)
+    monkeypatch.setattr(
+        runtime,
+        "get_task_coordinator_registry",
+        lambda: SimpleNamespace(busy_command_tasks=lambda: set()),
+    )
+    monkeypatch.setattr(
+        transport,
+        "_find_command_candidate",
+        lambda *_args: transport.CommandCandidate(11, 5, KINDS.START, True, "team:3"),
+    )
+    seen: list[dict] = []
+
+    def reserve(task_id, **kwargs):
+        seen.append({"task_id": task_id, **kwargs})
+        return None
+
+    monkeypatch.setattr(manager, "reserve_dispatch_slot", reserve)
+
+    async def executor(command):
+        raise AssertionError("no command should be applied")
+
+    assert await transport.dispatch_one_task_command(executor) is False
+    assert len(seen) == 1
+    assert seen[0]["task_id"] == 5
+    assert seen[0]["interactive"] is True
+    assert seen[0]["fairness_key"] == "team:3"
+
+
+# --- slot accounting per tenant ------------------------------------------------
+
+LARGE = DispatchPolicy(limit=10, interactive_reserve=0)
+
+
+def reserve(manager, task_id, key):
+    token = manager.reserve_dispatch_slot(
+        task_id, policy=LARGE, interactive=False, fairness_key=key
+    )
+    assert token is not None
+    return token
+
+
+async def test_slots_are_counted_per_tenant_and_a_task_already_active_keeps_its_key():
+    manager = BackgroundTaskManager()
+    reserve(manager, 7, "team:1")
+    reserve(manager, 8, "team:1")
+    assert manager.slot_tenant_counts() == (1, 2)
+
+    reserve(manager, 7, "team:2")
+
+    assert manager.slot_tenant_counts() == (1, 2)
+    assert manager._slot_keys == {7: "team:1", 8: "team:1"}
+
+
+async def test_the_tenant_with_most_slots_sets_the_top_count():
+    manager = BackgroundTaskManager()
+    for task_id, key in ((1, "a"), (2, "a"), (3, "a"), (4, "b"), (5, "c")):
+        reserve(manager, task_id, key)
+    assert manager.slot_tenant_counts() == (3, 3)
+
+
+async def test_a_manager_without_slots_reports_zero():
+    assert BackgroundTaskManager().slot_tenant_counts() == (0, 0)
+
+
+async def test_the_empty_key_of_a_pre_migration_row_is_an_ordinary_tenant():
+    manager = BackgroundTaskManager()
+    reserve(manager, 3, "")
+    assert manager.slot_tenant_counts() == (1, 1)
+
+
+async def test_a_reservation_without_a_key_records_nothing():
+    manager = BackgroundTaskManager()
+    assert manager.reserve_dispatch_slot(3, policy=LARGE, interactive=False)
+    assert manager._slot_keys == {}
+    assert manager.slot_tenant_counts() == (0, 0)
+
+
+async def test_an_execution_registered_outside_the_dispatcher_counts_for_no_tenant():
+    manager = BackgroundTaskManager()
+    finish = asyncio.Event()
+    handle = asyncio.get_running_loop().create_task(finish.wait())
+    try:
+        manager.register_task(21, handle)
+        assert 21 in manager._active_task_ids()
+        assert manager.slot_tenant_counts() == (0, 0)
+    finally:
+        finish.set()
+        await handle
+
+
+async def test_the_key_map_is_cleaned_only_by_the_cap_snapshot():
+    manager = BackgroundTaskManager()
+
+    # A reservation that ends without an execution.
+    token = reserve(manager, 7, "team:1")
+    manager.release_dispatch_slot(token)
+    assert manager._slot_keys == {7: "team:1"}
+    assert manager.slot_tenant_counts() == (0, 0)
+    assert manager._slot_keys == {7: "team:1"}
+    manager.dispatch_cap_snapshot(LARGE)
+    assert manager._slot_keys == {}
+
+    # A reservation whose execution is registered before the token is released.
+    finish = asyncio.Event()
+    handle = asyncio.get_running_loop().create_task(finish.wait())
+    token = reserve(manager, 8, "team:2")
+    manager.register_task(8, handle)
+    manager.release_dispatch_slot(token)
+    manager.dispatch_cap_snapshot(LARGE)
+    assert manager._slot_keys == {8: "team:2"}
+    assert manager.slot_tenant_counts() == (1, 1)
+
+    finish.set()
+    await handle
+    await asyncio.sleep(0)
+    manager.dispatch_cap_snapshot(LARGE)
+    assert manager._slot_keys == {}
+
+
+async def test_shutdown_clears_the_key_map():
+    manager = BackgroundTaskManager()
+    reserve(manager, 7, "team:1")
+    await manager.shutdown()
+    assert manager._slot_keys == {}
+
+
+async def test_start_accepting_clears_a_stale_key_map_and_does_not_count_it_as_work():
+    manager = BackgroundTaskManager()
+    manager._slot_keys[7] = "team:1"
+    manager.start_accepting()
+    assert manager._slot_keys == {}

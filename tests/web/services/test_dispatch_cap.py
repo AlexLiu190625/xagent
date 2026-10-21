@@ -823,14 +823,25 @@ def take_last_slot_after_snapshot(
     real_reserve = host.manager.reserve_dispatch_slot
     calls: list[int] = []
 
-    def reserve(task_id: int, *, policy: DispatchPolicy, interactive: bool) -> Any:
+    def reserve(
+        task_id: int,
+        *,
+        policy: DispatchPolicy,
+        interactive: bool,
+        fairness_key: str | None = None,
+    ) -> Any:
         if not calls:
             calls.append(task_id)
             assert (
                 real_reserve(other_task_id, policy=policy, interactive=interactive)
                 is not None
             )
-        return real_reserve(task_id, policy=policy, interactive=interactive)
+        return real_reserve(
+            task_id,
+            policy=policy,
+            interactive=interactive,
+            fairness_key=fairness_key,
+        )
 
     monkeypatch.setattr(host.manager, "reserve_dispatch_slot", reserve)
 

@@ -1857,6 +1857,7 @@ class CommandCandidate(NamedTuple):
     task_id: int
     kind: TaskCommandKind
     interactive: bool
+    fairness_key: str = ""
 
 
 def _find_command_candidate(
@@ -1919,6 +1920,7 @@ def _find_command_candidate(
             int(row.task_id),
             TaskCommandKind(row.kind),
             row.dispatch_class == DISPATCH_CLASS_INTERACTIVE,
+            str(row.fairness_key),
         )
 
 
@@ -2006,11 +2008,14 @@ async def dispatch_one_task_command(
         )
         if candidate is None:
             return False
-        selected_id, task_id, kind, interactive = candidate
+        selected_id, task_id, kind, interactive, fairness_key = candidate
         reservation = None
         if kind.value in EXECUTION_OPENING_KINDS:
             reservation = background_task_manager.reserve_dispatch_slot(
-                task_id, policy=cap.policy, interactive=interactive
+                task_id,
+                policy=cap.policy,
+                interactive=interactive,
+                fairness_key=fairness_key,
             )
             if reservation is None:
                 # A candidate picked under a snapshot is one this process could
