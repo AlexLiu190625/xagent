@@ -69,6 +69,7 @@ import { BuildFilePreviewSheet } from "./build-file-preview-sheet"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 import { AgentTriggersDialog } from "./agent-triggers-dialog"
 import { AgentSshBindings } from "./agent-ssh-bindings"
+import { getAgentTaskHref } from "@/lib/agent-ui-access"
 import { PromptContextFieldsEditor } from "./prompt-context-fields-editor"
 import { AgentFlowView } from "./agent-flow-view"
 import { useBuilderCatalog, type AgentModelConfig, type Model } from "./use-builder-catalog"
@@ -2137,7 +2138,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               {isEditMode && originalData?.status === "published" && (
                 <Button
                   variant="secondary"
-                  onClick={() => router.push(`/agent/${localAgentId}`)}
+                  onClick={() => router.push(getAgentTaskHref(localAgentId))}
                   disabled={isCreating || loadingAgent || publishBlockedByEdits || failedStagedTriggers.length > 0 || createdWebhookSecrets.length > 0}
                   title={publishBlockedByEdits ? t("builds.editor.header.saveBeforeChat") : undefined}
                 >
