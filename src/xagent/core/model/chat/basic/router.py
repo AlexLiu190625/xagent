@@ -24,10 +24,18 @@ only before its first chunk. A failure the request itself caused (context
 length, an invalid request, a tool-protocol violation, a refusal that names
 the output budget) never fails over.
 
+A configured fallback is held in reserve: while the Auto model has other
+candidates, routing chooses only between those, and the fallback serves a call
+only when routing fails, the selected candidate is unavailable, or no other
+candidate left after ``XAGENT_XROUTER_EXCLUDED_MODELS`` accepts the request's
+required input modalities. Routing itself is bounded to the candidates that
+accept those modalities; advisory modalities remain a preference within them.
+
 Every decision (prompt, candidate models with their predicted completion and
 cost, and the chosen slug) is logged to a SQLite call history via xrouter-llm's
 CallStore, defaulting to ``<storage_root>/xrouter/calls.db``. A configured Auto
-model with a single eligible candidate makes no decision and logs nothing.
+model with a single eligible candidate besides its fallback makes no decision
+and logs nothing.
 
 Env overrides (all optional; default to the bundled package data):
   XAGENT_XROUTER_MODEL          path to a trained predictor .joblib
@@ -377,6 +385,18 @@ class RouterLLM(BaseLLM):
             and self._fallback_model not in self._candidate_models
         ):
             raise ValueError("The Auto fallback model must be one of its candidates")
+        # The candidates routing chooses between. The fallback sits out while
+        # there is anything else to route to, so it only takes over a call.
+        self._routed_models = (
+            tuple(
+                model
+                for model in self._candidate_models
+                if model != self._fallback_model
+            )
+            or self._candidate_models
+            if self._candidate_models is not None
+            else None
+        )
 
     # ---- BaseLLM interface --------------------------------------------------
     @property
@@ -584,8 +604,41 @@ class RouterLLM(BaseLLM):
             select_kwargs["preferred_input_modalities"] = preferred_input_modalities
         if advisory_input_modalities:
             select_kwargs["advisory_input_modalities"] = advisory_input_modalities
-        model_id = self._sole_candidate(preferred_input_modalities)
+        # Decide once which configured candidates may serve this call, and use
+        # that one decision both to hand the call to a held-back fallback and
+        # to bound routing. xrouter treats modalities only as a preference, so
+        # narrowing to candidates that accept the content's required
+        # modalities is what keeps that content off an incompatible model;
+        # advisory modalities stay a preference within the narrowed pool.
+        model_id: str | None = None
+        candidates = self._eligible_candidates()
+        if candidates is not None and preferred_input_modalities:
+            accepting = await self._candidates_accepting(
+                candidates, preferred_input_modalities
+            )
+            if accepting:
+                candidates = accepting
+            else:
+                model_id = self._usable_fallback(preferred_input_modalities)
+                if model_id is not None:
+                    logger.info(
+                        "No eligible Auto candidate accepts %s; using fallback %s",
+                        ", ".join(preferred_input_modalities),
+                        model_id,
+                    )
+        elif candidates == ():
+            model_id = self._usable_fallback(preferred_input_modalities)
+        if (
+            model_id is None
+            and candidates is not None
+            and len(candidates) == 1
+            and not preferred_input_modalities
+        ):
+            # Nothing to route between: skip just the routing decision.
+            model_id = candidates[0]
         if model_id is None:
+            if candidates is not None:
+                select_kwargs["candidates"] = candidates
             model_id = await self._select_model(prompt, **select_kwargs)
             logger.info("xrouter selected routing profile %s", model_id)
         downstream = self._resolve_downstream(model_id)
@@ -621,21 +674,38 @@ class RouterLLM(BaseLLM):
             and fallback_window < window
         )
 
-    def _sole_candidate(self, required_input_modalities: tuple[str, ...]) -> str | None:
-        """The only configured candidate, when there is nothing to route between.
+    def _eligible_candidates(self) -> tuple[str, ...] | None:
+        """Routed candidates left after ``XAGENT_XROUTER_EXCLUDED_MODELS``.
 
-        Skips just the routing decision. An excluded candidate, or a request
-        whose content needs modalities that routing enforces, still goes
-        through ``_select_model`` so those rules apply exactly as before.
+        ``None`` for legacy Auto, whose pool is xrouter's preset config.
         """
-        if self._candidate_models is None or len(self._candidate_models) != 1:
+        if self._routed_models is None:
             return None
-        if required_input_modalities:
+        excluded = frozenset(get_xrouter_excluded_models())
+        return tuple(model for model in self._routed_models if model not in excluded)
+
+    async def _candidates_accepting(
+        self,
+        candidates: tuple[str, ...],
+        required_input_modalities: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        """The candidates whose profiles accept every required modality."""
+        required = set(required_input_modalities)
+        accepting = []
+        for model in candidates:
+            supported = await asyncio.to_thread(self._profile_input_modalities, model)
+            if required <= set(supported):
+                accepting.append(model)
+        return tuple(accepting)
+
+    def _usable_fallback(
+        self, required_input_modalities: tuple[str, ...]
+    ) -> str | None:
+        """The fallback, when it accepts the call's required modalities."""
+        try:
+            return self._compatible_fallback(required_input_modalities)
+        except RouterModalityRoutingError:
             return None
-        candidate = self._candidate_models[0]
-        if candidate in get_xrouter_excluded_models():
-            return None
-        return candidate
 
     def _resolve_downstream(
         self, model_id: str, *, failover_available: bool = False
@@ -678,10 +748,7 @@ class RouterLLM(BaseLLM):
         """The fallback a call routed to ``selected_model`` may move to."""
         if self._fallback_model is None or self._fallback_model == selected_model:
             return None
-        try:
-            return self._compatible_fallback(required_input_modalities)
-        except RouterModalityRoutingError:
-            return None
+        return self._usable_fallback(required_input_modalities)
 
     def _cooldown_key(self, downstream: BaseLLM) -> str | None:
         # Only a configured candidate names a saved model -- one endpoint and
@@ -756,6 +823,7 @@ class RouterLLM(BaseLLM):
         self,
         prompt: str,
         *,
+        candidates: Optional[Sequence[str]] = None,
         preferred_input_modalities: tuple[str, ...] = (),
         advisory_input_modalities: tuple[str, ...] = (),
     ) -> str:
@@ -768,6 +836,7 @@ class RouterLLM(BaseLLM):
                 prompt,
                 preferred_input_modalities,
                 advisory_input_modalities,
+                candidates,
             )
         except RouterModalityRoutingError:
             raise
@@ -800,8 +869,12 @@ class RouterLLM(BaseLLM):
         prompt: str,
         preferred_input_modalities: tuple[str, ...] = (),
         advisory_input_modalities: tuple[str, ...] = (),
+        candidates: Optional[Sequence[str]] = None,
     ) -> list[str]:
         """Route once.
+
+        ``candidates`` bounds a configured Auto call to the pool already
+        decided for it; without it the router's own pool is used.
 
         ``preferred_input_modalities`` are hard requirements derived from the
         conversation's own content; ``advisory_input_modalities`` are
@@ -847,7 +920,11 @@ class RouterLLM(BaseLLM):
             )
 
         excluded_models = frozenset(get_xrouter_excluded_models())
-        configured_models = tuple(self._candidate_pool(service))
+        configured_models = (
+            tuple(candidates)
+            if candidates is not None
+            else tuple(self._candidate_pool(service))
+        )
         eligible_models = [
             model for model in configured_models if model not in excluded_models
         ]
@@ -870,8 +947,8 @@ class RouterLLM(BaseLLM):
 
     def _candidate_pool(self, service: Any) -> list[str]:
         """Return this Auto model's explicit or preset candidate pool."""
-        if self._candidate_models is not None:
-            return list(self._candidate_models)
+        if self._routed_models is not None:
+            return list(self._routed_models)
         config = getattr(service, "configs", {}).get(self._config_name)
         return list(getattr(config, "models", ()) or ())
 

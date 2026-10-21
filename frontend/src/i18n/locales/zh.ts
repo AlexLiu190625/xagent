@@ -2138,7 +2138,7 @@ const zh = {
       duplicateProfile: "每个路由模型画像只能映射一次。",
       fallback: "兜底模型",
       selectFallback: "选择兜底模型",
-      fallbackHelp: "在路由失败，或选中的模型不可用（服务宕机、超时、限流、额度耗尽、凭证失效、模型不存在）时使用；Auto 不会回退到未配置的 Provider。",
+      fallbackHelp: "还有其他候选时不参与路由；只在路由失败、选中的模型不可用（服务宕机、超时、限流、额度耗尽、凭证失效、模型不存在），或其他候选都不支持所附内容时使用；Auto 不会回退到未配置的 Provider。",
       setDefault: "将 Auto 设为默认模型",
       setDefaultHelp: "新任务默认使用 Auto，除非显式选择其他模型。",
       save: "保存 Auto",

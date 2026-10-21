@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any, AsyncIterator
 
 import httpx
@@ -278,6 +279,9 @@ async def test_nothing_to_fail_over_to_raises(monkeypatch, selected, fallback):
         PRIMARY: _FakeLLM("saved-deepseek", error=error),
         FALLBACK: _FakeLLM("saved-gpt", error=error),
     }
+    if fallback is not None:
+        # Routing only lands on the fallback when it is the last candidate.
+        models = {FALLBACK: models[FALLBACK]}
     router = _router(monkeypatch, models, selected=selected, fallback=fallback)
 
     with pytest.raises(openai.APIConnectionError):
@@ -499,6 +503,207 @@ async def test_sole_candidate_with_required_modalities_goes_through_routing(
     await router.prepare_for_call(IMAGE_MESSAGES)
 
     assert len(router.selections) == 1
+
+
+@pytest.mark.asyncio
+async def test_fallback_is_held_out_of_routing_while_other_candidates_remain(
+    monkeypatch,
+):
+    third = "qwen/qwen3.6-plus"
+    models = {
+        PRIMARY: _FakeLLM("saved-deepseek"),
+        FALLBACK: _FakeLLM("saved-gpt"),
+        third: _FakeLLM("saved-qwen"),
+    }
+    router = _router(monkeypatch, models)
+
+    service = type("Service", (), {"configs": {}})()
+    assert router._candidate_pool(service) == [PRIMARY, third]
+
+    # With one candidate besides the fallback there is nothing to route, and
+    # the fallback still guards that candidate.
+    router = _router(
+        monkeypatch, {PRIMARY: models[PRIMARY], FALLBACK: models[FALLBACK]}
+    )
+    prepared = await router.prepare_for_call(MESSAGES)
+
+    assert router.selections == []
+    assert prepared.model_name == PRIMARY
+    assert await prepared.chat(MESSAGES) == "saved-deepseek"
+    assert (PRIMARY, True) in router.resolutions
+
+
+@pytest.mark.asyncio
+async def test_held_out_fallback_takes_over_an_unavailable_sole_candidate(
+    monkeypatch,
+):
+    primary = _FakeLLM(
+        "saved-deepseek", error=_status_error(openai.InternalServerError, 503)
+    )
+    fallback = _FakeLLM("saved-gpt")
+    router = _router(monkeypatch, {PRIMARY: primary, FALLBACK: fallback})
+
+    prepared = await router.prepare_for_call(MESSAGES)
+
+    assert await prepared.chat(MESSAGES) == "saved-gpt"
+    assert router.selections == []
+    assert (primary.calls, fallback.calls) == (1, 1)
+
+
+@pytest.mark.asyncio
+async def test_held_out_fallback_serves_content_no_routed_candidate_accepts(
+    monkeypatch,
+):
+    primary = _FakeLLM("saved-deepseek")
+    fallback = _FakeLLM("saved-gpt")
+    router = _router(monkeypatch, {PRIMARY: primary, FALLBACK: fallback})
+    monkeypatch.setattr(
+        router,
+        "_profile_input_modalities",
+        lambda model: ("text",) if model == PRIMARY else ("text", "image"),
+    )
+
+    prepared = await router.prepare_for_call(IMAGE_MESSAGES)
+
+    assert router.selections == []
+    assert prepared.model_name == FALLBACK
+    assert await prepared.chat(IMAGE_MESSAGES) == "saved-gpt"
+    assert primary.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_routed_candidate_that_accepts_the_content_keeps_it(monkeypatch):
+    primary = _FakeLLM("saved-deepseek")
+    fallback = _FakeLLM("saved-gpt")
+    router = _router(monkeypatch, {PRIMARY: primary, FALLBACK: fallback})
+    monkeypatch.setattr(
+        router, "_profile_input_modalities", lambda _model: ("text", "image")
+    )
+
+    prepared = await router.prepare_for_call(IMAGE_MESSAGES)
+
+    # Required modalities still go through routing, over the routed pool only.
+    assert len(router.selections) == 1
+    assert prepared.model_name == PRIMARY
+    assert await prepared.chat(IMAGE_MESSAGES) == "saved-deepseek"
+    assert fallback.calls == 0
+
+
+_VISION = "vision/model"
+_TEXT = "text/model"
+_OMNI = "omni/model"
+_PROFILE_MODALITIES = {
+    _VISION: ("text", "image"),
+    _TEXT: ("text",),
+    _OMNI: ("text", "image", "audio"),
+}
+
+
+class _SoftModalityRoutingService:
+    """xrouter 0.3.6's modality contract: a preference, not a filter.
+
+    Keeps only the models that accept every preferred modality when any do,
+    otherwise the whole pool, and then picks the last remaining model -- a
+    permitted policy outcome (say, the cheapest), not a live prediction.
+    """
+
+    configs: dict[str, Any] = {}
+    profiles = SimpleNamespace(
+        get=lambda model: SimpleNamespace(
+            input_modalities=_PROFILE_MODALITIES[model], context_length=None
+        )
+    )
+
+    def __init__(self) -> None:
+        self.routes: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+
+    def route(
+        self,
+        prompt: str,
+        *,
+        config_name: str,
+        models: list[str],
+        preferred_input_modalities: tuple[str, ...] = (),
+    ) -> dict[str, list[str]]:
+        preferred = set(preferred_input_modalities)
+        compatible = [
+            model for model in models if preferred <= set(_PROFILE_MODALITIES[model])
+        ]
+        self.routes.append((tuple(models), tuple(preferred_input_modalities)))
+        return {"selected": [(compatible or models)[-1]]}
+
+
+def _routed_router(
+    monkeypatch: pytest.MonkeyPatch, candidates: list[str], fallback: str | None
+) -> tuple[RouterLLM, _SoftModalityRoutingService]:
+    service = _SoftModalityRoutingService()
+    monkeypatch.setattr(router_module, "_get_service", lambda: service)
+    router = RouterLLM(
+        downstream_resolver=lambda model, **_kwargs: _FakeLLM(model),
+        candidate_models=candidates,
+        fallback_model=fallback,
+        use_environment_fallback=False,
+    )
+    return router, service
+
+
+@pytest.mark.asyncio
+async def test_excluded_candidate_does_not_hold_back_a_compatible_fallback(
+    monkeypatch,
+):
+    monkeypatch.setenv("XAGENT_XROUTER_EXCLUDED_MODELS", _VISION)
+    router, service = _routed_router(monkeypatch, [_VISION, _TEXT, _OMNI], _OMNI)
+
+    prepared = await router.prepare_for_call(IMAGE_MESSAGES)
+
+    # The only image-capable routed candidate is excluded, so the image goes
+    # to the fallback instead of being routed to the text-only candidate.
+    assert prepared.model_name == _OMNI
+    assert service.routes == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fallback", [_OMNI, None], ids=["fallback", "no-fallback"])
+async def test_advisory_modality_cannot_route_hard_content_to_an_incompatible_candidate(
+    monkeypatch, fallback
+):
+    candidates = [_VISION, _TEXT, *([fallback] if fallback else [])]
+    router, service = _routed_router(monkeypatch, candidates, fallback)
+
+    prepared = await router.prepare_for_call(
+        IMAGE_MESSAGES, preferred_input_modalities=("audio",)
+    )
+
+    # Routing is bounded to candidates accepting the image; the advisory audio
+    # preference, which none of them meets, only degrades.
+    assert prepared.model_name == _VISION
+    assert service.routes == [((_VISION,), ("audio", "image"))]
+
+
+@pytest.mark.asyncio
+async def test_routing_is_bounded_to_candidates_accepting_the_content(monkeypatch):
+    third = "vision/other"
+    _PROFILE_MODALITIES[third] = ("text", "image")
+    try:
+        router, service = _routed_router(monkeypatch, [_VISION, _TEXT, third], None)
+
+        prepared = await router.prepare_for_call(IMAGE_MESSAGES)
+    finally:
+        del _PROFILE_MODALITIES[third]
+
+    assert prepared.model_name == third
+    assert service.routes == [((_VISION, third), ("image",))]
+
+
+@pytest.mark.asyncio
+async def test_single_eligible_candidate_after_exclusion_skips_routing(monkeypatch):
+    monkeypatch.setenv("XAGENT_XROUTER_EXCLUDED_MODELS", _VISION)
+    router, service = _routed_router(monkeypatch, [_VISION, _TEXT, _OMNI], _OMNI)
+
+    prepared = await router.prepare_for_call(MESSAGES)
+
+    assert prepared.model_name == _TEXT
+    assert service.routes == []
 
 
 @pytest.mark.asyncio
