@@ -42,8 +42,23 @@ their connect may register a client with the vendor on every call. L2 covers
 them.
 
 L1 cannot detect a missing client secret: the server first reads the secret in
-the OAuth callback, after the vendor's consent screen. That gap is tracked in
-[#3248](https://github.com/xorbitsai/xagent/issues/3248).
+the OAuth callback, after the vendor's consent screen. Missing secrets are
+covered by `python -m xagent.web.oauth_readiness` instead
+([#3248](https://github.com/xorbitsai/xagent/issues/3248)). Run it in the
+backend container through the image entrypoint, which loads `ENCRYPTION_KEY`
+from its key file the same way it does for the server:
+
+```bash
+docker compose exec -T backend /opt/xagent/deploy/entrypoint.sh \
+  python -m xagent.web.oauth_readiness
+```
+
+It prints one line per provider saying whether the client ID and secret
+resolve, and from the `oauth_providers` row or the environment, never a value.
+A row encrypted under another key fails as `unreadable`; a process with no
+usable key fails once as `encryption-key`. It proves a value is present, not
+that the vendor accepts it. Its `--exclude` takes OAuth provider names
+(`google`), not the catalog app IDs this script's `--exclude` takes.
 
 ### Side effects
 
