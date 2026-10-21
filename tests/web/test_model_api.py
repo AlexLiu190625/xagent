@@ -1,6 +1,7 @@
 """Test model management API functionality"""
 
 import asyncio
+import json
 import os
 import tempfile
 from types import SimpleNamespace
@@ -81,6 +82,18 @@ def ensure_system_initialized() -> None:
         )
         assert setup_response.status_code == 200
         assert setup_response.json().get("success") is True
+
+
+@pytest.fixture
+def standalone_hook():
+    from xagent.web.services import quota_hooks
+
+    calls: list = []
+    quota_hooks.set_standalone_usage_hook(
+        lambda user_id, details, source: calls.append((user_id, details, source))
+    )
+    yield SimpleNamespace(calls=calls)
+    quota_hooks.set_standalone_usage_hook(None)
 
 
 @pytest.fixture(scope="function")
@@ -2537,6 +2550,184 @@ class TestModelAPI:
             {"audio": b"audio-bytes", "language": "en", "format": "webm"}
         ]
         assert created_models[0].closed is True
+
+    def _create_asr_model(self, regular_headers, sample_speech_model_data):
+        model = dict(sample_speech_model_data, model_id="test-asr", abilities=["asr"])
+        response = client.post("/api/models/", json=model, headers=regular_headers)
+        assert response.status_code == 200
+        response = client.post(
+            "/api/models/user-default",
+            json={"model_id": response.json()["id"], "config_type": "asr"},
+            headers=regular_headers,
+        )
+        assert response.status_code == 200
+
+    def test_transcribe_speech_bills_the_requesting_user_once(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        sample_speech_model_data,
+        standalone_hook,
+    ):
+        """The real ASR provider records the call; the endpoint delivers it."""
+        from xagent.core.model.asr.xinference import XinferenceASR
+
+        self._create_asr_model(regular_headers, sample_speech_model_data)
+
+        async def transcriptions(**_kwargs):
+            return {"text": "hello", "duration": 2.5}
+
+        async def handle(_self):
+            return SimpleNamespace(transcriptions=transcriptions)
+
+        with patch.object(XinferenceASR, "_ensure_model_handle", handle):
+            response = client.post(
+                "/api/models/speech/transcribe",
+                files={"file": ("voice.wav", b"RIFF", "audio/wav")},
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        [(user_id, details, source)] = standalone_hook.calls
+        assert (user_id, source) == (regular_user["id"], "speech_transcribe")
+        [row] = details
+        assert (row["call_type"], row["quantity"], row["model_id"]) == (
+            "asr",
+            2.5,
+            "test-asr",
+        )
+
+    def test_transcribe_speech_rejected_by_the_provider_bills_nothing(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        sample_speech_model_data,
+        standalone_hook,
+    ):
+        from xagent.core.model.asr.xinference import XinferenceASR
+
+        self._create_asr_model(regular_headers, sample_speech_model_data)
+
+        async def transcriptions(**_kwargs):
+            raise RuntimeError("model not launched")
+
+        async def handle(_self):
+            return SimpleNamespace(transcriptions=transcriptions)
+
+        with patch.object(XinferenceASR, "_ensure_model_handle", handle):
+            response = client.post(
+                "/api/models/speech/transcribe",
+                files={"file": ("voice.wav", b"RIFF", "audio/wav")},
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 500
+        assert standalone_hook.calls == []
+
+    @pytest.mark.parametrize("category", ["embedding", "rerank"])
+    def test_connection_probe_is_recorded_for_the_operator(
+        self, test_db, regular_user, regular_headers, standalone_hook, category
+    ):
+        import requests as real_requests
+
+        def ok(body):
+            response = real_requests.Response()
+            response.status_code = 200
+            response._content = json.dumps(body).encode()
+            return response
+
+        embed_body = {"data": [{"embedding": [0.1]}], "usage": {"prompt_tokens": 1}}
+        rerank_body = {"results": [{"index": 0}], "usage": {"total_tokens": 4}}
+        session = SimpleNamespace(headers={}, post=lambda url, json: ok(embed_body))
+        with (
+            patch(
+                "xagent.core.model.embedding.openai.OpenAIEmbedding._get_session",
+                lambda _self: session,
+            ),
+            patch(
+                "xagent.core.model.rerank.dashscope.requests.post",
+                lambda *args, **kwargs: ok(rerank_body),
+            ),
+        ):
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "category": category,
+                    "model_provider": "openai"
+                    if category == "embedding"
+                    else "dashscope",
+                    "model_name": "text-embedding-3-small"
+                    if category == "embedding"
+                    else "qwen3-rerank",
+                    "api_key": "k",
+                    "base_url": "https://embeddings.test/v1",
+                },
+                headers=regular_headers,
+            )
+
+        assert response.json()["status"] == "passed"
+        [(user_id, [row], source)] = standalone_hook.calls
+        assert (user_id, source) == (regular_user["id"], "model_probe")
+        # An unsaved model has no configured id: recorded, never priced.
+        assert (row["call_type"], row["model_id"]) == (category, "")
+
+    def test_a_timed_out_probe_still_delivers_its_usage(
+        self, test_db, regular_user, regular_headers, standalone_hook
+    ):
+        import threading
+
+        import requests as real_requests
+
+        from xagent.web.api import model as model_module
+
+        release, delivered = threading.Event(), threading.Event()
+
+        def slow_ok(url, json):
+            # The provider answers (and bills) after the probe gave up.
+            release.wait(5)
+            response = real_requests.Response()
+            response.status_code = 200
+            response._content = b'{"data": [{"embedding": [0.1]}]}'
+            return response
+
+        def hook(*args):
+            standalone_hook.calls.append(args)
+            delivered.set()
+
+        from xagent.web.services import quota_hooks
+
+        quota_hooks.set_standalone_usage_hook(hook)
+        session = SimpleNamespace(headers={}, post=slow_ok)
+        with (
+            patch(
+                "xagent.core.model.embedding.openai.OpenAIEmbedding._get_session",
+                lambda _self: session,
+            ),
+            patch.object(model_module, "_CONNECTION_TEST_TIMEOUT_SECONDS", 0.05),
+        ):
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "category": "embedding",
+                    "model_provider": "openai",
+                    "model_name": "text-embedding-3-small",
+                    "api_key": "k",
+                    "base_url": "https://embeddings.test/v1",
+                },
+                headers=regular_headers,
+            )
+            assert response.json()["message"] == "Connection timed out"
+            release.set()
+            assert delivered.wait(5)
+
+        [(user_id, [row], source)] = standalone_hook.calls
+        assert (user_id, source, row["call_type"]) == (
+            regular_user["id"],
+            "model_probe",
+            "embedding",
+        )
 
     def test_reject_asr_only_speech_model_as_tts_default(
         self,

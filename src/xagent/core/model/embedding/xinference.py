@@ -6,6 +6,7 @@ import logging
 from typing import Any, List, Optional, Union
 
 from ..public_xinference import PublicXinferenceClient as XinferenceClient
+from ..retrieval_metering import record_embedding_usage, reported_tokens
 from .base import BaseEmbedding
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,7 @@ class XinferenceEmbedding(BaseEmbedding):
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
         dimension: Optional[int] = None,
+        model_id: str = "",
     ):
         """
         Initialize Xinference embedding client.
@@ -34,8 +36,10 @@ class XinferenceEmbedding(BaseEmbedding):
             base_url: Xinference server base URL (e.g., "http://localhost:9997")
             api_key: Optional API key for authentication
             dimension: Optional embedding dimension
+            model_id: Configured model id recorded on usage rows
         """
         self.model = model
+        self.model_id = model_id
         self._model_uid = model_uid or model
         self.base_url = (base_url or "http://localhost:9997").rstrip("/")
         self.api_key = api_key
@@ -95,6 +99,17 @@ class XinferenceEmbedding(BaseEmbedding):
         try:
             # Create embeddings
             embedding_result = model_handle.create_embedding(input=texts)
+            # The SDK raises on a non-2xx reply, so a returned result is a
+            # billed call; record it before its shape is checked below.
+            record_embedding_usage(
+                self,
+                len(texts),
+                reported_tokens(
+                    embedding_result,
+                    ("usage", "prompt_tokens"),
+                    ("usage", "total_tokens"),
+                ),
+            )
 
             # Xinference returns an Embedding object with data field
             if hasattr(embedding_result, "data"):

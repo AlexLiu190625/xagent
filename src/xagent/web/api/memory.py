@@ -16,6 +16,7 @@ from ..dynamic_memory_store import get_memory_store, get_memory_store_manager
 from ..memory_lifecycle import MemoryUnavailableError
 from ..models.user import User
 from ..services.db_runtime import run_db_io_cancellation_safe
+from ..tracking.standalone_usage import usage_scope
 from ..user_isolated_memory import UserContext
 
 logger = logging.getLogger(__name__)
@@ -176,12 +177,16 @@ class MemoryManagementRouter:
                     try:
                         with memory_operation():
                             if search:
-                                memories = self.memory_store.search(
-                                    query=search,
-                                    k=1000,
-                                    filters=filters if filters else None,
-                                    similarity_threshold=similarity_threshold,
-                                )
+                                # Embeds the query.
+                                async with usage_scope(
+                                    int(user.id), usage_source="memory_api"
+                                ):
+                                    memories = self.memory_store.search(
+                                        query=search,
+                                        k=1000,
+                                        filters=filters if filters else None,
+                                        similarity_threshold=similarity_threshold,
+                                    )
                             else:
                                 memories = self.memory_store.list_all(filters)
                     except HTTPException:
@@ -294,8 +299,9 @@ class MemoryManagementRouter:
                         timestamp=existing_memory.timestamp,  # Keep original timestamp
                     )
 
-                    # Update in store
-                    response = self.memory_store.update(updated_memory)
+                    # Update in store; re-embeds the note.
+                    async with usage_scope(int(user.id), usage_source="memory_api"):
+                        response = self.memory_store.update(updated_memory)
                     if response.success:
                         return {
                             "success": True,
@@ -353,7 +359,9 @@ class MemoryManagementRouter:
                         metadata=memory_request.get("metadata", {}),
                     )
 
-                    response = store.add(memory_note)
+                    # Embeds the note.
+                    async with usage_scope(int(user.id), usage_source="memory_api"):
+                        response = store.add(memory_note)
                     if response.success:
                         return {
                             "success": True,

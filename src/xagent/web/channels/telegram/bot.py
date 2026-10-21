@@ -104,6 +104,7 @@ from ...services.uploaded_file_store import (
     compensate_staged_uploaded_files,
     stage_uploaded_file_from_local_path,
 )
+from ...tracking.standalone_usage import usage_scope
 from ..batch_control import (
     BatchChannelControl,
     selected_task_id,
@@ -1368,6 +1369,21 @@ class TelegramBotInstance(BatchChannelControl[int]):
         voice_file_ids: list[str],
         uploaded_info: list[dict[str, Any]],
         asr_model: Any,
+        owner_user_id: int | None,
+    ) -> dict[str, str]:
+        # Transcription runs before any agent run exists to track it, so the
+        # provider's usage is delivered here, for the channel owner whose ASR
+        # model is used.
+        async with usage_scope(owner_user_id, usage_source="telegram_voice"):
+            return await self._transcribe_voice_files_in_scope(
+                voice_file_ids, uploaded_info, asr_model
+            )
+
+    async def _transcribe_voice_files_in_scope(
+        self,
+        voice_file_ids: list[str],
+        uploaded_info: list[dict[str, Any]],
+        asr_model: Any,
     ) -> dict[str, str]:
         uploaded_by_source_id = {
             str(info.get("telegram_file_id")): info
@@ -1692,7 +1708,7 @@ class TelegramBotInstance(BatchChannelControl[int]):
                                 ]
                                 transcripts = (
                                     await self._transcribe_uploaded_voice_files(
-                                        voice_ids, voice_info, asr_model
+                                        voice_ids, voice_info, asr_model, owner_id
                                     )
                                     if voice_ids
                                     else {}
@@ -2324,6 +2340,7 @@ class TelegramBotInstance(BatchChannelControl[int]):
                             voice_file_ids,
                             uploaded_info,
                             voice_asr_model,
+                            expected_owner_user_id,
                         )
                         await self._close_voice_asr_model(voice_asr_model)
                         voice_asr_model = None

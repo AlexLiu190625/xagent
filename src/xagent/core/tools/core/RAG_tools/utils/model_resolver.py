@@ -460,6 +460,9 @@ def resolve_embedding_from_env(
     if model and key:
         return EmbeddingModelConfig(
             id=model,
+            # An env-configured model has no configured id to bill under;
+            # its calls are recorded unpriced, like env-built DashscopeRerank.
+            billing_model_id="",
             model_name=model,
             api_key=key,
             base_url=base,
@@ -499,6 +502,9 @@ def resolve_rerank_from_env(
     if model and key:
         return RerankModelConfig(
             id=model,
+            # An env-configured model has no configured id to bill under;
+            # its calls are recorded unpriced, like env-built DashscopeRerank.
+            billing_model_id="",
             model_name=model,
             api_key=key,
             base_url=base,

@@ -3,6 +3,7 @@ from collections.abc import Sequence
 from typing import Any, Optional
 
 from .. import public_requests as requests
+from ..retrieval_metering import read_billed_json, record_rerank_usage, reported_tokens
 from .base import BaseRerank
 
 # Model names that use the OpenAI-compatible /compatible-api/v1/reranks
@@ -54,6 +55,7 @@ class DashscopeRerank(BaseRerank):
         top_n: Optional[int] = None,
         instruct: Optional[str] = None,
         timeout: Optional[float] = None,
+        model_id: str = "",
     ):
         """
         Initialize Dashscope rerank model.
@@ -69,8 +71,10 @@ class DashscopeRerank(BaseRerank):
                 hit the 60s fallback: ``create_rerank_adapter`` always passes
                 ``RerankModelConfig.timeout``, whose own default is 180s, so
                 that is the effective timeout in the application.
+            model_id: Configured model id recorded on usage rows.
         """
         self.model = model
+        self.model_id = model_id
         self.api_key = api_key or os.getenv("DASHSCOPE_API_KEY")
         self.top_n = top_n
         self.instruct = instruct
@@ -86,6 +90,23 @@ class DashscopeRerank(BaseRerank):
     @property
     def is_new_format(self) -> bool:
         return self.model.lower() in NEW_FORMAT_MODELS
+
+    def _post(self, headers: dict[str, str], payload: dict[str, Any]) -> Any:
+        """Send one rerank request and return its parsed body.
+
+        Records the request as soon as it is accepted, before the body is
+        read: both API formats report ``usage.total_tokens``.
+        """
+        response = requests.post(
+            self.url, headers=headers, json=payload, timeout=self.timeout
+        )
+        response.raise_for_status()
+        return read_billed_json(
+            response,
+            lambda body: record_rerank_usage(
+                self, reported_tokens(body, ("usage", "total_tokens"))
+            ),
+        )
 
     def compress(
         self,
@@ -140,11 +161,7 @@ class DashscopeRerank(BaseRerank):
                 "parameters": {"return_documents": True} | optional_params,
             }
 
-        response = requests.post(
-            self.url, headers=headers, json=payload, timeout=self.timeout
-        )
-        response.raise_for_status()
-        data = response.json()
+        data = self._post(headers, payload)
 
         if self.is_new_format:
             # New qwen3-rerank format: no nested "output" wrapper, no
@@ -205,11 +222,7 @@ class DashscopeRerank(BaseRerank):
                 "parameters": {"return_documents": True} | optional_params,
             }
 
-        response = requests.post(
-            self.url, headers=headers, json=payload, timeout=self.timeout
-        )
-        response.raise_for_status()
-        data = response.json()
+        data = self._post(headers, payload)
 
         if self.is_new_format:
             results = data["results"]

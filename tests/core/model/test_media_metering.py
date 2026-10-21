@@ -406,3 +406,183 @@ def test_accepted_status(status, accepted):
     error = RuntimeError("x")
     error.status_code = status  # type: ignore[attr-defined]
     assert accepted_status(error) is accepted
+
+
+# --- WAV length from the bytes actually present ---------------------------------
+
+
+def _wav_with(
+    *,
+    tag: int = 1,
+    channels: int = 1,
+    rate: int = 16000,
+    bits: int = 16,
+    data: bytes,
+    declared: int | None = None,
+    extensible_tag: int | None = None,
+    extra_chunk: bytes = b"",
+) -> bytes:
+    block_align = channels * bits // 8
+    fmt = struct.pack(
+        "<HHIIHH", tag, channels, rate, rate * block_align, block_align, bits
+    )
+    if extensible_tag is not None:
+        # cbSize, valid bits, channel mask, then the SubFormat GUID.
+        fmt += struct.pack("<HHI", 22, bits, 0) + struct.pack("<H", extensible_tag)
+        fmt += bytes(14)
+    body = (
+        b"WAVE"
+        + b"fmt "
+        + struct.pack("<I", len(fmt))
+        + fmt
+        + extra_chunk
+        + b"data"
+        + struct.pack("<I", len(data) if declared is None else declared)
+        + data
+    )
+    return b"RIFF" + struct.pack("<I", len(body)) + body
+
+
+def test_wav_declaring_more_data_than_it_carries_bills_what_it_carries():
+    # Reproduces the over-billing: a 1000-byte 16 kHz mono file whose data
+    # chunk claims 0x7FFFFFFF bytes measured 67108.86 s through `wave`.
+    payload = _wav_with(data=bytes(1000 - 44), declared=0x7FFFFFFF)
+    assert len(payload) == 1000
+
+    assert measure_audio_seconds(payload, "wav") == pytest.approx(956 / 2 / 16000)
+
+
+def test_wav_declaring_less_data_than_it_carries_bills_the_declared_length():
+    payload = _wav_with(data=bytes(32000) + b"trailing junk", declared=16000)
+    assert measure_audio_seconds(payload, "") == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"tag": 3, "bits": 32},  # IEEE float
+        {"tag": 0xFFFE, "bits": 16, "extensible_tag": 1},  # EXTENSIBLE PCM
+        {"tag": 0xFFFE, "bits": 32, "extensible_tag": 3},  # EXTENSIBLE float
+        {"tag": 7, "bits": 8},  # µ-law
+    ],
+    ids=["float", "extensible-pcm", "extensible-float", "mulaw"],
+)
+def test_wav_formats_measured_from_their_frames(kwargs):
+    bytes_per_second = 16000 * kwargs["bits"] // 8
+    payload = _wav_with(data=bytes(bytes_per_second * 2), **kwargs)
+    assert measure_audio_seconds(payload, "wav") == pytest.approx(2.0)
+
+
+def test_wav_skips_unknown_chunks_including_their_pad_byte():
+    odd_chunk = b"LIST" + struct.pack("<I", 3) + b"abc" + b"\x00"
+    payload = _wav_with(data=bytes(32000), extra_chunk=odd_chunk)
+    assert measure_audio_seconds(payload, "wav") == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _wav_with(tag=2, bits=4, data=bytes(4000)),  # MS ADPCM: compressed
+        _wav_with(data=bytes(100))[:30],  # header cut off inside fmt
+    ],
+    ids=["compressed", "truncated-header"],
+)
+def test_unmeasurable_wav_falls_back_to_ffprobe(monkeypatch, payload):
+    argv_seen = []
+
+    def fake_run(argv, **_kwargs):
+        argv_seen.append(argv)
+        return SimpleNamespace(stdout=b"1.5\n")
+
+    monkeypatch.setattr(media_metering.shutil, "which", lambda _name: "/x/ffprobe")
+    monkeypatch.setattr(media_metering.subprocess, "run", fake_run)
+
+    assert measure_audio_seconds(payload, "") == pytest.approx(1.5)
+    [argv] = argv_seen
+    assert argv[argv.index("-f") + 1] == "wav"
+
+
+# --- ffprobe reads the caller's file and nothing else ----------------------------
+
+
+def _probe_argv(monkeypatch, payload: bytes, audio_format: str) -> list[str]:
+    argv_seen = []
+
+    def fake_run(argv, **_kwargs):
+        argv_seen.append(argv)
+        return SimpleNamespace(stdout=b"2\n")
+
+    monkeypatch.setattr(media_metering.shutil, "which", lambda _name: "/x/ffprobe")
+    monkeypatch.setattr(media_metering.subprocess, "run", fake_run)
+    measure_audio_seconds(payload, audio_format)
+    [argv] = argv_seen
+    return argv
+
+
+def _option(argv: list[str], name: str) -> str | None:
+    return argv[argv.index(name) + 1] if name in argv else None
+
+
+@pytest.mark.parametrize(
+    ("hint", "demuxer"),
+    [("webm", "webm"), ("m4a", "mov"), ("opus_48000_64", "ogg"), ("flac", "flac")],
+)
+def test_ffprobe_pins_the_demuxer_for_a_known_container(monkeypatch, hint, demuxer):
+    argv = _probe_argv(monkeypatch, b"\x00" * 64, hint)
+
+    assert _option(argv, "-f") == demuxer
+    assert _option(argv, "-protocol_whitelist") == "file"
+    # Input options must come before the input they apply to.
+    assert argv.index("-f") < argv.index("-i")
+    assert argv.index("-protocol_whitelist") < argv.index("-i")
+
+
+def test_a_hint_that_does_not_match_the_bytes_is_retried_unpinned(monkeypatch):
+    # The hint comes from the upload's filename: a WebM named x.mp3 fails the
+    # pinned probe, and must still be measured rather than billed as 0 s.
+    argv_seen = []
+
+    def fake_run(argv, **_kwargs):
+        argv_seen.append(argv)
+        return SimpleNamespace(stdout=b"" if "-f" in argv else b"4.5\n")
+
+    monkeypatch.setattr(media_metering.shutil, "which", lambda _name: "/x/ffprobe")
+    monkeypatch.setattr(media_metering.subprocess, "run", fake_run)
+    webm = b"\x1aE\xdf\xa3" + bytes(64)
+
+    assert measure_audio_seconds(webm, "mp3") == pytest.approx(4.5)
+    pinned, unpinned = argv_seen
+    assert _option(pinned, "-f") == "mp3"
+    assert _option(unpinned, "-f") is None
+    # The retry keeps the same confinement.
+    assert _option(unpinned, "-protocol_whitelist") == "file"
+    assert _option(unpinned, "-format_whitelist") == _option(
+        pinned, "-format_whitelist"
+    )
+
+
+def test_an_unhinted_probe_that_fails_is_not_retried(monkeypatch):
+    argv_seen = []
+
+    def fake_run(argv, **_kwargs):
+        argv_seen.append(argv)
+        return SimpleNamespace(stdout=b"")
+
+    monkeypatch.setattr(media_metering.shutil, "which", lambda _name: "/x/ffprobe")
+    monkeypatch.setattr(media_metering.subprocess, "run", fake_run)
+
+    assert media_metering._ffprobe_seconds(bytes(64), "") is None
+    assert len(argv_seen) == 1
+
+
+def test_ffprobe_on_an_unknown_container_only_allows_audio_demuxers(monkeypatch):
+    playlist = b"#EXTM3U\n#EXTINF:1,\nfile:///etc/passwd\n"
+    argv = _probe_argv(monkeypatch, playlist, "")
+
+    assert _option(argv, "-f") is None
+    assert _option(argv, "-protocol_whitelist") == "file"
+    allowed = set(_option(argv, "-format_whitelist").split(","))
+    assert allowed.isdisjoint({"hls", "applehttp", "concat", "m3u8", "tee", "data"})
+    assert {"mp3", "ogg", "wav", "webm", "mov"} <= allowed
+    # Audio demuxers ffprobe used to detect on its own still are.
+    assert {"aiff", "caf", "asf", "ac3", "mpegts"} <= allowed

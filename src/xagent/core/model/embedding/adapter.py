@@ -43,6 +43,9 @@ class EmbeddingModelAdapter(BaseEmbedding):
 
     def _create_embedding_model(self) -> BaseEmbedding:
         """Create the actual embedding model from configuration."""
+        # Stamped on the provider itself, which records its own usage: saas
+        # prices usage rows by model_id alone.
+        model_id = self.model_config.usage_model_id
         # Normalize provider name: map variants to canonical names
         # Note: 'openai_embedding' is a legacy value that should be treated as 'openai'
         provider = self.model_config.model_provider.lower().strip()
@@ -52,6 +55,7 @@ class EmbeddingModelAdapter(BaseEmbedding):
                 api_key=self.model_config.api_key,
                 base_url=self.model_config.base_url,
                 dimension=self.model_config.dimension,
+                model_id=model_id,
             )
         elif provider == "dashscope":
             return DashScopeEmbedding(
@@ -60,6 +64,7 @@ class EmbeddingModelAdapter(BaseEmbedding):
                 base_url=self.model_config.base_url,
                 dimension=self.model_config.dimension,
                 instruct=self.model_config.instruct,
+                model_id=model_id,
             )
         elif provider == "xinference":
             return XinferenceEmbedding(
@@ -67,6 +72,7 @@ class EmbeddingModelAdapter(BaseEmbedding):
                 base_url=self.model_config.base_url,
                 api_key=self.model_config.api_key,
                 dimension=self.model_config.dimension,
+                model_id=model_id,
             )
         else:
             raise ValueError(

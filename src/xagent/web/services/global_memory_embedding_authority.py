@@ -11,7 +11,7 @@ from enum import Enum
 from typing import Any, cast
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -41,6 +41,7 @@ CREDENTIAL_CONFIGURED = "configured"
 CREDENTIAL_UNAVAILABLE = "unavailable"
 _MAX_ENDPOINT_LENGTH = 500
 _MAX_MODEL_NAME_LENGTH = 100
+_MAX_BILLING_MODEL_ID_LENGTH = 100
 _MAX_DIMENSION = 65536
 _MAX_RETRIES = 100
 _HOSTNAME = re.compile(
@@ -94,6 +95,21 @@ class AuthorityConfiguration(BaseModel):
     credential_source: CredentialSource = CredentialSource.UNKNOWN
     global_sharing_consent: bool = False
     api_key: SecretStr = SecretStr("")
+    # The model id memory embedding usage is billed under. The authority is
+    # not a configured model row, so it has no id of its own a price table
+    # could know; the operator names the priced model it is billed as. Unset,
+    # usage is still recorded, with an empty model id. Not part of either
+    # fingerprint -- it changes no vector and no call -- so a change takes
+    # effect when workers next admit the store.
+    billing_model_id: str | None = Field(
+        default=None,
+        description=(
+            "Model id memory embedding usage is billed under. Omit it to keep "
+            "the stored value; send null or an empty string to clear it. A "
+            "change takes effect when workers next admit the memory store, "
+            "e.g. after a restart."
+        ),
+    )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -114,6 +130,7 @@ class GlobalMemoryEmbeddingAuthorityRecord:
     created_at: datetime | None = None
     updated_at: datetime | None = None
     credential_status: str = CREDENTIAL_UNAVAILABLE
+    billing_model_id: str | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -193,12 +210,23 @@ def _record_from_row(
         consented_at=cast(datetime, row.consented_at),
         created_at=cast("datetime | None", row.created_at),
         updated_at=cast("datetime | None", row.updated_at),
+        billing_model_id=_canonical_billing_model_id(row.billing_model_id),
     )
 
 
 def _fingerprint(payload: tuple[Any, ...]) -> str:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _canonical_billing_model_id(value: Any) -> str | None:
+    """A billing model id, or None for an unset or blank one."""
+    if value is None:
+        return None
+    billing_model_id = str(value).strip()
+    if len(billing_model_id) > _MAX_BILLING_MODEL_ID_LENGTH:
+        raise ValueError("Global memory embedding billing model id is invalid")
+    return billing_model_id or None
 
 
 def _canonicalize(config: AuthorityConfiguration) -> AuthorityConfiguration:
@@ -243,6 +271,7 @@ def _canonicalize(config: AuthorityConfiguration) -> AuthorityConfiguration:
             "model_name": model_name,
             "endpoint": endpoint,
             "instruct": instruct,
+            "billing_model_id": _canonical_billing_model_id(config.billing_model_id),
         }
     )
 
@@ -324,6 +353,9 @@ class GlobalMemoryEmbeddingAuthorityService:
     def set(
         self, config: AuthorityConfiguration, *, actor_subject: str
     ) -> GlobalMemoryEmbeddingAuthorityRecord:
+        # A body that omits billing_model_id keeps the stored one, so a client
+        # that predates the field cannot clear it by re-saving the authority.
+        keep_billing_model_id = "billing_model_id" not in config.model_fields_set
         normalized = _canonicalize(config)
         secret = normalized.api_key.get_secret_value()
         try:
@@ -353,6 +385,7 @@ class GlobalMemoryEmbeddingAuthorityService:
             "configured_by_actor_subject": actor_subject,
             "consented_by_actor_subject": actor_subject,
             "consented_at": consented_at,
+            "billing_model_id": normalized.billing_model_id,
         }
         bind = self.db.get_bind()
         dialect = bind.dialect.name if bind is not None else ""
@@ -371,12 +404,16 @@ class GlobalMemoryEmbeddingAuthorityService:
         update_values = {
             key: value for key, value in values.items() if key != "authority_key"
         }
+        if keep_billing_model_id:
+            del update_values["billing_model_id"]
         update_values["updated_at"] = func.now()
         table = GlobalMemoryEmbeddingAuthority.__table__
         written = self.db.execute(
             stmt.on_conflict_do_update(
                 index_elements=["authority_key"], set_=update_values
-            ).returning(table.c.created_at, table.c.updated_at)
+            ).returning(
+                table.c.created_at, table.c.updated_at, table.c.billing_model_id
+            )
         ).one()
         # Built before COMMIT: a concurrent delete may win the row the moment
         # the transaction lands, and must not fail this durable write.
@@ -396,6 +433,7 @@ class GlobalMemoryEmbeddingAuthorityService:
             credential_status=CREDENTIAL_CONFIGURED
             if round_trips
             else CREDENTIAL_UNAVAILABLE,
+            billing_model_id=_canonical_billing_model_id(written.billing_model_id),
         )
         self.db.commit()
         return record

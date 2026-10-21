@@ -186,6 +186,7 @@ async def test_transcribe_uploaded_voice_files_uses_registered_input_file() -> N
         ["voice-file-id"],
         uploaded_info,
         asr,
+        None,
     )
 
     assert transcripts == {"voice-file-id": "今晚有世界杯比赛吗？"}
@@ -216,6 +217,7 @@ async def test_transcribe_uploaded_voice_files_extracts_result_text() -> None:
             }
         ],
         ResultASR(),
+        None,
     )
 
     assert transcripts == {"voice-file-id": "今晚有世界杯比赛吗？"}
@@ -260,7 +262,91 @@ async def test_transcribe_uploaded_voice_files_rejects_empty_result() -> None:
                 }
             ],
             EmptyASR(),
+            None,
         )
+
+
+def _xinference_asr(*replies: dict):
+    """A real Xinference ASR provider over a scripted model handle."""
+    from xagent.core.model.asr.xinference import XinferenceASR
+
+    pending = list(replies)
+
+    async def transcriptions(**_kwargs):
+        return pending.pop(0)
+
+    asr = XinferenceASR(model="whisper", base_url="http://x.test")
+    asr.model_id = "owner-asr"
+
+    async def ensure():
+        return SimpleNamespace(transcriptions=transcriptions)
+
+    asr._ensure_model_handle = ensure  # type: ignore[method-assign]
+    return asr
+
+
+def _voice_files(tmp_path: Path, *ids: str) -> list[dict]:
+    info = []
+    for voice_id in ids:
+        path = tmp_path / f"{voice_id}.oga"
+        path.write_bytes(b"OggS")
+        info.append(
+            {"telegram_file_id": voice_id, "path": str(path), "type": "audio/ogg"}
+        )
+    return info
+
+
+@pytest.fixture
+def standalone_hook():
+    from xagent.web.services import quota_hooks
+
+    calls: list = []
+    quota_hooks.set_standalone_usage_hook(
+        lambda user_id, details, source: calls.append((user_id, details, source))
+    )
+    yield calls
+    quota_hooks.set_standalone_usage_hook(None)
+
+
+@pytest.mark.asyncio
+async def test_voice_transcription_bills_the_channel_owner_once(
+    tmp_path: Path, standalone_hook: list
+) -> None:
+    transcripts = await make_bot()._transcribe_uploaded_voice_files(
+        ["v1"],
+        _voice_files(tmp_path, "v1"),
+        _xinference_asr({"text": "hi", "duration": 3.0}),
+        42,
+    )
+
+    assert transcripts == {"v1": "hi"}
+    [(owner, [row], source)] = standalone_hook
+    assert (owner, source) == (42, "telegram_voice")
+    assert (row["call_type"], row["quantity"], row["model_id"]) == (
+        "asr",
+        3.0,
+        "owner-asr",
+    )
+
+
+@pytest.mark.asyncio
+async def test_voice_transcription_failing_after_billing_still_bills_once(
+    tmp_path: Path, standalone_hook: list
+) -> None:
+    """Both calls were billed before the second transcript turned out empty."""
+    with pytest.raises(TelegramVoiceTranscriptionError, match="empty text"):
+        await make_bot()._transcribe_uploaded_voice_files(
+            ["v1", "v2"],
+            _voice_files(tmp_path, "v1", "v2"),
+            _xinference_asr(
+                {"text": "hi", "duration": 3.0}, {"text": " ", "duration": 1.5}
+            ),
+            42,
+        )
+
+    [(owner, details, _source)] = standalone_hook
+    assert owner == 42
+    assert [row["quantity"] for row in details] == [3.0, 1.5]
 
 
 def test_resolve_voice_asr_model_returns_none_when_unconfigured(

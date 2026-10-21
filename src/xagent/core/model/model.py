@@ -99,13 +99,26 @@ class VideoModelConfig(ModelConfig):
     model_provider: str = "volcengine-ark"  # Volcengine/BytePlus ModelArk video
 
 
-class EmbeddingModelConfig(ModelConfig):
+class _MeteredModelConfig(ModelConfig):
+    # The model_id written on usage rows when it is not ``id``: a config
+    # whose ``id`` names no priced model (the memory authority, an unsaved
+    # connection test) sets it, and "" records the call with no model_id.
+    billing_model_id: Optional[str] = None
+
+    @property
+    def usage_model_id(self) -> str:
+        if self.billing_model_id is not None:
+            return self.billing_model_id
+        return self.id
+
+
+class EmbeddingModelConfig(_MeteredModelConfig):
     model_provider: str = "dashscope"  # openai, zhipu, dashscope, etc.
     dimension: Optional[int] = None
     instruct: Optional[str] = None
 
 
-class RerankModelConfig(ModelConfig):
+class RerankModelConfig(_MeteredModelConfig):
     model_provider: str = "dashscope"  # dashscope, xinference, etc.
     top_n: Optional[int] = None
     instruct: Optional[str] = None

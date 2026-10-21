@@ -17,7 +17,12 @@ def retry_on(e: Exception) -> bool:
 
 
 def _create_rerank_model(model_config: RerankModelConfig) -> BaseRerank:
-    """Create the underlying rerank model based on ``model_provider``."""
+    """Create the underlying rerank model based on ``model_provider``.
+
+    The configured model id is stamped on the provider, not this adapter:
+    the providers record their own usage, and the search pipeline calls the
+    provider directly, past the adapter.
+    """
     provider = (model_config.model_provider or "dashscope").lower()
 
     if provider == "xinference":
@@ -29,6 +34,7 @@ def _create_rerank_model(model_config: RerankModelConfig) -> BaseRerank:
             base_url=model_config.base_url,
             top_n=model_config.top_n,
             timeout=model_config.timeout,
+            model_id=model_config.usage_model_id,
         )
 
     # Default: DashScope-compatible rerank endpoint
@@ -41,6 +47,7 @@ def _create_rerank_model(model_config: RerankModelConfig) -> BaseRerank:
         top_n=model_config.top_n,
         instruct=model_config.instruct,
         timeout=model_config.timeout,
+        model_id=model_config.usage_model_id,
     )
 
 

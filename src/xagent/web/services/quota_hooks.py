@@ -55,6 +55,11 @@ _storage_gate_hook: Callable[[Any, Any], str | None] | None = None
 # (user_id) -> None; +1 billable action when a run is fired by a trigger
 # (webhook / scheduled / API). Opens its own session on the application side.
 _trigger_record_hook: Callable[[Any], None] | None = None
+# (user_id, details, source) -> None; usage recorded outside an agent run.
+# See ``set_standalone_usage_hook``.
+_standalone_usage_hook: (
+    Callable[[int | None, list[dict[str, Any]], str], None] | None
+) = None
 
 
 def set_run_gate_hook(hook: Callable[[Any, Any], str | None] | None) -> None:
@@ -82,6 +87,44 @@ def set_storage_gate_hook(hook: Callable[[Any, Any], str | None] | None) -> None
 def set_trigger_record_hook(hook: Callable[[Any], None] | None) -> None:
     global _trigger_record_hook
     _trigger_record_hook = hook
+
+
+def set_standalone_usage_hook(
+    hook: Callable[[int | None, list[dict[str, Any]], str], None] | None,
+) -> None:
+    """Register the receiver of usage recorded outside an agent run.
+
+    Called as ``hook(user_id, details, source)`` once per
+    :func:`xagent.web.tracking.standalone_usage.usage_scope` that recorded
+    anything: a knowledge-base search or ingestion, a memory API call, a model
+    connection test, a speech transcription.
+
+    - ``user_id``: the user the work was done for -- the requesting member, not
+      a knowledge base's storage tenant. ``None`` when the work cannot be
+      attributed; the usage is still delivered (and logged), never dropped and
+      never assigned to a guessed owner.
+    - ``details``: the ``TokenUsage.details`` rows recorded in the scope, as
+      copies the hook may keep. Mostly ``type: "media"`` rows (embedding,
+      rerank, ASR ...), but any LLM token rows recorded in the scope are
+      included too, so nothing billable is lost.
+    - ``source``: a short stable label for the entry point, e.g. ``kb_search``.
+
+    This is not ``record_usage``: nothing here is an agent execution, and the
+    ``delta_actions`` tool-call counter does not apply.
+
+    EXECUTION CONTRACT: invoked synchronously, never on the asyncio event loop
+    -- async entry points deliver from a worker thread. No database session is
+    passed: the hook opens and commits its own. Exceptions are logged and
+    swallowed; they never fail the work being metered.
+    """
+    global _standalone_usage_hook
+    _standalone_usage_hook = hook
+
+
+def get_standalone_usage_hook() -> (
+    Callable[[int | None, list[dict[str, Any]], str], None] | None
+):
+    return _standalone_usage_hook
 
 
 def check_run_gate(db: Any, user_id: Any) -> str | Mapping[str, Any] | None:

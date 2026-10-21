@@ -16,6 +16,7 @@ from collections.abc import Sequence
 from typing import Any, Dict, List, Optional
 
 from .. import public_requests as requests
+from ..retrieval_metering import read_billed_json, record_rerank_usage, reported_tokens
 from .base import BaseRerank
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,7 @@ class XinferenceRerank(BaseRerank):
         base_url: Optional[str] = None,
         top_n: Optional[int] = None,
         timeout: Optional[float] = None,
+        model_id: str = "",
     ):
         """
         Initialize Xinference rerank model.
@@ -50,13 +52,62 @@ class XinferenceRerank(BaseRerank):
                 ``http://localhost:9997``.
             top_n: Optional cap on the number of reranked results to return.
             timeout: HTTP request timeout in seconds (default: 60).
+            model_id: Configured model id recorded on usage rows.
         """
         self.model = model
+        self.model_id = model_id
         self._model_uid = model_uid or model
         self.api_key = api_key or os.getenv("XINFERENCE_API_KEY")
         self.base_url = (base_url or "http://localhost:9997").rstrip("/")
         self.top_n = top_n
         self.timeout = float(timeout) if timeout is not None else 60.0
+
+    def _post(self, documents: list[str], query: str) -> Any:
+        """Send one rerank request and return its parsed body.
+
+        Records the request as soon as it is accepted, before the body is
+        read. ``return_len`` asks the server to report token counts in
+        ``meta.tokens``; its ``output_tokens`` repeats the input count (a
+        rerank produces scores, not tokens), so only the input is recorded.
+        """
+        url = f"{self.base_url}/v1/rerank"
+        payload: dict[str, Any] = {
+            "model": self._model_uid,
+            "query": query,
+            "documents": documents,
+            "return_len": True,
+        }
+        if self.top_n is not None:
+            payload["top_n"] = self.top_n
+
+        logger.debug(
+            "Xinference rerank request: url=%s model=%s n_docs=%d top_n=%s",
+            url,
+            self._model_uid,
+            len(documents),
+            self.top_n,
+        )
+
+        response = requests.post(
+            url,
+            headers=self._headers(),
+            json=payload,
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+
+        try:
+            return read_billed_json(
+                response,
+                lambda body: record_rerank_usage(
+                    self, reported_tokens(body, ("meta", "tokens", "input_tokens"))
+                ),
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"Xinference rerank endpoint returned non-JSON response: "
+                f"{response.text[:200]!r}"
+            ) from exc
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -149,38 +200,7 @@ class XinferenceRerank(BaseRerank):
         if not documents:
             return []
 
-        url = f"{self.base_url}/v1/rerank"
-        payload: dict[str, Any] = {
-            "model": self._model_uid,
-            "query": query,
-            "documents": documents,
-        }
-        if self.top_n is not None:
-            payload["top_n"] = self.top_n
-
-        logger.debug(
-            "Xinference rerank request: url=%s model=%s n_docs=%d top_n=%s",
-            url,
-            self._model_uid,
-            len(documents),
-            self.top_n,
-        )
-
-        response = requests.post(
-            url,
-            headers=self._headers(),
-            json=payload,
-            timeout=self.timeout,
-        )
-        response.raise_for_status()
-
-        try:
-            data = response.json()
-        except ValueError as exc:
-            raise ValueError(
-                f"Xinference rerank endpoint returned non-JSON response: "
-                f"{response.text[:200]!r}"
-            ) from exc
+        data = self._post(documents, query)
 
         results = data.get("results")
         if not isinstance(results, list):
@@ -260,38 +280,7 @@ class XinferenceRerank(BaseRerank):
         if not documents:
             return []
 
-        url = f"{self.base_url}/v1/rerank"
-        payload: dict[str, Any] = {
-            "model": self._model_uid,
-            "query": query,
-            "documents": documents,
-        }
-        if self.top_n is not None:
-            payload["top_n"] = self.top_n
-
-        logger.debug(
-            "Xinference rerank request: url=%s model=%s n_docs=%d top_n=%s",
-            url,
-            self._model_uid,
-            len(documents),
-            self.top_n,
-        )
-
-        response = requests.post(
-            url,
-            headers=self._headers(),
-            json=payload,
-            timeout=self.timeout,
-        )
-        response.raise_for_status()
-
-        try:
-            data = response.json()
-        except ValueError as exc:
-            raise ValueError(
-                f"Xinference rerank endpoint returned non-JSON response: "
-                f"{response.text[:200]!r}"
-            ) from exc
+        data = self._post(documents, query)
 
         results = data.get("results")
         if not isinstance(results, list):

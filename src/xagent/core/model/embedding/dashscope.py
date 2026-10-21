@@ -3,6 +3,11 @@ from __future__ import annotations
 from typing import Any, List, Optional, Union
 
 from .. import public_requests as requests
+from ..retrieval_metering import (
+    read_billed_json,
+    record_embedding_usage,
+    reported_tokens,
+)
 from .base import BaseEmbedding
 
 
@@ -19,6 +24,7 @@ class DashScopeEmbedding(BaseEmbedding):
         base_url: Optional[str] = None,
         dimension: Optional[int] = None,
         instruct: Optional[str] = None,
+        model_id: str = "",
     ):
         """
         Initialize DashScope embedding client.
@@ -29,8 +35,10 @@ class DashScopeEmbedding(BaseEmbedding):
             base_url: API base URL (defaults to DashScope embedding endpoint)
             dimension: Embedding dimension (default: None)
             instruct: Optional instruction for embedding context
+            model_id: Configured model id recorded on usage rows
         """
         self.model = model
+        self.model_id = model_id
         self.api_key = api_key
         self.base_url = (
             base_url
@@ -112,7 +120,15 @@ class DashScopeEmbedding(BaseEmbedding):
                 response = session.post(self.base_url, json=payload)
                 response.raise_for_status()
 
-                data = response.json()
+                # Each sub-batch is its own billed call, so its own row.
+                data = read_billed_json(
+                    response,
+                    lambda body: record_embedding_usage(
+                        self,
+                        len(batch_texts),
+                        reported_tokens(body, ("usage", "total_tokens")),
+                    ),
+                )
 
                 if "output" not in data or "embeddings" not in data["output"]:
                     raise ValueError(f"Unexpected response format: {data}")

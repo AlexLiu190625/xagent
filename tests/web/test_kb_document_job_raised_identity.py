@@ -6,7 +6,7 @@ import uuid
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -479,3 +479,87 @@ def test_duplicate_submit_skips_the_existence_check(test_env, temp_uploads) -> N
 
     assert second == first
     check.assert_awaited_once()
+
+
+def _embed_then(outcome: Any) -> Any:
+    """Ingest that bills one embedding call, then succeeds or raises."""
+    from xagent.core.model.chat.token_context import MediaCallType, add_media_usage
+
+    def _ingest(**kwargs: Any) -> Any:
+        add_media_usage(call_type=MediaCallType.EMBEDDING, quantity=4, model_id="e")
+        return outcome(**kwargs)
+
+    return _ingest
+
+
+@pytest.mark.parametrize("raises", [False, True], ids=["success", "raised"])
+def test_document_job_bills_its_submitter_once(test_env, temp_uploads, raises):
+    from xagent.web.services import quota_hooks
+
+    calls: list = []
+    quota_hooks.set_standalone_usage_hook(
+        lambda user_id, details, source: calls.append((user_id, details, source))
+    )
+    try:
+        job_id = _submit(test_env, b"billed")
+        db = test_env[3]()
+        try:
+            job = db.query(BackgroundJob).filter(BackgroundJob.id == job_id).one()
+            submitter = int(job.user_id)
+            job.attempts, job.max_attempts = 1, 3
+            db.commit()
+            outcome = (
+                _raise_before_registration if raises else _register_and_succeed({})
+            )
+            with patch(_INGEST, side_effect=_embed_then(outcome)):
+                try:
+                    handle_kb_ingest_document(db, job)
+                except Exception:  # noqa: BLE001
+                    assert raises
+        finally:
+            db.close()
+    finally:
+        quota_hooks.set_standalone_usage_hook(None)
+
+    [(user_id, [row], source)] = calls
+    assert (user_id, source, row["quantity"]) == (submitter, "kb_ingest_job", 4.0)
+
+
+def test_web_job_bills_its_submitter_not_the_storage_tenant():
+    from xagent.core.model.chat.token_context import MediaCallType, add_media_usage
+    from xagent.web.jobs import kb_tasks
+    from xagent.web.services import quota_hooks
+
+    async def _crawl_bills_then_fails(**kwargs: Any) -> Any:
+        assert kwargs["user_id"] == 999  # storage stays with the tenant
+        add_media_usage(call_type=MediaCallType.EMBEDDING, quantity=2, model_id="e")
+        raise RuntimeError("crawl failed")
+
+    job = BackgroundJob(
+        user_id=101,
+        payload={
+            "user_id": 999,
+            "collection": "web_coll",
+            "crawl_config": {"start_url": "https://example.com"},
+            "ingestion_config": {},
+        },
+    )
+    calls: list = []
+    quota_hooks.set_standalone_usage_hook(
+        lambda user_id, details, source: calls.append((user_id, details, source))
+    )
+    try:
+        with (
+            patch.object(kb_tasks, "update_job_progress"),
+            patch.object(kb_tasks, "_cleanup_failed_web_collection_metadata_if_new"),
+            patch.object(
+                kb_tasks, "run_web_ingestion", side_effect=_crawl_bills_then_fails
+            ),
+            pytest.raises(RuntimeError, match="crawl failed"),
+        ):
+            kb_tasks.handle_kb_ingest_web(MagicMock(), job)
+    finally:
+        quota_hooks.set_standalone_usage_hook(None)
+
+    [(user_id, [row], source)] = calls
+    assert (user_id, source, row["quantity"]) == (101, "kb_ingest_web_job", 2.0)

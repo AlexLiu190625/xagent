@@ -3,6 +3,11 @@ from __future__ import annotations
 from typing import Any, List, Optional, Union
 
 from .. import public_requests as requests
+from ..retrieval_metering import (
+    read_billed_json,
+    record_embedding_usage,
+    reported_tokens,
+)
 from .base import BaseEmbedding
 
 
@@ -18,6 +23,7 @@ class OpenAIEmbedding(BaseEmbedding):
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         dimension: Optional[int] = None,
+        model_id: str = "",
     ):
         """
         Initialize OpenAI embedding client.
@@ -27,8 +33,10 @@ class OpenAIEmbedding(BaseEmbedding):
             api_key: OpenAI API key (or set OPENAI_API_KEY env var)
             base_url: API base URL
             dimension: Optional embedding dimension (for models that support it)
+            model_id: Configured model id recorded on usage rows
         """
         self.model = model
+        self.model_id = model_id
         self.api_key = api_key
 
         # Ensure base_url ends with /embeddings for OpenAI-compatible APIs
@@ -145,7 +153,16 @@ class OpenAIEmbedding(BaseEmbedding):
             response = session.post(self.base_url or "", json=payload)
             response.raise_for_status()
 
-            data = response.json()
+            data = read_billed_json(
+                response,
+                lambda body: record_embedding_usage(
+                    self,
+                    len(texts),
+                    reported_tokens(
+                        body, ("usage", "prompt_tokens"), ("usage", "total_tokens")
+                    ),
+                ),
+            )
 
             if "data" not in data:
                 raise ValueError(f"Unexpected response format: {data}")

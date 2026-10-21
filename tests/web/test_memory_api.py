@@ -731,3 +731,105 @@ class TestMemoryApiIntegration:
         )
         # Should fail due to missing required content field
         assert response.status_code == 422
+
+
+class TestMemoryApiUsage:
+    """Memory API calls embed outside any agent run; the caller is billed."""
+
+    @pytest.fixture
+    def hook(self):
+        from xagent.web.services import quota_hooks
+
+        calls: list = []
+        quota_hooks.set_standalone_usage_hook(
+            lambda user_id, details, source: calls.append((user_id, details, source))
+        )
+        yield calls
+        quota_hooks.set_standalone_usage_hook(None)
+
+    @staticmethod
+    def _embedding(result):
+        from xagent.core.model.chat.token_context import (
+            MediaCallType,
+            add_media_usage,
+        )
+
+        def _call(*_args, **_kwargs):
+            add_media_usage(
+                call_type=MediaCallType.EMBEDDING, quantity=1, model_id="mem"
+            )
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        return _call
+
+    def _assert_billed(self, hook, test_db, rows=1):
+        [(user_id, details, source)] = hook
+        assert (user_id, source) == (test_db.id, "memory_api")
+        assert [row["model_id"] for row in details] == ["mem"] * rows
+
+    def test_search_bills_the_caller(
+        self, client, mock_memory_store, auth_headers, hook, test_db
+    ):
+        mock_memory_store.search.side_effect = self._embedding([])
+        response = client.get("/api/memory/list?search=q", headers=auth_headers)
+
+        assert response.status_code == 200
+        self._assert_billed(hook, test_db)
+
+    def test_listing_without_search_bills_nothing(
+        self, client, mock_memory_store, auth_headers, hook
+    ):
+        mock_memory_store.list_all.return_value = []
+        client.get("/api/memory/list", headers=auth_headers)
+        assert hook == []
+
+    def test_create_bills_the_caller_even_when_the_store_fails(
+        self, client, mock_memory_store, auth_headers, hook, test_db
+    ):
+        from xagent.core.memory.core import MemoryResponse
+
+        mock_memory_store.add.side_effect = self._embedding(
+            MemoryResponse(success=True, memory_id="m1")
+        )
+        assert (
+            client.post(
+                "/api/memory", json={"content": "x"}, headers=auth_headers
+            ).status_code
+            == 200
+        )
+        mock_memory_store.add.side_effect = self._embedding(RuntimeError("disk full"))
+        assert (
+            client.post(
+                "/api/memory", json={"content": "x"}, headers=auth_headers
+            ).status_code
+            == 500
+        )
+
+        assert len(hook) == 2
+        assert {call[0] for call in hook} == {test_db.id}
+
+    def test_update_bills_the_caller(
+        self,
+        client,
+        mock_memory_store,
+        auth_headers,
+        hook,
+        test_db,
+        sample_memory_notes,
+    ):
+        from xagent.core.memory.core import MemoryResponse
+
+        mock_memory_store.get.return_value = MemoryResponse(
+            success=True, content=sample_memory_notes[0]
+        )
+        mock_memory_store.update.side_effect = self._embedding(
+            MemoryResponse(success=True)
+        )
+        response = client.put(
+            "/api/memory/memory_1", json={"content": "new"}, headers=auth_headers
+        )
+
+        assert response.status_code == 200
+        self._assert_billed(hook, test_db)

@@ -1620,3 +1620,114 @@ def test_ingest_tables_are_real_schema_manager_tables() -> None:
         "prompt_templates",  # same
         "kb_ids",  # same
     }
+
+
+def _run_metered_batch_embedding(
+    monkeypatch: pytest.MonkeyPatch, *, fail_batch: int | None = None
+) -> tuple[IngestionResult | None, BaseException | None, list[dict]]:
+    """Drive the concurrent batch path with a real DashScope provider.
+
+    The provider records its own usage, as in production, from inside the
+    encode pool's worker threads. Returns the usage rows that reached the
+    caller's context.
+    """
+    import json
+    import threading
+    from types import SimpleNamespace
+
+    import requests
+
+    from xagent.core.model.chat.token_context import TokenContextManager
+    from xagent.core.model.embedding.dashscope import DashScopeEmbedding
+
+    _patch_pipeline_dependencies(monkeypatch)
+    chunks = _make_chunks(6)
+    read_response = EmbeddingReadResponse(
+        chunks=chunks, total_count=6, pending_count=6
+    ).model_dump()
+    monkeypatch.setattr(
+        document_ingestion, "read_chunks_for_embedding", lambda **_: read_response
+    )
+
+    batch_started = threading.Barrier(3, timeout=5)
+
+    def post(url: str, **kwargs: object) -> requests.Response:
+        texts = kwargs["json"]["input"]["texts"]  # type: ignore[index]
+        batch_started.wait()  # all three batches really run side by side
+        response = requests.Response()
+        response.status_code = 200
+        body: dict = {"usage": {"total_tokens": 10 * len(texts)}}
+        if len(texts[0]) != fail_batch:
+            body["output"] = {
+                "embeddings": [{"embedding": [float(len(t)), 0.0]} for t in texts]
+            }
+        # The failing batch is billed (200) but unusable: no embeddings.
+        response._content = json.dumps(body).encode()
+        return response
+
+    provider = DashScopeEmbedding(api_key="k", dimension=2, model_id="kb-emb")
+    provider._session = SimpleNamespace(post=post)  # type: ignore[assignment]
+    config = EmbeddingModelConfig(
+        id="kb-emb",
+        model_name="text-embedding-v4",
+        model_provider="dashscope",
+        dimension=2,
+    )
+    monkeypatch.setattr(
+        document_ingestion,
+        "_resolve_embedding_adapter",
+        lambda _cfg: (config, provider),
+    )
+    monkeypatch.setattr(
+        document_ingestion,
+        "write_vectors_to_db",
+        lambda **kwargs: EmbeddingWriteResponse(
+            upsert_count=len(kwargs["embeddings"]),
+            deleted_stale_count=0,
+            index_status="skipped",
+        ).model_dump(),
+    )
+
+    result: IngestionResult | None = None
+    error: BaseException | None = None
+    with TokenContextManager() as manager:
+        try:
+            result = document_ingestion.process_document(
+                collection="demo",
+                source_path="/tmp/doc.md",
+                config=IngestionConfig(
+                    embedding_use_async=False,
+                    embedding_batch_size=2,
+                    embedding_concurrent=3,
+                    max_retries=1,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            error = exc
+    rows = [d for d in manager.get_usage().details if d.get("type") == "media"]
+    return result, error, rows
+
+
+def test_batch_embedding_usage_from_pool_threads_reaches_the_caller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pool threads do not carry the caller's context; before the per-worker
+    usage merge every concurrent batch's usage was silently dropped."""
+    result, error, rows = _run_metered_batch_embedding(monkeypatch)
+
+    assert error is None and result is not None and result.status == "success"
+    assert sorted(row["quantity"] for row in rows) == [2.0, 2.0, 2.0]
+    assert {row["model_id"] for row in rows} == {"kb-emb"}
+    assert sum(row["provider_input_tokens"] for row in rows) == 60
+
+
+def test_batch_embedding_failed_batch_still_merges_billed_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A batch the provider billed but returned unusable fails the document;
+    the usage of every batch billed so far must still reach the caller."""
+    # chunk texts are 1..6 chars long; batch 2 holds texts of length 3 and 4.
+    result, error, rows = _run_metered_batch_embedding(monkeypatch, fail_batch=3)
+
+    assert error is not None or (result is not None and result.status != "success")
+    assert sorted(row["quantity"] for row in rows) == [2.0, 2.0, 2.0]

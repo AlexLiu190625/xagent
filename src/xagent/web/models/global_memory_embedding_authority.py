@@ -35,6 +35,8 @@ class GlobalMemoryEmbeddingAuthority(Base):  # type: ignore[no-any-unimported]
     configured_by_actor_subject = Column(String(64), nullable=False)
     consented_by_actor_subject = Column(String(64), nullable=False)
     consented_at = Column(DateTime(timezone=True), nullable=False)
+    # Model id memory embedding usage is billed under; NULL records it unpriced.
+    billing_model_id = Column(String(100), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

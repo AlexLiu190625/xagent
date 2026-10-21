@@ -267,6 +267,9 @@ def authority_embedding_config(
     """Build the runtime embedding config from the global authority alone."""
     return EmbeddingModelConfig(
         id=AUTHORITY_CONFIG_ID,
+        # ``id`` names the authority, not a priced model: usage rows carry the
+        # operator's billing id instead, or none at all when it is unset.
+        billing_model_id=snapshot.billing_model_id or "",
         model_name=snapshot.model_name,
         model_provider=snapshot.provider,
         base_url=snapshot.endpoint,

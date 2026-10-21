@@ -191,6 +191,7 @@ from ..services.uploaded_file_store import (
     cleanup_superseded_uploaded_file_objects,
     snapshot_uploaded_file_version,
 )
+from ..tracking.standalone_usage import run_in_usage_scope, usage_scope
 from .cloud_storage import get_google_credentials
 
 T = TypeVar("T", bound=Callable[..., Any])
@@ -3585,7 +3586,15 @@ async def ingest(
             )
 
         loop = asyncio.get_running_loop()
-        api_result = await loop.run_in_executor(None, _run_ingestion)
+        # Billed to the member who uploaded, not the storage tenant. The scope
+        # lives in the worker, so a cancelled request still delivers it.
+        api_result = await loop.run_in_executor(
+            None,
+            run_in_usage_scope,
+            int(actor_user.id),
+            "kb_ingest",
+            _run_ingestion,
+        )
         result = api_result.result
         result = _with_user_actionable_ingestion_message(
             result,
@@ -4302,7 +4311,12 @@ async def ingest_cloud(
                         file_config = config.model_copy(
                             update={"parse_method": normalized_parse_method}
                         )
+                        # Billed to the requesting member. The scope lives in
+                        # the worker, so a cancelled request still delivers it.
                         api_result = await asyncio.to_thread(
+                            run_in_usage_scope,
+                            actor_user_id,
+                            "kb_ingest_cloud",
                             run_document_ingestion_with_outcome,
                             collection=safe_collection,
                             source_path=str(file_path),
@@ -4944,6 +4958,8 @@ async def search(
             status_code=422, detail=f"Invalid collection name: {str(e)}"
         ) from e
 
+    # Usage is billed to the member searching, not the collection's tenant.
+    actor_user_id = int(_user.id)
     _user, _ = _effective_knowledge_base_user(db, _user, safe_collection, action="read")
 
     if not embedding_model_id:
@@ -4974,14 +4990,15 @@ async def search(
     )
 
     progress_manager = get_progress_manager()
-    result = run_document_search(
-        collection=safe_collection,
-        query_text=query_text,
-        config=config,
-        progress_manager=progress_manager,
-        user_id=int(_user.id),
-        is_admin=bool(_user.is_admin),
-    )
+    async with usage_scope(actor_user_id, usage_source="kb_search"):
+        result = run_document_search(
+            collection=safe_collection,
+            query_text=query_text,
+            config=config,
+            progress_manager=progress_manager,
+            user_id=int(_user.id),
+            is_admin=bool(_user.is_admin),
+        )
 
     return result
 
@@ -5401,8 +5418,13 @@ async def ingest_web(
             finally:
                 db_session.close()
 
+        # The scope lives in the worker, so a cancelled request still
+        # delivers it; asyncio.run carries it into the crawl's tasks.
         api_result = await asyncio.get_running_loop().run_in_executor(
             None,
+            run_in_usage_scope,
+            int(actor_user.id),
+            "kb_ingest_web",
             lambda: asyncio.run(
                 run_web_ingestion_with_outcome(
                     collection=safe_collection,

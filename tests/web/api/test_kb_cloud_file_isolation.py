@@ -222,6 +222,87 @@ def test_a_file_raising_outside_its_try_does_not_end_the_request(
     metadata_store.save_collection_config.assert_awaited_once()
 
 
+def test_each_cloud_file_bills_the_requesting_member(
+    test_env, temp_uploads, monkeypatch
+) -> None:
+    from xagent.core.model.chat.token_context import MediaCallType, add_media_usage
+    from xagent.web.services import quota_hooks
+
+    app, headers, user, _ = test_env
+    _connect_drive(test_env, monkeypatch)
+
+    def _ingest(**_kwargs):
+        add_media_usage(call_type=MediaCallType.EMBEDDING, quantity=2, model_id="e")
+        return IngestionResult(
+            status="success",
+            doc_id="doc",
+            message="ok",
+            completed_steps=[
+                {"name": "register_document", "metadata": {"created": True}}
+            ],
+        )
+
+    class _Files:
+        def get(self, fileId, **_kw):
+            return kb_dir._fake_drive_metadata_request(fileId, "f.csv", "text/csv")
+
+        def get_media(self, fileId, **_kw):
+            return {"fileId": fileId}
+
+    class _Downloader:
+        def __init__(self, fh, _request):
+            self._fh = fh
+
+        def next_chunk(self):
+            self._fh.write(b"content")
+            return None, True
+
+    metadata_store = MagicMock()
+    metadata_store.get_collection_config = AsyncMock(return_value=None)
+    metadata_store.save_collection_config = AsyncMock()
+    calls: list = []
+    quota_hooks.set_standalone_usage_hook(
+        lambda user_id, details, source: calls.append((user_id, details, source))
+    )
+    try:
+        with ExitStack() as stack:
+            for p in (
+                patch(
+                    "xagent.web.api.kb.get_google_credentials", return_value=object()
+                ),
+                patch(
+                    "xagent.web.api.kb.build",
+                    return_value=SimpleNamespace(files=_Files),
+                ),
+                patch("xagent.web.api.kb.MediaIoBaseDownload", _Downloader),
+                patch("xagent.web.api.kb.run_document_ingestion", side_effect=_ingest),
+                patch(
+                    "xagent.web.api.kb._ensure_collection_access",
+                    new_callable=AsyncMock,
+                ),
+                patch(
+                    "xagent.web.api.kb.get_collection_sync",
+                    side_effect=ValueError("new"),
+                ),
+                patch(METADATA_STORE, return_value=metadata_store),
+            ):
+                stack.enter_context(p)
+            response = TestClient(app).post(
+                "/api/kb/ingest-cloud",
+                json={"collection": "cloud_coll", "files": _drive_files(2)},
+                headers=headers,
+            )
+    finally:
+        quota_hooks.set_standalone_usage_hook(None)
+
+    assert [e["status"] for e in response.json()] == ["success", "success"]
+    # One delivery per file, each from the thread that ran its ingestion.
+    assert sorted((u, s, len(d), d[0]["quantity"]) for u, d, s in calls) == [
+        (int(user.id), "kb_ingest_cloud", 1, 2.0),
+        (int(user.id), "kb_ingest_cloud", 1, 2.0),
+    ]
+
+
 def test_a_new_collection_whose_only_file_raises_is_cleaned_up(
     test_env, temp_uploads
 ) -> None:

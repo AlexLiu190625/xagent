@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Tuple
 
+from xagent.core.model.chat.token_context import call_with_own_usage, get_token_usage
 from xagent.core.model.embedding.base import BaseEmbedding
 from xagent.core.model.model import EmbeddingModelConfig
 
@@ -1290,10 +1291,26 @@ def _process_document_impl(
                     with concurrent.futures.ThreadPoolExecutor(
                         max_workers=min(max_encode_workers, len(batch_slices))
                     ) as encode_pool:
-                        # map preserves input order, so vectors line up with batches.
-                        all_vectors = list(
-                            encode_pool.map(_encode_batch, enumerate(batch_slices))
+                        # map preserves input order, so vectors line up with
+                        # batches. Pool threads do not carry this context, so
+                        # each batch records its usage privately and it is
+                        # merged here, on this thread -- including for batches
+                        # that failed after the provider had already billed.
+                        outcomes = list(
+                            encode_pool.map(
+                                lambda indexed: call_with_own_usage(
+                                    _encode_batch, indexed
+                                ),
+                                enumerate(batch_slices),
+                            )
                         )
+                    usage = get_token_usage()
+                    for batch_usage, _vectors, _error in outcomes:
+                        usage.merge(batch_usage)
+                    for _usage, _vectors, error in outcomes:
+                        if error is not None:
+                            raise error
+                    all_vectors = [vectors for _usage, vectors, _error in outcomes]
                 else:
                     all_vectors = [
                         _encode_batch((idx, bc)) for idx, bc in enumerate(batch_slices)

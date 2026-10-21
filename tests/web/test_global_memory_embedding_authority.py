@@ -466,3 +466,83 @@ def test_authority_identity_covers_more_than_the_vector_space(
         assert (
             after.vector_space_fingerprint() != before.vector_space_fingerprint()
         ) is vector_space_moves
+
+
+@pytest.mark.parametrize(
+    ("given", "stored"),
+    [
+        ("platform/text-embedding-v4", "platform/text-embedding-v4"),
+        ("  platform/x  ", "platform/x"),
+        ("   ", None),
+        (None, None),
+    ],
+)
+def test_billing_model_id_round_trips_outside_both_fingerprints(
+    authority_harness, given, stored
+):
+    client, sessions, _actor, _engine = authority_harness
+    with sessions() as db:
+        service = GlobalMemoryEmbeddingAuthorityService(db)
+        service.set(AuthorityConfiguration(**PAYLOAD), actor_subject="a")
+        before = service.load_snapshot()
+        written = service.set(
+            AuthorityConfiguration(**dict(PAYLOAD, billing_model_id=given)),
+            actor_subject="a",
+        )
+        after = service.load_snapshot()
+
+    assert written.billing_model_id == stored
+    assert after.billing_model_id == stored
+    assert client.get(URL).json()["billing_model_id"] == stored
+    # Billing changes no vector and no call.
+    assert after.authority_fingerprint() == before.authority_fingerprint()
+    assert after.vector_space_fingerprint() == before.vector_space_fingerprint()
+
+
+def test_a_put_without_billing_model_id_keeps_the_stored_one(authority_harness):
+    client, _sessions, _actor, _engine = authority_harness
+    billed = dict(PAYLOAD, billing_model_id="platform/x")
+    assert client.put(URL, json=billed).json()["billing_model_id"] == "platform/x"
+
+    # A client unaware of the field re-saves the authority.
+    assert client.put(URL, json=PAYLOAD).json()["billing_model_id"] == "platform/x"
+    assert client.get(URL).json()["billing_model_id"] == "platform/x"
+
+    cleared = dict(PAYLOAD, billing_model_id=None)
+    assert client.put(URL, json=cleared).json()["billing_model_id"] is None
+    assert client.get(URL).json()["billing_model_id"] is None
+
+
+def test_overlong_billing_model_id_is_rejected(authority_harness):
+    client, _sessions, _actor, _engine = authority_harness
+    response = client.put(URL, json=dict(PAYLOAD, billing_model_id="x" * 101))
+    assert response.status_code == 400
+    assert client.get(URL).json()["configured"] is False
+
+
+@pytest.mark.parametrize(
+    ("billing_model_id", "row_model_id"),
+    [("platform/text-embedding-v4", "platform/text-embedding-v4"), (None, "")],
+)
+def test_memory_embedding_rows_carry_the_billing_model_id(
+    authority_harness, billing_model_id, row_model_id
+):
+    """Never the authority's own config id, which names no priced model."""
+    from xagent.core.model.embedding.adapter import create_embedding_adapter
+    from xagent.web.memory_lifecycle import (
+        AUTHORITY_CONFIG_ID,
+        authority_embedding_config,
+    )
+
+    _client, sessions, _actor, _engine = authority_harness
+    with sessions() as db:
+        service = GlobalMemoryEmbeddingAuthorityService(db)
+        service.set(
+            AuthorityConfiguration(**dict(PAYLOAD, billing_model_id=billing_model_id)),
+            actor_subject="a",
+        )
+        config = authority_embedding_config(service.load_snapshot())
+
+    assert config.id == AUTHORITY_CONFIG_ID
+    provider = create_embedding_adapter(config)._inner._embedding_model
+    assert provider.model_id == row_model_id

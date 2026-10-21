@@ -43,6 +43,7 @@ class AuthorityState(BaseModel):
     global_sharing_consent: bool | None = None
     consented_at: datetime | None = None
     credential_status: str | None = None
+    billing_model_id: str | None = None
     configured_at: datetime | None = Field(default=None, validation_alias="created_at")
     updated_at: datetime | None = None
 

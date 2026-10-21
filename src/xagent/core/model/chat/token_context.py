@@ -431,11 +431,20 @@ class TokenContextManager:
 # Global functions for easier access
 
 
+class _UnboundTokenUsage(TokenUsage):
+    """The usage :func:`get_token_usage` binds when nothing else has.
+
+    Trackers and usage scopes bind a ``TokenUsage`` of their own, so rows
+    recorded here have nothing set up to report them; the type lets a metered
+    row say so.
+    """
+
+
 def get_token_usage() -> TokenUsage:
     """Get the current token usage, lazily creating a per-context instance."""
     usage = token_context.get()
     if usage is None:
-        usage = TokenUsage()
+        usage = _UnboundTokenUsage()
         token_context.set(usage)
     return usage
 
@@ -754,6 +763,34 @@ def set_token_usage(usage: TokenUsage) -> TokenUsage:
     return usage
 
 
+def call_with_own_usage(
+    fn: Callable[[Any], Any], arg: Any
+) -> tuple[TokenUsage, Any, Optional[BaseException]]:
+    """Run ``fn(arg)`` recording into a fresh ``TokenUsage`` of its own.
+
+    For work submitted to a thread pool, which does not carry the caller's
+    context: the worker records into this private usage, and the caller merges
+    it into its own on its own thread (``get_token_usage().merge(usage)``), so
+    no ``TokenUsage`` is ever appended to from two threads. Runs in a copied
+    context, leaving the pool thread's own context untouched for whatever
+    task reuses it next.
+
+    Returns ``(usage, result, error)``. The error is returned rather than
+    raised so the caller can merge the usage first -- calls the provider
+    billed before the failure still count.
+    """
+    usage = TokenUsage()
+
+    def _run() -> Any:
+        token_context.set(usage)
+        return fn(arg)
+
+    try:
+        return usage, contextvars.copy_context().run(_run), None
+    except Exception as e:  # noqa: BLE001
+        return usage, None, e
+
+
 def get_and_reset_token_usage() -> TokenUsage:
     """Get current usage and reset the context."""
     usage = get_token_usage()
@@ -1036,3 +1073,8 @@ def add_media_usage(
         resolution=resolution,
         tokens_estimated=tokens_estimated,
     )
+    if isinstance(usage, _UnboundTokenUsage):
+        logger.debug(
+            "%s usage recorded with no tracker or usage scope bound to report it",
+            call_type,
+        )
