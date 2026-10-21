@@ -13,9 +13,12 @@ from xagent.core.agent.context.memory_tool import (
     build_memory_tools,
     build_store_memory_tool,
 )
+from xagent.core.execution_scope import ExecutionScope, ExecutionScopeContext
 from xagent.core.memory.core import MemoryNote, MemoryResponse
+from xagent.core.memory.in_memory import InMemoryMemoryStore
 from xagent.core.memory.lancedb import LanceDBMemoryStore
-from xagent.web.user_isolated_memory import UserIsolatedMemoryStore
+from xagent.core.model.embedding import BaseEmbedding
+from xagent.web.user_isolated_memory import UserContext, UserIsolatedMemoryStore
 
 
 class RecordingMemoryStore:
@@ -216,12 +219,14 @@ class CrudMemoryStore(RecordingMemoryStore):
         self.notes = dict(notes or {})
         self.updated: list[MemoryNote] = []
         self.deleted: list[str] = []
+        self.get_calls: list[str] = []
 
     def search(self, **kwargs: Any) -> list[Any]:
         self.searches.append(kwargs)
         return list(self.notes.values())
 
     def get(self, note_id: str) -> MemoryResponse:
+        self.get_calls.append(note_id)
         note = self.notes.get(note_id)
         if note is None:
             return MemoryResponse(success=False, error="Note not found")
@@ -375,9 +380,219 @@ async def test_delete_memory_removes_note() -> None:
     result = await tool.execute(memory_id="mem-1")
     missing = await tool.execute(memory_id="mem-1")
 
-    assert result == {"success": True, "memory_id": "mem-1"}
+    assert result == {
+        "success": True,
+        "deleted": True,
+        "verified": True,
+        "memory_id": "mem-1",
+    }
     assert store.deleted == ["mem-1"]
+    assert store.get_calls == ["mem-1", "mem-1", "mem-1"]
+    assert store.searches == []
     assert missing["success"] is False
+    assert missing["deleted"] is False
+
+
+@pytest.mark.asyncio
+async def test_delete_memory_reports_lookup_delete_and_verification_failures() -> None:
+    secret = "postgresql://admin:password@memory.internal/private"
+
+    class LookupExceptionStore(CrudMemoryStore):
+        def get(self, note_id: str) -> MemoryResponse:
+            raise RuntimeError("lookup unavailable")
+
+    class LookupFailureStore(CrudMemoryStore):
+        def get(self, note_id: str) -> MemoryResponse:
+            return MemoryResponse(success=False, error=secret)
+
+    class DeleteFailureStore(CrudMemoryStore):
+        def delete(self, note_id: str) -> MemoryResponse:
+            return MemoryResponse(success=False, error=secret)
+
+    class DeleteExceptionStore(CrudMemoryStore):
+        def delete(self, note_id: str) -> MemoryResponse:
+            raise RuntimeError("delete unavailable")
+
+    class VerificationFailureStore(CrudMemoryStore):
+        def get(self, note_id: str) -> MemoryResponse:
+            self.get_calls.append(note_id)
+            if len(self.get_calls) == 1:
+                return super().get(note_id)
+            return MemoryResponse(success=False, error=secret)
+
+    class VerificationExceptionStore(CrudMemoryStore):
+        def get(self, note_id: str) -> MemoryResponse:
+            self.get_calls.append(note_id)
+            if len(self.get_calls) == 1:
+                return super().get(note_id)
+            raise RuntimeError("verification unavailable")
+
+    class DeleteNoOpStore(CrudMemoryStore):
+        def delete(self, note_id: str) -> MemoryResponse:
+            return MemoryResponse(success=True, memory_id=note_id)
+
+    note = _note("mem-1", "Forget this.")
+    lookup = await DeleteMemoryTool(
+        memory_store=LookupExceptionStore({"mem-1": note})
+    ).execute(memory_id="mem-1")
+    lookup_failure = await DeleteMemoryTool(
+        memory_store=LookupFailureStore({"mem-1": note})
+    ).execute(memory_id="mem-1")
+    delete = await DeleteMemoryTool(
+        memory_store=DeleteFailureStore({"mem-1": note})
+    ).execute(memory_id="mem-1")
+    delete_exception = await DeleteMemoryTool(
+        memory_store=DeleteExceptionStore({"mem-1": note})
+    ).execute(memory_id="mem-1")
+    verification = await DeleteMemoryTool(
+        memory_store=VerificationFailureStore({"mem-1": note})
+    ).execute(memory_id="mem-1")
+    verification_exception = await DeleteMemoryTool(
+        memory_store=VerificationExceptionStore({"mem-1": note})
+    ).execute(memory_id="mem-1")
+    still_exists = await DeleteMemoryTool(
+        memory_store=DeleteNoOpStore({"mem-1": note})
+    ).execute(memory_id="mem-1")
+
+    assert lookup == {
+        "success": False,
+        "deleted": False,
+        "error": "Failed to look up memory before deletion.",
+    }
+    assert lookup_failure == lookup
+    assert delete == {
+        "success": False,
+        "deleted": None,
+        "verified": False,
+        "error": "Failed to delete memory.",
+    }
+    assert delete_exception == delete
+    assert verification["success"] is False
+    assert verification["deleted"] is None
+    assert verification["verified"] is False
+    assert "could not be verified" in verification["error"]
+    assert verification_exception == verification
+    assert still_exists == {
+        "success": False,
+        "deleted": False,
+        "verified": False,
+        "error": "Memory deletion could not be verified; the memory still exists.",
+    }
+    assert all(
+        secret not in str(result)
+        for result in (
+            lookup_failure,
+            delete,
+            delete_exception,
+            verification,
+            verification_exception,
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_memory_fails_closed_on_success_without_content() -> None:
+    class MissingContentStore(CrudMemoryStore):
+        def get(self, note_id: str) -> MemoryResponse:
+            return MemoryResponse(success=True, memory_id=note_id, content=None)
+
+    store = MissingContentStore({"mem-1": _note("mem-1", "Forget this.")})
+    result = await DeleteMemoryTool(memory_store=store).execute("mem-1")
+
+    assert result == {
+        "success": False,
+        "deleted": False,
+        "error": "Failed to look up memory before deletion.",
+    }
+    assert store.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_delete_memory_rejects_other_owner_and_scope_ids() -> None:
+    base_store = InMemoryMemoryStore()
+    store = UserIsolatedMemoryStore(base_store)
+    scope_a = ExecutionScope(memory_dimensions={"channel": "a"})
+    scope_b = ExecutionScope(memory_dimensions={"channel": "b"})
+
+    with UserContext(1), ExecutionScopeContext(scope_a):
+        first = MemoryNote(content="User likes jasmine tea.")
+        assert store.add(first).success
+    with UserContext(1), ExecutionScopeContext(scope_b):
+        similar = MemoryNote(content="User likes jasmine tea with ice.")
+        assert store.add(similar).success
+    with UserContext(2), ExecutionScopeContext(scope_a):
+        other_owner = MemoryNote(content="User likes jasmine tea.")
+        assert store.add(other_owner).success
+
+    with UserContext(1), ExecutionScopeContext(scope_a):
+        deleted = await DeleteMemoryTool(memory_store=store).execute(first.id)
+        wrong_scope = await DeleteMemoryTool(memory_store=store).execute(similar.id)
+        wrong_owner = await DeleteMemoryTool(memory_store=store).execute(other_owner.id)
+
+    assert deleted["success"] is True
+    assert wrong_scope == {
+        "success": False,
+        "deleted": False,
+        "error": f"Memory '{similar.id}' not found or access denied.",
+    }
+    assert wrong_owner == {
+        "success": False,
+        "deleted": False,
+        "error": f"Memory '{other_owner.id}' not found or access denied.",
+    }
+    assert not base_store.get(first.id).success
+    assert base_store.get(similar.id).success
+    assert base_store.get(other_owner.id).success
+
+
+class _DeterministicEmbedding(BaseEmbedding):
+    def __init__(self) -> None:
+        self._dimension = 8
+
+    def encode(self, text: Any, dimension: Any = None, instruct: Any = None) -> Any:
+        if isinstance(text, str):
+            return [0.1] * self._dimension
+        return [[0.1] * self._dimension for _ in text]
+
+    def get_dimension(self) -> int:
+        return self._dimension
+
+    @property
+    def abilities(self) -> list[str]:
+        return ["embed"]
+
+
+@pytest.mark.asyncio
+async def test_delete_memory_persists_after_lancedb_reopen(tmp_path: Any) -> None:
+    scope = ExecutionScope(memory_dimensions={"channel": "a"})
+    first_store = UserIsolatedMemoryStore(
+        LanceDBMemoryStore(
+            db_dir=str(tmp_path),
+            collection_name="delete_reopen",
+            embedding_model=_DeterministicEmbedding(),
+        )
+    )
+    deleted_note = MemoryNote(content="User likes jasmine tea.")
+    retained_note = MemoryNote(content="User likes jasmine tea with ice.")
+
+    with UserContext(1), ExecutionScopeContext(scope):
+        assert first_store.add(deleted_note).success
+        assert first_store.add(retained_note).success
+        result = await DeleteMemoryTool(memory_store=first_store).execute(
+            deleted_note.id
+        )
+    assert result["success"] is True
+
+    reopened_store = UserIsolatedMemoryStore(
+        LanceDBMemoryStore(
+            db_dir=str(tmp_path),
+            collection_name="delete_reopen",
+            embedding_model=_DeterministicEmbedding(),
+        )
+    )
+    with UserContext(1), ExecutionScopeContext(scope):
+        assert not reopened_store.get(deleted_note.id).success
+        assert reopened_store.get(retained_note.id).success
 
 
 def test_build_memory_tools_composition() -> None:
@@ -389,6 +604,7 @@ def test_build_memory_tools_composition() -> None:
         "update_memory",
         "delete_memory",
     ]
+    assert "current user explicitly asks" in tools[-1].description
 
 
 @pytest.mark.asyncio

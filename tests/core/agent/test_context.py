@@ -2196,6 +2196,12 @@ def test_system_context_renders_memory_persistence_guidance() -> None:
     assert "Memory persistence:" in with_flag
     assert "store_memory" in with_flag
     assert "update_memory" in with_flag
+    assert "current trusted user explicitly asks" in with_flag
+    assert "Long-term memory is separate from visible chat history" in with_flag
+    assert (
+        "Do not store the deletion request or the deleted fact again during the "
+        "current turn"
+    ) in with_flag
 
 
 def _clock_context(timezone_name: str | None) -> ExecutionContext:
