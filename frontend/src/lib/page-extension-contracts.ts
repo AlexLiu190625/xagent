@@ -48,3 +48,15 @@ export type BuildPageExtensionProviderComponent =
 
 export type BuildAgentCardExtensionComponent =
   ComponentType<BuildAgentCardExtensionProps>
+
+// Wraps the Deploy dialog's key-based embed snippet. A replacement may render
+// `children` alongside alternative embed instructions; the OSS default renders only `children`.
+export interface DeployAgentEmbedExtensionProps {
+  agentId: number
+  // Origin the generated widget script loads from; empty until deployment config loads.
+  widgetOrigin: string
+  children: ReactNode
+}
+
+export type DeployAgentEmbedExtensionComponent =
+  ComponentType<DeployAgentEmbedExtensionProps>

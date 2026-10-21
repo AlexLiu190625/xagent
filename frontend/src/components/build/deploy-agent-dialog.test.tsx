@@ -40,6 +40,26 @@ vi.mock("@/lib/browser-location", () => ({
   getBrowserLocationOrigin: () => "https://cloud.example.test",
 }))
 
+vi.mock("@/lib/deploy-agent-extension", () => ({
+  DeployAgentEmbedExtension: ({
+    agentId,
+    widgetOrigin,
+    children,
+  }: {
+    agentId: number
+    widgetOrigin: string
+    children: React.ReactNode
+  }) => (
+    <div
+      data-testid="embed-extension"
+      data-agent-id={agentId}
+      data-widget-origin={widgetOrigin}
+    >
+      {children}
+    </div>
+  ),
+}))
+
 import { __resetDeploymentConfigCache } from "@/lib/deployment-config"
 import { DeployAgentDialog, type Agent } from "./deploy-agent-dialog"
 
@@ -224,6 +244,29 @@ describe("DeployAgentDialog regional targets", () => {
         ),
       )
     })
+  })
+
+  it("hands the embed snippet to the deploy extension slot", async () => {
+    render(
+      <DeployAgentDialog
+        deployAgent={AGENT}
+        onClose={vi.fn()}
+        onUpdate={vi.fn()}
+      />,
+    )
+
+    fireEvent.click(screen.getByText("deploy_agent.options.embed.title"))
+    const slot = await screen.findByTestId("embed-extension")
+    await waitFor(() => {
+      expect(slot).toHaveAttribute(
+        "data-widget-origin",
+        "https://sg-origin.cloud.example.test",
+      )
+    })
+    expect(slot).toHaveAttribute("data-agent-id", "7")
+    expect(slot).toContainElement(
+      screen.getByTitle("deploy_agent.embed_snippet.copy_btn"),
+    )
   })
 
   it("keeps widget copy disabled when deployment configuration fails", async () => {
