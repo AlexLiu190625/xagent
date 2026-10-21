@@ -88,3 +88,15 @@ Common usage:
 ```bash
 PYTHONPATH=src python scripts/export_openapi.py -o openapi.json
 ```
+
+## `connector_smoke/`
+
+Black-box connector smoke checks against a deployed instance. L1 checks the
+connector catalog and each builtin OAuth provider's client configuration, with
+no vendor accounts. See [connector_smoke/README.md](connector_smoke/README.md).
+
+Common usage:
+
+```bash
+PYTHONPATH=src:scripts python -m connector_smoke l1 --base-url https://xagent.example.com
+```
