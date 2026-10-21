@@ -4425,3 +4425,17 @@ class TestZendeskMarketplaceHeaders:
         assert config.get_zendesk_marketplace_headers() == {
             "X-Zendesk-Marketplace-App-Id": "1" * 256
         }
+
+
+def test_python_executor_timeout_default_and_override(monkeypatch):
+    monkeypatch.delenv("XAGENT_PYTHON_EXECUTOR_TIMEOUT_SECONDS", raising=False)
+    assert config.get_python_executor_timeout_seconds() == 1200
+
+    monkeypatch.setenv("XAGENT_PYTHON_EXECUTOR_TIMEOUT_SECONDS", "45")
+    assert config.get_python_executor_timeout_seconds() == 45
+
+
+@pytest.mark.parametrize("value", ["0", "-5", "soon"])
+def test_python_executor_timeout_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("XAGENT_PYTHON_EXECUTOR_TIMEOUT_SECONDS", value)
+    assert config.get_python_executor_timeout_seconds() == 1200

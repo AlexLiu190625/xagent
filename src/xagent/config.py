@@ -191,6 +191,7 @@ SANDBOX_ENV = "SANDBOX_ENV"
 SANDBOX_VOLUMES = "SANDBOX_VOLUMES"
 # Set only inside the sandbox tool runner, which has no database credentials.
 SANDBOX_TOOL_RUNNER = "XAGENT_SANDBOX_TOOL_RUNNER"
+PYTHON_EXECUTOR_TIMEOUT_SECONDS = "XAGENT_PYTHON_EXECUTOR_TIMEOUT_SECONDS"
 SANDBOX_HOST_PROJECT_ROOT = "XAGENT_SANDBOX_HOST_PROJECT_ROOT"
 SANDBOX_HOST_STORAGE_ROOT = "XAGENT_SANDBOX_HOST_STORAGE_ROOT"
 SANDBOX_MAX_CONCURRENCY = "XAGENT_SANDBOX_MAX_CONCURRENCY"
@@ -912,6 +913,22 @@ def get_sql_worker_port() -> int:
     if port > 65535:
         raise ValueError(f"Invalid {SQL_WORKER_PORT} value: {port}")
     return port
+
+
+def get_python_executor_timeout_seconds() -> int:
+    """Get the wall-clock limit for one execute_python_code call.
+
+    Priority:
+        1. XAGENT_PYTHON_EXECUTOR_TIMEOUT_SECONDS environment variable
+        2. 1200 seconds (20 minutes)
+
+    The default sits above the longest legitimate runs seen in production
+    (video rendering, ~16 minutes) while still bounding runaway code.
+
+    Returns:
+        Positive number of seconds. Invalid values fall back to the default.
+    """
+    return _get_positive_int_env(PYTHON_EXECUTOR_TIMEOUT_SECONDS, 1200)
 
 
 def get_sql_worker_query_timeout_seconds() -> int:

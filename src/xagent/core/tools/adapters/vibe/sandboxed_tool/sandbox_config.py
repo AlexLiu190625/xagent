@@ -19,6 +19,9 @@ class SandboxConfig:
     enabled: bool = True
     packages: tuple[str, ...] = ()
     env_vars: tuple[str, ...] = ()
+    # Returns the per-call wall-clock limit in seconds, read at call time so
+    # config overrides apply. None leaves the tool unbounded.
+    exec_timeout: Callable[[], int] | None = None
 
 
 def sandbox_config(
@@ -26,6 +29,7 @@ def sandbox_config(
     enabled: bool = True,
     packages: Iterable[str] | None = None,
     env_vars: Iterable[str] | None = None,
+    exec_timeout: Callable[[], int] | None = None,
 ) -> Callable[[_T], _T]:
     """Attach sandbox config metadata to a class via decorator."""
 
@@ -33,6 +37,7 @@ def sandbox_config(
         enabled=enabled,
         packages=tuple(packages or ()),
         env_vars=tuple(env_vars or ()),
+        exec_timeout=exec_timeout,
     )
 
     def decorator(cls: _T) -> _T:

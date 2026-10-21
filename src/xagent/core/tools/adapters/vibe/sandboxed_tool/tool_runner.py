@@ -129,7 +129,8 @@ def main() -> None:
     result = _execute_from_spec(execution_spec, init_params, tool_args)
 
     result_path = Path(parsed.result_file)
-    result_path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+    # ASCII escapes keep lone surrogates (undecodable filenames) encodable.
+    result_path.write_text(json.dumps(result), encoding="utf-8")
 
 
 if __name__ == "__main__":

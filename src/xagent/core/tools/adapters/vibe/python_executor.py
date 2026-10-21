@@ -9,6 +9,7 @@ from typing import Any, Dict, Mapping, Optional, Type
 
 from pydantic import BaseModel, Field
 
+from .....config import get_python_executor_timeout_seconds, in_sandbox_tool_runner
 from ....workspace import TaskWorkspace
 from ...artifacts import (
     build_generated_file_metadata,
@@ -16,6 +17,7 @@ from ...artifacts import (
     snapshot_generated_artifact_files,
 )
 from ...core.python_executor import PythonExecutorCore
+from ...core.python_subprocess import run_python_code_in_subprocess
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 from .function import FunctionTool
 from .sandboxed_tool.sandbox_config import sandbox_config
@@ -81,9 +83,6 @@ class PythonExecutorTool(AbstractBaseTool):
         # Add workspace environment variables if workspace is available
         workspace_env = self._get_workspace_env()
 
-        # Create core executor instance
-        executor = PythonExecutorCore(working_directory=working_directory)
-
         # Add workspace variables to the executor's globals if available
         if workspace_env:
             # Inject workspace variables into the code execution environment
@@ -96,7 +95,9 @@ class PythonExecutorTool(AbstractBaseTool):
         if self._workspace and working_directory:
             files_before = snapshot_generated_artifact_files(working_directory)
             with self._workspace.auto_register_files():
-                result = executor.execute_code(full_code, exec_args.capture_output)
+                result = self._execute(
+                    full_code, exec_args.capture_output, working_directory
+                )
             if result.get("success"):
                 files_after = snapshot_generated_artifact_files(working_directory)
                 result.update(
@@ -108,12 +109,33 @@ class PythonExecutorTool(AbstractBaseTool):
                     )
                 )
         else:
-            result = executor.execute_code(full_code, exec_args.capture_output)
+            result = self._execute(
+                full_code, exec_args.capture_output, working_directory
+            )
 
         return PythonExecutorResult(**result).model_dump()
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         return await asyncio.to_thread(self.run_json_sync, args)
+
+    @staticmethod
+    def _execute(
+        code: str, capture_output: bool, working_directory: Optional[str]
+    ) -> Dict[str, Any]:
+        """Run the code on the host under the configured limit, or in-process
+        inside the sandbox runner, which the sandbox wrapper bounds."""
+        if in_sandbox_tool_runner():
+            # The sandbox wrapper already bounds this runner process; a second
+            # interpreter here would only add startup cost.
+            return PythonExecutorCore(working_directory).execute_code(
+                code, capture_output
+            )
+        return run_python_code_in_subprocess(
+            code,
+            capture_output=capture_output,
+            working_directory=working_directory,
+            timeout_seconds=get_python_executor_timeout_seconds(),
+        )
 
     def _get_working_directory(self) -> Optional[str]:
         """Determine the working directory based on workspace settings"""
@@ -142,7 +164,8 @@ class PythonExecutorTool(AbstractBaseTool):
         "matplotlib>=3.5.0",
         "openpyxl>=3.1.0",  # required by the xlsx-financial-report skill
         "python-docx>=1.1.0",  # for .docx generation; skill lands in #1640
-    ]
+    ],
+    exec_timeout=get_python_executor_timeout_seconds,
 )
 class PythonExecutorToolForBasic(PythonExecutorTool):
     """Python executor tool with BASIC category."""
