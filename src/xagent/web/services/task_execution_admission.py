@@ -90,14 +90,22 @@ class AdmissionQueueFull(RuntimeError):
 
 @dataclass(frozen=True, kw_only=True)
 class CommandClassification:
-    """What a deployment decided for one new execution command at acceptance."""
+    """What a deployment decided for one new execution command at acceptance.
+
+    ``fairness_key`` is the tenant the command is accounted to; None means the
+    acceptance step gives it the task owner's default key.
+    """
 
     admission: AdmissionPolicy | None = None
     dispatch_class: DispatchClass = DISPATCH_CLASS_BATCH
+    fairness_key: str | None = None
 
     def __post_init__(self) -> None:
         if self.dispatch_class not in DISPATCH_CLASSES:
             raise ValueError(f"Unknown dispatch class: {self.dispatch_class!r}")
+        key = self.fairness_key
+        if key is not None and not (isinstance(key, str) and 1 <= len(key) <= 64):
+            raise ValueError(f"Invalid fairness key: {self.fairness_key!r}")
 
 
 @dataclass(frozen=True, kw_only=True)
