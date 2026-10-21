@@ -4968,14 +4968,37 @@ class WebToolConfig(BaseToolConfig):
             .order_by(MCPServer.id)
         )
 
-    async def _load_mcp_server_configs(self) -> List[Dict[str, Any]]:
+    async def load_mcp_server_config(self, server_id: int) -> Dict[str, Any] | None:
+        """Build one visible server's config exactly as a task would, uncached.
+
+        Returns None when the server is not visible to this config's user.
+        Like ``get_mcp_server_configs``, it resolves nothing without a user
+        identity.
+        """
+        if self._user_id is None:
+            return None
+        for config in await self._load_mcp_server_configs(only_server_id=server_id):
+            inner = config.get("config")
+            unavailable_id = inner.get("server_id") if isinstance(inner, dict) else None
+            if server_id in (config.get("id"), unavailable_id):
+                return config
+        return None
+
+    async def _load_mcp_server_configs(
+        self, *, only_server_id: int | None = None
+    ) -> List[Dict[str, Any]]:
         """Load MCP server configurations visible to this run: the user's
         personal servers, unioned with the governing agent's team-owned
         servers when a team-scope hook is installed. For each team-owned
         server id, this method also re-keys the shared env layer onto the
         governing team's own row -- see the team-env block below -- instead
         of leaving the shared layer keyed on the run owner's personal
-        shared-env hook answer."""
+        shared-env hook answer.
+
+        ``only_server_id`` narrows the visible set to that one server before
+        any credential is resolved, for a caller that starts a single
+        connector outside a task (services/mcp_connector_session.py). Tasks
+        never pass it."""
         self._mcp_oauth_diagnostics = []
         self._mcp_actor_stdio_session_identities = {}
         self._reset_mcp_config_load_cache_state()
@@ -5006,7 +5029,12 @@ class WebToolConfig(BaseToolConfig):
                 warn_team_env_hook_missing_once,
             )
 
-            servers = self._visible_mcp_server_query(team_mcp_ids).all()
+            visible_query = self._visible_mcp_server_query(team_mcp_ids)
+            if only_server_id is not None:
+                from ...web.models.mcp import MCPServer
+
+                visible_query = visible_query.filter(MCPServer.id == only_server_id)
+            servers = visible_query.all()
             logger.info(
                 "Found %s visible MCP servers for user %s (connector_team_id=%s)",
                 len(servers),

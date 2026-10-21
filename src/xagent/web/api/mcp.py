@@ -6006,70 +6006,66 @@ async def get_mcp_server_tools(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    """Get tools available from a specific MCP server."""
-    try:
-        user_id = int(current_user.id)
+    """Get tools available from a specific MCP server.
 
-        # Check user has access to this server
-        result = (
-            db.query(UserMCPServer, MCPServer)
-            .join(MCPServer, UserMCPServer.mcpserver_id == MCPServer.id)
-            .filter(
-                UserMCPServer.user_id == user_id,
-                UserMCPServer.is_active,
-                MCPServer.id == server_id,
-            )
-            .first()
+    The server is started exactly as an agent task would start it
+    (services/mcp_connector_session.py).
+    """
+    try:
+        from ..services.mcp_connector_session import (
+            ConnectorToolsOutcome,
+            list_connector_tools,
         )
 
-        if not result:
+        listing = await list_connector_tools(
+            db,
+            user=current_user,
+            server_id=server_id,
+            name_prefix=f"server_{server_id}_",
+        )
+        if listing.outcome is ConnectorToolsOutcome.NOT_FOUND:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="MCP server not found",
             )
-
-        _, server = result
-
-        from ..services.mcp_runtime import build_mcp_runtime_connection
-
-        runtime_build = await build_mcp_runtime_connection(
-            db,
-            server,
-            user_id=user_id,
-        )
-        if runtime_build.connection is None:
+        if listing.load_result is None:
+            # Any builder diagnostic answers 400 with that diagnostic, as this
+            # route always has, whether or not its code is a credential one.
+            if (
+                listing.diagnostic is not None
+                or listing.outcome is ConnectorToolsOutcome.NOT_CONNECTED
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=listing.diagnostic
+                    or {
+                        "code": listing.reason or "authorization_required",
+                        "message": "MCP server authorization is required",
+                    },
+                )
+            if listing.outcome is ConnectorToolsOutcome.UNSUPPORTED:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={
+                        "code": "unsupported",
+                        "message": "This MCP server can only start inside a task",
+                    },
+                )
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=runtime_build.diagnostic
-                or {
-                    "code": "authorization_required",
-                    "message": "MCP server authorization is required",
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail={
+                    "code": "mcp_tools_unavailable",
+                    "message": "MCP server could not be started.",
+                    "reason": listing.reason,
+                    "failures": [],
                 },
             )
-        connection = runtime_build.connection
 
-        # Try to load tools
-        from ...core.tools.adapters.vibe.connector_runtime import ConnectorRef
-        from ...core.tools.adapters.vibe.mcp_adapter import (
-            load_mcp_tools_as_agent_tools,
-        )
-
-        server_name = server.name
+        server_name = listing.server_name
         tools: List[Any] = []
         load_failures: tuple[dict[str, Any], ...] = ()
         if isinstance(server_name, str):
-            connections_dict: Dict[str, Any] = {server_name: connection}
-            # This listing never dispatches a call, but it is still a place
-            # where MCP tools are materialized: carry the persisted server id
-            # so every materialization seam in the process is identifiable,
-            # rather than leaving one that would fail closed if it ever grew
-            # an execution path.
-            load_result = await load_mcp_tools_as_agent_tools(
-                connections_dict,
-                connector_refs={server_name: ConnectorRef("mcp", int(server_id))},
-                name_prefix=f"server_{server_id}_",
-            )
-            projection = _project_mcp_tool_load_result(load_result)
+            projection = _project_mcp_tool_load_result(listing.load_result)
             if not projection.tools:
                 raise HTTPException(
                     status_code=status.HTTP_502_BAD_GATEWAY,
@@ -6083,7 +6079,7 @@ async def get_mcp_server_tools(
             load_failures = projection.failures
 
         response = {
-            "server_name": server.name,
+            "server_name": server_name,
             "tool_count": len(tools),
             "tools": [
                 {

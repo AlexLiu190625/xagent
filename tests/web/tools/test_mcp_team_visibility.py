@@ -409,11 +409,11 @@ async def test_unidentified_construction_resolves_no_mcp_configs_regardless_of_t
 @pytest.mark.asyncio
 async def test_direct_private_loader_call_resolves_nothing_without_identity(db_session):
     """``_load_mcp_server_configs()`` has no identity guard of its own;
-    ``get_mcp_server_configs()`` is its only production caller (``grep -n
-    "_load_mcp_server_configs\\b" src/xagent/web/tools/config.py`` shows
-    exactly one call site, inside that wrapper), and that wrapper's identity
-    guard is what keeps an unauthenticated build from ever reaching this
-    seam's team-scope resolution in production.
+    ``get_mcp_server_configs()`` and ``load_mcp_server_config()`` are its only
+    production callers (``grep -n "_load_mcp_server_configs\\b"
+    src/xagent/web/tools/config.py`` shows one call site inside each), and
+    those wrappers' identity guards are what keep an unauthenticated build
+    from ever reaching this seam's team-scope resolution in production.
 
     Calling the private method directly -- as this test suite already does
     throughout, for granularity -- bypasses that guard, but resolves
