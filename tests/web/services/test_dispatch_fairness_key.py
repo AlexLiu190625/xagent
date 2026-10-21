@@ -138,6 +138,7 @@ def test_a_new_execution_command_defaults_to_the_owner_key(host):
 def test_a_classifier_key_is_written_in_the_flush_that_writes_the_class(
     host, result, updates
 ):
+    result = dict(result)
     expected = result["fairness_key"]
     if expected == "owner":
         expected = result["fairness_key"] = f"user:{host.user}"
