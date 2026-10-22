@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 from contextlib import contextmanager
 from io import StringIO
@@ -263,16 +264,27 @@ def _counting(engine, marker: str) -> Iterator[list[str]]:
         event.remove(engine, "before_cursor_execute", record)
 
 
+def _expected_index(connection) -> None:
+    """The index is valid, in the right column order, with the right predicate.
+
+    The predicate is compared with a literal, deparsed as PostgreSQL stores it
+    and stripped of casts, parentheses and spaces, so a predicate that the model
+    and the migration both get wrong still fails here.
+    """
+    valid, predicate, columns = _pg_state(connection)
+    assert valid is True
+    assert columns == INDEX_COLUMNS
+    bare = re.sub(r"::[a-z ]+(\[\])?|[()\s]", "", predicate.lower())
+    assert bare == "status=anyarray['pending','processing']", predicate
+
+
 @pytest.mark.postgresql
 def test_postgresql_upgrade_repeat_and_downgrade(pg, monkeypatch) -> None:
     engine, _ = pg
     migration = _migration(monkeypatch, "fair_index_pg")
     with engine.connect() as connection:
         _run(migration, connection, "upgrade")
-        valid, predicate, columns = _pg_state(connection)
-        assert valid is True and columns == INDEX_COLUMNS
-        assert migration._postgres_predicate_matches_expected(predicate), predicate
-        assert "'pending'" in predicate and "'processing'" in predicate
+        _expected_index(connection)
 
         with _counting(engine, "CREATE INDEX") as creates:
             _run(migration, connection, "upgrade")
@@ -282,25 +294,63 @@ def test_postgresql_upgrade_repeat_and_downgrade(pg, monkeypatch) -> None:
         assert _pg_state(connection) is None
 
 
+WRONG_PREDICATE = (
+    "CREATE INDEX {index} ON {table} (fairness_key, dispatch_class, id) "
+    "WHERE status = 'pending'"
+)
+WRONG_ORDER = (
+    "CREATE INDEX {index} ON {table} (dispatch_class, fairness_key, id) "
+    "WHERE status IN ('pending', 'processing')"
+)
+RIGHT = (
+    "CREATE INDEX {index} ON {table} (fairness_key, dispatch_class, id) "
+    "WHERE status IN ('pending', 'processing')"
+)
+
+
 @pytest.mark.postgresql
-def test_postgresql_upgrade_replaces_an_index_with_another_predicate(
-    pg, monkeypatch
+@pytest.mark.parametrize(
+    "create,invalidate",
+    [(WRONG_PREDICATE, False), (WRONG_ORDER, False), (RIGHT, True)],
+    ids=["predicate", "column_order", "invalid"],
+)
+def test_postgresql_upgrade_replaces_an_index_that_is_not_the_expected_one(
+    pg, monkeypatch, create, invalidate
 ) -> None:
     engine, _ = pg
     migration = _migration(monkeypatch, "fair_index_pg_stale")
     with engine.connect() as connection:
-        connection.execute(
-            text(
-                f"CREATE INDEX {INDEX} ON {TABLE} "
-                "(fairness_key, dispatch_class, id) WHERE status = 'pending'"
+        connection.execute(text(create.format(index=INDEX, table=TABLE)))
+        if invalidate:
+            connection.execute(
+                text(
+                    "UPDATE pg_index SET indisvalid = false "
+                    f"WHERE indexrelid = '{INDEX}'::regclass"
+                )
             )
-        )
         connection.commit()
 
         _run(migration, connection, "upgrade")
 
-        _, predicate, _ = _pg_state(connection)
-        assert migration._postgres_predicate_matches_expected(predicate), predicate
+        _expected_index(connection)
+
+
+@pytest.mark.postgresql
+def test_postgresql_downgrade_gives_up_on_a_table_that_stays_locked(
+    pg, monkeypatch
+) -> None:
+    engine, holder_engine = pg
+    migration = _migration(monkeypatch, "fair_index_pg_down", **FAST)
+    with engine.connect() as connection:
+        _run(migration, connection, "upgrade")
+        # A downgrade that skipped the retry helper would wait for the reader
+        # until the statement timeout cancels it.
+        connection.execute(text("SET statement_timeout = '3s'"))
+        connection.commit()
+        with held_lock(holder_engine, TABLE, "ACCESS SHARE"):
+            with pytest.raises(RuntimeError, match=f"could not lock {TABLE}"):
+                _run(migration, connection, "downgrade")
+        assert _pg_state(connection) is not None
 
 
 @pytest.mark.postgresql
