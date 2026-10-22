@@ -154,6 +154,45 @@ describe("uploadWidgetSessionFile", () => {
       expect(sleeps).toEqual([2000, 4000, 8000])
     })
 
+    describe("with an HTTP-date Retry-After", () => {
+      beforeEach(() => {
+        vi.useFakeTimers({ toFake: ["Date"] })
+        vi.setSystemTime(new Date("2026-07-27T00:00:00.700Z"))
+      })
+
+      it("waits until the date, rounded up to a whole second", async () => {
+        fetchMock
+          .mockResolvedValueOnce(rateLimited({ "Retry-After": "Mon, 27 Jul 2026 00:00:05 GMT" }))
+          .mockResolvedValueOnce(created())
+        const { options, sleeps } = baseOptions()
+
+        await uploadWidgetSessionFile(options)
+
+        expect(sleeps).toEqual([5000])
+      })
+
+      it("caps a far date at sixty seconds plus jitter", async () => {
+        fetchMock
+          .mockResolvedValueOnce(rateLimited({ "Retry-After": "Mon, 27 Jul 2026 01:00:00 GMT" }))
+          .mockResolvedValueOnce(created())
+        const { options, sleeps } = baseOptions({ random: () => 0.999 })
+
+        await uploadWidgetSessionFile(options)
+
+        expect(sleeps).toEqual([60_499])
+      })
+
+      it("falls back to 2^attempt seconds for a date already past", async () => {
+        fetchMock.mockImplementation(async () =>
+          rateLimited({ "Retry-After": "Sun, 26 Jul 2026 23:59:00 GMT" }))
+        const { options, sleeps } = baseOptions()
+
+        await expectUploadError(uploadWidgetSessionFile(options), "upload_rate_limited")
+
+        expect(sleeps).toEqual([2000, 4000, 8000])
+      })
+    })
+
     it("asks for a fresh token before every request, including retries", async () => {
       fetchMock.mockResolvedValueOnce(rateLimited()).mockResolvedValueOnce(created())
       const tokens = ["st_one", "st_two"]

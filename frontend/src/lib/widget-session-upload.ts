@@ -114,10 +114,15 @@ const readErrorCode = async (response: Response, signal?: AbortSignal): Promise<
   return typeof code === "string" ? code : null
 }
 
+// Retry-After is either a number of seconds or an HTTP date. A date becomes the
+// seconds left until it, rounded up so the retry never comes before it. Zero, a
+// date already past, and an unreadable value all count as no header.
 const readRetryAfterSeconds = (response: Response): number | null => {
-  const raw = response.headers.get("Retry-After")
-  if (raw === null || !/^\d+$/.test(raw.trim())) return null
-  const seconds = Number.parseInt(raw.trim(), 10)
+  const raw = response.headers.get("Retry-After")?.trim()
+  if (!raw) return null
+  const seconds = /^\d+$/.test(raw)
+    ? Number.parseInt(raw, 10)
+    : Math.ceil((Date.parse(raw) - Date.now()) / 1000)
   return seconds > 0 ? seconds : null
 }
 
