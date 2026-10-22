@@ -55,8 +55,9 @@ def _validate_hostname(host: Any, label: str) -> None:
     if any(ch in _HOST_FORBIDDEN_CHARS or ch.isspace() for ch in host):
         raise ValueError(f"{label} must be an exact hostname")
     if host.endswith("."):
-        # A URL hostname never keeps its trailing dot as compared here, so such
-        # a registration could never match.
+        # A URL hostname keeps a trailing dot, so "host." and "host" would be
+        # two registrations for one DNS name; only the form without the dot is
+        # accepted.
         raise ValueError(f"{label} must not end with a dot")
     try:
         ipaddress.ip_address(host)
