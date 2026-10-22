@@ -79,6 +79,12 @@ const raceAbort = <T,>(promise: Promise<T>, signal?: AbortSignal): Promise<T> =>
   return new Promise<T>((resolve, reject) => {
     const onAbort = () => reject(abortError())
     signal.addEventListener("abort", onAbort, { once: true })
+    // The provider may have aborted the signal while it was being called, which
+    // is before this listener existed.
+    if (signal.aborted) {
+      onAbort()
+      return
+    }
     promise.then(
       (value) => { signal.removeEventListener("abort", onAbort); resolve(value) },
       (error) => { signal.removeEventListener("abort", onAbort); reject(error) },
@@ -152,8 +158,7 @@ export async function uploadWidgetSessionFile(
     try {
       return await raceAbort(source(), signal)
     } catch (error) {
-      if (isAbortError(error) || signal?.aborted) throw isAbortError(error) ? error : abortError()
-      if (error instanceof WidgetSessionUploadError) throw error
+      if (isAbortError(error) || error instanceof WidgetSessionUploadError) throw error
       throw new WidgetSessionUploadError("upload_failed")
     }
   }

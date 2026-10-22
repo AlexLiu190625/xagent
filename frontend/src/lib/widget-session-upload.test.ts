@@ -493,6 +493,22 @@ describe("uploadWidgetSessionFile cancellation", () => {
     expect(((await outcome) as Error).name).toBe("AbortError")
   })
 
+  it("stops at once when the token callback aborts the signal and never returns", async () => {
+    const controller = new AbortController()
+    const { options } = baseOptions({
+      signal: controller.signal,
+      getToken: vi.fn(() => {
+        controller.abort()
+        return new Promise<string>(() => {})
+      }),
+    })
+
+    const error = await settleWith(uploadWidgetSessionFile(options))
+
+    expect((error as Error).name).toBe("AbortError")
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
   it("removes its abort listener once the token arrives", async () => {
     fetchMock.mockResolvedValueOnce(created())
     const controller = new AbortController()
