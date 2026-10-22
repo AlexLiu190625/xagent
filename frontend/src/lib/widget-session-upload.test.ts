@@ -312,7 +312,7 @@ describe("uploadWidgetSessionFile", () => {
       expect(fetchMock).toHaveBeenCalledTimes(1)
     })
 
-    it("rethrows the AbortError raised by an aborted request", async () => {
+    it("rejects with an AbortError when the request is aborted", async () => {
       const controller = new AbortController()
       fetchMock.mockImplementationOnce(async () => {
         controller.abort()
@@ -515,6 +515,27 @@ describe("uploadWidgetSessionFile cancellation", () => {
     })
 
     const error = await settleWith(uploadWidgetSessionFile(options))
+
+    expect((error as Error).name).toBe("AbortError")
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it("handles a token promise that rejects after the provider aborted the signal", async () => {
+    const controller = new AbortController()
+    const token = pendingToken()
+    const { options } = baseOptions({
+      signal: controller.signal,
+      // Not a vi.fn(): a mock attaches its own handler to the promise it returns
+      // and would hide the unhandled rejection this test exists to catch.
+      getToken: () => {
+        controller.abort()
+        return token.promise
+      },
+    })
+
+    const error = await settleWith(uploadWidgetSessionFile(options))
+    token.reject(new Error("shared wait timed out"))
+    await new Promise((resolve) => setTimeout(resolve, 0))
 
     expect((error as Error).name).toBe("AbortError")
     expect(fetchMock).not.toHaveBeenCalled()

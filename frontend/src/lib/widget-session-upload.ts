@@ -52,9 +52,7 @@ export interface UploadWidgetSessionFileOptions {
 const abortError = (): DOMException => new DOMException("The upload was aborted.", "AbortError")
 
 const isAbortError = (error: unknown): boolean =>
-  error instanceof DOMException
-    ? error.name === "AbortError"
-    : typeof error === "object" && error !== null && (error as { name?: unknown }).name === "AbortError"
+  typeof error === "object" && error !== null && (error as { name?: unknown }).name === "AbortError"
 
 export const abortableSleep = (ms: number, signal?: AbortSignal): Promise<void> =>
   new Promise<void>((resolve, reject) => {
@@ -80,16 +78,15 @@ const raceAbort = <T,>(promise: Promise<T>, signal?: AbortSignal): Promise<T> =>
   return new Promise<T>((resolve, reject) => {
     const onAbort = () => reject(abortError())
     signal.addEventListener("abort", onAbort, { once: true })
-    // The provider may have aborted the signal while it was being called, which
-    // is before this listener existed.
-    if (signal.aborted) {
-      onAbort()
-      return
-    }
+    // Attached before the check below, so a promise that rejects after this
+    // wait was aborted is still handled.
     promise.then(
       (value) => { signal.removeEventListener("abort", onAbort); resolve(value) },
       (error) => { signal.removeEventListener("abort", onAbort); reject(error) },
     )
+    // The provider may have aborted the signal while it was being called, which
+    // is before this listener existed.
+    if (signal.aborted) onAbort()
   })
 }
 
@@ -183,7 +180,7 @@ export async function uploadWidgetSessionFile(
         signal,
       })
     } catch (error) {
-      if (isAbortError(error) || signal?.aborted) throw isAbortError(error) ? error : abortError()
+      if (isAbortError(error) || signal?.aborted) throw abortError()
       throw new WidgetSessionUploadError("upload_failed")
     }
 
