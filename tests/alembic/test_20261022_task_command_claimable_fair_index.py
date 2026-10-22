@@ -272,6 +272,7 @@ def test_postgresql_upgrade_repeat_and_downgrade(pg, monkeypatch) -> None:
         valid, predicate, columns = _pg_state(connection)
         assert valid is True and columns == INDEX_COLUMNS
         assert migration._postgres_predicate_matches_expected(predicate), predicate
+        assert "'pending'" in predicate and "'processing'" in predicate
 
         with _counting(engine, "CREATE INDEX") as creates:
             _run(migration, connection, "upgrade")
