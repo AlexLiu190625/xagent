@@ -33,8 +33,11 @@ export const CLIENT_ERROR_CODES = [
   "upload_too_large",
   "upload_proxy_error",
   "upload_failed",
-  // Client-only codes, like the three upload_* codes above: also add each one
-  // to CLIENT_ONLY_ERROR_CODES below.
+  "upload_rate_limited",
+  "upload_quota_exceeded",
+  "upload_rejected",
+  // Client-only codes, like the upload_* codes above: also add each one to
+  // CLIENT_ONLY_ERROR_CODES below.
   "connection_not_ready",
   "message_not_accepted",
   // Connector-runtime codes that reach the client on a terminal task_error
@@ -42,7 +45,7 @@ export const CLIENT_ERROR_CODES = [
   // ClientErrorCode enum -- this list is not the whole ClientErrorCode enum:
   // "model_error" is left out because it only rides on task_completed and
   // trace_error, never on a task_error frame, "auto_model_unavailable" is not
-  // listed either, and the five client-only codes (the upload_* codes,
+  // listed either, and the client-only codes (the upload_* codes,
   // connection_not_ready and message_not_accepted) are derived by the client.
   // It stays one table so a code has one wording for every audience. Only codes
   // with a producer that can reach that frame today are listed: a listed code
@@ -97,6 +100,9 @@ const CLIENT_ERROR_TRANSLATION_KEYS: Record<ClientErrorCode, TranslationKey> = {
   upload_too_large: "clientErrors.uploadTooLarge",
   upload_proxy_error: "clientErrors.uploadProxyError",
   upload_failed: "clientErrors.uploadFailed",
+  upload_rate_limited: "clientErrors.uploadRateLimited",
+  upload_quota_exceeded: "clientErrors.uploadQuotaExceeded",
+  upload_rejected: "clientErrors.uploadRejected",
   connection_not_ready: "clientErrors.connectionNotReady",
   message_not_accepted: "clientErrors.messageNotAccepted",
   missing_runtime_context: "clientErrors.missingRuntimeContext",
@@ -122,7 +128,7 @@ const CLIENT_ERROR_FALLBACKS: Record<ClientErrorCode, string> = {
   workforce_unavailable: "This workforce conversation can no longer accept messages; please start a new conversation.",
   workforce_archived: "This workforce has been archived. Unarchive and publish it before starting a new conversation, or select an active workforce.",
   message_attachment_corrupt: "A stored file for this message failed its integrity check and must be re-uploaded.",
-  message_attachment_unavailable: "A stored file for this message could not be read. Please try again.",
+  message_attachment_unavailable: "A file attached to this message is not available. Upload it again, then send the message.",
   task_checkpoint_unreadable: "The task's saved progress could not be read.",
   authentication_required: "Authentication is required to send this message.",
   task_access_denied: "You do not have access to this task.",
@@ -133,6 +139,9 @@ const CLIENT_ERROR_FALLBACKS: Record<ClientErrorCode, string> = {
   upload_too_large: "File is too large. Please reduce the upload size and try again.",
   upload_proxy_error: "Upload failed before reaching the application. Please check the server upload limit.",
   upload_failed: "Upload failed. Please try again.",
+  upload_rate_limited: "The file could not be uploaded right now. Please try again in a minute.",
+  upload_quota_exceeded: "You have reached the file limit for this chat.",
+  upload_rejected: "This file can't be uploaded. Check its name and type.",
   connection_not_ready: "Not connected. Your message was not sent.",
   message_not_accepted: "The message was not accepted.",
   missing_runtime_context: "This connector needs additional runtime input before it can run.",
@@ -157,6 +166,9 @@ const CLIENT_ONLY_ERROR_CODES: ReadonlySet<ClientErrorCode> = new Set([
   "upload_too_large",
   "upload_proxy_error",
   "upload_failed",
+  "upload_rate_limited",
+  "upload_quota_exceeded",
+  "upload_rejected",
   "connection_not_ready",
   "message_not_accepted",
 ])
