@@ -1,0 +1,188 @@
+import type { ClientErrorCode } from "@/lib/client-errors"
+
+export const WIDGET_SESSION_UPLOAD_PATH = "/v1/external/chat/sessions/files"
+
+// A 429 with code rate_limited is retried this many times before giving up.
+const MAX_RATE_LIMIT_RETRIES = 3
+const MAX_BACKOFF_SECONDS = 60
+const JITTER_MS = 500
+const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+
+export const isCanonicalUuid = (value: unknown): value is string =>
+  typeof value === "string" && CANONICAL_UUID.test(value)
+
+export class WidgetSessionUploadError extends Error {
+  readonly errorCode: ClientErrorCode
+
+  constructor(errorCode: ClientErrorCode, message?: string) {
+    super(message ?? errorCode)
+    this.name = "WidgetSessionUploadError"
+    this.errorCode = errorCode
+  }
+}
+
+// The result of one successful upload. The server-assigned id lives here and
+// never on the File object, so a File can be reused as a map key without being
+// mutated.
+export interface SessionUploadedFile {
+  kind: "uploaded"
+  fileId: string
+  name: string
+  size: number
+  type: string
+}
+
+export interface UploadWidgetSessionFileOptions {
+  origin: string
+  // Called before every request, so a long backoff never sends a token that
+  // expired while waiting.
+  getToken: () => Promise<string>
+  // Called once after a 401 to obtain a token that is newer than the one just
+  // rejected. The caller owns how often a refresh is acceptable: the widget
+  // script falls back to a degraded session when it is asked for three
+  // non-recovery refreshes within a minute, so a refresh per file at most.
+  refreshToken: () => Promise<string>
+  file: File
+  signal?: AbortSignal
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>
+  random?: () => number
+}
+
+const abortError = (): DOMException => new DOMException("The upload was aborted.", "AbortError")
+
+const isAbortError = (error: unknown): boolean =>
+  error instanceof DOMException
+    ? error.name === "AbortError"
+    : typeof error === "object" && error !== null && (error as { name?: unknown }).name === "AbortError"
+
+export const abortableSleep = (ms: number, signal?: AbortSignal): Promise<void> =>
+  new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortError())
+      return
+    }
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(abortError())
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort)
+      resolve()
+    }, ms)
+    signal?.addEventListener("abort", onAbort, { once: true })
+  })
+
+const readErrorCode = async (response: Response): Promise<string | null> => {
+  try {
+    const body: unknown = await response.json()
+    if (typeof body !== "object" || body === null) return null
+    const error = (body as { error?: unknown }).error
+    if (typeof error !== "object" || error === null) return null
+    const code = (error as { code?: unknown }).code
+    return typeof code === "string" ? code : null
+  } catch {
+    return null
+  }
+}
+
+const readRetryAfterSeconds = (response: Response): number | null => {
+  const raw = response.headers.get("Retry-After")
+  if (raw === null || !/^\d+$/.test(raw.trim())) return null
+  const seconds = Number.parseInt(raw.trim(), 10)
+  return seconds > 0 ? seconds : null
+}
+
+const backoffMs = (attempt: number, retryAfterSeconds: number | null, random: () => number): number => {
+  const exponential = 2 ** attempt
+  const seconds = Math.min(Math.max(retryAfterSeconds ?? exponential, exponential), MAX_BACKOFF_SECONDS)
+  return seconds * 1000 + Math.floor(random() * JITTER_MS)
+}
+
+const parseUploaded = async (response: Response, file: File): Promise<SessionUploadedFile> => {
+  let body: unknown
+  try {
+    body = await response.json()
+  } catch {
+    throw new WidgetSessionUploadError("upload_failed")
+  }
+  if (typeof body !== "object" || body === null) throw new WidgetSessionUploadError("upload_failed")
+  const info = body as Record<string, unknown>
+  if (!isCanonicalUuid(info.file_id)) throw new WidgetSessionUploadError("upload_failed")
+  return {
+    kind: "uploaded",
+    fileId: info.file_id,
+    name: typeof info.filename === "string" && info.filename ? info.filename : file.name,
+    size: typeof info.file_size === "number" && Number.isFinite(info.file_size) ? info.file_size : file.size,
+    type: typeof info.mime_type === "string" && info.mime_type ? info.mime_type : file.type,
+  }
+}
+
+// Uploads one file to the session upload endpoint with the session token. The
+// request never goes through the shared API wrapper and never touches the
+// browser's stored login token: the only credential is the session token.
+export async function uploadWidgetSessionFile(
+  options: UploadWidgetSessionFileOptions,
+): Promise<SessionUploadedFile> {
+  const { origin, file, signal } = options
+  const sleep = options.sleep ?? abortableSleep
+  const random = options.random ?? Math.random
+
+  const obtainToken = async (source: () => Promise<string>): Promise<string> => {
+    try {
+      return await source()
+    } catch (error) {
+      if (isAbortError(error) || error instanceof WidgetSessionUploadError) throw error
+      throw new WidgetSessionUploadError("upload_failed")
+    }
+  }
+
+  let rateLimitRetries = 0
+  let refreshed = false
+  let token = await obtainToken(options.getToken)
+
+  for (;;) {
+    if (signal?.aborted) throw abortError()
+
+    const formData = new FormData()
+    formData.append("file", file)
+    let response: Response
+    try {
+      response = await fetch(`${origin}${WIDGET_SESSION_UPLOAD_PATH}`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        body: formData,
+        credentials: "omit",
+        signal,
+      })
+    } catch (error) {
+      if (isAbortError(error) || signal?.aborted) throw isAbortError(error) ? error : abortError()
+      throw new WidgetSessionUploadError("upload_failed")
+    }
+
+    if (response.status === 201) return parseUploaded(response, file)
+
+    if (response.status === 429) {
+      const code = await readErrorCode(response)
+      if (code === "quota_exceeded") throw new WidgetSessionUploadError("upload_quota_exceeded")
+      if (code !== "rate_limited") throw new WidgetSessionUploadError("upload_failed")
+      if (rateLimitRetries >= MAX_RATE_LIMIT_RETRIES) {
+        throw new WidgetSessionUploadError("upload_rate_limited")
+      }
+      rateLimitRetries += 1
+      await sleep(backoffMs(rateLimitRetries, readRetryAfterSeconds(response), random), signal)
+      token = await obtainToken(options.getToken)
+      continue
+    }
+
+    if (response.status === 401) {
+      if (refreshed) throw new WidgetSessionUploadError("upload_failed")
+      refreshed = true
+      token = await obtainToken(options.refreshToken)
+      continue
+    }
+
+    if (response.status === 413) throw new WidgetSessionUploadError("upload_too_large")
+    if (response.status === 422) throw new WidgetSessionUploadError("upload_rejected")
+    throw new WidgetSessionUploadError("upload_failed")
+  }
+}
