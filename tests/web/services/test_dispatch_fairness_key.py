@@ -320,6 +320,11 @@ def test_the_claim_lookup_adds_no_statement_and_keeps_the_key_in_the_select_list
     assert_key_only_in_the_select_list(statements)
 
 
+def test_a_dispatch_candidate_cannot_be_built_without_its_key():
+    with pytest.raises(TypeError, match="fairness_key"):
+        transport.CommandCandidate(11, 5, KINDS.START, True)
+
+
 async def test_dispatch_passes_the_candidate_key_to_the_slot_reservation(
     host, monkeypatch
 ):

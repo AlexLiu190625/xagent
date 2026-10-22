@@ -381,7 +381,7 @@ async def test_one_notify_one_free_slot_admits_exactly_one(
                 command_id, task_id = next(handed_out)
             barrier.wait(10)
             return transport.CommandCandidate(
-                command_id, task_id, TaskCommandKind.START, False
+                command_id, task_id, TaskCommandKind.START, False, ""
             )
 
         monkeypatch.setattr(transport, "_find_command_candidate", find)
@@ -930,7 +930,9 @@ async def test_closed_cap_claims_controls_and_active_task_commands(
 
     if held_start is not None:
         assert transport._find_command_candidate(None, (), snapshot) == (
-            transport.CommandCandidate(command_id, target, TaskCommandKind(kind), False)
+            transport.CommandCandidate(
+                command_id, target, TaskCommandKind(kind), False, ""
+            )
         )
     assert await dispatch(host) is True
     assert host.claimed == [(target, TaskCommandKind(kind))]

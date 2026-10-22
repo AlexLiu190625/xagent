@@ -1857,7 +1857,7 @@ class CommandCandidate(NamedTuple):
     task_id: int
     kind: TaskCommandKind
     interactive: bool
-    fairness_key: str = ""
+    fairness_key: str
 
 
 def _find_command_candidate(
