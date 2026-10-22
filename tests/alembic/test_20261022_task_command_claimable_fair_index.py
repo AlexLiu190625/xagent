@@ -190,6 +190,12 @@ def test_offline_postgresql_builds_the_index_between_set_and_reset_lock_timeout(
     assert down.index("SET lock_timeout") < down.index("DROP INDEX")
 
 
+def test_offline_on_another_dialect_builds_the_index_without_a_predicate() -> None:
+    sql = _offline_sql("mysql", "upgrade")
+    assert f"CREATE INDEX {INDEX} ON {TABLE} (fairness_key, dispatch_class, id)" in sql
+    assert "WHERE" not in sql
+
+
 def test_offline_sqlite_builds_the_partial_index() -> None:
     sql = _offline_sql("sqlite", "upgrade")
     assert f"CREATE INDEX {INDEX} ON {TABLE} (fairness_key, dispatch_class, id)" in sql

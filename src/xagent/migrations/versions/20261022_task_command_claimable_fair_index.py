@@ -165,10 +165,9 @@ def upgrade() -> None:
     if context.as_sql:
         if context.dialect.name == "postgresql":
             offline_ddl_with_lock_timeout(_CREATE_SQL, lock_timeout=_LOCK_TIMEOUT)
-        elif context.dialect.name == "sqlite":
-            op.create_index(INDEX, TABLE, list(INDEX_COLUMNS), sqlite_where=PREDICATE)
         else:
-            op.create_index(INDEX, TABLE, list(INDEX_COLUMNS))
+            # Dialects other than SQLite ignore ``sqlite_where``.
+            op.create_index(INDEX, TABLE, list(INDEX_COLUMNS), sqlite_where=PREDICATE)
         return
 
     if context.dialect.name == "postgresql":
@@ -184,10 +183,8 @@ def upgrade() -> None:
         return
     if _index_columns(inspector, INDEX) is not None:
         return
-    if context.dialect.name == "sqlite":
-        op.create_index(INDEX, TABLE, list(INDEX_COLUMNS), sqlite_where=PREDICATE)
-    else:
-        op.create_index(INDEX, TABLE, list(INDEX_COLUMNS))
+    # Dialects other than SQLite ignore ``sqlite_where``.
+    op.create_index(INDEX, TABLE, list(INDEX_COLUMNS), sqlite_where=PREDICATE)
 
 
 def downgrade() -> None:
