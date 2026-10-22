@@ -1035,6 +1035,20 @@ describe("useWidgetSession upload coordination", () => {
       expect(reconnectRequests(postMessage)).toHaveLength(1)
     })
 
+    it("a caller that joins a pending refresh is rejected at the refresh's deadline, not a full deadline later", async () => {
+      vi.useFakeTimers()
+      const { result } = renderHook(() => useWidgetSession())
+      dispatchFromParent(updateMessage())
+
+      const first = settled(result.current.refreshSession("st_session_token"))
+      await act(async () => { await vi.advanceTimersByTimeAsync(80_000) })
+      const joiner = settled(result.current.refreshSession("st_session_token"))
+      await act(async () => { await vi.advanceTimersByTimeAsync(11_000) })
+
+      expect((await joiner).error).toMatchObject({ errorCode: "upload_failed" })
+      expect((await first).error).toMatchObject({ errorCode: "upload_failed" })
+    })
+
     it("resolves with the current session and sends no reconnect_request when the rejected token was already replaced", async () => {
       const postMessage = vi.spyOn(window, "postMessage")
       const { result } = renderHook(() => useWidgetSession())

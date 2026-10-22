@@ -364,8 +364,10 @@ export function useWidgetSession() {
     }, RESEND_RECONNECT_DEADLINE_MS),
   }), [])
 
-  // Waits for the next accepted session. Callers share one wait, and a wait
-  // never issues a second reconnect request.
+  // Waits for the next accepted session. Callers share one wait and one
+  // deadline: the wait gives up RESEND_RECONNECT_DEADLINE_MS after the first
+  // caller started it, so a caller that joins later waits only for the time
+  // left. A wait never issues a second reconnect request.
   const waitForNextSession = useCallback((): Promise<WidgetSession> => {
     if (sessionWaitRef.current) return sessionWaitRef.current.promise
     const waiters: Waiter<WidgetSession>[] = []
