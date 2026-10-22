@@ -373,3 +373,170 @@ describe("isCanonicalUuid", () => {
     expect(isCanonicalUuid(42)).toBe(false)
   })
 })
+
+describe("uploadWidgetSessionFile cancellation", () => {
+  const settleWith = (promise: Promise<unknown>) =>
+    promise.then(() => null, (reason: unknown) => reason)
+  const pendingToken = () => {
+    let resolve!: (value: string) => void
+    let reject!: (reason: unknown) => void
+    const promise = new Promise<string>((res, rej) => { resolve = res; reject = rej })
+    return { promise, resolve, reject }
+  }
+  const replyWith = (status: number, json: () => Promise<unknown>) =>
+    ({ status, headers: new Headers(), json }) as unknown as Response
+
+  it("does not call a token callback or send anything when already aborted", async () => {
+    const controller = new AbortController()
+    controller.abort()
+    const { options } = baseOptions({ signal: controller.signal })
+
+    const error = await settleWith(uploadWidgetSessionFile(options))
+
+    expect((error as Error).name).toBe("AbortError")
+    expect(options.getToken).not.toHaveBeenCalled()
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it("stops waiting for the first token as soon as it is aborted", async () => {
+    const token = pendingToken()
+    const controller = new AbortController()
+    const { options } = baseOptions({ signal: controller.signal, getToken: vi.fn(() => token.promise) })
+
+    const outcome = settleWith(uploadWidgetSessionFile(options))
+    await Promise.resolve()
+    controller.abort()
+
+    expect(((await outcome) as Error).name).toBe("AbortError")
+    token.resolve("st_late")
+    await Promise.resolve()
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it("stops waiting for the token refreshed after a 401", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(401, { error: { code: "invalid_api_key", message: "no" } }))
+    const token = pendingToken()
+    const controller = new AbortController()
+    const { options } = baseOptions({ signal: controller.signal, refreshToken: vi.fn(() => token.promise) })
+
+    const outcome = settleWith(uploadWidgetSessionFile(options))
+    await vi.waitFor(() => expect(options.refreshToken).toHaveBeenCalledTimes(1))
+    controller.abort()
+
+    expect(((await outcome) as Error).name).toBe("AbortError")
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("stops waiting for the token asked for after a rate-limit backoff", async () => {
+    fetchMock.mockResolvedValueOnce(rateLimited())
+    const token = pendingToken()
+    const controller = new AbortController()
+    const getToken = vi.fn()
+      .mockResolvedValueOnce("st_first")
+      .mockImplementationOnce(() => token.promise)
+    const { options } = baseOptions({ signal: controller.signal, getToken })
+
+    const outcome = settleWith(uploadWidgetSessionFile(options))
+    await vi.waitFor(() => expect(getToken).toHaveBeenCalledTimes(2))
+    controller.abort()
+
+    expect(((await outcome) as Error).name).toBe("AbortError")
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("aborts only the upload whose signal fired when two share one pending token", async () => {
+    const shared = pendingToken()
+    fetchMock.mockResolvedValueOnce(created())
+    const first = new AbortController()
+    const second = new AbortController()
+    const a = baseOptions({ signal: first.signal, getToken: vi.fn(() => shared.promise) })
+    const b = baseOptions({ signal: second.signal, getToken: vi.fn(() => shared.promise) })
+
+    const outcomeA = settleWith(uploadWidgetSessionFile(a.options))
+    const outcomeB = uploadWidgetSessionFile(b.options)
+    await Promise.resolve()
+    first.abort()
+    expect(((await outcomeA) as Error).name).toBe("AbortError")
+
+    shared.resolve("st_shared")
+    await expect(outcomeB).resolves.toMatchObject({ fileId: FILE_ID })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("keeps the abort when the shared wait fails after the abort", async () => {
+    const shared = pendingToken()
+    const first = new AbortController()
+    const second = new AbortController()
+    const a = baseOptions({ signal: first.signal, getToken: vi.fn(() => shared.promise) })
+    const b = baseOptions({ signal: second.signal, getToken: vi.fn(() => shared.promise) })
+
+    const outcomeA = settleWith(uploadWidgetSessionFile(a.options))
+    const outcomeB = settleWith(uploadWidgetSessionFile(b.options))
+    await Promise.resolve()
+    first.abort()
+    shared.reject(new WidgetSessionUploadError("upload_failed"))
+
+    expect(((await outcomeA) as Error).name).toBe("AbortError")
+    await expectUploadError(Promise.resolve(outcomeB).then((e) => { throw e }), "upload_failed")
+  })
+
+  it("keeps the abort when a non-abort token error arrives after the signal fired", async () => {
+    const token = pendingToken()
+    const controller = new AbortController()
+    const { options } = baseOptions({ signal: controller.signal, getToken: vi.fn(() => token.promise) })
+
+    const outcome = settleWith(uploadWidgetSessionFile(options))
+    await Promise.resolve()
+    controller.abort()
+    token.reject(new Error("boom"))
+
+    expect(((await outcome) as Error).name).toBe("AbortError")
+  })
+
+  it("removes its abort listener once the token arrives", async () => {
+    fetchMock.mockResolvedValueOnce(created())
+    const controller = new AbortController()
+    const added = vi.spyOn(controller.signal, "addEventListener")
+    const removed = vi.spyOn(controller.signal, "removeEventListener")
+    const { options } = baseOptions({ signal: controller.signal })
+
+    await uploadWidgetSessionFile(options)
+
+    const tokenListeners = added.mock.calls.filter(([type]) => type === "abort")
+    expect(tokenListeners.length).toBeGreaterThan(0)
+    for (const [, handler] of tokenListeners) {
+      expect(removed).toHaveBeenCalledWith("abort", handler)
+    }
+  })
+
+  it.each([
+    ["a 201", 201],
+    ["a 429", 429],
+  ])("reports an abort while reading the body of %s as an abort", async (_label, status) => {
+    fetchMock.mockResolvedValueOnce(replyWith(status, () => Promise.reject(new DOMException("x", "AbortError"))))
+    const { options } = baseOptions()
+    const error = await settleWith(uploadWidgetSessionFile(options))
+    expect((error as Error).name).toBe("AbortError")
+  })
+
+  it.each([
+    ["a 201", 201],
+    ["a 429", 429],
+  ])("reports a read error after the signal fired for %s as an abort", async (_label, status) => {
+    const controller = new AbortController()
+    fetchMock.mockResolvedValueOnce(replyWith(status, () => {
+      controller.abort()
+      return Promise.reject(new TypeError("body stream broke"))
+    }))
+    const { options } = baseOptions({ signal: controller.signal })
+    const error = await settleWith(uploadWidgetSessionFile(options))
+    expect((error as Error).name).toBe("AbortError")
+  })
+
+  it("still treats an unreadable 201 or 429 body as a plain failure when not aborted", async () => {
+    fetchMock.mockResolvedValueOnce(replyWith(201, () => Promise.reject(new TypeError("bad"))))
+    await expectUploadError(uploadWidgetSessionFile(baseOptions().options), "upload_failed")
+    fetchMock.mockResolvedValueOnce(replyWith(429, () => Promise.reject(new TypeError("bad"))))
+    await expectUploadError(uploadWidgetSessionFile(baseOptions().options), "upload_failed")
+  })
+})

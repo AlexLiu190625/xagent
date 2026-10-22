@@ -72,17 +72,42 @@ export const abortableSleep = (ms: number, signal?: AbortSignal): Promise<void> 
     signal?.addEventListener("abort", onAbort, { once: true })
   })
 
-const readErrorCode = async (response: Response): Promise<string | null> => {
+// Waits for `promise` unless `signal` aborts first. The abort settles only
+// this caller's wait; the promise itself, which may be shared, keeps running.
+const raceAbort = <T,>(promise: Promise<T>, signal?: AbortSignal): Promise<T> => {
+  if (!signal) return promise
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(abortError())
+    signal.addEventListener("abort", onAbort, { once: true })
+    promise.then(
+      (value) => { signal.removeEventListener("abort", onAbort); resolve(value) },
+      (error) => { signal.removeEventListener("abort", onAbort); reject(error) },
+    )
+  })
+}
+
+const readJsonBody = async (response: Response, signal?: AbortSignal): Promise<unknown> => {
   try {
-    const body: unknown = await response.json()
-    if (typeof body !== "object" || body === null) return null
-    const error = (body as { error?: unknown }).error
-    if (typeof error !== "object" || error === null) return null
-    const code = (error as { code?: unknown }).code
-    return typeof code === "string" ? code : null
-  } catch {
+    return await response.json()
+  } catch (error) {
+    if (isAbortError(error) || signal?.aborted) throw abortError()
+    throw new WidgetSessionUploadError("upload_failed")
+  }
+}
+
+const readErrorCode = async (response: Response, signal?: AbortSignal): Promise<string | null> => {
+  let body: unknown
+  try {
+    body = await readJsonBody(response, signal)
+  } catch (error) {
+    if (isAbortError(error)) throw error
     return null
   }
+  if (typeof body !== "object" || body === null) return null
+  const error = (body as { error?: unknown }).error
+  if (typeof error !== "object" || error === null) return null
+  const code = (error as { code?: unknown }).code
+  return typeof code === "string" ? code : null
 }
 
 const readRetryAfterSeconds = (response: Response): number | null => {
@@ -98,13 +123,8 @@ const backoffMs = (attempt: number, retryAfterSeconds: number | null, random: ()
   return seconds * 1000 + Math.floor(random() * JITTER_MS)
 }
 
-const parseUploaded = async (response: Response, file: File): Promise<SessionUploadedFile> => {
-  let body: unknown
-  try {
-    body = await response.json()
-  } catch {
-    throw new WidgetSessionUploadError("upload_failed")
-  }
+const parseUploaded = async (response: Response, file: File, signal?: AbortSignal): Promise<SessionUploadedFile> => {
+  const body = await readJsonBody(response, signal)
   if (typeof body !== "object" || body === null) throw new WidgetSessionUploadError("upload_failed")
   const info = body as Record<string, unknown>
   if (!isCanonicalUuid(info.file_id)) throw new WidgetSessionUploadError("upload_failed")
@@ -128,10 +148,12 @@ export async function uploadWidgetSessionFile(
   const random = options.random ?? Math.random
 
   const obtainToken = async (source: () => Promise<string>): Promise<string> => {
+    if (signal?.aborted) throw abortError()
     try {
-      return await source()
+      return await raceAbort(source(), signal)
     } catch (error) {
-      if (isAbortError(error) || error instanceof WidgetSessionUploadError) throw error
+      if (isAbortError(error) || signal?.aborted) throw isAbortError(error) ? error : abortError()
+      if (error instanceof WidgetSessionUploadError) throw error
       throw new WidgetSessionUploadError("upload_failed")
     }
   }
@@ -159,10 +181,10 @@ export async function uploadWidgetSessionFile(
       throw new WidgetSessionUploadError("upload_failed")
     }
 
-    if (response.status === 201) return parseUploaded(response, file)
+    if (response.status === 201) return parseUploaded(response, file, signal)
 
     if (response.status === 429) {
-      const code = await readErrorCode(response)
+      const code = await readErrorCode(response, signal)
       if (code === "quota_exceeded") throw new WidgetSessionUploadError("upload_quota_exceeded")
       if (code !== "rate_limited") throw new WidgetSessionUploadError("upload_failed")
       if (rateLimitRetries >= MAX_RATE_LIMIT_RETRIES) {
