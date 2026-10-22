@@ -1,21 +1,23 @@
 """Command line entry point for the connector smoke checks.
 
-Usage: ``PYTHONPATH=src:scripts python -m connector_smoke l1 --help``.
+Usage: ``PYTHONPATH=src:scripts python -m connector_smoke {l1,l2} --help``.
 See ``scripts/connector_smoke/README.md``.
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
+import time
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, TextIO
 
 import httpx
 
-from . import l1
-from .client import SmokeClient, SmokeError
+from . import l1, l2
+from .client import SmokeClient, SmokeError, SmokeTimeout
 
 ENV_BASE_URL = "XAGENT_CONNECTOR_SMOKE_BASE_URL"
 ENV_LOGIN = "XAGENT_CONNECTOR_SMOKE_LOGIN"
@@ -25,6 +27,13 @@ ENV_EXCLUDE = "XAGENT_CONNECTOR_SMOKE_EXCLUDE"
 ENV_INCLUDE = "XAGENT_CONNECTOR_SMOKE_INCLUDE"
 ENV_COOKIES = "XAGENT_CONNECTOR_SMOKE_COOKIES"
 ENV_OAUTH_ACCOUNTS = "XAGENT_CONNECTOR_SMOKE_OAUTH_ACCOUNTS"
+ENV_EXPECT = "XAGENT_CONNECTOR_SMOKE_EXPECT"
+
+# Above the server's bound on one answer: XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS
+# (60 s by default) plus the token refresh and, for an npx connector, the
+# sandbox lease that run before it. A shorter client timeout gives up while the
+# server is still working.
+DEFAULT_TOOLS_TIMEOUT = 120.0
 
 
 def run_l1(
@@ -106,6 +115,66 @@ def _check_oauth_target(
     return results
 
 
+def run_l2(
+    client: SmokeClient,
+    *,
+    login: str,
+    password: str,
+    login_field: str,
+    login_start: bool,
+    expect: set[str],
+    tools_timeout: float,
+) -> list[l1.CheckResult]:
+    try:
+        client.login(login, password, login_field=login_field, login_start=login_start)
+    except SmokeError as exc:
+        return [l1.CheckResult("login", False, str(exc))]
+
+    try:
+        apps = client.list_catalog_apps()
+    except SmokeError as exc:
+        return [l1.CheckResult("catalog", False, str(exc))]
+
+    targets, missing = l2.select_targets(apps, expect=expect)
+    results: list[l1.CheckResult] = []
+    # One connector at a time: each call starts an MCP session on the web
+    # process (xorbitsai/xagent-saas#1788).
+    for target in targets:
+        try:
+            response = client.list_server_tools(target.server_id, timeout=tools_timeout)
+        except SmokeTimeout:
+            results.append(l2.check_timeout(target.app_id, tools_timeout))
+            continue
+        except SmokeError as exc:
+            results.append(l2.check_request_error(target.app_id, str(exc)))
+            continue
+        results.append(
+            l2.check_tools_response(
+                target.app_id, response.status_code, response.payload
+            )
+        )
+
+    try:
+        servers = client.list_servers()
+    except SmokeError as exc:
+        results.append(l1.CheckResult("servers", False, str(exc)))
+        servers = []
+    unconnected = l2.select_unconnected(
+        servers,
+        connected=(target.app_id for target in targets),
+        missing=missing,
+    )
+    results.extend(
+        l2.check_unconnected(app_id, apps, servers) for app_id in unconnected
+    )
+    if not targets and not unconnected:
+        # A misconfigured monitor account must not pass by checking nothing.
+        results.append(
+            l1.CheckResult("connectors", False, "no connected connector to check")
+        )
+    return results
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -128,6 +197,17 @@ def main(
     base_origin = l1.normalize_origin(args.base_url)
     if base_origin is None:
         parser.error("--base-url must be an http(s) URL")
+    if args.layer == "l2":
+        return _main_l2(
+            args,
+            parser,
+            env,
+            login=login,
+            password=password,
+            base_origin=base_origin,
+            transport=transport,
+            out=out,
+        )
     expected_origin = l1.normalize_origin(args.callback_origin or base_origin)
     if expected_origin is None:
         parser.error("--callback-origin must be an http(s) origin")
@@ -172,24 +252,92 @@ def main(
             oauth_accounts=oauth_accounts,
         )
 
+    return _report(results, out)
+
+
+def _main_l2(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    env: Mapping[str, str],
+    *,
+    login: str,
+    password: str,
+    base_origin: str,
+    transport: httpx.BaseTransport | None,
+    out: TextIO,
+) -> int:
+    try:
+        cookies = _parse_pairs(
+            _arg_or_env(args.cookie, env, ENV_COOKIES), separator=";"
+        )
+    except ValueError as exc:
+        parser.error(f"{exc} (--cookie)")
+    if not math.isfinite(args.tools_timeout) or args.tools_timeout <= 0:
+        parser.error("--tools-timeout must be a positive number")
+
+    started = time.monotonic()
+    with SmokeClient(
+        args.base_url,
+        origin=base_origin,
+        cookies=cookies,
+        timeout=args.timeout,
+        transport=transport,
+    ) as client:
+        results = run_l2(
+            client,
+            login=login,
+            password=password,
+            login_field=args.login_field,
+            login_start=args.login_start,
+            expect=_parse_list(_arg_or_env(args.expect, env, ENV_EXPECT)),
+            tools_timeout=args.tools_timeout,
+        )
+    return _report(results, out, suffix=f" in {time.monotonic() - started:.0f}s")
+
+
+def _report(results: list[l1.CheckResult], out: TextIO, *, suffix: str = "") -> int:
     failed = sum(not result.ok for result in results)
     for result in results:
         print(l1.format_result(result), file=out)
-    print(f"{len(results)} checks, {failed} failed", file=out)
+    print(f"{len(results)} checks, {failed} failed{suffix}", file=out)
     return 1 if failed else 0
 
 
 def _build_parser(env: Mapping[str, str]) -> argparse.ArgumentParser:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--base-url",
+        default=env.get(ENV_BASE_URL),
+        help=f"deployment base URL (env {ENV_BASE_URL})",
+    )
+    common.add_argument(
+        "--cookie",
+        action="append",
+        metavar="NAME=VALUE",
+        help="cookie sent on every request, e.g. selected_region=sg; repeatable "
+        f"(env {ENV_COOKIES}, ';'-separated)",
+    )
+    common.add_argument(
+        "--login-field",
+        choices=("username", "email"),
+        default="username",
+        help="login request field that carries the login (default: username)",
+    )
+    common.add_argument(
+        "--login-start",
+        action="store_true",
+        help="call /api/auth/login/start first (Xagent SaaS region routing)",
+    )
+    common.add_argument(
+        "--timeout", type=float, default=20.0, help="seconds per request"
+    )
+
     parser = argparse.ArgumentParser(prog="connector_smoke")
     sub = parser.add_subparsers(dest="layer", required=True)
     p = sub.add_parser(
         "l1",
+        parents=[common],
         help="configuration smoke: catalog and builtin OAuth client configuration",
-    )
-    p.add_argument(
-        "--base-url",
-        default=env.get(ENV_BASE_URL),
-        help=f"deployment base URL (env {ENV_BASE_URL})",
     )
     p.add_argument(
         "--callback-origin",
@@ -210,31 +358,31 @@ def _build_parser(env: Mapping[str, str]) -> argparse.ArgumentParser:
         f"or comma-separated (env {ENV_INCLUDE})",
     )
     p.add_argument(
-        "--cookie",
-        action="append",
-        metavar="NAME=VALUE",
-        help="cookie sent on every request, e.g. selected_region=sg; repeatable "
-        f"(env {ENV_COOKIES}, ';'-separated)",
-    )
-    p.add_argument(
         "--oauth-account",
         action="append",
         metavar="PROVIDER=LABEL",
         help="account label for a provider hosted on the customer's account, "
         f"e.g. zendesk=acme; repeatable (env {ENV_OAUTH_ACCOUNTS})",
     )
-    p.add_argument(
-        "--login-field",
-        choices=("username", "email"),
-        default="username",
-        help="login request field that carries the login (default: username)",
+
+    p = sub.add_parser(
+        "l2",
+        parents=[common],
+        help="connection smoke: start every connected connector and list its tools",
     )
     p.add_argument(
-        "--login-start",
-        action="store_true",
-        help="call /api/auth/login/start first (Xagent SaaS region routing)",
+        "--expect",
+        action="append",
+        help="app the monitor account must have connected; repeatable or "
+        f"comma-separated (env {ENV_EXPECT})",
     )
-    p.add_argument("--timeout", type=float, default=20.0, help="seconds per request")
+    p.add_argument(
+        "--tools-timeout",
+        type=float,
+        default=DEFAULT_TOOLS_TIMEOUT,
+        help="seconds to wait for one connector to start and list its tools "
+        f"(default: {DEFAULT_TOOLS_TIMEOUT:g})",
+    )
     return parser
 
 

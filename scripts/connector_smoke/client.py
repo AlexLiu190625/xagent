@@ -21,8 +21,18 @@ class SmokeError(Exception):
     """A request or response the check cannot use; the message is safe to print."""
 
 
+class SmokeTimeout(SmokeError):
+    """The request did not complete within its timeout."""
+
+
 @dataclass(frozen=True)
 class LaunchStart:
+    status_code: int
+    payload: Any
+
+
+@dataclass(frozen=True)
+class JSONResponse:
     status_code: int
     payload: Any
 
@@ -107,6 +117,34 @@ class SmokeClient:
             raise SmokeError("catalog response is not a list")
         return [app for app in apps if isinstance(app, dict)]
 
+    def list_servers(self) -> list[dict[str, Any]]:
+        response = self._request("GET", "/api/mcp/servers")
+        if response.status_code != 200:
+            raise SmokeError(f"server list request failed: HTTP {response.status_code}")
+        try:
+            servers = response.json()
+        except ValueError:
+            servers = None
+        if not isinstance(servers, list):
+            raise SmokeError("server list response is not a list")
+        return [server for server in servers if isinstance(server, dict)]
+
+    def list_server_tools(self, server_id: int, *, timeout: float) -> JSONResponse:
+        """Start one connected server and list its tools.
+
+        The server may take its own load timeout, after the token refresh and
+        (for npx) the sandbox lease, to answer, so this request carries its own,
+        longer timeout.
+        """
+        response = self._request(
+            "GET", f"/api/mcp/servers/{int(server_id)}/tools", timeout=timeout
+        )
+        try:
+            payload: Any = response.json()
+        except ValueError:
+            payload = response.text
+        return JSONResponse(response.status_code, payload)
+
     def start_launch(
         self, provider: str, app_id: str, account: str | None = None
     ) -> LaunchStart:
@@ -151,6 +189,10 @@ class SmokeClient:
             response = self._http.request(
                 method, path, headers=headers if cookies else None, **kwargs
             )
+        except httpx.TimeoutException as exc:
+            raise SmokeTimeout(
+                f"{method} request failed: {type(exc).__name__}"
+            ) from None
         except (httpx.HTTPError, httpx.InvalidURL, ValueError) as exc:
             # The exception text can carry the request URL, which for a launch
             # redeem holds a ticket, or a header value. Report the class only.

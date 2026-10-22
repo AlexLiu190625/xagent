@@ -131,6 +131,129 @@ pytest tests/scripts/test_connector_smoke_l1.py tests/scripts/test_connector_smo
 The tests use recorded response shapes and an in-process fake deployment. None
 of them opens a network connection.
 
+## L2: connection smoke
+
+L2 starts every catalog connector the monitor account has connected and
+requires each one to list at least one tool
+([#3246](https://github.com/xorbitsai/xagent/issues/3246)). It calls
+`GET /api/mcp/servers/{id}/tools`, which starts the server exactly as an agent
+task would: the stdio launch with the user's token for builtin OAuth, the env
+layer the user picked for API-key connectors, and the user's grant for remote
+MCP OAuth (`src/xagent/web/services/mcp_connector_session.py`).
+
+**Which connectors.** Every app that `GET /api/mcp/apps` reports as connected
+(`is_connected` with a `server_id`) is started, whether or not it is expected,
+so a connector the account gains is checked without editing a list. Custom MCP
+servers and custom APIs are not catalog apps and are not started. Pass the apps
+each environment must have connected with `--expect`. An expected app that is
+not connected fails as `needs reconnect`, `not connected`, or `not in the
+catalog`. A builtin OAuth app whose stored token was cleared (`connection_status`
+is `needs_reconnect` in `GET /api/mcp/servers`) fails as `needs reconnect` even
+when it is not expected. Any other connector the account loses drops out of the
+run (for example a builtin OAuth token that expired with no refresh token,
+which `GET /api/mcp/servers` still reports as `connected`), so the scheduled
+job should always pass `--expect`. A run that finds no
+connected connector and expects none fails.
+Vendor test accounts for the monitor account are tracked in
+[#3262](https://github.com/xorbitsai/xagent/issues/3262).
+
+**What a pass proves** depends on the connector type:
+
+| Type | A pass proves |
+| --- | --- |
+| Remote MCP OAuth (Notion, HubSpot, Atlassian, …) | The credential works: `tools/list` reaches the vendor's server, and the grant is refreshed when it expires within 5 minutes. A vendor that rejects the token (HTTP 401/403) fails as `not connected (auth_rejected)`. |
+| Builtin OAuth (Google, Microsoft, Slack, GitHub, …) | The connector starts with a token injected; an expiring token is refreshed first. The in-repo servers' tool lists are static, so a token revoked at the vendor still passes. Credential validity is L3's ([#3247](https://github.com/xorbitsai/xagent/issues/3247)). |
+| API key (Stripe, AWS, PostHog, …) | The connector starts with the user's env resolved. The key is read only inside tool calls, so its validity is L3's. |
+| `chrome-devtools` | Not covered. It is hidden from the catalog, so the monitor account cannot connect it, and it can only start inside a task (`unsupported outside a task`). |
+
+### Side effects
+
+- Each connector runs once, one at a time. A stdio connector starts a process on
+  the backend host for the length of one `tools/list`; an `npx` connector runs
+  in a sandbox when the deployment has a sandbox manager. A load the server
+  abandons at its timeout may still be cleaned up in the background while the
+  next connector starts.
+- A builtin OAuth token that expires within 5 minutes is refreshed, and the new
+  token is stored, as a task would do. A refresh token the vendor has revoked
+  permanently is cleared, so that connector then needs a reconnect.
+- Logging in replaces the monitor account's refresh token, as in L1.
+
+### Run time
+
+Each connector takes as long as its server needs to start and answer
+`tools/list`, usually a few seconds. A connector that hangs costs at most
+`--tools-timeout` (120 s by default). That default sits above the server's bound
+on one answer: it responds within `XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS` (60 s
+by default) of starting the load, after the token refresh and, for an `npx`
+connector, the sandbox lease. A shorter client timeout gives up on a connector
+the server is still starting. If the deployment raises
+`XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS`, raise `--tools-timeout` by the same
+amount. The worst case is the number of
+connected apps times `--tools-timeout`: 50 connectors that all hang take 100
+minutes. The access token from the login lasts
+`XAGENT_ACCESS_TOKEN_EXPIRE_MINUTES` (120 by default), so raise it for the
+monitor account's deployment if a run can take longer. The summary line reports
+the elapsed time.
+
+### Usage
+
+```bash
+export XAGENT_CONNECTOR_SMOKE_LOGIN=monitor@example.com
+export XAGENT_CONNECTOR_SMOKE_PASSWORD=...
+PYTHONPATH=src:scripts python -m connector_smoke l2 \
+  --base-url https://xagent.example.com \
+  --expect slack,notion,stripe
+```
+
+L2 takes the same `--base-url`, `--cookie`, `--login-field`, `--login-start` and
+`--timeout` options as L1, plus:
+
+| Option | Environment variable | Meaning |
+| --- | --- | --- |
+| `--expect` | `XAGENT_CONNECTOR_SMOKE_EXPECT` | Apps the monitor account must have connected. Repeatable or comma-separated. |
+| `--tools-timeout` | (none) | Seconds to wait for one connector to start and list its tools. Default 120. |
+
+`--timeout` applies to the login, catalog and server-list requests only.
+
+### Output
+
+```text
+PASS l2:notion: 14 tools
+FAIL l2:slack: failed to start (initialize)
+FAIL l2:stripe: not connected (oauth_token_required)
+FAIL l2:gmail: needs reconnect
+4 checks, 3 failed in 131s
+```
+
+| Failure | Meaning |
+| --- | --- |
+| `not connected (<code>)` | The server answered 400 with a credential code (`oauth_token_required`, `authorization_required`, `insufficient_scope`, `token_refresh_failed`, …), or the vendor rejected the token (`auth_rejected`). |
+| `needs reconnect`, `not connected`, `not in the catalog` | An expected app is not connected; see above. |
+| `failed to start (<phase or reason>)` | The server could not be started or did not answer the MCP handshake. The phase is where the loader gave up (`src/xagent/core/tools/adapters/vibe/mcp_adapter.py`): `session_start` when the session could not be opened (for example the command could not be spawned), `initialize` when the process exited or never answered the handshake (a missing Python module ends here), `list_tools`, `sandbox_list_tools` (an `npx` connector that fails or hangs in the sandbox ends here). A code such as `sandbox_unavailable`, or a remote OAuth discovery code such as `metadata_not_found`, means the server was never started. A host (non-`npx`) connector that hangs past the server's own load bound ends as `initialize`: the route reports the phase, not that it timed out. |
+| `no tools` | The server started and listed no tools. |
+| `timed out after <n>s` | No answer within `--tools-timeout`. The server gives up on a hung connector before this, so this means the request itself stalled, for example in the token refresh that runs before the load. |
+| `unsupported outside a task` | An execution-scoped connector; see the table above. |
+| `server not found` | The server row disappeared between the catalog and the call (HTTP 404). |
+| `<METHOD> request failed: <Class>` | No HTTP answer, for example a connection error. |
+| `unexpected response (HTTP 200)` | The server answered 200 with a body that is not a JSON object. |
+| `HTTP <status>` | Any other answer, for example `HTTP 504` from a reverse proxy whose idle timeout is shorter than the server's load bound. |
+
+Two checks are not about one connector. `FAIL servers: ...` means the server
+list request failed; expected apps are then reported without the `needs
+reconnect` distinction. `FAIL connectors: no connected connector to check`
+means the run found nothing to start and expected nothing.
+
+Reasons are the codes and failure phases the server reports. The route does not
+return exception class names, and the output never contains a token, a key, a
+diagnostic message, or a server's error text. The exit codes are the same as
+L1's.
+
+### Tests
+
+```bash
+pytest tests/scripts/test_connector_smoke_l2.py
+```
+
 ## Startability check: every connector, no accounts
 
 L1 proves a connector is listed and its OAuth client is configured; it cannot
