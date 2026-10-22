@@ -68,6 +68,22 @@ def held_lock(
 
 
 @contextmanager
+def counting(engine: Engine, marker: str = "CREATE INDEX") -> Iterator[list[str]]:
+    """Record every statement on ``engine`` whose text contains ``marker``."""
+    seen: list[str] = []
+
+    def record(_conn, _cursor, statement, *_args) -> None:
+        if marker in statement:
+            seen.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        yield seen
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+
+@contextmanager
 def release_before_nth(
     engine: Engine, held: Connection, marker: str, n: int
 ) -> Iterator[None]:

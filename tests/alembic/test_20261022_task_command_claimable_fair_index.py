@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator
-from contextlib import contextmanager
 from io import StringIO
 from pathlib import Path
 
@@ -12,9 +10,10 @@ import pytest
 from alembic import command
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
-from sqlalchemy import create_engine, event, inspect, text
+from sqlalchemy import create_engine, inspect, text
 
 from tests.alembic.lock_retry_support import (
+    counting,
     driver_engines,
     held_lock,
     release_before_nth,
@@ -249,21 +248,6 @@ def _pg_state(connection):
     return None if row is None else (row[0], row[1], tuple(row[2]))
 
 
-@contextmanager
-def _counting(engine, marker: str) -> Iterator[list[str]]:
-    seen: list[str] = []
-
-    def record(_conn, _cursor, statement, *_args) -> None:
-        if marker in statement:
-            seen.append(statement)
-
-    event.listen(engine, "before_cursor_execute", record)
-    try:
-        yield seen
-    finally:
-        event.remove(engine, "before_cursor_execute", record)
-
-
 def _expected_index(connection) -> None:
     """The index is valid, in the right column order, with the right predicate.
 
@@ -286,7 +270,7 @@ def test_postgresql_upgrade_repeat_and_downgrade(pg, monkeypatch) -> None:
         _run(migration, connection, "upgrade")
         _expected_index(connection)
 
-        with _counting(engine, "CREATE INDEX") as creates:
+        with counting(engine) as creates:
             _run(migration, connection, "upgrade")
         assert creates == []
 
@@ -361,7 +345,7 @@ def test_postgresql_upgrade_is_retried_while_a_write_is_uncommitted(
     migration = _migration(monkeypatch, "fair_index_pg_lock", **FAST)
     with engine.connect() as connection:
         with held_lock(holder_engine, TABLE) as held:
-            with _counting(engine, "CREATE INDEX") as attempts:
+            with counting(engine) as attempts:
                 with pytest.raises(RuntimeError, match=f"could not lock {TABLE}"):
                     _run(migration, connection, "upgrade")
             assert len(attempts) == 3
@@ -380,7 +364,7 @@ def test_postgresql_upgrade_builds_the_index_while_readers_hold_the_table(
     migration = _migration(monkeypatch, "fair_index_pg_readers", **FAST)
     with engine.connect() as connection:
         with held_lock(holder_engine, TABLE, "ACCESS SHARE"):
-            with _counting(engine, "CREATE INDEX") as attempts:
+            with counting(engine) as attempts:
                 _run(migration, connection, "upgrade")
         assert len(attempts) == 1
         assert _pg_state(connection) is not None

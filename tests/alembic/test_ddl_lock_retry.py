@@ -13,6 +13,7 @@ from alembic.operations import Operations
 from sqlalchemy import create_engine, event, text
 
 from tests.alembic.lock_retry_support import (
+    counting,
     driver_engines,
     held_lock,
     release_before_nth,
@@ -53,21 +54,6 @@ def index_exists(connection) -> bool:
         ).scalar_one()
         == 1
     )
-
-
-@contextmanager
-def counting(engine, marker: str = "CREATE INDEX") -> Iterator[list[str]]:
-    attempts: list[str] = []
-
-    def record(_conn, _cursor, statement, *_args) -> None:
-        if marker in statement:
-            attempts.append(statement)
-
-    event.listen(engine, "before_cursor_execute", record)
-    try:
-        yield attempts
-    finally:
-        event.remove(engine, "before_cursor_execute", record)
 
 
 @pytest.fixture
