@@ -71,6 +71,7 @@ def _stdio_connection() -> dict[str, Any]:
         pytest.param({"connection_host": "mcp.example.test\t"}, id="host-tab"),
         pytest.param({"connection_host": "MCP.example.test"}, id="host-uppercase"),
         pytest.param({"connection_host": ""}, id="host-empty"),
+        pytest.param({"connection_host": "mcp.example.test."}, id="host-trailing-dot"),
         pytest.param({"connection_host": "10.0.0.1"}, id="host-ip"),
         pytest.param({"allowed_upload_hosts": frozenset()}, id="upload-hosts-empty"),
         pytest.param(
@@ -83,6 +84,10 @@ def _stdio_connection() -> dict[str, Any]:
         pytest.param(
             {"allowed_upload_hosts": frozenset({"Uploads.example.test"})},
             id="upload-host-uppercase",
+        ),
+        pytest.param(
+            {"allowed_upload_hosts": frozenset({"uploads.example.test."})},
+            id="upload-host-trailing-dot",
         ),
         pytest.param({"upload_path_prefix": "staged/"}, id="prefix-no-leading-slash"),
         pytest.param({"upload_path_prefix": "/staged"}, id="prefix-no-trailing-slash"),

@@ -54,6 +54,10 @@ def _validate_hostname(host: Any, label: str) -> None:
         raise ValueError(f"{label} must be lower-case")
     if any(ch in _HOST_FORBIDDEN_CHARS or ch.isspace() for ch in host):
         raise ValueError(f"{label} must be an exact hostname")
+    if host.endswith("."):
+        # A URL hostname never keeps its trailing dot as compared here, so such
+        # a registration could never match.
+        raise ValueError(f"{label} must not end with a dot")
     try:
         ipaddress.ip_address(host)
     except ValueError:
