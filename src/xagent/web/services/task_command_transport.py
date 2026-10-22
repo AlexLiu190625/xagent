@@ -498,7 +498,12 @@ def stage_task_command(
        attributable to the command insert itself. Classification runs once per
        new execution command, after the row is flushed. The deployment
        classifier's dispatch class is written to the row in the same
-       transaction, before the admission ticket is staged.
+       transaction, before the admission ticket is staged. The fairness key
+       is set on the inserted row (the owner key, or for a control command the
+       key of the task's latest command); a classifier's key replaces it in
+       the flush that writes the dispatch class. A control command of a task
+       with no earlier command takes the owner key, which can differ from a
+       deployment classifier's key for that task.
 
     Caller obligations:
 
@@ -604,6 +609,16 @@ def stage_task_command(
         if snapshot.status == TaskStatus.RUNNING and snapshot.runner_id is not None
         else None
     )
+    fairness_key = f"user:{int(snapshot.user_id)}"
+    if kind.value not in EXECUTION_OPENING_KINDS:
+        latest_key = db.execute(
+            select(TaskExecutionCommand.fairness_key)
+            .where(TaskExecutionCommand.task_id == resolved_task_id)
+            .order_by(TaskExecutionCommand.id.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if latest_key is not None:
+            fairness_key = str(latest_key)
     command = TaskExecutionCommand(
         task_id=resolved_task_id,
         actor_user_id=actor_user_id,
@@ -619,6 +634,7 @@ def stage_task_command(
         reply_host_id=reply_host_id,
         reply_origin=reply_origin,
         status=COMMAND_PENDING,
+        fairness_key=fairness_key,
     )
     db.add(command)
     db.flush()
@@ -681,11 +697,18 @@ def stage_task_command(
                 previous_dispatch_class=previous_dispatch_class,
             ),
         )
+        changed = False
         if classification.dispatch_class != command.dispatch_class:
             command.dispatch_class = classification.dispatch_class  # type: ignore[assignment]
-            # The session does not autoflush; write the class before anything
-            # else in the acceptance transaction can read the row, whatever the
-            # caller does next.
+            changed = True
+        classified_key = classification.fairness_key
+        if classified_key is not None and classified_key != command.fairness_key:
+            command.fairness_key = classified_key  # type: ignore[assignment]
+            changed = True
+        if changed:
+            # The session does not autoflush; write the class and the key before
+            # anything else in the acceptance transaction can read the row,
+            # whatever the caller does next.
             db.flush()
     stage_task_admission(
         db, command, classification.admission if classification else None
@@ -1834,6 +1857,7 @@ class CommandCandidate(NamedTuple):
     task_id: int
     kind: TaskCommandKind
     interactive: bool
+    fairness_key: str
 
 
 def _find_command_candidate(
@@ -1896,6 +1920,7 @@ def _find_command_candidate(
             int(row.task_id),
             TaskCommandKind(row.kind),
             row.dispatch_class == DISPATCH_CLASS_INTERACTIVE,
+            str(row.fairness_key),
         )
 
 
@@ -1983,11 +2008,14 @@ async def dispatch_one_task_command(
         )
         if candidate is None:
             return False
-        selected_id, task_id, kind, interactive = candidate
+        selected_id, task_id, kind, interactive, fairness_key = candidate
         reservation = None
         if kind.value in EXECUTION_OPENING_KINDS:
             reservation = background_task_manager.reserve_dispatch_slot(
-                task_id, policy=cap.policy, interactive=interactive
+                task_id,
+                policy=cap.policy,
+                interactive=interactive,
+                fairness_key=fairness_key,
             )
             if reservation is None:
                 # A candidate picked under a snapshot is one this process could

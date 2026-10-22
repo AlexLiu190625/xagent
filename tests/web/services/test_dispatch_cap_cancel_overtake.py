@@ -333,15 +333,15 @@ async def test_control_overtake_matrix(
     layer2 = transport._find_command_candidate(control_id, (), cap)
 
     control_candidate = transport.CommandCandidate(
-        control_id, task_id, TaskCommandKind(control), False
+        control_id, task_id, TaskCommandKind(control), False, ""
     )
     held_candidate = transport.CommandCandidate(
-        held_id, task_id, TaskCommandKind(held_kind), False
+        held_id, task_id, TaskCommandKind(held_kind), False, ""
     )
     if order in ("pause_between", "cancel_between"):
         # Only the earlier control is claimable; the later one waits behind it.
         assert layer1 == transport.CommandCandidate(
-            first_id, task_id, TaskCommandKind(order.split("_")[0]), False
+            first_id, task_id, TaskCommandKind(order.split("_")[0]), False, ""
         )
         assert layer2 is None
     elif order == "control_first" or cap_state == "closed_task_inactive":

@@ -100,6 +100,10 @@ class TaskExecutionCommand(Base):  # type: ignore
     dispatch_class = Column(
         String(16), nullable=False, server_default="batch", default="batch"
     )
+    # The tenant this command is accounted to. Set in the acceptance
+    # transaction and never updated after it commits. Rows that predate the
+    # column read the empty string and count as an ordinary tenant.
+    fairness_key = Column(String(64), nullable=False, server_default="", default="")
     attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
     failure_count = Column(Integer, nullable=False, default=0, server_default="0")
     defer_count = Column(Integer, nullable=False, default=0, server_default="0")

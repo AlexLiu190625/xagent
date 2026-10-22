@@ -381,7 +381,7 @@ async def test_one_notify_one_free_slot_admits_exactly_one(
                 command_id, task_id = next(handed_out)
             barrier.wait(10)
             return transport.CommandCandidate(
-                command_id, task_id, TaskCommandKind.START, False
+                command_id, task_id, TaskCommandKind.START, False, ""
             )
 
         monkeypatch.setattr(transport, "_find_command_candidate", find)
@@ -823,14 +823,25 @@ def take_last_slot_after_snapshot(
     real_reserve = host.manager.reserve_dispatch_slot
     calls: list[int] = []
 
-    def reserve(task_id: int, *, policy: DispatchPolicy, interactive: bool) -> Any:
+    def reserve(
+        task_id: int,
+        *,
+        policy: DispatchPolicy,
+        interactive: bool,
+        fairness_key: str | None = None,
+    ) -> Any:
         if not calls:
             calls.append(task_id)
             assert (
                 real_reserve(other_task_id, policy=policy, interactive=interactive)
                 is not None
             )
-        return real_reserve(task_id, policy=policy, interactive=interactive)
+        return real_reserve(
+            task_id,
+            policy=policy,
+            interactive=interactive,
+            fairness_key=fairness_key,
+        )
 
     monkeypatch.setattr(host.manager, "reserve_dispatch_slot", reserve)
 
@@ -919,7 +930,9 @@ async def test_closed_cap_claims_controls_and_active_task_commands(
 
     if held_start is not None:
         assert transport._find_command_candidate(None, (), snapshot) == (
-            transport.CommandCandidate(command_id, target, TaskCommandKind(kind), False)
+            transport.CommandCandidate(
+                command_id, target, TaskCommandKind(kind), False, ""
+            )
         )
     assert await dispatch(host) is True
     assert host.claimed == [(target, TaskCommandKind(kind))]
