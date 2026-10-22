@@ -38,12 +38,13 @@ MIGRATION_PATH = (
 FAST = {"_LOCK_TIMEOUT": "200ms", "_LOCK_RETRY_DELAYS": (0.01, 0.01)}
 
 
-def _table_sql(dialect: str, *, with_key: bool = True) -> str:
+def _table_sql(dialect: str, *, with_key: bool = True, with_status: bool = True) -> str:
     serial = "SERIAL" if dialect == "postgresql" else "INTEGER"
     key = "fairness_key VARCHAR(64) NOT NULL DEFAULT '', " if with_key else ""
+    status = "status VARCHAR(16) NOT NULL, " if with_status else ""
     return (
         f"CREATE TABLE {TABLE} (id {serial} PRIMARY KEY, task_id INTEGER NOT NULL, "
-        f"kind VARCHAR(32) NOT NULL, status VARCHAR(16) NOT NULL, {key}"
+        f"kind VARCHAR(32) NOT NULL, {status}{key}"
         "dispatch_class VARCHAR(16) NOT NULL DEFAULT 'batch')"
     )
 
@@ -101,7 +102,7 @@ def test_sqlite_upgrade_builds_the_partial_index_and_downgrade_drops_it() -> Non
         assert INDEX not in _index_names(connection)
 
 
-def test_sqlite_upgrade_skips_without_the_table_or_without_a_column() -> None:
+def test_sqlite_upgrade_skips_without_the_table() -> None:
     engine = create_engine("sqlite:///:memory:")
     config = create_alembic_config(engine)
     with engine.begin() as connection:
@@ -110,13 +111,16 @@ def test_sqlite_upgrade_skips_without_the_table_or_without_a_column() -> None:
         command.upgrade(config, REVISION)
         assert TABLE not in inspect(connection).get_table_names()
 
+
+@pytest.mark.parametrize(
+    "missing", [{"with_key": False}, {"with_status": False}], ids=["key", "status"]
+)
+def test_sqlite_upgrade_skips_without_a_column(missing) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    config = create_alembic_config(engine)
     with engine.begin() as connection:
-        connection.execute(text("DELETE FROM alembic_version"))
-        connection.execute(
-            text("INSERT INTO alembic_version (version_num) VALUES (:r)"),
-            {"r": DOWN_REVISION},
-        )
-        connection.execute(text(_table_sql("sqlite", with_key=False)))
+        _stamp(connection)
+        connection.execute(text(_table_sql("sqlite", **missing)))
         config.attributes["connection"] = connection
         command.upgrade(config, REVISION)
         assert INDEX not in _index_names(connection)
@@ -292,11 +296,19 @@ RIGHT = (
 )
 
 
+NON_PARTIAL = "CREATE INDEX {index} ON {table} (fairness_key, dispatch_class, id)"
+
+
 @pytest.mark.postgresql
 @pytest.mark.parametrize(
     "create,invalidate",
-    [(WRONG_PREDICATE, False), (WRONG_ORDER, False), (RIGHT, True)],
-    ids=["predicate", "column_order", "invalid"],
+    [
+        (WRONG_PREDICATE, False),
+        (WRONG_ORDER, False),
+        (RIGHT, True),
+        (NON_PARTIAL, False),
+    ],
+    ids=["predicate", "column_order", "invalid", "non_partial"],
 )
 def test_postgresql_upgrade_replaces_an_index_that_is_not_the_expected_one(
     pg, monkeypatch, create, invalidate
@@ -317,6 +329,22 @@ def test_postgresql_upgrade_replaces_an_index_that_is_not_the_expected_one(
         _run(migration, connection, "upgrade")
 
         _expected_index(connection)
+
+
+@pytest.mark.postgresql
+@pytest.mark.parametrize("column", ["fairness_key", "status"])
+def test_postgresql_upgrade_skips_a_table_without_a_required_column(
+    pg, monkeypatch, column
+) -> None:
+    engine, _ = pg
+    migration = _migration(monkeypatch, "fair_index_pg_missing")
+    with engine.connect() as connection:
+        connection.execute(text(f"ALTER TABLE {TABLE} DROP COLUMN {column}"))
+        connection.commit()
+        with counting(engine) as creates:
+            _run(migration, connection, "upgrade")
+        assert creates == []
+        assert _pg_state(connection) is None
 
 
 @pytest.mark.postgresql
