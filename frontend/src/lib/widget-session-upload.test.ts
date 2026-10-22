@@ -269,6 +269,17 @@ describe("uploadWidgetSessionFile", () => {
       ])
     })
 
+    it("passes the rejected token to refreshToken", async () => {
+      fetchMock
+        .mockResolvedValueOnce(jsonResponse(401, { error: { code: "invalid_api_key", message: "no" } }))
+        .mockResolvedValueOnce(created())
+      const { options } = baseOptions()
+
+      await uploadWidgetSessionFile(options)
+
+      expect(options.refreshToken).toHaveBeenCalledWith("st_current")
+    })
+
     it("fails with upload_failed after a second 401", async () => {
       fetchMock.mockImplementation(async () => jsonResponse(401, { error: { code: "invalid_api_key", message: "no" } }))
       const { options } = baseOptions()

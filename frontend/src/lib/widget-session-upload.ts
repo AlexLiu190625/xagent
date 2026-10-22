@@ -37,11 +37,12 @@ export interface UploadWidgetSessionFileOptions {
   // Called before every request, so a long backoff never sends a token that
   // expired while waiting.
   getToken: () => Promise<string>
-  // Called once after a 401 to obtain a token that is newer than the one just
-  // rejected. The caller owns how often a refresh is acceptable: the widget
-  // script falls back to a degraded session when it is asked for three
-  // non-recovery refreshes within a minute, so a refresh per file at most.
-  refreshToken: () => Promise<string>
+  // Called at most once per upload, after a 401, with the token that was
+  // rejected; resolves with a different token. Each refresh closes the chat
+  // socket, and the widget script ends the session on the fourth reconnect
+  // before a connection has stayed open for 60 s, so a refresh is worth
+  // asking for only while the rejected token is still the current one.
+  refreshToken: (rejectedToken: string) => Promise<string>
   file: File
   signal?: AbortSignal
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>
@@ -204,7 +205,8 @@ export async function uploadWidgetSessionFile(
     if (response.status === 401) {
       if (refreshed) throw new WidgetSessionUploadError("upload_failed")
       refreshed = true
-      token = await obtainToken(options.refreshToken)
+      const rejected = token
+      token = await obtainToken(() => options.refreshToken(rejected))
       continue
     }
 

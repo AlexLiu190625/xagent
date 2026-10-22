@@ -2,6 +2,8 @@ import { act, cleanup, renderHook } from "@testing-library/react"
 import { StrictMode } from "react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
+import { uploadWidgetSessionFile } from "@/lib/widget-session-upload"
+
 import {
   buildWidgetSessionWebSocketUrl,
   useWidgetSession,
@@ -867,21 +869,6 @@ describe("useWidgetSession upload coordination", () => {
       expect(reconnectRequests(postMessage)).toHaveLength(0)
     })
 
-    it("asks for a new token when less than a minute is left and resolves with the new session", async () => {
-      const postMessage = vi.spyOn(window, "postMessage")
-      const { result } = renderHook(() => useWidgetSession())
-      dispatchFromParent(updateMessage({
-        session_token_expires_at: expiringIn(30_000),
-        absolute_expires_at: expiringIn(30 * 60_000),
-      }))
-      // The stale update itself is refused; the bridge asks for a fresh one.
-      expect(reconnectRequests(postMessage)).toHaveLength(1)
-
-      dispatchFromParent(updateMessage())
-      const session = await result.current.ensureFreshSession()
-      expect(session.token).toBe("st_session_token")
-    })
-
     it("sends one reconnect_request and resolves with the refreshed session", async () => {
       vi.useFakeTimers()
       const postMessage = vi.spyOn(window, "postMessage")
@@ -959,7 +946,7 @@ describe("useWidgetSession upload coordination", () => {
 
       expect((await waiting).error).toMatchObject({ errorCode: "upload_failed" })
       expect((await settled(result.current.ensureFreshSession())).error).toMatchObject({ errorCode: "upload_failed" })
-      expect((await settled(result.current.refreshSession())).error).toMatchObject({ errorCode: "upload_failed" })
+      expect((await settled(result.current.refreshSession("st_session_token"))).error).toMatchObject({ errorCode: "upload_failed" })
     })
 
     it("rejects when the parent never answers within the resend deadline", async () => {
@@ -993,12 +980,16 @@ describe("useWidgetSession upload coordination", () => {
   })
 
   describe("refreshSession", () => {
-    it("requests a refresh even when the token is fresh", async () => {
+    afterEach(() => {
+      vi.unstubAllGlobals()
+    })
+
+    it("requests a refresh when the current token is the rejected one, even while it looks fresh", async () => {
       const postMessage = vi.spyOn(window, "postMessage")
       const { result } = renderHook(() => useWidgetSession())
       dispatchFromParent(updateMessage())
 
-      const waiting = result.current.refreshSession()
+      const waiting = result.current.refreshSession("st_session_token")
       expect(reconnectRequests(postMessage)).toHaveLength(1)
       dispatchFromParent(updateMessage({ session_token: "st_after_401" }))
 
@@ -1018,7 +1009,7 @@ describe("useWidgetSession upload coordination", () => {
       const fresh = result.current.ensureFreshSession()
       dispatchFromParent(updateMessage({ session_token: "st_renewed" }))
       await fresh
-      const recovered = result.current.refreshSession()
+      const recovered = result.current.refreshSession("st_renewed")
       dispatchFromParent(updateMessage({ session_token: "st_renewed_again" }))
 
       await expect(recovered).resolves.toMatchObject({ token: "st_renewed_again" })
@@ -1036,12 +1027,78 @@ describe("useWidgetSession upload coordination", () => {
       await act(async () => { await vi.advanceTimersByTimeAsync(40_000) })
 
       const fresh = result.current.ensureFreshSession()
-      const recovered = result.current.refreshSession()
+      const recovered = result.current.refreshSession("st_session_token")
       dispatchFromParent(updateMessage({ session_token: "st_renewed" }))
 
       await expect(fresh).resolves.toMatchObject({ token: "st_renewed" })
       await expect(recovered).resolves.toMatchObject({ token: "st_renewed" })
       expect(reconnectRequests(postMessage)).toHaveLength(1)
+    })
+
+    it("resolves with the current session and sends no reconnect_request when the rejected token was already replaced", async () => {
+      const postMessage = vi.spyOn(window, "postMessage")
+      const { result } = renderHook(() => useWidgetSession())
+      dispatchFromParent(updateMessage())
+
+      const first = result.current.refreshSession("st_session_token")
+      dispatchFromParent(updateMessage({ session_delivery_id: "delivery-b", session_token: "st_renewed" }))
+      await first
+      const stale = result.current.refreshSession("st_session_token")
+
+      await expect(stale).resolves.toMatchObject({ token: "st_renewed" })
+      expect(reconnectRequests(postMessage)).toHaveLength(1)
+    })
+
+    it("two uploads whose 401s for the same token arrive before and after the shared refresh cause one reconnect_request", async () => {
+      const postMessage = vi.spyOn(window, "postMessage")
+      const { result } = renderHook(() => useWidgetSession())
+      dispatchFromParent(updateMessage())
+
+      const fileId = "0b1e5c9e-3f1a-4a63-9b0e-6c1d2f3a4b5c"
+      const unauthorized = () => new Response(
+        JSON.stringify({ error: { code: "invalid_api_key", message: "no" } }),
+        { status: 401, headers: { "Content-Type": "application/json" } },
+      )
+      const uploaded = () => new Response(
+        JSON.stringify({ file_id: fileId }),
+        { status: 201, headers: { "Content-Type": "application/json" } },
+      )
+      let releaseSecond!: () => void
+      const gate = new Promise<void>((resolve) => { releaseSecond = resolve })
+      let rejections = 0
+      const authorizations: string[] = []
+      const fetchMock = vi.fn(async (_url: string, init: { headers: { Authorization: string } }) => {
+        const authorization = init.headers.Authorization
+        authorizations.push(authorization)
+        if (authorization !== "Bearer st_session_token") return uploaded()
+        rejections += 1
+        if (rejections === 2) await gate
+        return unauthorized()
+      })
+      vi.stubGlobal("fetch", fetchMock)
+
+      const upload = () => uploadWidgetSessionFile({
+        origin: "https://chat.example.test",
+        getToken: async () => (await result.current.ensureFreshSession()).token,
+        refreshToken: async (rejected) => (await result.current.refreshSession(rejected)).token,
+        file: new File(["hello world"], "report.pdf", { type: "application/pdf" }),
+      })
+      const first = upload()
+      const second = upload()
+
+      await vi.waitFor(() => expect(reconnectRequests(postMessage)).toHaveLength(1))
+      dispatchFromParent(updateMessage({ session_delivery_id: "delivery-b", session_token: "st_renewed" }))
+      await expect(first).resolves.toMatchObject({ fileId })
+      releaseSecond()
+      await expect(second).resolves.toMatchObject({ fileId })
+
+      expect(reconnectRequests(postMessage)).toHaveLength(1)
+      expect(authorizations).toEqual([
+        "Bearer st_session_token",
+        "Bearer st_session_token",
+        "Bearer st_renewed",
+        "Bearer st_renewed",
+      ])
     })
   })
 
@@ -1087,7 +1144,7 @@ describe("useWidgetSession upload coordination", () => {
       const { result } = renderHook(() => useWidgetSession())
       dispatchFromParent(updateMessage())
       act(() => result.current.handleConnectionOpen("widget-session:1"))
-      const refreshed = result.current.refreshSession()
+      const refreshed = result.current.refreshSession("st_session_token")
       const waiting = result.current.waitForOpenConnection()
       dispatchFromParent(updateMessage({ session_delivery_id: "delivery-b" }))
       await refreshed

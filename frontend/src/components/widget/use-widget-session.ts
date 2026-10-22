@@ -385,10 +385,11 @@ export function useWidgetSession() {
       : null, [])
 
   // Resolves with a session whose token has at least TOKEN_REFRESH_THRESHOLD_MS
-  // left, asking the parent for a new one when it does not. The widget script
-  // falls back to a degraded session once three non-recovery refreshes happen
-  // within a minute (frontend/public/widget.js), so a caller must not refresh
-  // more than once per file beyond this call.
+  // left, asking the parent for a new one when it does not. Every refresh
+  // closes the chat socket and opens a new one, and frontend/public/widget.js
+  // ends the session (session_terminal, network_unavailable) on the fourth
+  // reconnect -- for any reason, a closed socket included -- unless a
+  // connection has stayed open for 60 s since the count was last reset.
   const ensureFreshSession = useCallback((): Promise<WidgetSession> => {
     const unavailable = unavailableError()
     if (unavailable) return Promise.reject(unavailable)
@@ -401,15 +402,18 @@ export function useWidgetSession() {
     return wait
   }, [requestReconnect, unavailableError, waitForNextSession])
 
-  // Resolves with a newly issued session regardless of how long the current
-  // token has left. Meant for recovering from a rejected token; shares the wait
-  // of any refresh already under way.
-  const refreshSession = useCallback((): Promise<WidgetSession> => {
+  // Recovers from a rejected token. Resolves with the current session when it
+  // no longer uses `rejectedToken`, because another caller already replaced
+  // it; otherwise resolves with a newly issued one, sharing the wait of any
+  // refresh already under way.
+  const refreshSession = useCallback((rejectedToken: string): Promise<WidgetSession> => {
     const unavailable = unavailableError()
     if (unavailable) return Promise.reject(unavailable)
+    const current = sessionRef.current
+    if (current && current.token !== rejectedToken) return Promise.resolve(current)
     const alreadyWaiting = sessionWaitRef.current !== null
     const wait = waitForNextSession()
-    if (!alreadyWaiting && sessionRef.current) requestReconnect("token_expired")
+    if (!alreadyWaiting && current) requestReconnect("token_expired")
     return wait
   }, [requestReconnect, unavailableError, waitForNextSession])
 
