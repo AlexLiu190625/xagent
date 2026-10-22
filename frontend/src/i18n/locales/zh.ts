@@ -49,7 +49,7 @@ const zh = {
     workforceUnavailable: "此 Workforce 对话已无法接收新消息，请开始新对话。",
     workforceArchived: "此 Workforce 已归档。请先取消归档并重新发布，再开始新对话；或选择一个活跃的 Workforce。",
     messageAttachmentCorrupt: "此消息使用的已存储文件完整性校验失败，请重新上传。",
-    messageAttachmentUnavailable: "此消息附带的文件不可用，请重新上传后再发送。",
+    messageAttachmentUnavailable: "无法读取此消息使用的已存储文件，请重试。",
     taskCheckpointUnreadable: "无法读取任务保存的进度。",
     authenticationRequired: "需要登录后才能发送此消息。",
     taskAccessDenied: "你无权访问此任务。",

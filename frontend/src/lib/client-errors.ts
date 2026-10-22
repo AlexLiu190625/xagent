@@ -128,7 +128,7 @@ const CLIENT_ERROR_FALLBACKS: Record<ClientErrorCode, string> = {
   workforce_unavailable: "This workforce conversation can no longer accept messages; please start a new conversation.",
   workforce_archived: "This workforce has been archived. Unarchive and publish it before starting a new conversation, or select an active workforce.",
   message_attachment_corrupt: "A stored file for this message failed its integrity check and must be re-uploaded.",
-  message_attachment_unavailable: "A file attached to this message is not available. Upload it again, then send the message.",
+  message_attachment_unavailable: "A stored file for this message could not be read. Please try again.",
   task_checkpoint_unreadable: "The task's saved progress could not be read.",
   authentication_required: "Authentication is required to send this message.",
   task_access_denied: "You do not have access to this task.",

@@ -49,7 +49,7 @@ const en = {
     workforceUnavailable: "This workforce conversation can no longer accept messages; please start a new conversation.",
     workforceArchived: "This workforce has been archived. Unarchive and publish it before starting a new conversation, or select an active workforce.",
     messageAttachmentCorrupt: "A stored file for this message failed its integrity check and must be re-uploaded.",
-    messageAttachmentUnavailable: "A file attached to this message is not available. Upload it again, then send the message.",
+    messageAttachmentUnavailable: "A stored file for this message could not be read. Please try again.",
     taskCheckpointUnreadable: "The task's saved progress could not be read.",
     authenticationRequired: "Authentication is required to send this message.",
     taskAccessDenied: "You do not have access to this task.",

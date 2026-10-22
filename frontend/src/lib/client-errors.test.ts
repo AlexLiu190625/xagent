@@ -41,7 +41,7 @@ describe("client error wire contract", () => {
     ["workforce_unavailable", "clientErrors.workforceUnavailable", "This workforce conversation can no longer accept messages; please start a new conversation."],
     ["workforce_archived", "clientErrors.workforceArchived", "This workforce has been archived. Unarchive and publish it before starting a new conversation, or select an active workforce."],
     ["message_attachment_corrupt", "clientErrors.messageAttachmentCorrupt", "A stored file for this message failed its integrity check and must be re-uploaded."],
-    ["message_attachment_unavailable", "clientErrors.messageAttachmentUnavailable", "A file attached to this message is not available. Upload it again, then send the message."],
+    ["message_attachment_unavailable", "clientErrors.messageAttachmentUnavailable", "A stored file for this message could not be read. Please try again."],
     ["task_checkpoint_unreadable", "clientErrors.taskCheckpointUnreadable", "The task's saved progress could not be read."],
     ["authentication_required", "clientErrors.authenticationRequired", "Authentication is required to send this message."],
     ["task_access_denied", "clientErrors.taskAccessDenied", "You do not have access to this task."],
