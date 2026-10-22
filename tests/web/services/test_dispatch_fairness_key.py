@@ -247,8 +247,17 @@ SELECTED_KEY = (
     ", task_execution_commands.fairness_key AS task_execution_commands_fairness_key"
 )
 # The statements a shared claim of a START issued before the key column existed
-# (commit 446ea1bb, SQLite). A change to the claim, admission or either table's
-# columns changes them: regenerate by running the same claim on that tree.
+# (SQLite, whitespace collapsed). A test compares the claim with them, with the
+# key column removed once from each statement. If the claim, admission or either
+# table's columns change on purpose, re-record the file from the current tree
+# (the list the failing assertion prints) or drop the comparison.
+CLAIM_BASELINE_HINT = (
+    "The shared claim no longer matches the statements recorded before the key "
+    "column existed. If that is intended, re-record "
+    "fixtures/shared_claim_statements_before_fairness_key.json from the current "
+    "tree with SELECTED_KEY removed once from each statement (the list printed "
+    "below), or drop this comparison."
+)
 SHARED_CLAIM_BEFORE = json.loads(
     (
         Path(__file__).parent
@@ -394,15 +403,15 @@ def test_the_shared_claim_of_a_start_matches_the_statements_before_the_key(host)
     assert claimed.id == staged.staged_db_id
     assert claimed.kind == KINDS.START
     # The claim lookup and the refetch select the row; nothing else names the key.
-    assert [s.count(SELECTED_KEY) for s in statements] == [1, 0, 0, 0, 1, 0]
+    recorded = json.dumps(
+        [s.replace(SELECTED_KEY, "", 1) for s in statements], indent=1
+    )
+    message = f"{CLAIM_BASELINE_HINT}\n{recorded}"
+    assert [s.count(SELECTED_KEY) for s in statements] == [1, 0, 0, 0, 1, 0], message
     assert_key_only_in_the_select_list(statements)
     assert [s.replace(SELECTED_KEY, "", 1) for s in statements] == (
         SHARED_CLAIM_BEFORE
-    ), (
-        "The shared claim changed. If that is intended, regenerate "
-        "fixtures/shared_claim_statements_before_fairness_key.json by running "
-        "this claim on commit 446ea1bb (sqlite, whitespace collapsed)."
-    )
+    ), message
 
 
 def test_a_dispatch_candidate_cannot_be_built_without_its_key():
