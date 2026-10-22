@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from xagent.core.tools.adapters.vibe import mcp_adapter as mcp_adapter_module
 from xagent.core.tools.adapters.vibe import signed_upload
+from xagent.core.tools.adapters.vibe.mcp_adapter import (
+    _build_mcp_tool_adapter,
+    load_mcp_tools_as_agent_tools,
+)
 from xagent.core.tools.adapters.vibe.signed_upload import (
     SignedUploadBinding,
     find_signed_upload_binding,
@@ -222,3 +229,100 @@ def test_is_signed_upload_issuing_tool(
 def test_empty_registry_matches_nothing() -> None:
     assert find_signed_upload_binding(_connection(), "attach_document") is None
     assert is_signed_upload_issuing_tool(_connection(), "request_upload") is False
+
+
+def _server_tool(name: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        name=name,
+        description=f"{name} tool",
+        inputSchema={
+            "type": "object",
+            "properties": {"document": {"type": "string"}},
+        },
+    )
+
+
+def _serve_tools(monkeypatch: pytest.MonkeyPatch, *tool_names: str) -> None:
+    class FakeSession:
+        async def initialize(self) -> None:
+            return None
+
+    @asynccontextmanager
+    async def fake_create_session(_connection: Any):
+        yield FakeSession()
+
+    async def fake_load_mcp_tools(_session: Any) -> list[SimpleNamespace]:
+        return [_server_tool(name) for name in tool_names]
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", fake_create_session)
+    monkeypatch.setattr(mcp_adapter_module, "load_mcp_tools", fake_load_mcp_tools)
+
+
+def _describe(tool: Any) -> tuple[str, str, dict[str, Any]]:
+    return (tool.name, tool.description, tool.args_type().model_json_schema())
+
+
+_ALL_TOOLS = ("attach_document", "request_upload", "other")
+
+
+@pytest.mark.asyncio
+async def test_signed_upload_issuing_tool_is_withheld_from_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _serve_tools(monkeypatch, *_ALL_TOOLS)
+    remote = _connection()
+    expected_all = [
+        _describe(_build_mcp_tool_adapter("docs", remote, _server_tool(name)))
+        for name in _ALL_TOOLS
+    ]
+
+    # No registration: every tool is loaded, identical to a direct build.
+    unregistered = await load_mcp_tools_as_agent_tools({"docs": remote})
+    assert [_describe(tool) for tool in unregistered.tools] == expected_all
+    assert unregistered.failures == ()
+
+    register_signed_upload_binding(_binding())
+
+    # Registered on the same host: the issuing tool is withheld.
+    registered = await load_mcp_tools_as_agent_tools({"docs": remote})
+    assert [_describe(tool) for tool in registered.tools] == [
+        expected_all[0],
+        expected_all[2],
+    ]
+    assert registered.failures == ()
+    assert registered.loaded_servers == ("docs",)
+
+    # Registered for another host: nothing is withheld.
+    other_host = {
+        "transport": "streamable_http",
+        "url": "https://other.example.test/mcp",
+    }
+    elsewhere = await load_mcp_tools_as_agent_tools({"docs": other_host})
+    assert [tool.name for tool in elsewhere.tools] == [
+        "mcp_docs_attach_document",
+        "mcp_docs_request_upload",
+        "mcp_docs_other",
+    ]
+
+    # A stdio connection never matches a binding.
+    stdio = _stdio_connection()
+    local = await load_mcp_tools_as_agent_tools({"docs": stdio}, sandbox=None)
+    assert [tool.name for tool in local.tools] == [
+        "mcp_docs_attach_document",
+        "mcp_docs_request_upload",
+        "mcp_docs_other",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_server_with_only_the_issuing_tool_loads_no_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _serve_tools(monkeypatch, "request_upload")
+    register_signed_upload_binding(_binding())
+
+    result = await load_mcp_tools_as_agent_tools({"docs": _connection()})
+
+    assert result.tools == ()
+    assert result.failures == ()
+    assert result.loaded_servers == ()
