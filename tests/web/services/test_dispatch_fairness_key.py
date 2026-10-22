@@ -3,12 +3,15 @@
 import asyncio
 import contextlib
 import itertools
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.orm import sessionmaker
 
+from tests.web.services.coordinator_command_shared import claim_for_owner
 from xagent.web.models import database as database_module
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus
@@ -16,6 +19,7 @@ from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.user import User
 from xagent.web.services import task_command_transport as transport
 from xagent.web.services import task_coordinator_runtime as runtime
+from xagent.web.services import task_coordinator_service as ownership
 from xagent.web.services import task_execution
 from xagent.web.services import task_execution_admission as admission
 from xagent.web.services.task_dispatch_cap import (
@@ -239,6 +243,19 @@ def test_a_repeated_command_id_changes_nothing(host):
 # --- dispatch candidate and claim statements ----------------------------------
 
 CLAIM_STATEMENTS = 4  # statements one claim issues
+SELECTED_KEY = (
+    ", task_execution_commands.fairness_key AS task_execution_commands_fairness_key"
+)
+# The statements a shared claim of a START issued before the key column existed
+# (commit 446ea1bb, SQLite). A change to the claim, admission or either table's
+# columns changes them: regenerate by running the same claim on that tree.
+SHARED_CLAIM_BEFORE = json.loads(
+    (
+        Path(__file__).parent
+        / "fixtures"
+        / "shared_claim_statements_before_fairness_key.json"
+    ).read_text()
+)
 POLICY = DispatchPolicy(limit=2, interactive_reserve=1)
 # (name, other active tasks, candidate's task active too, statements, found)
 CAP_STATES = [
@@ -255,10 +272,29 @@ def captured_statements(host, action):
     return result, seen
 
 
+COUNT_PREFIX = "SELECT count(*) AS count_1 FROM ("
+
+
+def assert_key_only_in_the_count_select_list(statement):
+    # The count wraps the candidate query: the key belongs to the inner select
+    # list only, not to the outer select list and not after the inner FROM.
+    assert statement.startswith(COUNT_PREFIX), statement
+    select_list, _, rest = statement[len(COUNT_PREFIX) :].partition(" FROM ")
+    assert "fairness_key" in select_list, statement
+    assert "fairness_key" not in rest, statement
+
+
 def assert_key_only_in_the_select_list(statements):
+    # A SELECT may name the key before its first FROM only; any other statement
+    # (an UPDATE's SET or WHERE included) may not name it at all.
     for statement in statements:
-        head, _, rest = statement.partition(" FROM ")
-        assert "fairness_key" not in rest, statement
+        if statement.startswith(COUNT_PREFIX):
+            assert_key_only_in_the_count_select_list(statement)
+        elif statement.startswith("SELECT "):
+            _, _, rest = statement.partition(" FROM ")
+            assert "fairness_key" not in rest, statement
+        else:
+            assert "fairness_key" not in statement, statement
 
 
 def staged_interactive_start(host, kind=KINDS.START):
@@ -318,6 +354,55 @@ def test_the_claim_lookup_adds_no_statement_and_keeps_the_key_in_the_select_list
     assert claimed is not None
     assert len(statements) == CLAIM_STATEMENTS
     assert_key_only_in_the_select_list(statements)
+
+
+@pytest.mark.parametrize("shared,expected", [("true", 2), ("false", 1)])
+def test_the_count_keeps_the_key_in_its_inner_select_list(
+    host, monkeypatch, shared, expected
+):
+    # One START and one MESSAGE: without shared execution START stays dormant,
+    # so the count also shows which mode the statement was built for.
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", shared)
+    staged_interactive_start(host, KINDS.START)
+    staged_interactive_start(host, KINDS.MESSAGE)
+
+    def count():
+        with host.sessions() as db:
+            return transport.count_claimable_task_commands(db, runner_id="worker")
+
+    counted, statements = captured_statements(host, count)
+
+    assert counted == expected
+    assert len(statements) == 1
+    assert_key_only_in_the_count_select_list(statements[0])
+
+
+def test_the_shared_claim_of_a_start_matches_the_statements_before_the_key(host):
+    task_id, staged = staged_interactive_start(host)
+    with host.sessions() as db:
+        lease = ownership.acquire_task_lease_no_commit(db, task_id, runner_id="worker")
+        db.commit()
+    assert lease is not None
+
+    def claim():
+        with host.sessions() as db:
+            return claim_for_owner(db, lease, staged.staged_db_id)
+
+    claimed, statements = captured_statements(host, claim)
+
+    assert claimed is not None
+    assert claimed.id == staged.staged_db_id
+    assert claimed.kind == KINDS.START
+    # The claim lookup and the refetch select the row; nothing else names the key.
+    assert [s.count(SELECTED_KEY) for s in statements] == [1, 0, 0, 0, 1, 0]
+    assert_key_only_in_the_select_list(statements)
+    assert [s.replace(SELECTED_KEY, "", 1) for s in statements] == (
+        SHARED_CLAIM_BEFORE
+    ), (
+        "The shared claim changed. If that is intended, regenerate "
+        "fixtures/shared_claim_statements_before_fairness_key.json by running "
+        "this claim on commit 446ea1bb (sqlite, whitespace collapsed)."
+    )
 
 
 def test_a_dispatch_candidate_cannot_be_built_without_its_key():
