@@ -35,9 +35,8 @@ class SignedUploadBinding:
     tool_name: str  # tool whose argument is replaced
     file_argument: str  # scalar argument carrying file:<id>
     issuing_tool_name: str  # tool that returns the signed upload URL
-    allowed_upload_hosts: frozenset[
-        str
-    ]  # exact hostnames, no wildcards, no IP literals
+    # exact hostnames, no wildcards, no IP literals
+    allowed_upload_hosts: frozenset[str]
     upload_path_prefix: str  # starts and ends with "/"
     content_types: Mapping[str, str]  # lower-case suffix with dot -> MIME
 
@@ -64,6 +63,8 @@ def _validate_hostname(host: Any, label: str) -> None:
 
 def _validate_binding(binding: SignedUploadBinding) -> None:
     _validate_hostname(binding.connection_host, "connection_host")
+    if not isinstance(binding.allowed_upload_hosts, frozenset):
+        raise ValueError("allowed_upload_hosts must be a frozenset of hostnames")
     if not binding.allowed_upload_hosts:
         raise ValueError("allowed_upload_hosts must not be empty")
     for upload_host in binding.allowed_upload_hosts:
@@ -77,6 +78,10 @@ def _validate_binding(binding: SignedUploadBinding) -> None:
     if ".." in prefix:
         raise ValueError("upload_path_prefix must not contain '..'")
 
+    if not isinstance(binding.content_types, Mapping):
+        raise ValueError("content_types must be a mapping")
+    if not binding.content_types:
+        raise ValueError("content_types must not be empty")
     for suffix, mime in binding.content_types.items():
         if not isinstance(suffix, str) or not suffix.startswith("."):
             raise ValueError("content_types keys must start with '.'")
@@ -92,6 +97,20 @@ def _validate_binding(binding: SignedUploadBinding) -> None:
     ):
         if not isinstance(value, str) or not value:
             raise ValueError(f"{label} must be a non-empty string")
+
+    if binding.issuing_tool_name == binding.tool_name:
+        raise ValueError("issuing_tool_name must differ from tool_name")
+    for other in _BINDINGS.values():
+        if other.connection_host != binding.connection_host:
+            continue
+        if (
+            other.issuing_tool_name == binding.tool_name
+            or binding.issuing_tool_name == other.tool_name
+        ):
+            raise ValueError(
+                "a tool of this connection host cannot be both an issuing tool "
+                "and a replaced tool"
+            )
 
     if (binding.connection_host, binding.tool_name) in _BINDINGS:
         raise ValueError("a binding for this connection host and tool already exists")

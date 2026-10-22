@@ -92,6 +92,23 @@ def _stdio_connection() -> dict[str, Any]:
             {"content_types": {".PDF": "application/pdf"}}, id="suffix-uppercase"
         ),
         pytest.param({"content_types": {".pdf": ""}}, id="mime-empty"),
+        pytest.param(
+            {"allowed_upload_hosts": "uploads.example.test"},
+            id="upload-hosts-is-a-string",
+        ),
+        pytest.param(
+            {"allowed_upload_hosts": ["uploads.example.test"]},
+            id="upload-hosts-is-a-list",
+        ),
+        pytest.param({"content_types": None}, id="content-types-none"),
+        pytest.param(
+            {"content_types": [(".pdf", "application/pdf")]},
+            id="content-types-not-a-mapping",
+        ),
+        pytest.param({"content_types": {}}, id="content-types-empty"),
+        pytest.param(
+            {"issuing_tool_name": "attach_document"}, id="issuing-tool-is-the-tool"
+        ),
         pytest.param({"tool_name": ""}, id="tool-name-empty"),
         pytest.param({"file_argument": ""}, id="file-argument-empty"),
         pytest.param({"issuing_tool_name": ""}, id="issuing-tool-empty"),
@@ -114,6 +131,44 @@ def test_register_signed_upload_binding_rejects_duplicate_host_and_tool() -> Non
     assert (
         signed_upload._BINDINGS[(CONNECTION_HOST, "attach_document")].issuing_tool_name
         == "request_upload"
+    )
+
+
+def test_register_signed_upload_binding_rejects_tool_used_as_both_roles() -> None:
+    register_signed_upload_binding(_binding())
+
+    # Issuing tool of the new binding is the replaced tool of an existing one.
+    with pytest.raises(ValueError):
+        register_signed_upload_binding(
+            _binding(tool_name="attach_image", issuing_tool_name="attach_document")
+        )
+    # Replaced tool of the new binding is the issuing tool of an existing one.
+    with pytest.raises(ValueError):
+        register_signed_upload_binding(
+            _binding(tool_name="request_upload", issuing_tool_name="issue_other")
+        )
+
+    assert len(signed_upload._BINDINGS) == 1
+
+
+def test_register_signed_upload_binding_allows_shared_issuing_tool() -> None:
+    register_signed_upload_binding(_binding())
+    other = _binding(tool_name="attach_image")
+
+    register_signed_upload_binding(other)
+
+    assert find_signed_upload_binding(_connection(), "attach_image") is other
+
+
+def test_register_signed_upload_binding_role_clash_is_per_connection_host() -> None:
+    register_signed_upload_binding(_binding())
+
+    register_signed_upload_binding(
+        _binding(
+            connection_host="other.example.test",
+            tool_name="request_upload",
+            issuing_tool_name="issue_other",
+        )
     )
 
 
