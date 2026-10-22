@@ -163,12 +163,19 @@ def test_register_signed_upload_binding_allows_shared_issuing_tool() -> None:
 def test_register_signed_upload_binding_role_clash_is_per_connection_host() -> None:
     register_signed_upload_binding(_binding())
 
-    register_signed_upload_binding(
-        _binding(
-            connection_host="other.example.test",
-            tool_name="request_upload",
-            issuing_tool_name="issue_other",
+    other = _binding(
+        connection_host="other.example.test",
+        tool_name="request_upload",
+        issuing_tool_name="issue_other",
+    )
+    register_signed_upload_binding(other)
+
+    assert (
+        find_signed_upload_binding(
+            {"transport": "streamable_http", "url": "https://other.example.test/mcp"},
+            "request_upload",
         )
+        is other
     )
 
 
