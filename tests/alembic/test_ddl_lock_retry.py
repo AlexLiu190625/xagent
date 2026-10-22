@@ -155,7 +155,9 @@ def test_a_set_the_server_refuses_still_runs_the_restore(pg) -> None:
         assert connection.execute(text("SHOW lock_timeout")).scalar_one() == "1234ms"
 
 
-@pytest.mark.parametrize("bad", ["0s", "0ms", "5s; DROP TABLE x", "", "-1s", "5", "5m"])
+@pytest.mark.parametrize(
+    "bad", ["0s", "0ms", "5s; DROP TABLE x", "", "-1s", "5", "5m", "5s\n"]
+)
 def test_a_lock_timeout_that_is_not_a_positive_number_of_ms_or_s_is_refused(bad):
     with pytest.raises(ValueError, match="lock_timeout"):
         offline_ddl_with_lock_timeout("SELECT 1", lock_timeout=bad)
@@ -175,6 +177,17 @@ def test_it_refuses_a_connection_that_is_not_postgresql_and_runs_nothing() -> No
         with pytest.raises(ValueError, match="PostgreSQL"):
             run(connection, "CREATE TABLE t (id INTEGER)")
     assert seen == []
+
+
+def test_offline_sql_is_refused_before_anything_is_emitted() -> None:
+    output = StringIO()
+    context = MigrationContext.configure(
+        dialect_name="postgresql", opts={"as_sql": True, "output_buffer": output}
+    )
+    with Operations.context(context):
+        with pytest.raises(ValueError, match="offline_ddl_with_lock_timeout"):
+            run_ddl_with_lock_retry(CREATE, table=TABLE)
+    assert output.getvalue() == ""
 
 
 def test_offline_output_is_the_statement_between_set_and_reset_in_that_order() -> None:

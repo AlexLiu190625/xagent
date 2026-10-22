@@ -19,11 +19,11 @@ LOCK_NOT_AVAILABLE = "55P03"
 # PostgreSQL reads a lock timeout of 0 as "wait forever", so only a positive
 # whole number of milliseconds or seconds is accepted. The value is spliced into
 # the SQL text, so nothing else may pass.
-_LOCK_TIMEOUT_PATTERN = re.compile(r"^[1-9][0-9]*(ms|s)$")
+_LOCK_TIMEOUT_PATTERN = re.compile(r"[1-9][0-9]*(ms|s)")
 
 
 def _check_lock_timeout(lock_timeout: str) -> None:
-    if not _LOCK_TIMEOUT_PATTERN.match(lock_timeout):
+    if not _LOCK_TIMEOUT_PATTERN.fullmatch(lock_timeout):
         raise ValueError(
             "lock_timeout must be a positive whole number of ms or s, "
             f"got {lock_timeout!r}"
@@ -47,8 +47,9 @@ def run_ddl_with_lock_retry(
     """Run ``statement`` with ``lock_timeout`` set, retrying only lock timeouts.
 
     Only valid inside an Alembic migration on a PostgreSQL connection; any other
-    dialect raises ``ValueError`` before a statement runs. The statement runs
-    in an autocommit block, so it commits on its own. After each lock timeout
+    dialect, and offline SQL (``--sql``), raise ``ValueError`` before a statement
+    runs or is emitted. The statement runs in an autocommit block, so it commits
+    on its own. After each lock timeout
     the call waits for the next value of ``retry_delays`` and tries again; when
     they are used up it raises ``RuntimeError`` naming ``table``. Any other
     error is raised as it is. The session's lock timeout from before the call is
@@ -58,6 +59,9 @@ def run_ddl_with_lock_retry(
     context = op.get_context()
     if context.dialect.name != "postgresql":
         raise ValueError("run_ddl_with_lock_retry only supports PostgreSQL")
+    if context.as_sql:
+        # Checked before the autocommit block, which would already emit COMMIT.
+        raise ValueError("use offline_ddl_with_lock_timeout in --sql mode")
     with context.autocommit_block():
         bind = op.get_bind()
         previous = bind.execute(sa.text("SHOW lock_timeout")).scalar_one()
