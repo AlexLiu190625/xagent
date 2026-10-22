@@ -748,3 +748,94 @@ describe("useWidgetSession", () => {
     )
   })
 })
+
+describe("useWidgetSession capabilities", () => {
+  const validCapabilities = () => ({
+    file_uploads: {
+      allowed_extensions: [".pdf", ".png"],
+      max_file_bytes: 4096,
+      max_files_per_message: 3,
+    },
+  })
+  const withUploads = (overrides: Record<string, unknown>) => ({
+    file_uploads: { ...validCapabilities().file_uploads, ...overrides },
+  })
+
+  it("parses a valid file_uploads capability", () => {
+    const { result } = renderHook(() => useWidgetSession())
+    dispatchFromParent(updateMessage({ capabilities: validCapabilities() }))
+
+    expect(result.current.status).toBe("active")
+    expect(result.current.session?.capabilities).toEqual({
+      fileUploads: {
+        allowedExtensions: [".pdf", ".png"],
+        maxFileBytes: 4096,
+        maxFilesPerMessage: 3,
+      },
+    })
+  })
+
+  it("treats a missing capabilities field as no capabilities", () => {
+    const { result } = renderHook(() => useWidgetSession())
+    dispatchFromParent(updateMessage())
+
+    expect(result.current.status).toBe("active")
+    expect(result.current.session?.capabilities).toBeUndefined()
+    expect(result.current.session).not.toHaveProperty("capabilities")
+  })
+
+  it.each([
+    ["uppercase extension", withUploads({ allowed_extensions: [".PDF"] })],
+    ["extension without a dot", withUploads({ allowed_extensions: ["pdf"] })],
+    ["a bare dot", withUploads({ allowed_extensions: ["."] })],
+    ["non-string extension", withUploads({ allowed_extensions: [1] })],
+    ["extensions not an array", withUploads({ allowed_extensions: ".pdf" })],
+    ["empty extensions", withUploads({ allowed_extensions: [] })],
+    ["zero max_file_bytes", withUploads({ max_file_bytes: 0 })],
+    ["negative max_file_bytes", withUploads({ max_file_bytes: -1 })],
+    ["fractional max_file_bytes", withUploads({ max_file_bytes: 1.5 })],
+    ["string max_file_bytes", withUploads({ max_file_bytes: "4096" })],
+    ["zero max_files_per_message", withUploads({ max_files_per_message: 0 })],
+    ["negative max_files_per_message", withUploads({ max_files_per_message: -2 })],
+    ["fractional max_files_per_message", withUploads({ max_files_per_message: 2.5 })],
+    ["string max_files_per_message", withUploads({ max_files_per_message: "3" })],
+    ["file_uploads not an object", { file_uploads: "yes" }],
+    ["no file_uploads key", { other: {} }],
+    ["capabilities not an object", "file_uploads"],
+    ["capabilities an array", [validCapabilities()]],
+    ["capabilities null", null],
+  ])("treats %s as no capabilities without failing the session", (_label, capabilities) => {
+    const { result } = renderHook(() => useWidgetSession())
+    dispatchFromParent(updateMessage({ capabilities }))
+
+    expect(result.current.status).toBe("active")
+    expect(result.current.session?.capabilities).toBeUndefined()
+  })
+
+  it("ignores unknown capability keys", () => {
+    const { result } = renderHook(() => useWidgetSession())
+    dispatchFromParent(updateMessage({
+      capabilities: { ...validCapabilities(), voice: { enabled: true } },
+    }))
+
+    expect(result.current.status).toBe("active")
+    expect(result.current.session?.capabilities).toEqual({
+      fileUploads: {
+        allowedExtensions: [".pdf", ".png"],
+        maxFileBytes: 4096,
+        maxFilesPerMessage: 3,
+      },
+    })
+  })
+
+  it("replaces the previous capabilities on every session_update", () => {
+    const { result } = renderHook(() => useWidgetSession())
+    dispatchFromParent(updateMessage({ session_delivery_id: "delivery-a", capabilities: validCapabilities() }))
+    expect(result.current.session?.capabilities).toBeDefined()
+
+    dispatchFromParent(updateMessage({ session_delivery_id: "delivery-b" }))
+
+    expect(result.current.status).toBe("active")
+    expect(result.current.session?.capabilities).toBeUndefined()
+  })
+})

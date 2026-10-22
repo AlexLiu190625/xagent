@@ -21,11 +21,25 @@ export interface WidgetSessionAgent {
   suggestedPrompts: string[]
 }
 
+export interface WidgetSessionFileUploads {
+  allowedExtensions: readonly string[]
+  maxFileBytes: number
+  maxFilesPerMessage: number
+}
+
+// What the session server advertises for this session. A session without a
+// usable advertisement has no `capabilities` key, so no capability-gated
+// feature is offered.
+export interface WidgetSessionCapabilities {
+  fileUploads: WidgetSessionFileUploads
+}
+
 export interface WidgetSession {
   token: string
   tokenExpiresAt: string
   absoluteExpiresAt: string
   agent: WidgetSessionAgent
+  capabilities?: WidgetSessionCapabilities
   generation: number
 }
 
@@ -79,6 +93,38 @@ const parseAgent = (value: unknown): WidgetSessionAgent | null => {
     ...(typeof value.description === "string" ? { description: value.description } : {}),
     ...(typeof value.logo_url === "string" ? { logoUrl: value.logo_url } : {}),
     suggestedPrompts: value.suggested_prompts as string[],
+  }
+}
+
+const isPositiveInteger = (value: unknown): value is number =>
+  typeof value === "number" && Number.isInteger(value) && value > 0
+
+const isAllowedExtension = (value: unknown): value is string =>
+  typeof value === "string"
+  && value.length >= 2
+  && value.startsWith(".")
+  && value === value.toLowerCase()
+
+// The parent forwards the server's capabilities untouched, so everything here
+// is untrusted. Anything that does not match the documented shape counts as
+// "no capabilities" (undefined) instead of failing the session.
+export const parseCapabilities = (value: unknown): WidgetSessionCapabilities | undefined => {
+  if (!isRecord(value) || !isRecord(value.file_uploads)) return undefined
+  const uploads = value.file_uploads
+  const extensions = uploads.allowed_extensions
+  if (
+    !Array.isArray(extensions)
+    || extensions.length === 0
+    || !extensions.every(isAllowedExtension)
+    || !isPositiveInteger(uploads.max_file_bytes)
+    || !isPositiveInteger(uploads.max_files_per_message)
+  ) return undefined
+  return {
+    fileUploads: {
+      allowedExtensions: [...extensions],
+      maxFileBytes: uploads.max_file_bytes,
+      maxFilesPerMessage: uploads.max_files_per_message,
+    },
   }
 }
 
@@ -325,11 +371,13 @@ export function useWidgetSession() {
 
       recoveryInFlightRef.current = false
       generationRef.current += 1
+      const capabilities = parseCapabilities(event.data.capabilities)
       const session: WidgetSession = {
         token,
         tokenExpiresAt: event.data.session_token_expires_at as string,
         absoluteExpiresAt: event.data.absolute_expires_at as string,
         agent,
+        ...(capabilities ? { capabilities } : {}),
         generation: generationRef.current,
       }
       activeSessionGenerationRef.current = session.generation
