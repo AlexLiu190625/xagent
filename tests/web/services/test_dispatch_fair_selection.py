@@ -31,7 +31,7 @@ from xagent.web.models.task import Task, TaskStatus
 from xagent.web.services import task_command_transport as transport
 from xagent.web.services import task_coordinator_runtime as runtime
 from xagent.web.services import task_coordinator_service as ownership
-from xagent.web.services import task_execution
+from xagent.web.services import task_dispatch_cap, task_execution
 from xagent.web.services import task_execution_admission as admission
 from xagent.web.services.task_dispatch_cap import DispatchCapSnapshot, DispatchPolicy
 from xagent.web.services.task_execution import BackgroundTaskManager
@@ -153,6 +153,46 @@ def test_the_switch_reads_the_configured_value(monkeypatch, switch):
     monkeypatch.setenv(SWITCH, "false")
     assert transport._fair_share_enabled() is False
     assert switch() == []
+
+
+async def test_the_policy_line_reports_the_switch_when_its_value_changes(
+    monkeypatch, caplog
+):
+    monkeypatch.setattr(task_dispatch_cap, "_policy_memo", None)
+    monkeypatch.setattr(task_dispatch_cap, "_logged_policy", None)
+    monkeypatch.setattr(admission, "_installed", admission._UPSTREAM)
+    monkeypatch.setenv(config.DISPATCHER_MAX_INFLIGHT_PER_PROCESS, "10")
+    monkeypatch.delenv(config.DISPATCHER_INTERACTIVE_RESERVE_PER_PROCESS, raising=False)
+    monkeypatch.delenv(SWITCH, raising=False)
+    # The handler keeps the level of the last call, so the lower one goes last.
+    caplog.set_level(logging.WARNING, logger="xagent.config")
+    caplog.set_level(logging.INFO, logger=task_dispatch_cap.logger.name)
+
+    for raw, snapshots in ((None, 2), ("true", 2), ("garbage", 3), ("YES", 1)):
+        if raw is None:
+            monkeypatch.delenv(SWITCH, raising=False)
+        else:
+            monkeypatch.setenv(SWITCH, raw)
+        for _ in range(snapshots):
+            task_dispatch_cap.build_dispatch_cap_snapshot()
+
+    lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "dispatch policy" in record.getMessage()
+    ]
+    assert [line.rsplit("fair_share=", 1)[1] for line in lines] == [
+        "False",
+        "True",
+        "False",
+        "True",
+    ]
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "xagent.config" and record.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1 and SWITCH in warnings[0]
 
 
 # --- a SQLite world of queued commands --------------------------------------------

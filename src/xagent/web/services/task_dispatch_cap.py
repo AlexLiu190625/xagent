@@ -18,8 +18,10 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from ...config import (
+    DISPATCHER_FAIR_SHARE,
     DISPATCHER_INTERACTIVE_RESERVE_PER_PROCESS,
     DISPATCHER_MAX_INFLIGHT_PER_PROCESS,
+    get_dispatcher_fair_share_enabled,
     get_dispatcher_interactive_reserve_per_process,
     get_dispatcher_max_inflight_per_process,
 )
@@ -120,9 +122,9 @@ class DispatchCapSnapshot:
 # The last raw environment values and the policy parsed from them; the clamp
 # warning is logged once per parse. Event-loop thread only.
 _policy_memo: tuple[tuple[str | None, str | None], DispatchPolicy] | None = None
-# The policy, classifier name and admission declaration the process last
-# reported, so the report repeats only when one of them changes.
-_logged_policy: tuple[DispatchPolicy, str, bool] | None = None
+# The policy, classifier name, admission declaration and raw fair-share value the
+# process last reported, so the report repeats only when one of them changes.
+_logged_policy: tuple[DispatchPolicy, str, bool, str | None] | None = None
 
 
 def current_dispatch_policy() -> DispatchPolicy:
@@ -162,9 +164,9 @@ def current_dispatch_policy() -> DispatchPolicy:
 def build_dispatch_cap_snapshot() -> DispatchCapSnapshot:
     """Snapshot the process's active task ids. Event-loop thread only.
 
-    Reports the effective policy, with the installed classifier, the first time
-    a process builds a snapshot and whenever the policy, the classifier or its
-    admission declaration changes.
+    Reports the effective policy, with the installed classifier and the fair-share
+    switch, the first time a process builds a snapshot and whenever the policy,
+    the classifier, its admission declaration or the switch's raw value changes.
     """
 
     from .task_execution import background_task_manager
@@ -180,17 +182,20 @@ def _report_policy(policy: DispatchPolicy) -> None:
     from .task_execution_admission import describe_installed_classifier
 
     classifier, admission = describe_installed_classifier()
-    reported = (policy, classifier, admission)
+    # The raw switch value, not its parse: parsing an invalid value warns, and
+    # this runs for every snapshot.
+    reported = (policy, classifier, admission, os.getenv(DISPATCHER_FAIR_SHARE))
     if reported == _logged_policy:
         return
     _logged_policy = reported
     logger.info(
         "dispatch policy limit=%s interactive_reserve=%s classifier=%s "
-        "admission_enabled=%s",
+        "admission_enabled=%s fair_share=%s",
         policy.limit,
         policy.interactive_reserve,
         classifier,
         admission,
+        get_dispatcher_fair_share_enabled(),
     )
     if admission and policy.interactive_reserve > 0:
         logger.warning(
