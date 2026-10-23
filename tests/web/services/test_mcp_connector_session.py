@@ -45,7 +45,7 @@ from xagent.web.services.mcp_runtime import (
     mcp_env_hooks_snapshot,
     set_mcp_shared_env_hook,
 )
-from xagent.web.tools.config import WebToolConfig
+from xagent.web.tools.config import WebToolConfig, set_oauth_token_resolver_hook
 
 LOADER = "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools"
 SANDBOX_MANAGER = "xagent.web.sandbox_manager.get_sandbox_manager"
@@ -842,9 +842,21 @@ async def test_invalid_settings_fail_closed_in_web_runtime(
 
     monkeypatch.setattr(BUILD_RUNTIME_CONNECTION, _forbidden_runtime_connection)
 
-    configs = await WebToolConfig(
-        db=db, request=None, user=user, user_id=user.id
-    ).get_mcp_server_configs()
+    # Records and supplies no token, so a resolution that ran before the check
+    # would leave the outcome unchanged and show up only in this list.
+    resolver_calls: list[Any] = []
+
+    def _recording_resolver(request: Any) -> None:
+        resolver_calls.append(request)
+        return None
+
+    set_oauth_token_resolver_hook(_recording_resolver)
+    try:
+        configs = await WebToolConfig(
+            db=db, request=None, user=user, user_id=user.id
+        ).get_mcp_server_configs()
+    finally:
+        set_oauth_token_resolver_hook(None)
 
     (config,) = [item for item in configs if item["name"] == server.name]
     assert config["transport"] == "unavailable"
@@ -852,6 +864,7 @@ async def test_invalid_settings_fail_closed_in_web_runtime(
     assert config["config"]["reason"] == "invalid_configuration"
     assert config["config"]["message"] == "MCP server upload settings are invalid."
     assert runtime_calls == []
+    assert resolver_calls == []
     assert MARKER not in caplog.text
     error = signed_upload_settings_error(
         stored, transport=server.transport, url=server.url

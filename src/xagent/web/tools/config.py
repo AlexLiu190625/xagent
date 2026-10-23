@@ -4738,18 +4738,22 @@ class WebToolConfig(BaseToolConfig):
             # is built.  Settings that cannot be used make the whole connector
             # unavailable instead of being dropped: without them the issuing
             # tool would reach the model and the replaced tool would forward
-            # file references unchanged.  Actor-run built-in and remote OAuth
-            # catalog connectors never carry them.
+            # file references unchanged.  That is also why an actor-run remote
+            # OAuth catalog connector, which runs only on its catalog
+            # definition, is unavailable when its row stores any settings,
+            # valid or not, while the runtime fields removed above are simply
+            # left out.  (A built-in catalog row has the oauth transport and
+            # never reaches this branch; under an actor, one that stores
+            # settings is not canonical and is already unavailable.)
             signed_uploads = getattr(server, "signed_uploads", None)
             if (
-                not actor_builtin
-                and not actor_remote_oauth
-                and server.transport in SIGNED_UPLOAD_TRANSPORTS
+                server.transport in SIGNED_UPLOAD_TRANSPORTS
                 and signed_uploads is not None
                 and signed_uploads != []
             ):
                 if (
-                    signed_upload_settings_error(
+                    actor_remote_oauth
+                    or signed_upload_settings_error(
                         signed_uploads,
                         transport=server.transport,
                         url=getattr(server, "url", None),
@@ -4757,7 +4761,7 @@ class WebToolConfig(BaseToolConfig):
                     is not None
                 ):
                     logger.warning(
-                        "MCP server '%s' has invalid signed upload settings",
+                        "MCP server '%s' has signed upload settings it cannot use",
                         server.name,
                     )
                     return self._build_unavailable_mcp_config(

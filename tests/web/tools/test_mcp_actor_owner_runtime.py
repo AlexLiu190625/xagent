@@ -1739,16 +1739,21 @@ SIGNED_UPLOADS = [
 
 
 @pytest.mark.asyncio
-async def test_signed_uploads_stay_off_actor_builtin_connection(db_session) -> None:
-    _add_builtin_server(db_session.db, db_session.user)
+async def test_actor_builtin_row_storing_signed_uploads_is_unavailable(
+    db_session,
+) -> None:
+    server = _add_builtin_server(db_session.db, db_session.user)
     _add_actor_credential(
         db_session.db, db_session.user, owner=OWNER_A, token="actor-token"
     )
+    server.signed_uploads = SIGNED_UPLOADS
+    db_session.db.commit()
 
     configs = await _config(db_session, policy=_policy()).get_mcp_server_configs()
 
-    assert _token(configs[0]) == "actor-token"
-    assert "signed_uploads" not in configs[0]
+    assert configs[0]["transport"] == "unavailable"
+    assert configs[0]["config"]["reason"] == "config_load_failed"
+    assert "actor-token" not in str(configs)
 
 
 @pytest.mark.asyncio
@@ -1757,7 +1762,7 @@ async def test_signed_uploads_stay_off_actor_builtin_connection(db_session) -> N
     [SIGNED_UPLOADS, {"tool_name": "attach_document"}],
     ids=["valid", "invalid"],
 )
-async def test_signed_uploads_stay_off_actor_remote_oauth_connection(
+async def test_actor_remote_oauth_row_storing_signed_uploads_is_unavailable(
     db_session, stored
 ) -> None:
     server = _add_remote_server(db_session.db, db_session.user)
@@ -1773,6 +1778,7 @@ async def test_signed_uploads_stay_off_actor_remote_oauth_connection(
 
     configs = await _config(db_session, policy=_policy()).get_mcp_server_configs()
 
-    assert configs[0]["transport"] != "unavailable"
-    assert configs[0]["config"]["headers"]["Authorization"] == "Bearer actor-token"
-    assert "signed_uploads" not in configs[0]
+    assert configs[0]["transport"] == "unavailable"
+    assert configs[0]["config"]["reason"] == "invalid_configuration"
+    assert configs[0]["config"]["message"] == "MCP server upload settings are invalid."
+    assert "actor-token" not in str(configs)
