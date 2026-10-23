@@ -20,7 +20,6 @@ from xagent.core.tools.adapters.vibe.mcp_adapter import (
 from xagent.core.tools.adapters.vibe.signed_upload import (
     SignedUploadBinding,
     connection_signed_uploads,
-    find_signed_upload_binding,
     parse_signed_upload_settings,
     signed_upload_settings_error,
 )
@@ -543,6 +542,13 @@ def _issuing_tools(connection: Any) -> set[str]:
     }
 
 
+def _binding_for(connection: Any, tool_name: str) -> SignedUploadBinding | None:
+    bindings = {
+        binding.tool_name: binding for binding in connection_signed_uploads(connection)
+    }
+    return bindings.get(tool_name)
+
+
 def _with_settings(connection: dict[str, Any]) -> dict[str, Any]:
     return {
         **connection,
@@ -632,10 +638,10 @@ def _with_settings(connection: dict[str, Any]) -> dict[str, Any]:
         ),
     ],
 )
-def test_find_signed_upload_binding(
+def test_connection_signed_uploads_binding_for_tool(
     connection: Any, tool_name: str, expected: SignedUploadBinding | None
 ) -> None:
-    assert find_signed_upload_binding(connection, tool_name) == expected
+    assert _binding_for(connection, tool_name) == expected
 
 
 @pytest.mark.parametrize(
@@ -688,8 +694,6 @@ def test_lookups_raise_for_settings_on_a_connection_without_hostname(
     }
 
     with pytest.raises(ValueError, match=_exactly(NO_HOSTNAME)):
-        find_signed_upload_binding(connection, "attach_document")
-    with pytest.raises(ValueError, match=_exactly(NO_HOSTNAME)):
         connection_signed_uploads(connection)
 
 
@@ -709,8 +713,6 @@ def test_lookups_raise_for_invalid_settings(raw: Any, message: str) -> None:
     connection = _connection(signed_uploads=raw)
 
     with pytest.raises(ValueError, match=_exactly(message)):
-        find_signed_upload_binding(connection, "attach_document")
-    with pytest.raises(ValueError, match=_exactly(message)):
         connection_signed_uploads(connection)
 
 
@@ -718,7 +720,6 @@ def test_lookups_raise_for_invalid_settings(raw: Any, message: str) -> None:
 def test_lookups_ignore_invalid_settings_on_other_transports(transport: str) -> None:
     connection = _connection(transport, signed_uploads={"tool_name": "x"})
 
-    assert find_signed_upload_binding(connection, "attach_document") is None
     assert connection_signed_uploads(connection) == ()
 
 
@@ -732,15 +733,15 @@ def test_settings_of_two_connections_do_not_interact() -> None:
         ],
     }
 
-    assert find_signed_upload_binding(first, "attach_document") == _binding()
-    assert find_signed_upload_binding(first, "request_upload") is None
+    assert _binding_for(first, "attach_document") == _binding()
+    assert _binding_for(first, "request_upload") is None
     assert _issuing_tools(first) == {"request_upload"}
-    assert find_signed_upload_binding(second, "request_upload") == _binding(
+    assert _binding_for(second, "request_upload") == _binding(
         connection_host="other.example.test",
         tool_name="request_upload",
         issuing_tool_name="issue_other",
     )
-    assert find_signed_upload_binding(second, "attach_document") is None
+    assert _binding_for(second, "attach_document") is None
     assert _issuing_tools(second) == {"issue_other"}
 
 
@@ -853,7 +854,6 @@ async def test_no_signed_uploads_keeps_tool_list(
 def test_no_signed_uploads_keeps_tool_list_for_non_mapping_connection(
     connection: Any,
 ) -> None:
-    assert find_signed_upload_binding(connection, "attach_document") is None
     assert connection_signed_uploads(connection) == ()
 
 
@@ -1043,6 +1043,22 @@ async def test_invalid_settings_are_found_before_any_session(
     assert mcp_load_failure_message(result.failures[0].phase) == (
         "MCP server upload settings are invalid."
     )
+
+
+@pytest.mark.asyncio
+async def test_a_bug_while_reading_settings_is_not_reported_as_invalid_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def broken(_connection: Any) -> Any:
+        raise TypeError("planted")
+
+    monkeypatch.setattr(mcp_adapter_module, "connection_signed_uploads", broken)
+
+    result = await _load({"A": _connection()})
+
+    assert [(failure.phase, failure.error_type) for failure in result.failures] == [
+        (MCPFailurePhase.SESSION_START, "TypeError")
+    ]
 
 
 @pytest.mark.asyncio

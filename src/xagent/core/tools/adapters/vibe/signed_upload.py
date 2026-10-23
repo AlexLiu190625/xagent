@@ -280,20 +280,6 @@ def connection_signed_uploads(connection: Any) -> tuple[SignedUploadBinding, ...
     )
 
 
-def find_signed_upload_binding(
-    connection: Any, tool_name: str
-) -> SignedUploadBinding | None:
-    """Return the binding that ``connection`` sets up for ``tool_name``, if any.
-
-    The binding is read from the connection's own ``signed_uploads`` setting.
-    Raises ``ValueError`` when that setting is present but not valid.
-    """
-    for binding in connection_signed_uploads(connection):
-        if binding.tool_name == tool_name:
-            return binding
-    return None
-
-
 @dataclass(frozen=True)
 class SignedUploadTicket:
     """A validated reply of an issuing tool."""
