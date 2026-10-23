@@ -813,6 +813,31 @@ describe("SessionAgentChatPage file attachments", () => {
       await waitFor(() => expect(surfaces.start?.isSending).toBe(false))
     })
 
+    it("does not start another upload once a file of the send was removed", async () => {
+      const socket = await mountActive()
+      const second = deferred<Response>()
+      fetchMock
+        .mockImplementationOnce(async () => created(FILE_A, "a.pdf"))
+        .mockReturnValueOnce(second.promise)
+      const [a, b, c] = [pdf("a.pdf"), pdf("b.pdf"), pdf("c.pdf")]
+      let failure: unknown
+      let sending!: Promise<unknown>
+      act(() => { surfaces.start?.onFilesChange([a, b, c]) })
+      act(() => {
+        sending = surfaces.start?.onSend("hello", [a, b, c], { clientMessageId: "cid-rm2" })
+          .then(() => null, (error: unknown) => { failure = error })
+      })
+      await waitFor(() => expect(uploadCalls()).toHaveLength(2))
+
+      act(() => { surfaces.start?.onFilesChange([b, c]) })
+      await act(async () => { second.resolve(created(FILE_B, "b.pdf")) })
+      await act(async () => { await sending })
+
+      expect(uploadCalls()).toHaveLength(2)
+      expect((failure as Error).name).toBe("AbortError")
+      expect(chatFrames(socket)).toHaveLength(0)
+    })
+
     it("uploads again after the server reports an attached file as unavailable", async () => {
       const socket = await mountActive()
       fetchMock
