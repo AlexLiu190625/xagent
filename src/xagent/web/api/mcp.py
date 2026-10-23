@@ -52,6 +52,10 @@ from ...core.tools.adapters.vibe.connector_runtime import (
     ConnectorRef,
     validate_runtime_config_declaration,
 )
+from ...core.tools.adapters.vibe.signed_upload import (
+    SIGNED_UPLOAD_TRANSPORTS,
+    signed_upload_settings_error,
+)
 from ...core.tools.core.mcp.data_config import MCPServerConfig
 from ...core.tools.core.mcp.manager.db import DatabaseMCPServerManager
 from ...core.tools.core.mcp.model import MASKED_SECRET_VALUE, SENSITIVE_AUTH_FIELDS
@@ -143,6 +147,18 @@ MCP_OAUTH_FLOW_STATE_SWEEP_BATCH = 1000
 MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHODS = frozenset(
     {"none", "client_secret_post", "client_secret_basic"}
 )
+_SIGNED_UPLOADS_FIELD_DESCRIPTION = (
+    "Signed-upload settings: one object per tool that takes a workspace file, "
+    "with exactly the keys tool_name, file_argument, issuing_tool_name, "
+    "allowed_upload_hosts, upload_path_prefix and content_types. When the model "
+    "passes a file:<id> reference in file_argument, the host calls "
+    "issuing_tool_name for a signed URL and PUTs the file's bytes to it; the URL "
+    "must be HTTPS on one of allowed_upload_hosts under upload_path_prefix. "
+    "Used only on sse and streamable_http connectors; null and [] mean none. "
+    "Only the connector's owner or a platform administrator can change it. "
+    "Stored settings that cannot be used make the connector unavailable with "
+    "reason invalid_configuration, and signed_uploads_error says why."
+)
 
 
 # Pydantic models for API
@@ -164,6 +180,9 @@ class MCPServerCreate(BaseModel):
     )
     runtime_bindings: Optional[list[dict]] = Field(
         None, description="Runtime binding declarations"
+    )
+    signed_uploads: Optional[list[dict]] = Field(
+        None, description=_SIGNED_UPLOADS_FIELD_DESCRIPTION
     )
     allow_delegated_authorization: bool = Field(
         False, description="Allow runtime Authorization header binding"
@@ -188,6 +207,9 @@ class MCPServerUpdate(BaseModel):
     )
     runtime_bindings: Optional[list[dict]] = Field(
         None, description="Runtime binding declarations"
+    )
+    signed_uploads: Optional[list[dict]] = Field(
+        None, description=_SIGNED_UPLOADS_FIELD_DESCRIPTION
     )
     allow_delegated_authorization: Optional[bool] = Field(
         None, description="Allow runtime Authorization header binding"
@@ -238,6 +260,11 @@ class MCPServerResponse(BaseModel):
     env_source: Optional[Literal["own", "shared", "platform"]] = None
     runtime_input_schema: Optional[dict]
     runtime_bindings: Optional[list[dict]]
+    # The stored settings as they are; signed_uploads_error alone says whether
+    # the connector can use them.  Typed loosely so a malformed stored value
+    # cannot fail the response.
+    signed_uploads: Optional[Any]
+    signed_uploads_error: Optional[str]
     allow_delegated_authorization: bool
     can_edit_global: bool
     transport_display: str
@@ -2159,6 +2186,29 @@ def _validate_mcp_runtime_config(
     )
 
 
+_SIGNED_UPLOADS_TRANSPORT_ERROR = (
+    "signed_uploads are supported only for the "
+    f"{' and '.join(sorted(SIGNED_UPLOAD_TRANSPORTS))} transports; to use "
+    "another transport, set signed_uploads to [] in the same request"
+)
+
+
+def _validate_signed_uploads(raw: Any, *, transport: Any, url: Any) -> None:
+    """Reject signed-upload settings the saved connector could not use.
+
+    ``raw``, ``transport`` and ``url`` are the values the connector holds after
+    the save.  ``None`` and an empty list mean no settings and always pass.
+    Raises ``ValueError`` whose text is fixed and never carries a stored value.
+    """
+    if raw is None or raw == []:
+        return
+    if transport not in SIGNED_UPLOAD_TRANSPORTS:
+        raise ValueError(_SIGNED_UPLOADS_TRANSPORT_ERROR)
+    error = signed_upload_settings_error(raw, transport=transport, url=url)
+    if error is not None:
+        raise ValueError(error)
+
+
 # Every MCPServer field a generic server update/create request can set.
 # name==value on both sides (config attribute name equals the DB column
 # name for all of these) -- kept as a single source both
@@ -2363,6 +2413,11 @@ def _global_config_tampered(server_data: MCPServerUpdate, server: MCPServer) -> 
         and server_data.runtime_bindings != server.runtime_bindings
     ):
         return True
+    # NULL and an empty list both mean no settings; no other value does.
+    if "signed_uploads" in fields_set and (
+        [] if server_data.signed_uploads is None else server_data.signed_uploads
+    ) != ([] if server.signed_uploads is None else server.signed_uploads):
+        return True
     if "allow_delegated_authorization" in fields_set and bool(
         server_data.allow_delegated_authorization
     ) != bool(server.allow_delegated_authorization):
@@ -2444,6 +2499,13 @@ def _db_server_to_response(
     if isinstance(config.get("env"), dict):
         config["env"] = _mask_env(config["env"])
 
+    stored_signed_uploads = server.signed_uploads
+    # Computed without raising, so one row's malformed value cannot fail a
+    # whole list response.
+    signed_uploads_error = signed_upload_settings_error(
+        stored_signed_uploads, transport=server.transport, url=server.url
+    )
+
     return MCPServerResponse(
         id=server.id,
         user_id=user_mcp.user_id,
@@ -2457,6 +2519,8 @@ def _db_server_to_response(
         env_source=getattr(user_mcp, "env_source", None),
         runtime_input_schema=server.runtime_input_schema,
         runtime_bindings=server.runtime_bindings,
+        signed_uploads=stored_signed_uploads,
+        signed_uploads_error=signed_uploads_error,
         allow_delegated_authorization=bool(server.allow_delegated_authorization),
         can_edit_global=_check_mcp_permission(user_mcp, is_admin, require="edit"),
         transport_display=server.transport_display,
@@ -2493,6 +2557,8 @@ def _custom_api_to_mcp_response(
         user_env=None,
         runtime_input_schema=api.runtime_input_schema,
         runtime_bindings=api.runtime_bindings,
+        signed_uploads=None,
+        signed_uploads_error=None,
         allow_delegated_authorization=bool(api.allow_delegated_authorization),
         can_edit_global=bool(user_api.can_edit),
         transport_display="Custom API",
@@ -3734,6 +3800,7 @@ def _server_has_policy_beyond_catalog_identity(server: MCPServer) -> bool:
         for field in (
             "runtime_input_schema",
             "runtime_bindings",
+            "signed_uploads",
         )
     ):
         return True
@@ -4478,6 +4545,9 @@ def create_mcp_server(
                 allow_delegated_authorization=server_data.allow_delegated_authorization,
                 static_headers=config.headers,
             )
+            _validate_signed_uploads(
+                server_data.signed_uploads, transport=config.transport, url=config.url
+            )
             if isinstance(config.env, dict):
                 _merge_masked_env(config.env, {})
         except ValueError as e:
@@ -4510,6 +4580,7 @@ def create_mcp_server(
         orm_server = cast(Any, server)
         orm_server.runtime_input_schema = server_data.runtime_input_schema
         orm_server.runtime_bindings = server_data.runtime_bindings
+        orm_server.signed_uploads = server_data.signed_uploads
         orm_server.allow_delegated_authorization = (
             server_data.allow_delegated_authorization
         )
@@ -4581,8 +4652,8 @@ def update_mcp_server(
             user_mcp, getattr(current_user, "is_admin", False), require="edit"
         )
 
-        # Which row a request writes decides which row it locks. Seven of the
-        # nine fields of ``MCPServerUpdate`` target the shared ``MCPServer``
+        # Which row a request writes decides which row it locks. Eight of the
+        # ten fields of ``MCPServerUpdate`` target the shared ``MCPServer``
         # definition row; ``is_active`` and ``user_env`` write this caller's
         # own ``UserMCPServer`` link row and nothing else. Locking the
         # definition row for a payload that carries only those two made an
@@ -4887,6 +4958,33 @@ def update_mcp_server(
                     allow_delegated_authorization=allow_delegated_authorization,
                     static_headers=config.headers,
                 )
+                signed_uploads_in_request = (
+                    can_edit_global and "signed_uploads" in fields_set
+                )
+                signed_uploads = (
+                    server_data.signed_uploads
+                    if signed_uploads_in_request
+                    else server.signed_uploads
+                )
+                # The settings are checked against the saved connector only when
+                # this request changes them, the transport or the URL, so a
+                # stored value that stopped being valid does not block unrelated
+                # edits; the runtime marks such a connector unavailable and the
+                # response reports why.  This differs on purpose from
+                # runtime_input_schema and runtime_bindings above, which are
+                # checked on every definition-row write: the upload rules may be
+                # tightened later, and re-checking stored settings here would
+                # then reject every rename or description edit of a connector
+                # that carries them, while the runtime already refuses to use
+                # them.
+                if (
+                    signed_uploads_in_request
+                    or config.transport != server.transport
+                    or config.url != server.url
+                ):
+                    _validate_signed_uploads(
+                        signed_uploads, transport=config.transport, url=config.url
+                    )
             except ValueError as e:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
@@ -4908,6 +5006,8 @@ def update_mcp_server(
                     orm_server.runtime_input_schema = runtime_input_schema
                 if "runtime_bindings" in fields_set:
                     orm_server.runtime_bindings = runtime_bindings
+                if "signed_uploads" in fields_set:
+                    orm_server.signed_uploads = signed_uploads
                 if "allow_delegated_authorization" in fields_set:
                     orm_server.allow_delegated_authorization = (
                         allow_delegated_authorization
