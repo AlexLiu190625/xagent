@@ -32,6 +32,9 @@ import httpx
 _REMOTE_TRANSPORTS = frozenset({"streamable_http", "sse"})
 _HOST_FORBIDDEN_CHARS = frozenset("*/:@")
 _REMOTE_FILE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+# RFC 9110 token for a header name; visible ASCII, space and tab for a value.
+_HEADER_NAME_PATTERN = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+_HEADER_VALUE_PATTERN = re.compile(r"[\t\x20-\x7e]*")
 _FORBIDDEN_UPLOAD_HEADERS = frozenset(
     {"authorization", "cookie", "host", "connection", "transfer-encoding"}
 )
@@ -271,6 +274,12 @@ def parse_signed_upload_response(
     except ValueError:
         raise _malformed() from None
     if expires_at.tzinfo is None or expires_at.utcoffset() is None:
+        raise _malformed()
+
+    if not all(
+        _HEADER_NAME_PATTERN.fullmatch(key) and _HEADER_VALUE_PATTERN.fullmatch(value)
+        for key, value in headers.items()
+    ):
         raise _malformed()
 
     names = [key.lower() for key in headers]

@@ -125,6 +125,10 @@ def test_parse_signed_upload_response_prefers_structured_content_over_text() -> 
             },
             id="allowed-headers",
         ),
+        pytest.param(
+            {"headers": {"X-Meta.v_1": "a b\tc;q=0.8, d", "x-empty": ""}},
+            id="token-name-and-spaced-value",
+        ),
     ],
 )
 def test_parse_signed_upload_response_accepts_variants(
@@ -215,6 +219,37 @@ _MALFORMED_CASES = [
     pytest.param(
         _structured(_payload(headers={"X-Thing": "a", "x-thing": "a"})),
         id="duplicate-header-same-value",
+    ),
+    pytest.param(
+        _structured(_payload(headers={"X-Thing": "caf\u00e9"})),
+        id="header-value-non-ascii",
+    ),
+    pytest.param(
+        _structured(_payload(headers={"X-Thing": "a\r\nX-Injected: 1"})),
+        id="header-value-crlf",
+    ),
+    pytest.param(
+        _structured(_payload(headers={"X-Thing": "a\nb"})), id="header-value-newline"
+    ),
+    pytest.param(
+        _structured(_payload(headers={"X-Thing": "a\x00b"})), id="header-value-nul"
+    ),
+    pytest.param(
+        _structured(_payload(headers={"X-Thing": "a\x7fb"})), id="header-value-delete"
+    ),
+    pytest.param(
+        _structured(_payload(headers={"X Thing": "a"})), id="header-name-space"
+    ),
+    pytest.param(
+        _structured(_payload(headers={"X:Thing": "a"})), id="header-name-colon"
+    ),
+    pytest.param(_structured(_payload(headers={"": "a"})), id="header-name-empty"),
+    pytest.param(
+        _structured(_payload(headers={"X-Th\u00efng": "a"})), id="header-name-non-ascii"
+    ),
+    pytest.param(
+        _structured(_payload(headers={"X-Thing\n": "a"})),
+        id="header-name-trailing-newline",
     ),
 ]
 
