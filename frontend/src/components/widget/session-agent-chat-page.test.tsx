@@ -840,11 +840,21 @@ describe("SessionAgentChatPage", () => {
       expect(app.startProps?.attachmentsBusy).toBe(false)
     })
 
+    it("offers the conversation panel's upload entry while uploads are advertised", () => {
+      setBridge("active", withUploads())
+      app.state.taskId = 5
+      render(<SessionAgentChatPage />)
+
+      expect(app.panelProps?.hideFileUpload).toBe(false)
+      expect(app.panelProps?.attachments).toEqual({ accept: ".pdf,.png", maxFiles: 3, maxFileBytes: 4096 })
+    })
+
     it("passes no upload callbacks to the surfaces when uploads are not advertised", () => {
       setBridge("active", activeSession())
       app.state.taskId = 5
       render(<SessionAgentChatPage />)
 
+      expect(app.panelProps?.hideFileUpload).toBe(true)
       expect(app.panelProps?.onSend).toBeUndefined()
       expect(app.panelProps?.attachments).toBeUndefined()
       expect(app.panelProps?.onAttachmentFilesChange).toBeUndefined()

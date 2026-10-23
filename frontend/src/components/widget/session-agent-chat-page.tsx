@@ -548,7 +548,7 @@ function SessionConversationContent({
             showTokenUsage={false}
             showDagPreview={false}
             showTaskFiles={false}
-            hideFileUpload={true}
+            hideFileUpload={!attachments}
             hideConfig={true}
             compactInput={true}
             deferFileUpload={true}
