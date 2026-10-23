@@ -646,6 +646,30 @@ async def test_the_dispatch_loop_counts_one_attempt_and_lists_the_queue_once_ove
     assert not manager._dispatch_reservations
 
 
+def test_follow_ups_of_one_task_that_fill_a_tenants_window_make_it_miss(
+    world, on, clock
+):
+    """A tenant whose oldest FAIR_SHARE_WINDOW (16) queued commands are all follow-ups
+    of one task that cannot be claimed this time counts as missed, although it has
+    newer tasks behind them: the window is a known limit of the selection."""
+    running = world.add("A", status="processing")
+    task = world.task_of(running)
+    for _ in range(transport.FAIR_SHARE_WINDOW):
+        world.follow_up(task, "A")
+    world.add("A")  # behind the window
+    b_new = world.add("B")
+    cap = cap_of(active={task}, occupancy={"B": 1})
+
+    chosen, seen = recorded(world, lambda: scan(cap, attempt=attempt(), busy=(task,)))
+
+    assert chosen == b_new
+    assert transport.drain_fair_misses() == 1
+    assert windows_asked(seen) == ["batch", "batch"]
+    again, seen = recorded(world, lambda: scan(cap, attempt=attempt(), busy=(task,)))
+    assert again == b_new
+    assert windows_asked(seen) == ["batch"]
+
+
 def test_the_state_is_used_only_under_the_lock_and_no_statement_runs_under_it(
     world, on, clock, monkeypatch
 ):
