@@ -2408,13 +2408,11 @@ async def dispatch_one_task_command(
     registry = get_task_coordinator_registry()
     skipped_task_ids = set(registry.busy_command_tasks())
     attempt = _new_fair_attempt()
-    # Without the switch the scan is called as it always was.
-    fair_arguments = {} if attempt is None else {"attempt": attempt}
     while True:
         cap = build_dispatch_cap_snapshot()
         candidate = await run_db_io_cancellation_safe(
             lambda: _find_command_candidate(
-                command_db_id, tuple(skipped_task_ids), cap, **fair_arguments
+                command_db_id, tuple(skipped_task_ids), cap, attempt=attempt
             )
         )
         if candidate is None:

@@ -11,12 +11,13 @@ from sqlalchemy.dialects import postgresql
 from tests.alembic.lock_retry_support import driver_engines
 from tests.shared.postgres_disposable import disposable_database_factory
 from tests.web.services.fair_selection_support import (
-    CAP_STATES,
+    WORLDS,
     FakeClock,
     World,
+    attempt,
+    cap_of,
     play,
     scan,
-    seed_world,
 )
 from xagent.web.models import database as database_module
 from xagent.web.models.database import Base
@@ -314,33 +315,32 @@ def statements_sent(world, action):
 
 
 @pytest.mark.postgresql
-@pytest.mark.parametrize("cap_state", sorted(CAP_STATES))
 @pytest.mark.parametrize(
     "raw", [None, "false", "garbage"], ids=["unset", "false", "garbage"]
 )
-def test_with_the_switch_off_a_scan_sends_what_it_sent_before(
-    pg_world, monkeypatch, cap_state, raw
+def test_with_the_switch_off_a_scan_lists_no_tenant_and_takes_the_oldest(
+    pg_world, monkeypatch, raw
 ) -> None:
     world, _ = pg_world
+    ids = [world.add(*row[:2], kind=row[2]) for row in WORLDS["three"]]
+    cap = cap_of(occupancy={"user:1": 1})
     if raw is None:
         monkeypatch.delenv(SWITCH)
     else:
         monkeypatch.setenv(SWITCH, raw)
-    first = seed_world(world, "three")
-    cap = transport.DispatchCapSnapshot(
-        policy=DispatchPolicy(limit=2, interactive_reserve=1),
-        active_ids=CAP_STATES[cap_state](first),
-    )
-    off = transport._new_fair_attempt()
-    assert off is None
+    monkeypatch.setattr(transport, "_fair_share_memo", None)
+    assert transport._new_fair_attempt() is None
 
-    chosen, seen = statements_sent(world, lambda: scan(cap, attempt=off))
-    plain, plain_seen = statements_sent(world, lambda: scan(cap))
+    chosen, seen = statements_sent(world, lambda: scan(cap, attempt=None))
 
-    assert chosen == plain
-    assert seen == plain_seen
+    assert chosen == ids[0]
     assert not any("RECURSIVE" in statement for statement in seen)
+    assert not any("fairness_key >=" in statement for statement in seen)
     assert transport._fair_state.attempts == 0
+    # The same world with the switch on is served differently.
+    monkeypatch.setenv(SWITCH, "true")
+    monkeypatch.setattr(transport, "_fair_share_memo", None)
+    assert scan(cap, attempt=attempt()) == ids[1]
 
 
 @pytest.mark.postgresql

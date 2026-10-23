@@ -155,21 +155,6 @@ WORLDS = {
         ("user:2", "batch", "pause"),
     ],
 }
-# The active tasks of each cap state, given the task of the first command.
-CAP_STATES = {
-    "open": lambda first: frozenset(),
-    "batch_line": lambda first: frozenset({9001}),
-    "full": lambda first: frozenset({9001, 9002}),
-    "full_task_active": lambda first: frozenset({9001, first}),
-}
-
-
-def seed_world(world: "World", name: str) -> int:
-    """Queue the commands of one named world; the task of the first, or a stand-in."""
-    ids = [world.add(*row[:2], kind=row[2]) for row in WORLDS[name]]
-    return world.task_of(ids[0]) if ids else 9003
-
-
 # --- random worlds and a brute-force reading of the selection rules --------------------
 
 CLASSES = ("batch", "interactive")
@@ -453,8 +438,9 @@ def cap_of(active=(), occupancy=None, policy=BIG):
 
 def scan(cap, *, attempt=None, busy=(), command_db_id=None):
     """The id one scan picks; ``attempt`` is one dispatch attempt, shared by rescans."""
-    extra = {} if attempt is None else {"attempt": attempt}
-    candidate = transport._find_command_candidate(command_db_id, busy, cap, **extra)
+    candidate = transport._find_command_candidate(
+        command_db_id, busy, cap, attempt=attempt
+    )
     return None if candidate is None else candidate.id
 
 

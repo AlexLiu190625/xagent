@@ -4,13 +4,14 @@ import logging
 import random
 import threading
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 from tests.web.services.fair_selection_support import (
-    CAP_STATES,
     QUEUED,
     WORLDS,
     FakeClock,
@@ -21,7 +22,6 @@ from tests.web.services.fair_selection_support import (
     play,
     random_world,
     scan,
-    seed_world,
     store_world,
 )
 from xagent import config
@@ -29,6 +29,7 @@ from xagent.web.models import database as database_module
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.services import task_command_transport as transport
+from xagent.web.services import task_coordinator_runtime as runtime
 from xagent.web.services import task_coordinator_service as ownership
 from xagent.web.services import task_execution
 from xagent.web.services import task_execution_admission as admission
@@ -540,31 +541,69 @@ def test_a_cancel_of_a_running_task_matches_both_lookups_and_is_taken(world, on,
 @pytest.mark.parametrize(
     "raw", [None, "false", "garbage"], ids=["unset", "false", "garbage"]
 )
-@pytest.mark.parametrize("cap_state", sorted(CAP_STATES))
-@pytest.mark.parametrize("name", sorted(WORLDS))
-def test_with_the_switch_off_a_scan_sends_what_it_sent_before(
-    world, monkeypatch, clock, name, cap_state, raw
+def test_with_the_switch_off_a_scan_lists_no_tenant_and_takes_the_oldest(
+    world, monkeypatch, clock, raw
 ):
+    ids = [world.add(*row[:2], kind=row[2]) for row in WORLDS["three"]]
+    cap = cap_of(occupancy={"user:1": 1})
     if raw is None:
         monkeypatch.delenv(SWITCH, raising=False)
     else:
         monkeypatch.setenv(SWITCH, raw)
     monkeypatch.setattr(transport, "_fair_share_memo", None)
-    first = seed_world(world, name)
-    cap = DispatchCapSnapshot(
-        policy=POLICY, active_ids=CAP_STATES[cap_state](first), occupancy={}
-    )
-    off = transport._new_fair_attempt()
-    assert off is None
+    assert transport._new_fair_attempt() is None
 
-    chosen, seen = recorded(world, lambda: scan(cap, attempt=off))
-    plain, plain_seen = recorded(world, lambda: scan(cap))
+    chosen, seen = recorded(world, lambda: scan(cap, attempt=None))
 
-    assert chosen == plain
-    assert [s for s, _ in seen] == [s for s, _ in plain_seen]
+    assert chosen == ids[0]
     assert not any("RECURSIVE" in s or "GROUP BY" in s for s, _ in seen)
     assert windows_asked(seen) == []
     assert transport._fair_state.attempts == 0
+    # The same world with the switch on is served differently, so the checks above
+    # are not a scan that would have found the oldest command anyway.
+    monkeypatch.setenv(SWITCH, "true")
+    monkeypatch.setattr(transport, "_fair_share_memo", None)
+    assert scan(cap, attempt=attempt()) == ids[1]
+
+
+async def test_the_dispatch_loop_counts_one_attempt_and_lists_the_queue_once_over_a_rescan(
+    world, on, clock, monkeypatch
+):
+    world.add("a")
+    world.add("b")
+    manager = BackgroundTaskManager()
+    monkeypatch.setattr(task_execution, "background_task_manager", manager)
+    monkeypatch.setattr(transport, "build_dispatch_cap_snapshot", lambda: cap_of())
+    ensured: list[int] = []
+
+    async def ensure(task_id):
+        ensured.append(task_id)
+        if len(ensured) == 1:
+            # A coordinator that still runs a command: the loop sets the task
+            # aside and scans again.
+            return SimpleNamespace(_command_tasks={object()})
+        return SimpleNamespace(
+            _command_tasks=set(),
+            execute_command=AsyncMock(return_value=False),
+            require_recovery=lambda: None,
+        )
+
+    registry = SimpleNamespace(busy_command_tasks=lambda: set(), ensure=ensure)
+    monkeypatch.setattr(runtime, "get_task_coordinator_registry", lambda: registry)
+
+    async def executor(command):
+        raise AssertionError("no command should be applied")
+
+    seen, stop = statements_of(world.engine)
+    try:
+        await transport.dispatch_one_task_command(executor)
+    finally:
+        stop()
+
+    assert transport._fair_state.attempts == 1
+    assert sum("GROUP BY" in statement for statement in seen) == 1
+    assert len(ensured) == 2 and ensured[0] != ensured[1]
+    assert not manager._dispatch_reservations
 
 
 def test_the_state_is_used_only_under_the_lock_and_no_statement_runs_under_it(

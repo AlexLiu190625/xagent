@@ -376,7 +376,9 @@ async def test_one_notify_one_free_slot_admits_exactly_one(
         handed_out = iter(pending)
         lock = threading.Lock()
 
-        def find(command_db_id: Any, busy: Any, cap: Any = None) -> Any:
+        def find(
+            command_db_id: Any, busy: Any, cap: Any = None, attempt: Any = None
+        ) -> Any:
             with lock:
                 command_id, task_id = next(handed_out)
             barrier.wait(10)
