@@ -808,6 +808,16 @@ def _resolver_cases(variant: str) -> list[_Case]:
         shared = _first_401(variant, [INVALID_TOKEN])
         return lambda label, n: shared
 
+    def chained_from_initial() -> Script:
+        initial = _first_401(variant, [INVALID_TOKEN])
+        failure = _retry_failure()
+        failure.__cause__ = initial
+
+        def script(label: str, n: int) -> BaseException | None:
+            return initial if n == 0 else failure
+
+        return script
+
     def rewrapped() -> Script:
         initial = _http_401([INVALID_TOKEN])
         rewrapped_error = httpx.HTTPStatusError(
@@ -897,6 +907,14 @@ def _resolver_cases(variant: str) -> list[_Case]:
             # walked again: a bare 401 is the root itself and counts, the same
             # 401 inside a group does not.
             "auth_failed" if variant == "bare" else "retry_failed",
+            ["initial", "fresh"],
+            refresh_calls={"resolver": 1, "connector": 0},
+        ),
+        _Case(
+            "resolver-retry-failure-is-caused-by-the-initial-401" + tag,
+            connection(fresh_refresh),
+            chained_from_initial,
+            "retry_failed",
             ["initial", "fresh"],
             refresh_calls={"resolver": 1, "connector": 0},
         ),
