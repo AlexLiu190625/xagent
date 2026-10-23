@@ -147,6 +147,18 @@ MCP_OAUTH_FLOW_STATE_SWEEP_BATCH = 1000
 MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHODS = frozenset(
     {"none", "client_secret_post", "client_secret_basic"}
 )
+_SIGNED_UPLOADS_FIELD_DESCRIPTION = (
+    "Signed-upload settings: one object per tool that takes a workspace file, "
+    "with exactly the keys tool_name, file_argument, issuing_tool_name, "
+    "allowed_upload_hosts, upload_path_prefix and content_types. When the model "
+    "passes a file:<id> reference in file_argument, the host calls "
+    "issuing_tool_name for a signed URL and PUTs the file's bytes to it; the URL "
+    "must be HTTPS on one of allowed_upload_hosts under upload_path_prefix. "
+    "Used only on sse and streamable_http connectors; null and [] mean none. "
+    "Only the connector's owner or a platform administrator can change it. "
+    "Stored settings that cannot be used make the connector unavailable with "
+    "reason invalid_configuration, and signed_uploads_error says why."
+)
 
 
 # Pydantic models for API
@@ -170,7 +182,7 @@ class MCPServerCreate(BaseModel):
         None, description="Runtime binding declarations"
     )
     signed_uploads: Optional[list[dict]] = Field(
-        None, description="Signed-upload settings, one entry per file-taking tool"
+        None, description=_SIGNED_UPLOADS_FIELD_DESCRIPTION
     )
     allow_delegated_authorization: bool = Field(
         False, description="Allow runtime Authorization header binding"
@@ -197,7 +209,7 @@ class MCPServerUpdate(BaseModel):
         None, description="Runtime binding declarations"
     )
     signed_uploads: Optional[list[dict]] = Field(
-        None, description="Signed-upload settings, one entry per file-taking tool"
+        None, description=_SIGNED_UPLOADS_FIELD_DESCRIPTION
     )
     allow_delegated_authorization: Optional[bool] = Field(
         None, description="Allow runtime Authorization header binding"
