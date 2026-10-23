@@ -146,14 +146,14 @@ def explain(engine, statement: str):
 
 
 @pytest.mark.postgresql
-def test_the_tenant_listing_reads_the_tenant_index(busy_table) -> None:
+def test_the_plan_of_the_tenant_listing_reads_the_tenant_index(busy_table) -> None:
     plan = explain(busy_table, str(transport._LIST_QUEUED_TENANTS_POSTGRESQL))
 
     assert INDEX in index_names(plan)
 
 
 @pytest.mark.postgresql
-def test_the_window_query_of_one_tenant_reads_the_tenant_index(busy_table) -> None:
+def test_the_plan_of_a_tenants_window_query_reads_the_tenant_index(busy_table) -> None:
     cap = DispatchCapSnapshot(
         policy=DispatchPolicy(limit=30, interactive_reserve=3),
         active_ids=frozenset(),
