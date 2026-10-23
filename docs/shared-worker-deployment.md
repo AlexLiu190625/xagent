@@ -58,7 +58,7 @@ Every app process (`combined` or `web` role) and every worker logs one INFO line
 per minute, including minutes with no work:
 
 ```
-runtime diagnostics role=worker pid=4242 window_s=60.0 inflight=1 resume_inflight=0 started_1m=2 finished_1m=1 ok=1 failed=0 cancelled=0 gate_held_s=0.0 slot_tenants=1 slot_top=1 loop_lag_max_ms=12.3 loop_lag_samples=0 degradations=-
+runtime diagnostics role=worker pid=4242 window_s=60.0 inflight=1 resume_inflight=0 started_1m=2 finished_1m=1 ok=1 failed=0 cancelled=0 gate_held_s=0.0 slot_tenants=1 slot_top=1 loop_lag_max_ms=12.3 loop_lag_samples=0 degradations=- fair_misses=0
 ```
 
 Read the lines per `pid`. A pid that keeps logging `inflight=0` is alive and
@@ -86,14 +86,24 @@ commands, and without shared execution, where dispatch takes no slot
 reservation. `degradations` lists the names of the process's active degraded
 signals, sorted and comma-separated, or `-` when there are none. `/health`
 reports them only for a web process; a worker has no HTTP endpoint, so this
-line is where a worker's degradations appear. The line is not logged when
-`XAGENT_LOG_LEVEL` is above `INFO`.
+line is where a worker's degradations appear. `fair_misses` is how many times
+in the minute a query for the commands of one tenant key and dispatch class found
+nothing this process could claim; that pair is then skipped for two seconds. It
+is 0 when `XAGENT_DISPATCHER_FAIR_SHARE` is off and in a process that does not
+dispatch task commands. The line is not logged when `XAGENT_LOG_LEVEL` is above
+`INFO`.
 
 Runtime metrics (OpenTelemetry, OTLP/HTTP) are separate from this line and off
 unless configured (`XAGENT_RUNTIME_TELEMETRY_ENABLED` or an OTLP metrics
 endpoint; see `example.env`). Configure them on worker processes as well as web
 processes: in a split deployment, execution-side metrics such as trace writes
 and event write retries are recorded by the workers, where tasks run.
+
+`XAGENT_DISPATCHER_FAIR_SHARE` is off by default, and with it off the dispatcher
+selects commands exactly as before. With it on, a process that has room for a new
+execution takes the oldest claimable command of the tenant that holds the fewest
+of its slots, instead of the oldest claimable command of all. A value that is
+not a boolean counts as off and is reported once for each distinct value.
 
 ## Configuration and upgrade
 
