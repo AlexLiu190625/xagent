@@ -67,7 +67,8 @@ Field meanings:
   tenant key and dispatch class found nothing this process could claim, so that
   the pair was skipped for a while. Counted per window like ``started_1m``. It
   is ``0`` when ``XAGENT_DISPATCHER_FAIR_SHARE`` is off and in a process that
-  does not dispatch task commands.
+  does not dispatch task commands. Read ``fair_share=`` on the dispatch policy
+  line to tell whether the switch is on.
 """
 
 from __future__ import annotations

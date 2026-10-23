@@ -1898,7 +1898,8 @@ def _fair_share_enabled() -> bool:
     last parse saw returns that parse's result without parsing or warning, so a
     wrong value is reported once however often it is read. Threads that read a
     new value at the same moment may each parse it, which at worst repeats the
-    warning.
+    warning. The dispatch policy line parses the value on its own when it changes,
+    so an invalid value is warned about there too.
     """
     global _fair_share_memo
     raw = os.getenv(DISPATCHER_FAIR_SHARE)
@@ -2169,12 +2170,13 @@ def _fair_pick(
 
     ``claimable()`` is the claimable query of the scan, ``oldest_claimable()`` its
     plain lookup of the oldest row. Tenants are ranked by the slots they hold in
-    this process, then by their oldest queued command, and the first
-    FAIR_SHARE_TENANTS_PER_SCAN that are not skipped are asked in that order: the
-    first with a claimable command among its window supplies the best candidate,
-    and the oldest claimable command older than that which needs no new slot
-    (``_older_needing_no_new_slot``) is taken in its place. A (tenant key, class) with no claimable command in its window is missed
-    and skipped for a while. With no tenant ranked, the plain lookup decides.
+    this process, then by their oldest queued command that opens an execution, and
+    the first FAIR_SHARE_TENANTS_PER_SCAN that are not skipped are asked in that
+    order: the first with a claimable command among its window supplies the best
+    candidate, and the oldest claimable command older than that which needs no new
+    slot (``_older_needing_no_new_slot``) is taken in its place. A (tenant key,
+    class) with no claimable command in its window is missed and skipped for a
+    while. With no tenant ranked, the plain lookup decides.
 
     The listing is taken once per attempt, so a rescan may rank a queue that has
     moved on; at worst that costs one more window query or one more recorded miss.

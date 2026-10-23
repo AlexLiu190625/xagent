@@ -102,8 +102,18 @@ and event write retries are recorded by the workers, where tasks run.
 `XAGENT_DISPATCHER_FAIR_SHARE` is off by default, and with it off the dispatcher
 selects commands exactly as before. With it on, a process that has room for a new
 execution takes the oldest claimable command of the tenant that holds the fewest
-of its slots, instead of the oldest claimable command of all. A value that is
-not a boolean counts as off and is reported once for each distinct value.
+of its slots, instead of the oldest claimable command of all; tenants that hold
+as many slots are ordered by their oldest queued command that opens an execution.
+Only executions the process started through its dispatcher count for a tenant,
+as for `slot_tenants`: a resume started another way, such as one for a task that
+waited for an A2A or a user reply, holds a slot of the cap but counts for no
+tenant, so its tenant ranks as if it held fewer slots. The switch accepts `1`,
+`true`, `yes` or `on` and `0`, `false`, `no` or `off`, in any case; unset or
+blank is off. Any other value counts as off and logs a warning when the value
+changes, not on every read. The value in use is logged as `fair_share=` on the
+process's `dispatch policy` line, at its first dispatch snapshot and whenever the
+value changes, so that line tells whether the switch is on; `fair_misses` is 0
+both when it is off and when it is on with nothing missed.
 
 ## Configuration and upgrade
 
