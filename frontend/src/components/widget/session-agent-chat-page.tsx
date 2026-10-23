@@ -290,9 +290,9 @@ function SessionConversationContent({
   // Uploads one file with the session token. A send passes itself as `send`:
   // aborting the send aborts this upload, and every token the upload uses
   // must come from a session whose capability still accepts all of the
-  // send's files. A retry passes no `send`, so only removing its file, the
-  // session ending or the page unmounting stops it, and its tokens are
-  // checked against that one file. The abort controller is registered before
+  // send's files. A retry passes no `send`, so only removing its own file,
+  // the session becoming unavailable or ending, or the page unmounting stops
+  // it, and its tokens are checked against that one file. The abort controller is registered before
   // the first token wait, so every wait of the upload can be cancelled.
   // Uploading counts as attachment work from the call, token wait included,
   // and the file cards' retry buttons are disabled while any upload or send
