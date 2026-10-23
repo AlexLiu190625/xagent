@@ -440,6 +440,29 @@ def test_non_owner_resending_stored_invalid_signed_uploads_is_not_checked() -> N
     assert _row(server_id) == before
 
 
+def test_non_owner_empty_list_against_a_stored_non_list_is_a_change() -> None:
+    _admin_headers()
+    owner = _register_second_user("bob", "bobpass1")
+    server_id = _create_ok(owner)
+    _store(server_id, {})
+    other = _register_second_user("carol", "carolpass1")
+    _link_non_owner("carol", server_id)
+    before = _row(server_id)
+
+    resp = client.put(
+        f"/api/mcp/servers/{server_id}",
+        json={"signed_uploads": []},
+        headers=other,
+    )
+
+    # Only null and [] mean no settings.  A stored {} is neither, so [] is a
+    # change and the non-owner is refused.  The row stays as it is either way,
+    # because a non-owner's value is never saved.
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["detail"] == OWNER_ONLY_DETAIL
+    assert _row(server_id) == before
+
+
 @pytest.mark.parametrize("case", ["admin-valid", "admin-missing-key"])
 def test_platform_admin_can_change_signed_uploads(case: str) -> None:
     admin = _admin_headers()

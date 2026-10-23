@@ -804,6 +804,7 @@ def _invalid_entry(**changes: Any) -> dict[str, Any]:
     ("stored", "url"),
     [
         pytest.param({"tool_name": MARKER}, None, id="not-a-list"),
+        pytest.param({}, None, id="empty-object"),
         pytest.param(
             [
                 {
