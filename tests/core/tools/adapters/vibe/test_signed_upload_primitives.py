@@ -326,17 +326,17 @@ _UPLOADS = "uploads.example.test"
         pytest.param(
             "https://other.example.test/staged/x",
             "other.example.test",
-            id="host-not-registered",
+            id="host-not-allowed",
         ),
         pytest.param(
             f"https://evil.{_UPLOADS}/staged/x",
             f"evil.{_UPLOADS}",
-            id="subdomain-of-registered-host",
+            id="subdomain-of-allowed-host",
         ),
         pytest.param(
             f"https://{_UPLOADS}.evil/staged/x",
             f"{_UPLOADS}.evil",
-            id="registered-host-as-prefix",
+            id="allowed-host-as-prefix",
         ),
         pytest.param(
             f"https://{_UPLOADS}./staged/x", f"{_UPLOADS}.", id="trailing-dot"
