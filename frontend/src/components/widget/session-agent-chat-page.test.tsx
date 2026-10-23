@@ -758,16 +758,16 @@ describe("SessionAgentChatPage", () => {
       ["replacement_awaiting_task", false, false],
       ["unbound", true, false],
       ["unbound", false, true],
-    ])("lets sendMessage refuse a send made in the %s phase without uploading", async (phase, locked, resetPending) => {
+    ])("refuses a send made in the %s phase without calling sendMessage or uploading", async (phase, locked, resetPending) => {
       setBridge("active", withUploads())
       app.sessionConversationState = phase
       app.isSessionInteractionLocked = locked
       app.isConversationResetPending = resetPending
       render(<SessionAgentChatPage />)
 
-      await startSend()("hello", [pdf()], {})
+      await expect(startSend()("hello", [pdf()], {})).rejects.toThrow("not ready for attachments")
 
-      expect(app.sendMessage).toHaveBeenCalledWith("hello", {}, [])
+      expect(app.sendMessage).not.toHaveBeenCalled()
       expect(bridge.value.ensureFreshSession).not.toHaveBeenCalled()
       expect(fetch).not.toHaveBeenCalled()
     })

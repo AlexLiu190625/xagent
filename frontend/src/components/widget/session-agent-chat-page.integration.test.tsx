@@ -717,6 +717,7 @@ describe("SessionAgentChatPage file attachments", () => {
 
       expect(signal.aborted).toBe(true)
       expect((failure as Error).name).toBe("AbortError")
+      expect(failure).toMatchObject({ notificationHandled: true })
       expect(statusOf(a)).toBeUndefined()
     })
 

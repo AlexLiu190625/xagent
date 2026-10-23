@@ -220,8 +220,14 @@ function SessionConversationContent({
       setAttachmentStatus(file, "uploaded")
       return uploaded
     } catch (error) {
-      // A released file has no card left to mark.
-      if (!controller.signal.aborted) setAttachmentStatus(file, "failed")
+      // A released file has no card left to mark, and the visitor who removed
+      // it needs no "not sent" notice for it.
+      if (controller.signal.aborted) {
+        throw typeof error === "object" && error !== null
+          ? Object.assign(error, { notificationHandled: true })
+          : error
+      }
+      setAttachmentStatus(file, "failed")
       throw error
     } finally {
       if (uploadControllersRef.current.get(file) === controller) {
@@ -287,13 +293,13 @@ function SessionConversationContent({
       || isSessionInteractionLocked
       || isConversationResetPending
     ) {
-      // sendMessage refuses these states with its own error.
-      await sendMessage(message, config, [])
-      return
+      // sendMessage would refuse the turn in these states, but calling it
+      // with the files dropped could send the text alone if its own view of
+      // the state is newer than this render's, so the send stops here.
+      throw new Error("Message not sent: the conversation is not ready for attachments.")
     }
     assertAttachmentsSendable(files, config, attachments)
 
-    await uploads.ensureFreshSession()
     const uploaded: SessionUploadedFile[] = []
     for (const file of files) {
       const known = uploadedFilesRef.current.get(file)
