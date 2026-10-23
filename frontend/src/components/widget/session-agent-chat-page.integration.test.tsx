@@ -838,6 +838,40 @@ describe("SessionAgentChatPage file attachments", () => {
       expect(socket.close).toHaveBeenCalled()
     })
 
+    it("lets a selected file be sent again after the session was unavailable and came back", async () => {
+      await mountActive()
+      fetchMock.mockImplementationOnce(pendingUntilAborted)
+      const a = pdf("a.pdf")
+      let failure: unknown
+      act(() => { surfaces.start?.onFilesChange([a]) })
+      act(() => {
+        void surfaces.start?.onSend("hello", [a], { clientMessageId: "cid-away" })
+          .then(() => null, (error: unknown) => { failure = error })
+      })
+      await waitFor(() => expect(uploadCalls()).toHaveLength(1))
+      expect(statusOf(a)).toBe("uploading")
+
+      dispatchDegradedSession()
+      await waitFor(() => expect(failure).toBeDefined())
+      dispatchSession({ session_delivery_id: "delivery-back", capabilities })
+      await waitFor(() => expect(MockWebSocket.instances).toHaveLength(2))
+      const next = MockWebSocket.instances[1]
+      act(() => next.open("xagent-session-v1"))
+
+      await waitFor(() => expect(surfaces.start?.files).toEqual([a]))
+      expect(statusOf(a)).toBeUndefined()
+      expect(surfaces.start?.attachmentsBusy).toBe(false)
+      fetchMock.mockImplementationOnce(async () => created(FILE_A, "a.pdf"))
+      let sending!: Promise<unknown>
+      act(() => {
+        sending = surfaces.start?.onSend("hello", [a], { clientMessageId: "cid-back" })
+      })
+      await waitFor(() => expect(chatFrames(next)).toHaveLength(1))
+      expect(chatFrames(next)[0].file_ids).toEqual([FILE_A])
+      accept(next, "cid-back")
+      await act(async () => { await sending })
+    })
+
     it("aborts uploads in flight when the page unmounts", async () => {
       const { unmount } = render(<SessionAgentChatPage />)
       dispatchSession({ capabilities })
@@ -1008,14 +1042,19 @@ describe("SessionAgentChatPage file attachments", () => {
 
         expect(failure).toMatchObject({ message, userFacing: true })
         expect(uploadCalls()).toHaveLength(0)
-        expect(statusOf(a)).toBeUndefined()
-        expect(statusOf(b)).toBeUndefined()
         await waitFor(() => expect(MockWebSocket.instances).toHaveLength(2))
         act(() => MockWebSocket.instances[1].open("xagent-session-v1"))
         expect(chatFrames(socket)).toHaveLength(0)
         expect(chatFrames(MockWebSocket.instances[1])).toHaveLength(0)
         expect(surfaces.start?.files).toEqual(filesAfter(a, b))
         await waitFor(() => expect(surfaces.start?.isSending).toBe(false))
+
+        // Without a capability the page hides the cards, so their state is only
+        // visible once a session advertises uploads again.
+        dispatchSession({ session_delivery_id: "delivery-c", capabilities })
+        await waitFor(() => expect(surfaces.start?.attachmentStatuses).toBeDefined())
+        expect(statusOf(a)).toBeUndefined()
+        expect(statusOf(b)).toBeUndefined()
       },
     )
 

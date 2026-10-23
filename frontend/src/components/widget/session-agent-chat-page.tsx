@@ -233,11 +233,18 @@ function SessionConversationContent({
     previous.filter((file) => !kept.has(file)).forEach(releaseAttachment)
   }, [releaseAttachment])
 
+  // Cancels every upload and send. A file still selected goes back to not
+  // uploaded: the registry is cleared here, so the upload's own abort handling
+  // cannot tell the file is still selected, and the card would otherwise stay
+  // at "Uploading…" if the session comes back.
   const abortAllUploads = useCallback(() => {
-    uploadControllersRef.current.forEach((controller) => controller.abort())
+    uploadControllersRef.current.forEach((controller, file) => {
+      controller.abort()
+      setAttachmentStatus(file, null)
+    })
     uploadControllersRef.current.clear()
     activeSendsRef.current.forEach((send) => send.controller.abort())
-  }, [])
+  }, [setAttachmentStatus])
 
   useEffect(() => abortAllUploads, [abortAllUploads])
   useEffect(() => {
@@ -290,8 +297,8 @@ function SessionConversationContent({
   // Uploading counts as attachment work from the call, token wait included,
   // and the file cards' retry buttons are disabled while any upload or send
   // with files is in flight. The composer itself stays open while a task is
-  // running, so a send with files can still start beside an upload; the
-  // bridge then shares or skips the token refresh after a 401.
+  // running, but the file being uploaded shows as uploading, so the composer
+  // refuses to submit until it settles.
   const uploadAttachment = useCallback(async (
     file: File,
     send?: AttachmentSend,
@@ -430,7 +437,8 @@ function SessionConversationContent({
       if (files.some((file) => !uploadedFilesRef.current.has(file))) {
         throw removedFileError()
       }
-      // The socket that just opened belongs to the latest accepted session.
+      // The open socket belongs to the latest accepted session, whose
+      // capability this ref holds.
       assertCapabilityAccepts(files, latestAttachmentsRef.current)
 
       try {
