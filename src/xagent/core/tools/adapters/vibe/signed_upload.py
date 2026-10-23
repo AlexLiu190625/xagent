@@ -1,4 +1,4 @@
-"""Registry of remote MCP connectors that take files through a signed upload.
+"""Signed-upload settings of remote MCP connectors.
 
 Some remote MCP servers accept a file in two steps: a tool call returns a
 short-lived signed upload URL plus a server-side file id, and the caller then
@@ -6,10 +6,10 @@ sends the file bytes to that URL.  A model can do neither step on its own: it
 only holds a workspace file reference, never the bytes, and the signed URL is a
 credential that must not reach it.
 
-An embedding deployment registers such a connector here, at process start, with
-:func:`register_signed_upload_binding`.  This package registers nothing by
-itself.  While no binding is registered, MCP tool adapters behave exactly as
-they do without this module.
+The owner of a connector describes such tools in the connector's own
+``signed_uploads`` setting, which reaches the adapter in the connection
+mapping.  A connection without that setting behaves exactly as it does without
+this module.
 
 A binding replaces one scalar string argument of one tool.  A list value in
 that argument is passed through unchanged.
@@ -29,7 +29,26 @@ from urllib.parse import urlsplit
 
 import httpx
 
-_REMOTE_TRANSPORTS = frozenset({"streamable_http", "sse"})
+# The host-run upload is wired only for these two transports; settings on any
+# other transport are never read.
+SIGNED_UPLOAD_TRANSPORTS = frozenset({"sse", "streamable_http"})
+_MAX_SETTINGS_ENTRIES = 20
+_MAX_NAME_LENGTH = 255
+_MAX_HOSTNAME_LENGTH = 253
+_MAX_UPLOAD_HOSTS = 20
+_MAX_CONTENT_TYPES = 50
+_MAX_SUFFIX_LENGTH = 16
+_SETTINGS_ENTRY_KEYS = frozenset(
+    {
+        "tool_name",
+        "file_argument",
+        "issuing_tool_name",
+        "allowed_upload_hosts",
+        "upload_path_prefix",
+        "content_types",
+    }
+)
+_UNREADABLE_SETTINGS_MESSAGE = "Upload settings could not be read."
 _HOST_FORBIDDEN_CHARS = frozenset("*/:@")
 _REMOTE_FILE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 # RFC 9110 token for a header name; visible ASCII, space and tab for a value.
@@ -46,7 +65,8 @@ _FORBIDDEN_URL_PATH_ESCAPES = ("%2e", "%2f", "%5c")
 class SignedUploadBinding:
     """One tool of one remote connector whose file argument is uploaded by the host."""
 
-    connection_host: str  # lower-case hostname, exact match with the connection URL
+    # hostname of the connection URL; filled in when settings are parsed
+    connection_host: str
     tool_name: str  # tool whose argument is replaced
     file_argument: str  # scalar argument carrying file:<id>
     issuing_tool_name: str  # tool that returns the signed upload URL
@@ -54,12 +74,6 @@ class SignedUploadBinding:
     allowed_upload_hosts: frozenset[str]
     upload_path_prefix: str  # starts and ends with "/"
     content_types: Mapping[str, str]  # lower-case suffix with dot -> MIME
-
-
-# Registered bindings keyed by (connection_host, tool_name).
-# Tests, including an embedder's tests, replace this mapping to start from an
-# empty registry.
-_BINDINGS: dict[tuple[str, str], SignedUploadBinding] = {}
 
 
 def _validate_hostname(host: Any, label: str) -> None:
@@ -71,7 +85,7 @@ def _validate_hostname(host: Any, label: str) -> None:
         raise ValueError(f"{label} must be an exact hostname")
     if host.endswith("."):
         # A URL hostname keeps a trailing dot, so "host." and "host" would be
-        # two registrations for one DNS name; only the form without the dot is
+        # two entries for one DNS name; only the form without the dot is
         # accepted.
         raise ValueError(f"{label} must not end with a dot")
     try:
@@ -81,74 +95,140 @@ def _validate_hostname(host: Any, label: str) -> None:
     raise ValueError(f"{label} must be a hostname, not an IP address")
 
 
-def _validate_binding(binding: SignedUploadBinding) -> None:
-    _validate_hostname(binding.connection_host, "connection_host")
-    if not isinstance(binding.allowed_upload_hosts, frozenset):
-        raise ValueError("allowed_upload_hosts must be a frozenset of hostnames")
-    if not binding.allowed_upload_hosts:
-        raise ValueError("allowed_upload_hosts must not be empty")
-    for upload_host in binding.allowed_upload_hosts:
-        _validate_hostname(upload_host, "allowed_upload_hosts entry")
+def _validate_string(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} must be a non-empty string")
+    if len(value) > _MAX_NAME_LENGTH:
+        raise ValueError(f"{label} must not be longer than {_MAX_NAME_LENGTH}")
+    return value
 
-    prefix = binding.upload_path_prefix
+
+def _validate_entry(
+    entry: Any, position: int, connection_host: str
+) -> SignedUploadBinding:
+    """Validate one stored settings entry; ``position`` only labels errors."""
+    label = f"signed_uploads[{position}]"
+    if not isinstance(entry, dict):
+        raise ValueError(f"{label} must be an object")
+    if set(entry) != _SETTINGS_ENTRY_KEYS:
+        raise ValueError(f"{label} must have exactly the documented keys")
+
+    tool_name = _validate_string(entry["tool_name"], f"{label}.tool_name")
+    file_argument = _validate_string(entry["file_argument"], f"{label}.file_argument")
+    issuing_tool_name = _validate_string(
+        entry["issuing_tool_name"], f"{label}.issuing_tool_name"
+    )
+
+    hosts_label = f"{label}.allowed_upload_hosts"
+    hosts = entry["allowed_upload_hosts"]
+    if not isinstance(hosts, list):
+        raise ValueError(f"{hosts_label} must be a list of hostnames")
+    if not hosts:
+        raise ValueError(f"{hosts_label} must not be empty")
+    if len(hosts) > _MAX_UPLOAD_HOSTS:
+        raise ValueError(
+            f"{hosts_label} must not have more than {_MAX_UPLOAD_HOSTS} entries"
+        )
+    for upload_host in hosts:
+        if isinstance(upload_host, str) and len(upload_host) > _MAX_HOSTNAME_LENGTH:
+            raise ValueError(
+                f"{hosts_label} entry must not be longer than {_MAX_HOSTNAME_LENGTH}"
+            )
+        _validate_hostname(upload_host, f"{hosts_label} entry")
+
+    prefix_label = f"{label}.upload_path_prefix"
+    prefix = entry["upload_path_prefix"]
     if not isinstance(prefix, str) or not (
         prefix.startswith("/") and prefix.endswith("/")
     ):
-        raise ValueError("upload_path_prefix must start and end with '/'")
+        raise ValueError(f"{prefix_label} must start and end with '/'")
     if ".." in prefix:
-        raise ValueError("upload_path_prefix must not contain '..'")
+        raise ValueError(f"{prefix_label} must not contain '..'")
+    if len(prefix) > _MAX_NAME_LENGTH:
+        raise ValueError(f"{prefix_label} must not be longer than {_MAX_NAME_LENGTH}")
 
-    if not isinstance(binding.content_types, Mapping):
-        raise ValueError("content_types must be a mapping")
-    if not binding.content_types:
-        raise ValueError("content_types must not be empty")
-    for suffix, mime in binding.content_types.items():
+    types_label = f"{label}.content_types"
+    content_types = entry["content_types"]
+    if not isinstance(content_types, dict):
+        raise ValueError(f"{types_label} must be an object")
+    if not content_types:
+        raise ValueError(f"{types_label} must not be empty")
+    if len(content_types) > _MAX_CONTENT_TYPES:
+        raise ValueError(
+            f"{types_label} must not have more than {_MAX_CONTENT_TYPES} entries"
+        )
+    for suffix, mime in content_types.items():
         if not isinstance(suffix, str) or not suffix.startswith("."):
-            raise ValueError("content_types keys must start with '.'")
+            raise ValueError(f"{types_label} keys must start with '.'")
         if suffix != suffix.lower():
-            raise ValueError("content_types keys must be lower-case")
-        if not isinstance(mime, str) or not mime:
-            raise ValueError("content_types values must be non-empty")
-
-    for label, value in (
-        ("tool_name", binding.tool_name),
-        ("file_argument", binding.file_argument),
-        ("issuing_tool_name", binding.issuing_tool_name),
-    ):
-        if not isinstance(value, str) or not value:
-            raise ValueError(f"{label} must be a non-empty string")
-
-    if binding.issuing_tool_name == binding.tool_name:
-        raise ValueError("issuing_tool_name must differ from tool_name")
-    for other in _BINDINGS.values():
-        if other.connection_host != binding.connection_host:
-            continue
-        if (
-            other.issuing_tool_name == binding.tool_name
-            or binding.issuing_tool_name == other.tool_name
-        ):
+            raise ValueError(f"{types_label} keys must be lower-case")
+        if len(suffix) > _MAX_SUFFIX_LENGTH:
             raise ValueError(
-                "a tool of this connection host cannot be both an issuing tool "
-                "and a replaced tool"
+                f"{types_label} keys must not be longer than {_MAX_SUFFIX_LENGTH}"
+            )
+        if not isinstance(mime, str) or not mime:
+            raise ValueError(f"{types_label} values must be non-empty")
+        if len(mime) > _MAX_NAME_LENGTH:
+            raise ValueError(
+                f"{types_label} values must not be longer than {_MAX_NAME_LENGTH}"
             )
 
-    if (binding.connection_host, binding.tool_name) in _BINDINGS:
-        raise ValueError("a binding for this connection host and tool already exists")
+    return SignedUploadBinding(
+        connection_host=connection_host,
+        tool_name=tool_name,
+        file_argument=file_argument,
+        issuing_tool_name=issuing_tool_name,
+        allowed_upload_hosts=frozenset(hosts),
+        upload_path_prefix=prefix,
+        content_types=MappingProxyType(dict(content_types)),
+    )
 
 
-def register_signed_upload_binding(binding: SignedUploadBinding) -> None:
-    """Register ``binding``; raise ``ValueError`` if it is invalid or a duplicate."""
-    _validate_binding(binding)
-    _BINDINGS[(binding.connection_host, binding.tool_name)] = binding
+def _check_entries_together(bindings: list[SignedUploadBinding]) -> None:
+    """Reject settings whose entries clash with each other."""
+    seen_tools: set[str] = set()
+    for position, binding in enumerate(bindings):
+        if binding.tool_name in seen_tools:
+            raise ValueError(
+                f"signed_uploads[{position}].tool_name repeats an earlier entry"
+            )
+        seen_tools.add(binding.tool_name)
+    issuing_tools = {binding.issuing_tool_name for binding in bindings}
+    if seen_tools & issuing_tools:
+        raise ValueError("a tool cannot be both an issuing tool and a replaced tool")
 
 
-def _remote_connection_host(connection: Any) -> str | None:
-    """Return the lower-case URL hostname of a remote connection, else ``None``."""
-    if not isinstance(connection, Mapping):
-        return None
-    if connection.get("transport") not in _REMOTE_TRANSPORTS:
-        return None
-    url = connection.get("url")
+def parse_signed_upload_settings(
+    raw: Any, *, connection_host: str | None
+) -> tuple[SignedUploadBinding, ...]:
+    """Validate a connector's stored signed_uploads value; raise ValueError.
+
+    ``None`` and an empty list mean no settings and give an empty tuple.  Any
+    other value must be a list of entries with exactly the documented keys, and
+    the connection needs a hostname (``connection_host``, the lower-case
+    hostname of the connection URL, taken as given).  The error text is fixed
+    and never carries a stored value.
+    """
+    if raw is None or (isinstance(raw, list) and not raw):
+        return ()
+    if connection_host is None:
+        raise ValueError("the connection URL has no hostname")
+    if not isinstance(raw, list):
+        raise ValueError("signed_uploads must be a list")
+    if len(raw) > _MAX_SETTINGS_ENTRIES:
+        raise ValueError(
+            f"signed_uploads must not have more than {_MAX_SETTINGS_ENTRIES} entries"
+        )
+    bindings = [
+        _validate_entry(entry, position, connection_host)
+        for position, entry in enumerate(raw)
+    ]
+    _check_entries_together(bindings)
+    return tuple(bindings)
+
+
+def _url_hostname(url: Any) -> str | None:
+    """Return the lower-case hostname of ``url``, or ``None`` if it has none."""
     if not isinstance(url, str):
         return None
     try:
@@ -157,24 +237,61 @@ def _remote_connection_host(connection: Any) -> str | None:
         return None
 
 
+def signed_upload_settings_error(raw: Any, *, transport: Any, url: Any) -> str | None:
+    """Why stored settings are unusable, or None when absent, inert or valid."""
+    if not isinstance(transport, str) or transport not in SIGNED_UPLOAD_TRANSPORTS:
+        return None
+    try:
+        parse_signed_upload_settings(raw, connection_host=_url_hostname(url))
+    except ValueError as exc:
+        return str(exc)
+    except Exception:
+        return _UNREADABLE_SETTINGS_MESSAGE
+    return None
+
+
+def _connection_signed_uploads(connection: Any) -> tuple[SignedUploadBinding, ...]:
+    """Read and validate the settings carried by ``connection``.
+
+    A connection that is not a mapping, or whose transport does not take part,
+    has no settings.  Stored settings that are not valid raise ``ValueError``.
+    """
+    if not isinstance(connection, Mapping):
+        return ()
+    transport = connection.get("transport")
+    if not isinstance(transport, str) or transport not in SIGNED_UPLOAD_TRANSPORTS:
+        return ()
+    raw = connection.get("signed_uploads")
+    if raw is None or (isinstance(raw, list) and not raw):
+        return ()
+    return parse_signed_upload_settings(
+        raw, connection_host=_url_hostname(connection.get("url"))
+    )
+
+
 def find_signed_upload_binding(
     connection: Any, tool_name: str
 ) -> SignedUploadBinding | None:
-    """Return the binding registered for ``tool_name`` on ``connection``, if any."""
-    host = _remote_connection_host(connection)
-    if host is None:
-        return None
-    return _BINDINGS.get((host, tool_name))
+    """Return the binding that ``connection`` sets up for ``tool_name``, if any.
+
+    The binding is read from the connection's own ``signed_uploads`` setting.
+    Raises ``ValueError`` when that setting is present but not valid.
+    """
+    for binding in _connection_signed_uploads(connection):
+        if binding.tool_name == tool_name:
+            return binding
+    return None
 
 
 def is_signed_upload_issuing_tool(connection: Any, tool_name: str) -> bool:
-    """Whether ``tool_name`` is the issuing tool of a binding on ``connection``."""
-    host = _remote_connection_host(connection)
-    if host is None:
-        return False
+    """Whether ``tool_name`` is the issuing tool of a binding on ``connection``.
+
+    The bindings are read from the connection's own ``signed_uploads`` setting.
+    Raises ``ValueError`` when that setting is present but not valid.
+    """
     return any(
-        binding.connection_host == host and binding.issuing_tool_name == tool_name
-        for binding in _BINDINGS.values()
+        binding.issuing_tool_name == tool_name
+        for binding in _connection_signed_uploads(connection)
     )
 
 

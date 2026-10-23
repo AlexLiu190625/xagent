@@ -4261,8 +4261,9 @@ async def _load_direct_mcp_tools(
     adapter_error_type: str | None = None
     for mcp_tool in mcp_tools:
         if is_signed_upload_issuing_tool(connection, mcp_tool.name):
-            # The host calls this tool itself while preparing a registered
-            # signed upload; the model never receives the URL it returns.
+            # The host calls this tool itself while preparing a signed upload
+            # set up for this connector; the model never receives the URL it
+            # returns.
             continue
         try:
             adapter = _build_mcp_tool_adapter(
@@ -4573,7 +4574,10 @@ async def load_mcp_tools_as_agent_tools(
             # fixed-format message with no secret) or a genuine bug escaping
             # the loop -- per-server session/initialize/list-tools failures
             # for direct transports are handled, and logged, inside
-            # _load_direct_mcp_tools's retry loop instead. Opt-in: set
+            # _load_direct_mcp_tools's retry loop instead. It also receives
+            # the ValueError raised when a connection carries invalid
+            # signed-upload settings; that failure is reported under the
+            # session-start phase. Opt-in: set
             # XAGENT_LOG_LEVEL=DEBUG (or run with --debug) to capture it.
             logger.debug(
                 "MCP server load failure detail for server %s",

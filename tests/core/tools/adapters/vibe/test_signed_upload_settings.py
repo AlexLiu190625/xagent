@@ -1,0 +1,865 @@
+from __future__ import annotations
+
+import copy
+from contextlib import asynccontextmanager
+from types import MappingProxyType, SimpleNamespace
+from typing import Any
+
+import pytest
+
+from xagent.core.tools.adapters.vibe import mcp_adapter as mcp_adapter_module
+from xagent.core.tools.adapters.vibe import signed_upload
+from xagent.core.tools.adapters.vibe.mcp_adapter import (
+    _build_mcp_tool_adapter,
+    load_mcp_tools_as_agent_tools,
+)
+from xagent.core.tools.adapters.vibe.signed_upload import (
+    SignedUploadBinding,
+    find_signed_upload_binding,
+    is_signed_upload_issuing_tool,
+    parse_signed_upload_settings,
+    signed_upload_settings_error,
+)
+
+CONNECTION_HOST = "mcp.example.test"
+CONNECTION_URL = f"https://{CONNECTION_HOST}/mcp"
+UNREADABLE = "Upload settings could not be read."
+
+
+def _entry(**overrides: Any) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "tool_name": "attach_document",
+        "file_argument": "document",
+        "issuing_tool_name": "request_upload",
+        "allowed_upload_hosts": ["uploads.example.test"],
+        "upload_path_prefix": "/staged/",
+        "content_types": {".pdf": "application/pdf", ".png": "image/png"},
+    }
+    entry.update(overrides)
+    return entry
+
+
+def _without(key: str, **overrides: Any) -> dict[str, Any]:
+    entry = _entry(**overrides)
+    del entry[key]
+    return entry
+
+
+def _binding(**overrides: Any) -> SignedUploadBinding:
+    fields: dict[str, Any] = {
+        "connection_host": CONNECTION_HOST,
+        "tool_name": "attach_document",
+        "file_argument": "document",
+        "issuing_tool_name": "request_upload",
+        "allowed_upload_hosts": frozenset({"uploads.example.test"}),
+        "upload_path_prefix": "/staged/",
+        "content_types": {".pdf": "application/pdf", ".png": "image/png"},
+    }
+    fields.update(overrides)
+    return SignedUploadBinding(**fields)
+
+
+def _connection(transport: str = "streamable_http", **extra: Any) -> dict[str, Any]:
+    return {"transport": transport, "url": CONNECTION_URL, **extra}
+
+
+def _stdio_connection(**extra: Any) -> dict[str, Any]:
+    # Carries a ``url`` key so only the transport check can keep it from
+    # reading the settings.
+    return {
+        "transport": "stdio",
+        "command": "python",
+        "args": [],
+        "url": CONNECTION_URL,
+        **extra,
+    }
+
+
+def _parse(raw: Any, connection_host: str | None = CONNECTION_HOST) -> Any:
+    return parse_signed_upload_settings(raw, connection_host=connection_host)
+
+
+def _many_entries(count: int) -> list[dict[str, Any]]:
+    return [
+        _entry(tool_name=f"tool_{index}", issuing_tool_name="request_upload")
+        for index in range(count)
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Validation rules
+# ---------------------------------------------------------------------------
+
+
+def _name_field_cells(field: str) -> list[Any]:
+    return [
+        pytest.param([_entry(**{field: ""})], id=f"{field}-empty"),
+        pytest.param([_entry(**{field: 7})], id=f"{field}-not-a-string"),
+        pytest.param([_entry(**{field: None})], id=f"{field}-none"),
+        pytest.param([_entry(**{field: "x" * 256})], id=f"{field}-too-long"),
+    ]
+
+
+REJECTED_SETTINGS = [
+    # not a list
+    pytest.param({"tool_name": "attach_document"}, id="value-is-a-dict"),
+    pytest.param("attach_document", id="value-is-a-string"),
+    pytest.param(7, id="value-is-a-number"),
+    pytest.param(False, id="value-is-false"),
+    pytest.param("", id="value-is-an-empty-string"),
+    pytest.param({}, id="value-is-an-empty-dict"),
+    pytest.param((_entry(),), id="value-is-a-tuple"),
+    # too many entries
+    pytest.param(_many_entries(21), id="too-many-entries"),
+    # entry shape
+    pytest.param(["attach_document"], id="entry-is-a-string"),
+    pytest.param([None], id="entry-is-none"),
+    pytest.param([[_entry()]], id="entry-is-a-list"),
+    pytest.param([_entry(), 7], id="second-entry-is-a-number"),
+    pytest.param([{}], id="entry-is-empty"),
+    *[pytest.param([_without(key)], id=f"missing-{key}") for key in _entry()],
+    pytest.param([_entry(extra="x")], id="extra-key"),
+    # names
+    *_name_field_cells("tool_name"),
+    *_name_field_cells("file_argument"),
+    *_name_field_cells("issuing_tool_name"),
+    # clashes between entries
+    pytest.param(
+        [_entry(), _entry(issuing_tool_name="other_issuer")], id="duplicate-tool-name"
+    ),
+    pytest.param(
+        [
+            _entry(),
+            _entry(tool_name="attach_image", issuing_tool_name="attach_document"),
+        ],
+        id="issuing-tool-of-a-later-entry-is-an-earlier-tool",
+    ),
+    pytest.param(
+        [_entry(), _entry(tool_name="request_upload", issuing_tool_name="issue_other")],
+        id="tool-of-a-later-entry-is-an-earlier-issuing-tool",
+    ),
+    pytest.param(
+        [_entry(issuing_tool_name="attach_document")], id="issuing-tool-is-the-tool"
+    ),
+    # allowed_upload_hosts
+    pytest.param(
+        [_entry(allowed_upload_hosts="uploads.example.test")], id="hosts-is-a-string"
+    ),
+    pytest.param(
+        [_entry(allowed_upload_hosts=frozenset({"uploads.example.test"}))],
+        id="hosts-is-a-frozenset",
+    ),
+    pytest.param([_entry(allowed_upload_hosts=None)], id="hosts-is-none"),
+    pytest.param([_entry(allowed_upload_hosts=[])], id="hosts-empty"),
+    pytest.param(
+        [_entry(allowed_upload_hosts=[f"h{i}.example.test" for i in range(21)])],
+        id="hosts-too-many",
+    ),
+    pytest.param([_entry(allowed_upload_hosts=["*.example.test"])], id="host-star"),
+    pytest.param([_entry(allowed_upload_hosts=["192.168.1.5"])], id="host-ip"),
+    pytest.param([_entry(allowed_upload_hosts=["::1"])], id="host-ipv6"),
+    pytest.param(
+        [_entry(allowed_upload_hosts=["Uploads.example.test"])], id="host-uppercase"
+    ),
+    pytest.param(
+        [_entry(allowed_upload_hosts=["uploads.example.test."])],
+        id="host-trailing-dot",
+    ),
+    pytest.param(
+        [_entry(allowed_upload_hosts=["uploads.example.test:8443"])], id="host-colon"
+    ),
+    pytest.param([_entry(allowed_upload_hosts=[""])], id="host-empty"),
+    pytest.param([_entry(allowed_upload_hosts=[7])], id="host-not-a-string"),
+    pytest.param(
+        [_entry(allowed_upload_hosts=["uploads.example.test", "a" * 254])],
+        id="host-too-long",
+    ),
+    # upload_path_prefix
+    pytest.param([_entry(upload_path_prefix="staged/")], id="prefix-no-leading-slash"),
+    pytest.param([_entry(upload_path_prefix="/staged")], id="prefix-no-trailing-slash"),
+    pytest.param([_entry(upload_path_prefix="/staged/../x/")], id="prefix-dotdot"),
+    pytest.param(
+        [_entry(upload_path_prefix="/" + "p" * 254 + "/")], id="prefix-too-long"
+    ),
+    pytest.param([_entry(upload_path_prefix=None)], id="prefix-not-a-string"),
+    # content_types
+    pytest.param([_entry(content_types=None)], id="content-types-none"),
+    pytest.param(
+        [_entry(content_types=[(".pdf", "application/pdf")])],
+        id="content-types-not-a-dict",
+    ),
+    pytest.param([_entry(content_types={})], id="content-types-empty"),
+    pytest.param(
+        [_entry(content_types={f".t{i}": "text/plain" for i in range(51)})],
+        id="content-types-too-many",
+    ),
+    pytest.param(
+        [_entry(content_types={"pdf": "application/pdf"})], id="suffix-no-dot"
+    ),
+    pytest.param(
+        [_entry(content_types={".PDF": "application/pdf"})], id="suffix-uppercase"
+    ),
+    pytest.param(
+        [_entry(content_types={"." + "s" * 16: "application/pdf"})],
+        id="suffix-too-long",
+    ),
+    pytest.param([_entry(content_types={".pdf": ""})], id="mime-empty"),
+    pytest.param([_entry(content_types={".pdf": 7})], id="mime-not-a-string"),
+    pytest.param([_entry(content_types={".pdf": "m" * 256})], id="mime-too-long"),
+]
+
+
+@pytest.mark.parametrize("raw", REJECTED_SETTINGS)
+def test_parse_signed_upload_settings_rejects(raw: Any) -> None:
+    with pytest.raises(ValueError):
+        _parse(raw)
+
+
+PLANTED_VALUES = [
+    pytest.param([_entry(PLANTED_extra="x")], id="extra-key-name"),
+    pytest.param(
+        [_entry(content_types={".PLANTED": "application/pdf"})], id="suffix-uppercase"
+    ),
+    pytest.param(
+        [_entry(allowed_upload_hosts=["PLANTED.example.test"])], id="host-uppercase"
+    ),
+    pytest.param([_entry(tool_name="PLANTED" + "x" * 300)], id="tool-name-too-long"),
+    pytest.param([_entry(upload_path_prefix="PLANTED")], id="prefix-no-slashes"),
+    pytest.param([_entry(upload_path_prefix="/PLANTED/../")], id="prefix-dotdot"),
+    pytest.param(
+        [_entry(content_types={".pdf": "PLANTED" + "m" * 300})], id="mime-too-long"
+    ),
+    pytest.param(
+        [_entry(tool_name="PLANTED"), _entry(tool_name="PLANTED")],
+        id="duplicate-tool-name",
+    ),
+    pytest.param(
+        [_entry(tool_name="PLANTED", issuing_tool_name="PLANTED")],
+        id="issuing-tool-is-the-tool",
+    ),
+]
+
+
+@pytest.mark.parametrize("raw", PLANTED_VALUES)
+def test_parse_signed_upload_settings_errors_carry_no_stored_value(raw: Any) -> None:
+    with pytest.raises(ValueError) as exc_info:
+        _parse(raw)
+
+    assert "PLANTED" not in str(exc_info.value)
+
+
+def _boundary_entry() -> dict[str, Any]:
+    return _entry(
+        tool_name="t" * 255,
+        file_argument="f" * 255,
+        issuing_tool_name="i" * 255,
+        allowed_upload_hosts=[f"h{i}.example.test" for i in range(19)] + ["a" * 253],
+        upload_path_prefix="/" + "p" * 253 + "/",
+        content_types={f".t{i:02d}": "m" * 255 for i in range(49)}
+        | {"." + "s" * 15: "x/y"},
+    )
+
+
+def test_parse_signed_upload_settings_accepts() -> None:
+    raw = [_entry(), _entry(tool_name="attach_image")]
+
+    result = _parse(raw)
+
+    assert isinstance(result, tuple)
+    assert result == (_binding(), _binding(tool_name="attach_image"))
+    for binding in result:
+        assert isinstance(binding.allowed_upload_hosts, frozenset)
+        assert isinstance(binding.content_types, MappingProxyType)
+        assert binding.connection_host == CONNECTION_HOST
+    with pytest.raises(TypeError):
+        result[0].content_types[".txt"] = "text/plain"  # type: ignore[index]
+
+
+def test_parse_signed_upload_settings_copies_what_it_keeps() -> None:
+    raw = [_entry()]
+
+    result = _parse(raw)
+    raw[0]["content_types"][".txt"] = "text/plain"
+    raw[0]["allowed_upload_hosts"].append("later.example.test")
+
+    assert result == (_binding(),)
+
+
+@pytest.mark.parametrize(
+    "connection_host", ["10.0.0.1", "mcp.example.test.", "::1", "MCP.Example.Test"]
+)
+def test_parse_signed_upload_settings_takes_connection_host_as_given(
+    connection_host: str,
+) -> None:
+    result = _parse([_entry()], connection_host=connection_host)
+
+    assert result == (_binding(connection_host=connection_host),)
+    assert result[0].connection_host == connection_host
+
+
+def test_parse_signed_upload_settings_accepts_limits_exactly() -> None:
+    result = _parse([_boundary_entry()])
+
+    assert len(result) == 1
+    assert len(result[0].allowed_upload_hosts) == 20
+    assert len(result[0].content_types) == 50
+    assert len(_parse(_many_entries(20))) == 20
+
+
+def test_parse_signed_upload_settings_accepts_repeated_upload_host() -> None:
+    result = _parse(
+        [_entry(allowed_upload_hosts=["uploads.example.test", "uploads.example.test"])]
+    )
+
+    assert result[0].allowed_upload_hosts == frozenset({"uploads.example.test"})
+
+
+@pytest.mark.parametrize("raw", [None, []], ids=["none", "empty-list"])
+@pytest.mark.parametrize("connection_host", [CONNECTION_HOST, None])
+def test_parse_signed_upload_settings_empty_value(
+    raw: Any, connection_host: str | None
+) -> None:
+    assert _parse(raw, connection_host=connection_host) == ()
+
+
+def test_parse_signed_upload_settings_non_empty_needs_a_connection_host() -> None:
+    with pytest.raises(ValueError):
+        _parse([_entry()], connection_host=None)
+
+
+# ---------------------------------------------------------------------------
+# signed_upload_settings_error
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("transport", ["streamable_http", "sse"])
+def test_signed_upload_settings_error(transport: str) -> None:
+    def error(raw: Any, url: Any = CONNECTION_URL) -> str | None:
+        return signed_upload_settings_error(raw, transport=transport, url=url)
+
+    assert error([_entry()]) is None
+    assert error(None) is None
+    assert error([]) is None
+    assert error(None, url=None) is None
+    # Present but unusable.
+    for bad in ({"tool_name": "x"}, [{}], [_entry(allowed_upload_hosts=["10.0.0.1"])]):
+        message = error(bad)
+        assert isinstance(message, str) and message
+    for bad_url in (None, 7, "https://[bad/mcp", "https:///mcp"):
+        message = error([_entry()], url=bad_url)
+        assert isinstance(message, str) and message
+    # The reason never carries a stored value.
+    message = error([_entry(PLANTED_extra="x")])
+    assert message and "PLANTED" not in message
+
+
+@pytest.mark.parametrize(
+    "transport",
+    ["stdio", "websocket", "oauth", "", None, 7, ["sse"], {"sse"}, ("sse",)],
+    ids=repr,
+)
+def test_signed_upload_settings_error_ignores_other_transports(
+    transport: Any,
+) -> None:
+    for raw in ([_entry()], {"tool_name": "x"}, [{}]):
+        assert (
+            signed_upload_settings_error(raw, transport=transport, url=CONNECTION_URL)
+            is None
+        )
+
+
+def test_signed_upload_settings_error_never_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def broken(raw: Any, *, connection_host: str | None) -> Any:
+        raise TypeError("PLANTED")
+
+    monkeypatch.setattr(signed_upload, "parse_signed_upload_settings", broken)
+
+    assert (
+        signed_upload_settings_error([_entry()], transport="sse", url=CONNECTION_URL)
+        == UNREADABLE
+    )
+
+
+# ---------------------------------------------------------------------------
+# Lookup functions
+# ---------------------------------------------------------------------------
+
+
+def _with_settings(connection: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **connection,
+        "signed_uploads": [_entry(), _entry(tool_name="attach_image")],
+    }
+
+
+@pytest.mark.parametrize(
+    ("connection", "tool_name", "expected"),
+    [
+        pytest.param(
+            _with_settings(_connection("streamable_http")),
+            "attach_document",
+            _binding(),
+            id="http",
+        ),
+        pytest.param(
+            _with_settings(_connection("sse")),
+            "attach_document",
+            _binding(),
+            id="sse",
+        ),
+        pytest.param(
+            _with_settings(_connection("streamable_http")),
+            "attach_image",
+            _binding(tool_name="attach_image"),
+            id="second-entry",
+        ),
+        pytest.param(
+            _with_settings(_connection("websocket")), "attach_document", None, id="ws"
+        ),
+        pytest.param(
+            _with_settings(_stdio_connection()), "attach_document", None, id="stdio"
+        ),
+        pytest.param(
+            _with_settings({"transport": "oauth", "url": CONNECTION_URL}),
+            "attach_document",
+            None,
+            id="other-transport",
+        ),
+        pytest.param(
+            _with_settings({"transport": ["sse"], "url": CONNECTION_URL}),
+            "attach_document",
+            None,
+            id="unhashable-transport",
+        ),
+        pytest.param(
+            _with_settings({"url": CONNECTION_URL}),
+            "attach_document",
+            None,
+            id="no-transport",
+        ),
+        pytest.param(
+            _with_settings(_connection()), "other_tool", None, id="other-tool"
+        ),
+        pytest.param(
+            _with_settings(_connection()), "request_upload", None, id="issuing-tool"
+        ),
+        pytest.param(_connection(), "attach_document", None, id="no-settings"),
+        pytest.param(
+            _connection(signed_uploads=None), "attach_document", None, id="none"
+        ),
+        pytest.param(
+            _connection(signed_uploads=[]), "attach_document", None, id="empty"
+        ),
+        pytest.param(
+            {"transport": "streamable_http", "signed_uploads": []},
+            "attach_document",
+            None,
+            id="empty-and-no-url",
+        ),
+        pytest.param(
+            _with_settings(
+                {"transport": "streamable_http", "url": "https://MCP.Example.TEST/mcp"}
+            ),
+            "attach_document",
+            _binding(),
+            id="uppercase-url-host",
+        ),
+        pytest.param(
+            _with_settings(
+                {"transport": "streamable_http", "url": "https://other.example.test/x"}
+            ),
+            "attach_document",
+            _binding(connection_host="other.example.test"),
+            id="host-is-the-connection-own",
+        ),
+    ],
+)
+def test_find_signed_upload_binding(
+    connection: Any, tool_name: str, expected: SignedUploadBinding | None
+) -> None:
+    assert find_signed_upload_binding(connection, tool_name) == expected
+
+
+@pytest.mark.parametrize(
+    ("connection", "tool_name", "expected"),
+    [
+        pytest.param(_with_settings(_connection()), "request_upload", True, id="http"),
+        pytest.param(
+            _with_settings(_connection("sse")), "request_upload", True, id="sse"
+        ),
+        pytest.param(
+            _with_settings(_connection()), "attach_document", False, id="business-tool"
+        ),
+        pytest.param(
+            _with_settings(_connection("websocket")),
+            "request_upload",
+            False,
+            id="websocket",
+        ),
+        pytest.param(
+            _with_settings(_stdio_connection()), "request_upload", False, id="stdio"
+        ),
+        pytest.param(_connection(), "request_upload", False, id="no-settings"),
+        pytest.param(
+            _connection(signed_uploads=[]), "request_upload", False, id="empty"
+        ),
+    ],
+)
+def test_is_signed_upload_issuing_tool(
+    connection: Any, tool_name: str, expected: bool
+) -> None:
+    assert is_signed_upload_issuing_tool(connection, tool_name) is expected
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        pytest.param(None, id="no-url"),
+        pytest.param(7, id="url-not-a-string"),
+        pytest.param("https://[bad/mcp", id="unparseable-url"),
+        pytest.param("https:///mcp", id="url-without-hostname"),
+    ],
+)
+def test_lookups_raise_for_settings_on_a_connection_without_hostname(
+    url: Any,
+) -> None:
+    connection = {
+        "transport": "streamable_http",
+        "url": url,
+        "signed_uploads": [_entry()],
+    }
+
+    with pytest.raises(ValueError):
+        find_signed_upload_binding(connection, "attach_document")
+    with pytest.raises(ValueError):
+        is_signed_upload_issuing_tool(connection, "request_upload")
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [{"tool_name": "x"}, [{}], [_entry(allowed_upload_hosts=["10.0.0.1"])]],
+    ids=["not-a-list", "missing-keys", "ip-upload-host"],
+)
+def test_lookups_raise_for_invalid_settings(raw: Any) -> None:
+    connection = _connection(signed_uploads=raw)
+
+    with pytest.raises(ValueError):
+        find_signed_upload_binding(connection, "attach_document")
+    with pytest.raises(ValueError):
+        is_signed_upload_issuing_tool(connection, "request_upload")
+
+
+@pytest.mark.parametrize("transport", ["stdio", "websocket"])
+def test_lookups_ignore_invalid_settings_on_other_transports(transport: str) -> None:
+    connection = _connection(transport, signed_uploads={"tool_name": "x"})
+
+    assert find_signed_upload_binding(connection, "attach_document") is None
+    assert is_signed_upload_issuing_tool(connection, "request_upload") is False
+
+
+def test_settings_of_two_connections_do_not_interact() -> None:
+    first = _connection(signed_uploads=[_entry()])
+    second = {
+        "transport": "streamable_http",
+        "url": "https://other.example.test/mcp",
+        "signed_uploads": [
+            _entry(tool_name="request_upload", issuing_tool_name="issue_other")
+        ],
+    }
+
+    assert find_signed_upload_binding(first, "attach_document") == _binding()
+    assert find_signed_upload_binding(first, "request_upload") is None
+    assert is_signed_upload_issuing_tool(first, "request_upload") is True
+    assert is_signed_upload_issuing_tool(first, "issue_other") is False
+    assert find_signed_upload_binding(second, "request_upload") == _binding(
+        connection_host="other.example.test",
+        tool_name="request_upload",
+        issuing_tool_name="issue_other",
+    )
+    assert find_signed_upload_binding(second, "attach_document") is None
+    assert is_signed_upload_issuing_tool(second, "request_upload") is False
+    assert is_signed_upload_issuing_tool(second, "issue_other") is True
+
+
+def test_two_connections_on_one_host_keep_their_own_settings() -> None:
+    first = _connection(signed_uploads=[_entry()])
+    second = _connection(signed_uploads=[_entry(issuing_tool_name="issue_other")])
+
+    assert is_signed_upload_issuing_tool(first, "request_upload") is True
+    assert is_signed_upload_issuing_tool(first, "issue_other") is False
+    assert is_signed_upload_issuing_tool(second, "request_upload") is False
+    assert is_signed_upload_issuing_tool(second, "issue_other") is True
+
+
+# ---------------------------------------------------------------------------
+# Loading through the MCP adapter
+# ---------------------------------------------------------------------------
+
+
+def _server_tool(name: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        name=name,
+        description=f"{name} tool",
+        inputSchema={
+            "type": "object",
+            "properties": {"document": {"type": "string"}},
+        },
+    )
+
+
+def _serve_tools(monkeypatch: pytest.MonkeyPatch, *tool_names: str) -> None:
+    class FakeSession:
+        async def initialize(self) -> None:
+            return None
+
+    @asynccontextmanager
+    async def fake_create_session(_connection: Any):
+        yield FakeSession()
+
+    async def fake_load_mcp_tools(_session: Any) -> list[SimpleNamespace]:
+        return [_server_tool(name) for name in tool_names]
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", fake_create_session)
+    monkeypatch.setattr(mcp_adapter_module, "load_mcp_tools", fake_load_mcp_tools)
+
+
+def _describe(tool: Any) -> tuple[str, str, dict[str, Any]]:
+    return (tool.name, tool.description, tool.args_type().model_json_schema())
+
+
+_ALL_TOOLS = ("attach_document", "request_upload", "other")
+
+
+async def _load(connections: dict[str, Any]) -> Any:
+    return await load_mcp_tools_as_agent_tools(connections, sandbox=None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "connection",
+    [
+        pytest.param(_connection(), id="no-key"),
+        pytest.param(_connection(signed_uploads=None), id="none"),
+        pytest.param(_connection(signed_uploads=[]), id="empty-list"),
+        pytest.param(
+            _stdio_connection(signed_uploads=[_entry()]), id="stdio-with-settings"
+        ),
+        pytest.param(
+            {
+                "transport": "websocket",
+                "url": f"wss://{CONNECTION_HOST}/mcp",
+                "signed_uploads": [_entry()],
+            },
+            id="websocket-with-settings",
+        ),
+    ],
+)
+async def test_no_signed_uploads_keeps_tool_list(
+    monkeypatch: pytest.MonkeyPatch, connection: dict[str, Any]
+) -> None:
+    _serve_tools(monkeypatch, *_ALL_TOOLS)
+    plain = {k: v for k, v in connection.items() if k != "signed_uploads"}
+
+    expected = await _load({"docs": plain})
+    actual = await _load({"docs": connection})
+
+    assert [tool.name for tool in expected.tools] == [
+        f"mcp_docs_{name}" for name in _ALL_TOOLS
+    ]
+    assert [_describe(tool) for tool in actual.tools] == [
+        _describe(tool) for tool in expected.tools
+    ]
+    assert actual.failures == ()
+    assert expected.failures == ()
+    assert actual.loaded_servers == expected.loaded_servers == ("docs",)
+
+
+@pytest.mark.parametrize(
+    "connection",
+    [
+        pytest.param(
+            [("transport", "streamable_http"), ("signed_uploads", [_entry()])],
+            id="list",
+        ),
+        pytest.param(None, id="none"),
+    ],
+)
+def test_no_signed_uploads_keeps_tool_list_for_non_mapping_connection(
+    connection: Any,
+) -> None:
+    assert find_signed_upload_binding(connection, "attach_document") is None
+    assert is_signed_upload_issuing_tool(connection, "request_upload") is False
+
+
+@pytest.mark.asyncio
+async def test_signed_upload_issuing_tool_is_withheld_from_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _serve_tools(monkeypatch, *_ALL_TOOLS)
+    remote = _connection()
+    expected_all = [
+        _describe(_build_mcp_tool_adapter("docs", remote, _server_tool(name)))
+        for name in _ALL_TOOLS
+    ]
+
+    # No settings: every tool is loaded, identical to a direct build.
+    plain = await load_mcp_tools_as_agent_tools({"docs": remote})
+    assert [_describe(tool) for tool in plain.tools] == expected_all
+    assert plain.failures == ()
+
+    # Settings on the connection: the issuing tool is withheld.
+    configured_connection = _connection(signed_uploads=[_entry()])
+    configured = await load_mcp_tools_as_agent_tools({"docs": configured_connection})
+    assert [_describe(tool) for tool in configured.tools] == [
+        expected_all[0],
+        expected_all[2],
+    ]
+    assert configured.failures == ()
+    assert configured.loaded_servers == ("docs",)
+
+    # Another connector on another host without settings: nothing is withheld.
+    other_host = {
+        "transport": "streamable_http",
+        "url": "https://other.example.test/mcp",
+    }
+    elsewhere = await load_mcp_tools_as_agent_tools({"docs": other_host})
+    assert [tool.name for tool in elsewhere.tools] == [
+        "mcp_docs_attach_document",
+        "mcp_docs_request_upload",
+        "mcp_docs_other",
+    ]
+
+    # A stdio connection never reads settings.
+    stdio = _stdio_connection(signed_uploads=[_entry()])
+    local = await load_mcp_tools_as_agent_tools({"docs": stdio}, sandbox=None)
+    assert [tool.name for tool in local.tools] == [
+        "mcp_docs_attach_document",
+        "mcp_docs_request_upload",
+        "mcp_docs_other",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_server_with_only_the_issuing_tool_loads_no_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _serve_tools(monkeypatch, "request_upload")
+
+    result = await load_mcp_tools_as_agent_tools(
+        {"docs": _connection(signed_uploads=[_entry()])}
+    )
+
+    assert result.tools == ()
+    assert result.failures == ()
+    assert result.loaded_servers == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "other_url",
+    [
+        pytest.param("https://other.example.test/mcp", id="other-host"),
+        pytest.param(CONNECTION_URL, id="same-url"),
+    ],
+)
+async def test_issuing_tool_hidden_only_on_its_connector(
+    monkeypatch: pytest.MonkeyPatch, other_url: str
+) -> None:
+    _serve_tools(monkeypatch, *_ALL_TOOLS)
+    connector_a = _connection(signed_uploads=[_entry()])
+    connector_b = {"transport": "streamable_http", "url": other_url}
+
+    result = await load_mcp_tools_as_agent_tools({"A": connector_a, "B": connector_b})
+
+    names = [tool.name for tool in result.tools]
+    assert names == [
+        "mcp_A_attach_document",
+        "mcp_A_other",
+        "mcp_B_attach_document",
+        "mcp_B_request_upload",
+        "mcp_B_other",
+    ]
+    assert result.failures == ()
+    assert result.loaded_servers == ("A", "B")
+
+
+_MARKER = "planted_marker_tool"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "connector_a",
+    [
+        pytest.param(
+            _connection(signed_uploads={"tool_name": _MARKER}), id="not-a-list"
+        ),
+        pytest.param(
+            _connection(signed_uploads=[_without("file_argument", tool_name=_MARKER)]),
+            id="missing-key",
+        ),
+        pytest.param(
+            _connection(
+                signed_uploads=[
+                    _entry(tool_name=_MARKER, allowed_upload_hosts=["10.0.0.1"])
+                ]
+            ),
+            id="ip-upload-host",
+        ),
+        pytest.param(
+            _connection(
+                url="https:///mcp", signed_uploads=[_entry(issuing_tool_name=_MARKER)]
+            ),
+            id="url-without-hostname",
+        ),
+        pytest.param(
+            _connection(url=7, signed_uploads=[_entry(issuing_tool_name=_MARKER)]),
+            id="url-not-a-string",
+        ),
+        pytest.param(
+            _connection(
+                url="https://[bad/mcp", signed_uploads=[_entry(tool_name=_MARKER)]
+            ),
+            id="unparseable-url",
+        ),
+    ],
+)
+async def test_invalid_settings_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    connector_a: dict[str, Any],
+) -> None:
+    caplog.set_level("DEBUG")
+    _serve_tools(monkeypatch, *_ALL_TOOLS)
+    connector_b = _connection()
+    assert "url" in connector_a
+
+    result = await load_mcp_tools_as_agent_tools(
+        {"A": copy.deepcopy(connector_a), "B": connector_b}
+    )
+
+    failures_of_a = [f for f in result.failures if f.server_name == "A"]
+    assert len(failures_of_a) == 1
+    assert failures_of_a[0].error_type == "ValueError"
+    assert not [tool for tool in result.tools if tool.name.startswith("mcp_A_")]
+    assert "A" not in result.loaded_servers
+    assert [tool.name for tool in result.tools] == [
+        "mcp_B_attach_document",
+        "mcp_B_request_upload",
+        "mcp_B_other",
+    ]
+    assert "B" in result.loaded_servers
+    assert _MARKER not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# No process-wide registry
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name", ["_BINDINGS", "register_signed_upload_binding", "_REMOTE_TRANSPORTS"]
+)
+def test_no_process_registry(name: str) -> None:
+    assert not hasattr(signed_upload, name)
