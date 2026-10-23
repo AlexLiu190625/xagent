@@ -1724,3 +1724,55 @@ async def test_policy_none_preserves_ordinary_builtin_oauth(db_session) -> None:
 
     assert _token(configs[0]) == "ordinary-token"
     assert "actor-token" not in str(configs)
+
+
+SIGNED_UPLOADS = [
+    {
+        "tool_name": "attach_document",
+        "file_argument": "document_file_id",
+        "issuing_tool_name": "request_upload",
+        "allowed_upload_hosts": ["uploads.example.test"],
+        "upload_path_prefix": "/staged/",
+        "content_types": {".pdf": "application/pdf"},
+    }
+]
+
+
+@pytest.mark.asyncio
+async def test_signed_uploads_stay_off_actor_builtin_connection(db_session) -> None:
+    _add_builtin_server(db_session.db, db_session.user)
+    _add_actor_credential(
+        db_session.db, db_session.user, owner=OWNER_A, token="actor-token"
+    )
+
+    configs = await _config(db_session, policy=_policy()).get_mcp_server_configs()
+
+    assert _token(configs[0]) == "actor-token"
+    assert "signed_uploads" not in configs[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stored",
+    [SIGNED_UPLOADS, {"tool_name": "attach_document"}],
+    ids=["valid", "invalid"],
+)
+async def test_signed_uploads_stay_off_actor_remote_oauth_connection(
+    db_session, stored
+) -> None:
+    server = _add_remote_server(db_session.db, db_session.user)
+    _add_remote_grant(
+        db_session.db,
+        db_session.user,
+        server,
+        owner=OWNER_A,
+        token="actor-token",
+    )
+    server.signed_uploads = stored
+    db_session.db.commit()
+
+    configs = await _config(db_session, policy=_policy()).get_mcp_server_configs()
+
+    assert configs[0]["transport"] != "unavailable"
+    assert configs[0]["config"]["headers"]["Authorization"] == "Bearer actor-token"
+    assert "signed_uploads" not in configs[0]
