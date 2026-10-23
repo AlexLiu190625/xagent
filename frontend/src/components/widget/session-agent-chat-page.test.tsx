@@ -794,6 +794,28 @@ describe("SessionAgentChatPage", () => {
       expect(toastMock.error).toHaveBeenCalledTimes(2)
     })
 
+    it("passes the token the upload server rejected to refreshSession", async () => {
+      setBridge("active", withUploads())
+      render(<SessionAgentChatPage />)
+      const session = activeSession()
+      bridge.value.ensureFreshSession.mockResolvedValue({ ...session, token: "st_current" })
+      bridge.value.refreshSession.mockResolvedValue({ ...session, token: "st_refreshed" })
+      vi.mocked(fetch)
+        .mockResolvedValueOnce(new Response(
+          JSON.stringify({ error: { code: "invalid_api_key", message: "no" } }),
+          { status: 401, headers: { "Content-Type": "application/json" } },
+        ))
+        .mockResolvedValueOnce(new Response(
+          JSON.stringify({ file_id: "0b1e5c9e-3f1a-4a63-9b0e-6c1d2f3a4b5c" }),
+          { status: 201, headers: { "Content-Type": "application/json" } },
+        ))
+
+      await act(async () => { await retry(pdf()) })
+
+      expect(bridge.value.refreshSession).toHaveBeenCalledTimes(1)
+      expect(bridge.value.refreshSession).toHaveBeenCalledWith("st_current")
+    })
+
     it("passes no upload callbacks to the surfaces when uploads are not advertised", () => {
       setBridge("active", activeSession())
       app.state.taskId = 5

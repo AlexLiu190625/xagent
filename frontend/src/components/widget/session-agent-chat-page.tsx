@@ -58,7 +58,7 @@ const getSessionTerminalPresentation = (code: string | null): SessionTerminalPre
 // What the page needs from the bridge to upload files before a send.
 interface SessionUploadControls {
   ensureFreshSession: () => Promise<WidgetSession>
-  refreshSession: () => Promise<WidgetSession>
+  refreshSession: (rejectedToken: string) => Promise<WidgetSession>
   waitForOpenConnection: () => Promise<void>
 }
 
@@ -238,8 +238,9 @@ function SessionConversationContent({
     panelFilesRef.current = next
   }, [releaseRemovedAttachments])
 
-  // Uploads one file with the session token. Requests are never concurrent:
-  // callers await each file before starting the next.
+  // Uploads one file with the session token. A send uploads its files one
+  // after another; a retry started from a file card may run beside it, and
+  // the bridge then shares or skips the token refresh after a 401.
   const uploadAttachment = useCallback(async (file: File): Promise<SessionUploadedFile> => {
     const controller = new AbortController()
     uploadControllersRef.current.set(file, controller)
@@ -249,7 +250,7 @@ function SessionConversationContent({
       const uploaded = await uploadWidgetSessionFile({
         origin: window.location.origin,
         getToken: async () => (await uploads.ensureFreshSession()).token,
-        refreshToken: async () => (await uploads.refreshSession()).token,
+        refreshToken: async (rejected) => (await uploads.refreshSession(rejected)).token,
         file,
         signal: controller.signal,
       })
