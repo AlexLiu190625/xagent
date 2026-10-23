@@ -1092,6 +1092,12 @@ class DatabaseTraceHandler(BaseTraceHandler):
                         )
                 is_state = data.get("checkpoint_type") in READABLE_CHECKPOINT_TYPES
                 attempt = data.get("tool_attempt_id")
+                # A resumed interaction settles the original attempt in a later
+                # run. Its pair gets its own identity under that attempt.
+                settlement = data.get("settlement_delivery") is True
+                fact_type = (
+                    f"settlement:{event_type_str}" if settlement else event_type_str
+                )
                 if attempt:
                     from uuid import NAMESPACE_URL, uuid5
 
@@ -1100,10 +1106,28 @@ class DatabaseTraceHandler(BaseTraceHandler):
                     event.id = str(
                         uuid5(
                             NAMESPACE_URL,
-                            f"task:{self.task_id}:{self.build_id or 'root'}:{attempt}:{event_type_str}",
+                            f"task:{self.task_id}:{self.build_id or 'root'}:{attempt}:{fact_type}",
                         )
                     )
-                    if (
+                    if settlement:
+                        # Settlement replays its pair until both commit. A row
+                        # from an earlier run whose commit ack was lost is the
+                        # same settlement, not a conflict.
+                        if (
+                            db.query(TaskExecutionEvent.id)
+                            .filter(
+                                TaskExecutionEvent.task_id == self.task_id,
+                                TaskExecutionEvent.scope_id
+                                == (self.build_id or "root"),
+                                TaskExecutionEvent.idempotency_key
+                                == f"tool:{attempt}:{fact_type}",
+                            )
+                            .first()
+                            is not None
+                        ):
+                            db.commit()
+                            return
+                    elif (
                         event_type_str == "tool_execution_start"
                         and db.query(TaskExecutionEvent.id)
                         .filter(
@@ -1120,9 +1144,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
                             "Tool attempt already started; result reconciliation required"
                         )
                 key = (
-                    f"tool:{attempt}:{event_type_str}"
-                    if attempt
-                    else f"runtime:{event.id}"
+                    f"tool:{attempt}:{fact_type}" if attempt else f"runtime:{event.id}"
                 )
                 payload: dict[str, Any] = {
                     "data": data,

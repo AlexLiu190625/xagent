@@ -11117,6 +11117,8 @@ def test_settlement_ledger_fields_survive_a_record_round_trip() -> None:
         settlement_status="succeeded",
         turn_id="original-turn",
         settlement_turn_id="approval-turn",
+        tool_attempt_id="attempt-1",
+        assistant_message_id="batch-1",
     )
 
     restored = ToolCallRecord.from_dict(record.to_dict())
