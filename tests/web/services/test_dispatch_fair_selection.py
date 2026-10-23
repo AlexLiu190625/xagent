@@ -3,8 +3,13 @@
 import logging
 
 import pytest
+import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
+from tests.web.services.fair_selection_support import World
 from xagent import config
+from xagent.web.models import database as database_module
+from xagent.web.models.database import Base
 from xagent.web.services import task_command_transport as transport
 from xagent.web.services import task_execution
 from xagent.web.services.task_dispatch_cap import DispatchCapSnapshot, DispatchPolicy
@@ -12,6 +17,7 @@ from xagent.web.services.task_execution import BackgroundTaskManager
 
 SWITCH = "XAGENT_DISPATCHER_FAIR_SHARE"
 LARGE = DispatchPolicy(limit=10, interactive_reserve=0)
+POLICY = DispatchPolicy(limit=2, interactive_reserve=1)
 
 
 # --- the cap snapshot's slot counts ---------------------------------------------
@@ -126,3 +132,96 @@ def test_the_switch_reads_the_configured_value(monkeypatch, switch):
     monkeypatch.setenv(SWITCH, "false")
     assert transport._fair_share_enabled() is False
     assert switch() == []
+
+
+# --- a SQLite world of queued commands --------------------------------------------
+
+
+@pytest.fixture
+def world(tmp_path, monkeypatch):
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'fair.db'}")
+    Base.metadata.create_all(engine)
+    built = World(engine)
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setattr(database_module, "_SessionLocal", built.sessions)
+    monkeypatch.setattr(transport, "get_runner_id", lambda: "me")
+    try:
+        yield built
+    finally:
+        engine.dispose()
+
+
+def statements_of(engine):
+    seen: list[str] = []
+
+    def record(_conn, _cursor, statement, *_args):
+        seen.append(" ".join(statement.split()))
+
+    sa.event.listen(engine, "before_cursor_execute", record)
+    return seen, lambda: sa.event.remove(engine, "before_cursor_execute", record)
+
+
+def test_listing_gives_the_oldest_queued_command_of_each_tenant_and_class(world):
+    first = world.add("a", "batch")
+    world.add("a", "batch", status="processing")
+    third = world.add("a", "interactive")
+    world.add("b", "batch", status="completed")
+    world.add("b", "batch", status="failed")
+    sixth = world.add("b", "interactive")
+    seen, stop = statements_of(world.engine)
+    try:
+        with world.sessions() as db:
+            tenants = transport._list_queued_tenants(db)
+    finally:
+        stop()
+
+    assert tenants == {
+        "a": {"batch": first, "interactive": third},
+        "b": {"interactive": sixth},
+    }
+    assert len(seen) == 1
+
+
+def test_listing_counts_a_command_that_cannot_be_claimed_as_queued(world):
+    pinned = world.add("a", pinned=True)
+    unavailable = world.add("b", unavailable=True)
+    with world.sessions() as db:
+        assert transport._list_queued_tenants(db) == {
+            "a": {"batch": pinned},
+            "b": {"batch": unavailable},
+        }
+
+
+def test_between_the_batch_line_and_the_limit_only_interactive_commands_count():
+    tenants = {
+        "a": {"batch": 1, "interactive": 3},
+        "b": {"batch": 2},
+        "c": {"interactive": 4},
+    }
+    open_cap = DispatchCapSnapshot(policy=POLICY, active_ids=frozenset())
+    band = DispatchCapSnapshot(policy=POLICY, active_ids=frozenset({90}))
+
+    assert transport._tenants_in_band(tenants, open_cap) == tenants
+    assert transport._tenants_in_band(tenants, band) == {
+        "a": {"interactive": 3},
+        "c": {"interactive": 4},
+    }
+    assert transport._tenants_in_band(tenants, None) == tenants
+
+
+def test_the_window_is_a_range_on_the_key_so_that_the_index_serves_it():
+    sql = str(
+        transport._queued_tenant_window("user:1", "batch").compile(
+            dialect=postgresql.dialect()
+        )
+    )
+
+    assert "fairness_key >=" in sql and "fairness_key <=" in sql
+    assert "fairness_key =" not in sql
+    assert "ORDER BY task_execution_commands.fairness_key, " in sql
+    assert transport.FAIR_SHARE_WINDOW == 16
+    assert f"LIMIT {transport.FAIR_SHARE_WINDOW}" in str(
+        transport._queued_tenant_window("user:1", "batch").compile(
+            dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
+        )
+    )
