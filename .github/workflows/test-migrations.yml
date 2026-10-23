@@ -59,6 +59,8 @@ on:
       - 'tests/migrations/test_task_admission_pacing_schema.py'
       - 'tests/web/services/test_queued_channel_pause_admission.py'
       - 'tests/web/services/test_dispatch_fair_selection_postgresql.py'
+      - 'tests/web/services/fair_selection_support.py'
+      - 'src/xagent/web/services/task_dispatch_cap.py'
       - 'tests/web/services/test_queued_start_cancel_admission.py'
       - 'tests/web/services/test_shared_channel_execution.py'
       - 'src/xagent/web/services/shared_channel_execution.py'
@@ -283,6 +285,8 @@ jobs:
             tests/migrations/test_task_admission_pacing_schema.py
             tests/web/services/test_queued_channel_pause_admission.py
             tests/web/services/test_dispatch_fair_selection_postgresql.py
+            tests/web/services/fair_selection_support.py
+            src/xagent/web/services/task_dispatch_cap.py
             tests/web/services/test_queued_start_cancel_admission.py
             tests/web/services/test_shared_channel_execution.py
             src/xagent/web/services/shared_channel_execution.py

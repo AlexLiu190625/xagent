@@ -2021,6 +2021,51 @@ def _in_tenant_window(query: Query[Any], key: str, dispatch_class: str) -> Query
     )
 
 
+def _older_controls(query: Query[Any], before_id: int) -> Query[Any]:
+    """``query`` narrowed to pause and cancel commands older than ``before_id``.
+
+    ix_task_commands_claimable_kind serves it and holds claimable rows only, so it
+    reads the claimable controls, not the backlog.
+    """
+    return query.filter(
+        TaskExecutionCommand.kind.in_(sorted(CONTROL_KINDS)),
+        TaskExecutionCommand.id < before_id,
+    )
+
+
+def _older_of_tasks(
+    query: Query[Any], before_id: int, task_ids: frozenset[int]
+) -> Query[Any]:
+    """``query`` narrowed to commands of ``task_ids`` older than ``before_id``.
+
+    No index bounds it: ix_task_commands_task_order also holds the settled history
+    of each task, so PostgreSQL reads either that history or the claimable ids
+    older than ``before_id``, whichever it estimates to be cheaper.
+    """
+    return query.filter(
+        TaskExecutionCommand.task_id.in_(sorted(task_ids)),
+        TaskExecutionCommand.id < before_id,
+    )
+
+
+def _older_needing_no_new_slot(
+    claimable: Callable[[], Query[Any]], before_id: int, active: frozenset[int]
+) -> Any:
+    """The oldest claimable command older than ``before_id`` that needs no new slot.
+
+    That is a control of any task, or a command of a task this process already
+    runs. The two are looked up separately and the older found row is taken, so
+    the control lookup keeps its index whatever the other costs; a control of a
+    running task matches both lookups and is the same row. The second lookup is
+    not sent when the process runs no task. None when neither finds a row.
+    """
+    found = [_older_controls(claimable(), before_id).first()]
+    if active:
+        found.append(_older_of_tasks(claimable(), before_id, active).first())
+    rows = [row for row in found if row is not None]
+    return min(rows, key=lambda row: row.id) if rows else None
+
+
 class _FairState:
     """What fair-share selection remembers between scans of one process.
 
@@ -2127,8 +2172,8 @@ def _fair_pick(
     this process, then by their oldest queued command, and the first
     FAIR_SHARE_TENANTS_PER_SCAN that are not skipped are asked in that order: the
     first with a claimable command among its window supplies the best candidate,
-    and a command that needs no new slot and is older than that is taken in its
-    place. A (tenant key, class) with no claimable command in its window is missed
+    and the oldest claimable command older than that which needs no new slot
+    (``_older_needing_no_new_slot``) is taken in its place. A (tenant key, class) with no claimable command in its window is missed
     and skipped for a while. With no tenant ranked, the plain lookup decides.
 
     The listing is taken once per attempt, so a rescan may rank a queue that has
@@ -2169,17 +2214,7 @@ def _fair_pick(
     if best is None:
         return oldest_claimable()
     active = cap.active_ids if cap is not None else frozenset()
-    older = (
-        claimable()
-        .filter(
-            or_(
-                TaskExecutionCommand.kind.in_(sorted(CONTROL_KINDS)),
-                TaskExecutionCommand.task_id.in_(sorted(active)),
-            ),
-            TaskExecutionCommand.id < best.id,
-        )
-        .first()
-    )
+    older = _older_needing_no_new_slot(claimable, best.id, active)
     return best if older is None else older
 
 

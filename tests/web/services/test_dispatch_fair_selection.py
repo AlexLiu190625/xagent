@@ -478,6 +478,65 @@ def test_a_queue_with_no_interactive_command_between_the_lines_reads_as_today(
     assert batch_a is not None
 
 
+def running_tenant_and_newer_task(world):
+    """Tenant A runs a task and has a newer task of its own; B has the newest.
+
+    A holds a slot, so B ranks first and its start is the selected command.
+    """
+    a_start = world.add("A", status="completed")
+    a_task = world.task_of(a_start)
+    world.add("A")  # a new task of A: older than B's, but it needs a new slot
+    return a_task
+
+
+def test_a_follow_up_of_a_running_task_goes_before_a_newer_task_of_another_tenant(
+    world, on, clock
+):
+    a_task = running_tenant_and_newer_task(world)
+    message = world.follow_up(a_task, "A")
+    world.add("B")
+    cap = cap_of(active={a_task}, occupancy={"A": 1})
+
+    assert scan(cap, attempt=attempt()) == message
+
+
+def test_a_cancel_goes_before_a_newer_task_of_another_tenant(world, on, clock):
+    running_tenant_and_newer_task(world)
+    cancel = world.add("A", kind="cancel")  # a task of its own, not a running one
+    world.add("B")
+    cap = cap_of(active=(), occupancy={"A": 1})
+
+    assert scan(cap, attempt=attempt()) == cancel
+
+
+@pytest.mark.parametrize(
+    "order", ["control_first", "follow_up_first"], ids=lambda order: order
+)
+def test_of_two_older_commands_needing_no_slot_the_older_is_taken(
+    world, on, clock, order
+):
+    a_task = running_tenant_and_newer_task(world)
+    if order == "control_first":
+        cancel = world.add("A", kind="cancel")
+        message = world.follow_up(a_task, "A")
+    else:
+        message = world.follow_up(a_task, "A")
+        cancel = world.add("A", kind="cancel")
+    world.add("B")
+    cap = cap_of(active={a_task}, occupancy={"A": 1})
+
+    assert scan(cap, attempt=attempt()) == min(cancel, message)
+
+
+def test_a_cancel_of_a_running_task_matches_both_lookups_and_is_taken(world, on, clock):
+    a_task = running_tenant_and_newer_task(world)
+    cancel = world.follow_up(a_task, "A", kind="cancel")
+    world.add("B")
+    cap = cap_of(active={a_task}, occupancy={"A": 1})
+
+    assert scan(cap, attempt=attempt()) == cancel
+
+
 @pytest.mark.parametrize(
     "raw", [None, "false", "garbage"], ids=["unset", "false", "garbage"]
 )

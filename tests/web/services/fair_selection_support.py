@@ -18,7 +18,8 @@ from xagent.web.services.task_dispatch_cap import DispatchCapSnapshot, DispatchP
 
 
 class World:
-    """Commands queued for tenants, each of its own task, in a SQLite file."""
+    """Commands queued for tenants on any engine; ``add`` gives each its own task,
+    ``follow_up`` adds to one."""
 
     def __init__(self, engine) -> None:
         self.engine = engine
@@ -62,6 +63,23 @@ class World:
                 dispatch_class=dispatch_class,
                 fairness_key=tenant,
                 retry_available_at=later if unavailable else None,
+            )
+            db.add(command)
+            db.commit()
+            return command.id
+
+    def follow_up(self, task_id, tenant, kind="message", status="pending") -> int:
+        """Queue one more command of an existing task."""
+        self.count += 1
+        with self.sessions() as db:
+            command = TaskExecutionCommand(
+                task_id=task_id,
+                command_id=f"f{self.count}",
+                kind=kind,
+                payload={},
+                status=status,
+                dispatch_class="batch",
+                fairness_key=tenant,
             )
             db.add(command)
             db.commit()
