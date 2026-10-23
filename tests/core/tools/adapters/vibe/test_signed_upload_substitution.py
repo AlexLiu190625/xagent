@@ -1129,8 +1129,31 @@ async def test_signed_upload_issuing_401_then_refresh_continues_the_upload(
     assert env.staging_leftovers() == []
 
 
+# The other host's own error text must not reach the model: the host check
+# runs before the issuing reply is read.
+OTHER_HOST_SAYS = "other host says hi"
+
+
+def _issuing_is_error_from_the_other_host(env: _Env) -> None:
+    env.issue = lambda args: CallToolResult(
+        content=[TextContent(type="text", text=OTHER_HOST_SAYS)],
+        isError=True,
+    )
+
+
+def _issuing_succeeds(env: _Env) -> None:
+    pass
+
+
+@pytest.mark.parametrize(
+    "set_up_issuing",
+    [
+        pytest.param(_issuing_succeeds, id="issuing-succeeds"),
+        pytest.param(_issuing_is_error_from_the_other_host, id="issuing-is-error"),
+    ],
+)
 async def test_signed_upload_refuses_a_refreshed_issuing_connection_to_another_host(
-    env: _Env,
+    env: _Env, set_up_issuing: Callable[[_Env], None]
 ) -> None:
     def refresh() -> dict[str, Any]:
         return _connection(
@@ -1138,6 +1161,7 @@ async def test_signed_upload_refuses_a_refreshed_issuing_connection_to_another_h
             headers={"Authorization": FRESH_AUTH},
         )
 
+    set_up_issuing(env)
     env.issue = _rejecting_the_initial_credential(env, env.issue)
 
     result = await env.adapter(
@@ -1146,6 +1170,7 @@ async def test_signed_upload_refuses_a_refreshed_issuing_connection_to_another_h
 
     assert result["is_error"] is True
     assert _text(result) == UNTRUSTED_CONNECTOR
+    assert OTHER_HOST_SAYS not in _text(result)
     assert env.put_requests == []
     assert env.calls_to(OUTER_TOOL) == []
     assert env.staging_leftovers() == []

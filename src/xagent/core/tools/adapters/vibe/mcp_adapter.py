@@ -3672,12 +3672,12 @@ class MCPToolAdapter(AbstractBaseTool):
         ``file:<id>`` always names a workspace file.  A bare UUID names one
         only when the workspace can stage it for this task; otherwise it is
         taken as the connector's own file id and reaches the tool unchanged.
-        The per-call connection's host is checked before the workspace is
-        asked, so over a connection to another host a bare UUID is refused
-        too.
+        When the task has a workspace, the per-call connection's host is
+        checked before the workspace is asked, so over a connection to another
+        host a bare UUID is refused too.
 
         When a step refuses the upload, ``_SignedUploadRefused`` carries the
-        result to return and the tool is not called.  An ``OSError`` while
+        result to return and the tool is not called.  Any other ``OSError`` while
         staging or hashing the file, and cancellation, propagate as they are.
         The staged copy is removed on every outcome.
 
