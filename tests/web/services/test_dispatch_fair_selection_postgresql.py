@@ -68,11 +68,16 @@ def test_the_listing_gives_the_same_tenants_as_on_sqlite(pg, tmp_path) -> None:
         world = World(engine)
         for tenant, dispatch_class, status in QUEUED_ROWS:
             world.add(tenant, dispatch_class, status=status)
+        # Sorts before every other queued key, so an anchor that counts it shows.
+        world.add("0-only-a-pause", kind="pause")
+        # And one between them, which only a step that counts it reaches.
+        world.add("only-a-pause", kind="cancel")
         with world.sessions() as db:
             found[name] = transport._list_queued_tenants(db)
     lite.dispose()
 
     assert found["postgresql"] == found["sqlite"]
+    # A pause takes no slot, so its key does not make a tenant.
     assert set(found["postgresql"]) == {"a", "b", "c", "user:10", "user:2"}
     assert set(found["postgresql"]["b"]) == {"interactive"}
 

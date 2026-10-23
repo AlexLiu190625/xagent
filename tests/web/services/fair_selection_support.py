@@ -223,6 +223,18 @@ def random_world(
                 ticketed=name in full and kind not in CONTROL_KINDS,
             )
         )
+    # Pauses and cancels whose key is not the key of any tenant with work, as when
+    # a task changed hands after the command that was copied from.
+    if rng.random() < 0.4:
+        commands += [
+            Cmd(
+                f"stale:{n}",
+                rng.choice(CLASSES),
+                rng.choice(["pause", "cancel"]),
+                "pending",
+            )
+            for n in range(rng.randint(1, 3))
+        ]
     if rng.random() < 0.3:
         rng.shuffle(commands)
     return RandomWorld(leading + commands, full)
@@ -357,6 +369,8 @@ class Reference:
         by_id = {c.id: c for c in self.commands}
         oldest: dict[tuple[str, str], int] = {}
         for c in queued:
+            if c.kind in CONTROL_KINDS:
+                continue  # takes no slot, so it makes no tenant of its own
             key = (c.tenant, c.dispatch_class)
             oldest[key] = min(oldest.get(key, c.id), c.id)
         if cap.batch_closed:

@@ -423,6 +423,40 @@ def test_a_scan_for_one_command_sends_what_it_always_sent_and_is_not_counted(
     assert transport._fair_state.attempts == 0
 
 
+def test_a_control_command_with_a_stale_key_does_not_make_a_tenant_of_its_own(
+    world, on, clock
+):
+    first = world.add("a")
+    world.add("a")
+    world.add("b", kind="pause")  # carries a key its task no longer has
+    cap = cap_of(active=[900], occupancy={"a": 1})
+    off = scan(cap)
+
+    chosen = scan(cap, attempt=attempt())
+
+    assert chosen == off == first
+    with world.sessions() as db:
+        assert transport._list_queued_tenants(db) == {"a": {"batch": first}}
+
+
+def test_a_control_command_with_a_stale_key_does_not_hide_the_commands_ahead_of_it(
+    world, on, clock
+):
+    for _ in range(16):
+        world.add("a", pinned=True)
+    seventeenth = world.add("a")
+    world.add("b", kind="pause")
+    cap = cap_of()
+    off = scan(cap)
+
+    chosen = scan(cap, attempt=attempt())
+
+    # One tenant has work that opens an execution, so the scan reads as it always
+    # did: no window is asked, nothing is missed or skipped.
+    assert chosen == off == seventeenth
+    assert transport.drain_fair_misses() == 0
+
+
 def test_a_queue_with_no_interactive_command_between_the_lines_reads_as_today(
     world, on, clock, monkeypatch
 ):
