@@ -392,6 +392,59 @@ def test_non_owner_cannot_change_signed_uploads(
     assert _row(server_id) == before
 
 
+@pytest.mark.parametrize("case", ["admin-valid", "admin-missing-key"])
+def test_platform_admin_can_change_signed_uploads(case: str) -> None:
+    admin = _admin_headers()
+    owner = _register_second_user("bob", "bobpass1")
+    server_id = _create_ok(owner)
+    _link_non_owner("admin", server_id)
+    before = _row(server_id)
+    assert before["signed_uploads_is_null"] is True
+
+    if case == "admin-valid":
+        resp = client.put(
+            f"/api/mcp/servers/{server_id}",
+            json={"signed_uploads": SIGNED_UPLOADS},
+            headers=admin,
+        )
+        assert resp.status_code == 200, resp.text
+        assert _row(server_id)["signed_uploads"] == SIGNED_UPLOADS
+    else:
+        raw = _without_content_types()
+        resp = client.put(
+            f"/api/mcp/servers/{server_id}",
+            json={"signed_uploads": raw},
+            headers=admin,
+        )
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["detail"] == _invalid_detail(
+            raw, transport="streamable_http", url=URL
+        )
+        assert _row(server_id) == before
+
+
+def test_owner_saving_the_stored_invalid_signed_uploads_is_still_checked() -> None:
+    _admin_headers()
+    owner = _register_second_user("bob", "bobpass1")
+    server_id = _create_ok(owner)
+    stored = [{"tool_name": "attach_document"}]
+    _store(server_id, stored)
+    before = _row(server_id)
+    assert before["signed_uploads"] == stored
+
+    resp = client.put(
+        f"/api/mcp/servers/{server_id}",
+        json={"signed_uploads": stored},
+        headers=owner,
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["detail"] == _invalid_detail(
+        stored, transport="streamable_http", url=URL
+    )
+    assert _row(server_id) == before
+
+
 def _add_custom_api(owner_name: str) -> None:
     db = _direct_db_session()
     try:
