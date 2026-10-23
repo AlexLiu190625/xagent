@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -1908,10 +1909,16 @@ def _fair_share_enabled() -> bool:
     return memo[1]
 
 
-# With the fair-share switch on, a scan with room asks each of the FAIR_SHARE_TENANTS
-# first-ranked tenants for the oldest command it can claim among the
-# FAIR_SHARE_WINDOW oldest queued commands of one (tenant key, dispatch class).
+# With the fair-share switch on, a scan with room asks each of the first
+# FAIR_SHARE_TENANTS_PER_SCAN ranked tenants for the oldest command it can claim among
+# the FAIR_SHARE_WINDOW oldest queued commands of one (tenant key, dispatch class). A
+# (tenant key, class) that has none is not asked again for FAIR_SHARE_SKIP_SECONDS,
+# and every FAIR_SHARE_FALLBACK_EVERY-th counted attempt reads the queue as it always
+# did, so a command that only the full scan can reach is not left behind forever.
 FAIR_SHARE_WINDOW = 16
+FAIR_SHARE_TENANTS_PER_SCAN = 4
+FAIR_SHARE_SKIP_SECONDS = 2.0
+FAIR_SHARE_FALLBACK_EVERY = 8
 
 # The oldest queued command of each (tenant key, dispatch class), by skipping from
 # one pair to the next through ix_task_commands_claimable_fair; a scan of the queue
@@ -2007,6 +2014,168 @@ def _in_tenant_window(query: Query[Any], key: str, dispatch_class: str) -> Query
     )
 
 
+class _FairState:
+    """What fair-share selection remembers between scans of one process.
+
+    Every field is guarded by ``_fair_state_lock``, which is held for memory reads
+    and writes only, never across a database call or a log line.
+    """
+
+    def __init__(self) -> None:
+        # Counted dispatch attempts, to find the fallback rounds.
+        self.attempts = 0
+        # Until when (``_fair_clock``) a (tenant key, dispatch class) is not asked.
+        self.skips: dict[tuple[str, str], float] = {}
+        # Window queries that found nothing since the diagnostics line last asked.
+        self.misses = 0
+
+
+_fair_state = _FairState()
+_fair_state_lock = threading.Lock()
+
+
+def _fair_clock() -> float:
+    return time.monotonic()
+
+
+def drain_fair_misses() -> int:
+    """The window queries that found nothing since the last call, and start again.
+
+    The diagnostics line reports the count for its window.
+    """
+    with _fair_state_lock:
+        misses = _fair_state.misses
+        _fair_state.misses = 0
+    return misses
+
+
+def _fair_live_skips() -> frozenset[tuple[str, str]]:
+    """The (tenant key, class) pairs not to ask now, dropping the lapsed ones."""
+    now = _fair_clock()
+    with _fair_state_lock:
+        skips = _fair_state.skips
+        for pair in [pair for pair, until in skips.items() if until <= now]:
+            del skips[pair]
+        return frozenset(skips)
+
+
+def _fair_record_miss(key: str, dispatch_class: str) -> None:
+    until = _fair_clock() + FAIR_SHARE_SKIP_SECONDS
+    with _fair_state_lock:
+        _fair_state.skips[(key, dispatch_class)] = until
+        _fair_state.misses += 1
+
+
+@dataclass
+class _FairAttempt:
+    """What one dispatch attempt carries from one scan to the next.
+
+    ``decided`` is set by the first scan, which counts the attempt when it has
+    room and fixes whether the attempt is a fallback round; a rescan keeps that
+    decision. ``tenants`` is the listing of the queue, taken by the first scan
+    that ranks and reused by the rescans of the same attempt.
+    """
+
+    decided: bool = False
+    fallback: bool = False
+    tenants: dict[str, dict[str, int]] | None = None
+
+
+def _new_fair_attempt() -> _FairAttempt | None:
+    """The attempt record for one dispatch attempt, or None with the switch off."""
+    return _FairAttempt() if _fair_share_enabled() else None
+
+
+def _ranks_tenants(
+    attempt: _FairAttempt, command_db_id: int | None, cap: DispatchCapSnapshot | None
+) -> bool:
+    """Whether this scan ranks tenants, counting the attempt on its first scan.
+
+    A scan for one command, or with no room, reads the queue as it always did
+    and is not counted. Otherwise the first scan counts the attempt, and every
+    FAIR_SHARE_FALLBACK_EVERY-th counted attempt is a fallback round for all its
+    scans.
+    """
+    has_room = command_db_id is None and (cap is None or not cap.closed)
+    if not attempt.decided:
+        attempt.decided = True
+        if has_room:
+            with _fair_state_lock:
+                _fair_state.attempts += 1
+                attempt.fallback = _fair_state.attempts % FAIR_SHARE_FALLBACK_EVERY == 0
+    return has_room and not attempt.fallback
+
+
+def _fair_pick(
+    db: Session,
+    attempt: _FairAttempt,
+    cap: DispatchCapSnapshot | None,
+    claimable: Callable[[], Query[Any]],
+    oldest_claimable: Callable[[], Any],
+) -> Any:
+    """The command a scan with room takes while tenants are ranked, or None.
+
+    ``claimable()`` is the claimable query of the scan, ``oldest_claimable()`` its
+    plain lookup of the oldest row. Tenants are ranked by the slots they hold in
+    this process, then by their oldest queued command, and the first
+    FAIR_SHARE_TENANTS_PER_SCAN that are not skipped are asked in that order: the
+    first with a claimable command among its window supplies the best candidate,
+    and a command that needs no new slot and is older than that is taken in its
+    place. A (tenant key, class) with no claimable command in its window is missed
+    and skipped for a while. With no tenant ranked, the plain lookup decides.
+
+    The listing is taken once per attempt, so a rescan may rank a queue that has
+    moved on; at worst that costs one more window query or one more recorded miss.
+    A task the attempt already set aside (``busy``) that fills the window of a tenant
+    makes that tenant miss and be skipped, as a task that cannot be claimed does.
+    """
+    if attempt.tenants is None:
+        attempt.tenants = _list_queued_tenants(db)
+    tenants = _tenants_in_band(attempt.tenants, cap)
+    if len(tenants) <= 1:
+        return oldest_claimable()
+    skipped = _fair_live_skips()
+    occupancy = cap.occupancy if cap is not None else {}
+    ranked = sorted(
+        (
+            occupancy.get(key, 0),
+            min(classes.values()),
+            key,
+            [name for name in sorted(classes) if (key, name) not in skipped],
+        )
+        for key, classes in tenants.items()
+    )
+    best = None
+    for _, _, key, classes in [entry for entry in ranked if entry[3]][
+        :FAIR_SHARE_TENANTS_PER_SCAN
+    ]:
+        hits = []
+        for dispatch_class in classes:
+            row = _in_tenant_window(claimable(), key, dispatch_class).first()
+            if row is None:
+                _fair_record_miss(key, dispatch_class)
+            else:
+                hits.append(row)
+        if hits:
+            best = min(hits, key=lambda row: row.id)
+            break
+    if best is None:
+        return oldest_claimable()
+    active = cap.active_ids if cap is not None else frozenset()
+    older = (
+        claimable()
+        .filter(
+            or_(
+                TaskExecutionCommand.kind.in_(sorted(CONTROL_KINDS)),
+                TaskExecutionCommand.task_id.in_(sorted(active)),
+            ),
+            TaskExecutionCommand.id < best.id,
+        )
+        .first()
+    )
+    return best if older is None else older
+
+
 class CommandCandidate(NamedTuple):
     """The command a dispatch scan picked and what its slot decision needs."""
 
@@ -2021,6 +2190,7 @@ def _find_command_candidate(
     command_db_id: int | None,
     busy_task_ids: tuple[int, ...] = (),
     cap: DispatchCapSnapshot | None = None,
+    attempt: _FairAttempt | None = None,
 ) -> CommandCandidate | None:
     """A reply to a waiting task, else the oldest command this process could claim now.
 
@@ -2039,6 +2209,8 @@ def _find_command_candidate(
     claimable, the full scan still runs, adding one indexed round trip. A
     command committed after the precheck is found by the next poll or the
     in-process notify, within the bound ``stage_task_command`` documents.
+    With the fair-share switch on, the oldest command of the first-ranked tenant
+    that has one is taken instead.
     """
     from ..models.database import get_session_local
 
@@ -2062,12 +2234,23 @@ def _find_command_candidate(
                 TaskExecutionCommand.task_id.notin_(busy_task_ids)
             ).first()
 
+        def claimable() -> Query[Any]:
+            return _dispatcher_candidate_query(
+                db,
+                runner_id=runner_id,
+                command_db_id=None,
+                shared=True,
+                cap=cap,
+                now=now,
+            ).filter(TaskExecutionCommand.task_id.notin_(busy_task_ids))
+
         row = None
         any_reply = False
         if command_db_id is None and (cap is None or not cap.closed):
             any_open, any_reply = db.execute(_OPEN_COMMAND_AND_REPLY_PRESENCE).one()
             if not any_open:
                 return None
+        ranking = attempt is not None and _ranks_tenants(attempt, command_db_id, cap)
         if any_reply:
             # A reply to a waiting task is served before any other claimable
             # command, oldest first. That deliberately includes older pause
@@ -2081,7 +2264,10 @@ def _find_command_candidate(
             # slot is not claimable, so the narrow query decides.
             row = first_candidate(TaskCommandKind.RESUME_INPUT)
         if row is None:
-            row = first_candidate()
+            if attempt is not None and ranking:
+                row = _fair_pick(db, attempt, cap, claimable, first_candidate)
+            else:
+                row = first_candidate()
         if row is None:
             return None
         return CommandCandidate(
@@ -2179,10 +2365,15 @@ async def dispatch_one_task_command(
 
     registry = get_task_coordinator_registry()
     skipped_task_ids = set(registry.busy_command_tasks())
+    attempt = _new_fair_attempt()
+    # Without the switch the scan is called as it always was.
+    fair_arguments = {} if attempt is None else {"attempt": attempt}
     while True:
         cap = build_dispatch_cap_snapshot()
         candidate = await run_db_io_cancellation_safe(
-            lambda: _find_command_candidate(command_db_id, tuple(skipped_task_ids), cap)
+            lambda: _find_command_candidate(
+                command_db_id, tuple(skipped_task_ids), cap, **fair_arguments
+            )
         )
         if candidate is None:
             return False

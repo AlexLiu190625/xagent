@@ -1,6 +1,7 @@
 """Fair-share selection against PostgreSQL: the listing, and which index each query uses."""
 
 import json
+import random
 from datetime import datetime, timezone
 
 import pytest
@@ -9,7 +10,15 @@ from sqlalchemy.dialects import postgresql
 
 from tests.alembic.lock_retry_support import driver_engines
 from tests.shared.postgres_disposable import disposable_database_factory
-from tests.web.services.fair_selection_support import World
+from tests.web.services.fair_selection_support import (
+    CAP_STATES,
+    FakeClock,
+    World,
+    play,
+    scan,
+    seed_world,
+)
+from xagent.web.models import database as database_module
 from xagent.web.models.database import Base
 from xagent.web.services import task_command_transport as transport
 from xagent.web.services.task_dispatch_cap import DispatchCapSnapshot, DispatchPolicy
@@ -170,3 +179,77 @@ def test_the_window_query_of_one_tenant_reads_the_tenant_index(busy_table) -> No
 
     assert "fairness_key >=" in statement and "fairness_key <=" in statement
     assert INDEX in index_names(explain(busy_table, statement))
+
+
+SWITCH = "XAGENT_DISPATCHER_FAIR_SHARE"
+
+
+@pytest.fixture
+def pg_world(pg, monkeypatch):
+    """A world on PostgreSQL with the switch on and a clock the test moves."""
+    clock = FakeClock()
+    built = World(pg)
+    monkeypatch.setattr(transport, "_fair_clock", clock)
+    monkeypatch.setattr(transport, "_fair_state", transport._FairState())
+    monkeypatch.setattr(transport, "_fair_share_memo", None)
+    monkeypatch.setattr(transport, "get_runner_id", lambda: "me")
+    monkeypatch.setattr(database_module, "_SessionLocal", built.sessions)
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setenv(SWITCH, "true")
+    return built, clock
+
+
+def statements_sent(world, action):
+    seen: list[str] = []
+
+    def record(_conn, _cursor, statement, *_args):
+        seen.append(" ".join(statement.split()))
+
+    sa.event.listen(world.engine, "before_cursor_execute", record)
+    try:
+        return action(), seen
+    finally:
+        sa.event.remove(world.engine, "before_cursor_execute", record)
+
+
+@pytest.mark.postgresql
+@pytest.mark.parametrize("cap_state", sorted(CAP_STATES))
+@pytest.mark.parametrize(
+    "raw", [None, "false", "garbage"], ids=["unset", "false", "garbage"]
+)
+def test_with_the_switch_off_a_scan_sends_what_it_sent_before(
+    pg_world, monkeypatch, cap_state, raw
+) -> None:
+    world, _ = pg_world
+    if raw is None:
+        monkeypatch.delenv(SWITCH)
+    else:
+        monkeypatch.setenv(SWITCH, raw)
+    first = seed_world(world, "three")
+    cap = transport.DispatchCapSnapshot(
+        policy=DispatchPolicy(limit=2, interactive_reserve=1),
+        active_ids=CAP_STATES[cap_state](first),
+    )
+    off = transport._new_fair_attempt()
+    assert off is None
+
+    chosen, seen = statements_sent(world, lambda: scan(cap, attempt=off))
+    plain, plain_seen = statements_sent(world, lambda: scan(cap))
+
+    assert chosen == plain
+    assert seen == plain_seen
+    assert not any("RECURSIVE" in statement for statement in seen)
+    assert transport._fair_state.attempts == 0
+
+
+@pytest.mark.postgresql
+def test_the_dispatcher_follows_the_reference_over_random_worlds(pg_world) -> None:
+    world, clock = pg_world
+    for seed in range(30):
+        play(
+            world,
+            clock,
+            30_000 + seed,
+            tenants=random.Random(seed).randint(2, 7),
+            reserves=lambda limit: range(limit),
+        )
