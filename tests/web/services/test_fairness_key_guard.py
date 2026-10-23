@@ -200,19 +200,48 @@ def aliased_update(table, command):
             "UPDATE OR REPLACE task_execution_commands SET fairness_key = 'x' "
             f"WHERE id = {c.id}"
         ),
+        lambda t, c: sa.text(
+            f"UPDATE task_execution_commands SET FAIRNESS_KEY = 'x' WHERE id = {c.id}"
+        ),
+        lambda t, c: sa.text(
+            f"UPDATE task_execution_commands SET Fairness_Key = 'x' WHERE id = {c.id}"
+        ),
+        lambda t, c: sa.text(
+            "UPDATE task_execution_commands SET \"FAIRNESS_KEY\" = 'x' "
+            f"WHERE id = {c.id}"
+        ),
+        lambda t, c: sa.text(
+            "UPDATE task_execution_commands SET error = 'WHERE', fairness_key = 'x' "
+            f"WHERE id = {c.id}"
+        ),
+        lambda t, c: sa.text(
+            "UPDATE task_execution_commands SET error = 'from', fairness_key = 'x' "
+            f"WHERE id = {c.id}"
+        ),
+        lambda t, c: sa.text(
+            "UPDATE task_execution_commands SET error = "
+            "(SELECT 'a' FROM task_execution_commands LIMIT 1), fairness_key = 'x' "
+            f"WHERE id = {c.id}"
+        ),
     ],
     ids=[
         "keyword",
         "unpacked",
         "mapping",
         "quoted_raw",
-        "lowercase_raw",
+        "lowercase_keywords",
         "alias",
         "upsert",
         "block_comment",
         "line_comment",
         "with_clause",
         "or_replace",
+        "uppercase_key",
+        "mixed_case_key",
+        "quoted_uppercase_key",
+        "where_in_a_value",
+        "from_in_a_value",
+        "subquery_before_the_key",
     ],
 )
 def test_other_ways_to_write_the_key_are_refused(host, write) -> None:
@@ -221,6 +250,115 @@ def test_other_ways_to_write_the_key_are_refused(host, write) -> None:
         with pytest.raises(AssertionError, match="fairness_key"):
             db.execute(write(TaskExecutionCommand.__table__, command))
     refused_once()
+
+
+@pytest.mark.parametrize(
+    "write",
+    [
+        lambda c: sa.text(
+            "UPDATE task_execution_commands SET error = 'x' "
+            f"WHERE fairness_key = 'user:1' AND id = {c.id}"
+        ),
+        lambda c: sa.text(
+            f"UPDATE task_execution_commands SET error = 'fairness_key' WHERE id = {c.id}"
+        ),
+        lambda c: sa.text(
+            "UPDATE task_execution_commands SET error = "
+            "(SELECT fairness_key FROM task_execution_commands LIMIT 1) "
+            f"WHERE id = {c.id}"
+        ),
+    ],
+    ids=["key_only_in_where", "key_only_in_a_value", "key_only_read_in_set"],
+)
+def test_raw_sql_that_updates_the_table_and_mentions_the_key_anywhere_is_refused(
+    host, write
+) -> None:
+    """Raw SQL is not parsed, so any mention of the key in a raw UPDATE of the table
+    is refused, written or not."""
+    with host.sessions_() as db:
+        command = host.command(db)
+        with pytest.raises(AssertionError, match="fairness_key"):
+            db.execute(write(command))
+    refused_once()
+
+
+def test_raw_sql_that_does_not_update_the_table_is_let_through(host) -> None:
+    with host.sessions_() as db:
+        command = host.command(db)
+        db.execute(sa.text("SELECT FAIRNESS_KEY FROM task_execution_commands"))
+        db.execute(
+            sa.text(
+                "UPDATE tasks SET title = "
+                "(SELECT fairness_key FROM task_execution_commands LIMIT 1) "
+                f"WHERE id = {command.task_id}"
+            )
+        )
+        db.execute(
+            sa.text(
+                f"UPDATE task_execution_commands SET error = 'x' WHERE id = {command.id}"
+            )
+        )
+    assert guard.take_violations() == []
+
+
+def test_an_upsert_that_names_the_key_in_another_case_is_refused(host) -> None:
+    table = TaskExecutionCommand.__table__
+    with host.sessions_() as db:
+        command = host.command(db)
+        upsert = (
+            sqlite_insert(table)
+            .values(
+                id=command.id,
+                task_id=command.task_id,
+                command_id="again",
+                kind="start",
+                payload={},
+            )
+            .on_conflict_do_update(index_elements=["id"], set_={"FAIRNESS_KEY": "x"})
+        )
+        # SQLAlchemy only warns about a name that is not a column key; SQLite
+        # reads it as the key column.
+        with pytest.warns(sa.exc.SAWarning, match="Additional column names"):
+            with pytest.raises(AssertionError, match="fairness_key"):
+                db.execute(upsert)
+    refused_once()
+
+
+class AppendsAfterTheCopy(list):
+    """A record into which another thread appends just after a copy is taken."""
+
+    def __init__(self, items, late):
+        super().__init__(items)
+        self.late = late
+        self.appended = False
+
+    def _append_once(self):
+        if not self.appended:
+            self.appended = True
+            super().append(self.late)
+
+    def __getitem__(self, index):
+        value = super().__getitem__(index)
+        if isinstance(index, slice):
+            self._append_once()
+        return value
+
+    def __iter__(self):
+        items = list(super().__iter__())
+        self._append_once()
+        return iter(items)
+
+
+def test_a_record_added_while_the_records_are_taken_is_kept_for_the_next_take(
+    monkeypatch,
+) -> None:
+    early = ("t::early", "UPDATE early", None)
+    late = ("t::late", "UPDATE late", None)
+    monkeypatch.setattr(guard, "violations", AppendsAfterTheCopy([early], late))
+
+    assert guard.take_violations() == [early]
+    assert guard.take_violations() == [late]
+    assert guard.take_violations() == []
 
 
 def test_a_bulk_update_through_the_query_is_refused(host) -> None:

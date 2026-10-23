@@ -3,16 +3,20 @@
 The key is written when a command is accepted and never updated afterwards, so
 the only statement allowed to write it is the flush ``stage_task_command``
 issues for the command it is accepting. The guard listens on every engine
-through the ``Engine`` class and looks at each statement that mentions the key:
+through the ``Engine`` class and looks at each statement that mentions the key, in any case:
 
 * A compiled UPDATE of the command table, or of an alias of it, counts when the
   columns it writes include the key, so a statement that only reads the key
   (``SET x = (SELECT fairness_key ...)``) passes.
 * A compiled INSERT into the command table counts when its ON CONFLICT DO UPDATE
-  sets the key. It is never allowed: it filters on no command id.
+  sets the key. It is never allowed: it filters on no command id. The key is
+  matched in any case, since SQLite reads ``"FAIRNESS_KEY"`` as the same column.
 * A statement without a compiled UPDATE (raw SQL) counts when, after leading
   comments, it is an UPDATE of the command table (optionally behind a WITH clause
-  or as UPDATE OR <action>) and its SET clause names the key.
+  or as UPDATE OR <action>) and the key's name appears anywhere in it, in any
+  case. Raw SQL is not parsed: an UPDATE of the table that names the key only in
+  WHERE, in a string value or in a subquery is refused as well, so such a
+  statement has to be written with the ORM.
 
 A statement that counts is allowed only when ``stage_task_command``, found by
 its code object on the stack of the thread that runs the statement, is
@@ -27,7 +31,8 @@ a test loudly instead of letting a write through.
 
 A violation is recorded and raised. Production code may catch the exception, so
 every test also checks the record when it ends, and the session checks it once
-more at the end.
+more at the end. Taking the record removes only what was taken, so a violation
+a background thread records meanwhile is reported by the next check.
 """
 
 from __future__ import annotations
@@ -53,14 +58,14 @@ current_test = ""
 
 _RAW_UPDATE = re.compile(
     r"^(?:WITH\b.*?\bUPDATE|UPDATE)(?:\s+OR\s+\w+)?\s+(?:ONLY\s+)?"
-    r'(?:"?\w+"?\.)?"?' + TABLE + r'"?\b(?P<rest>.*)',
+    r'(?:"?\w+"?\.)?"?' + TABLE + r'"?\b',
     re.IGNORECASE | re.DOTALL,
 )
-_SET_CLAUSE = re.compile(
-    r"\bSET\b(?P<set>.*?)(?:\bWHERE\b|\bFROM\b|\bRETURNING\b|$)",
-    re.IGNORECASE | re.DOTALL,
-)
-_KEY_WORD = re.compile(r"\b" + KEY + r"\b")
+
+
+def mentions_key(statement: str) -> bool:
+    """Whether the key's name appears anywhere in the statement, in any case."""
+    return KEY in statement.lower()
 
 
 def _without_leading_comments(statement: str) -> str:
@@ -74,13 +79,12 @@ def _without_leading_comments(statement: str) -> str:
             return statement
 
 
-def raw_update_writes_key(statement: str) -> bool:
-    """Whether raw SQL is an UPDATE of the command table that names the key in SET."""
-    update = _RAW_UPDATE.match(_without_leading_comments(statement))
-    if update is None:
-        return False
-    clause = _SET_CLAUSE.search(update.group("rest"))
-    return clause is not None and _KEY_WORD.search(clause.group("set")) is not None
+def raw_update_mentions_key(statement: str) -> bool:
+    """Whether raw SQL is an UPDATE of the command table that mentions the key anywhere."""
+    return (
+        mentions_key(statement)
+        and _RAW_UPDATE.match(_without_leading_comments(statement)) is not None
+    )
 
 
 def _base_table(table: Any) -> Any:
@@ -91,13 +95,17 @@ def _base_table(table: Any) -> Any:
 
 
 def insert_updates_key(compiled: Any) -> bool:
-    """Whether a compiled INSERT into the command table sets the key on conflict."""
+    """Whether a compiled INSERT into the command table sets the key on conflict.
+
+    The name is compared in any case: SQLite reads ``"FAIRNESS_KEY"`` as the key
+    column although SQLAlchemy only warns about a name that is not a column key.
+    """
     statement = compiled.statement
     if not isinstance(statement, Insert) or _base_table(statement.table).name != TABLE:
         return False
     clause = getattr(statement, "_post_values_clause", None)
     return any(
-        getattr(column, "key", column) == KEY
+        str(getattr(column, "key", column)).lower() == KEY
         for column, _ in getattr(clause, "update_values_to_set", None) or ()
     )
 
@@ -177,7 +185,7 @@ def _command_being_accepted() -> int | None:
 
 
 def before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
-    if KEY not in statement:
+    if not mentions_key(statement):
         return
     compiled = None if context is None else context.compiled
     target = None if compiled is None else compiled.statement
@@ -193,7 +201,7 @@ def before_cursor_execute(conn, cursor, statement, parameters, context, executem
     elif isinstance(target, Insert):
         if not insert_updates_key(compiled):
             return
-    elif not raw_update_writes_key(statement):
+    elif not raw_update_mentions_key(statement):
         return
     violations.append((current_test, statement, parameters))
     raise AssertionError(
@@ -214,7 +222,12 @@ def install() -> None:
 
 
 def take_violations() -> list[tuple[str, str, Any]]:
-    """Return the recorded violations and forget them."""
-    found = list(violations)
-    violations.clear()
+    """Return the violations recorded so far and forget only those.
+
+    Any thread may record a violation; only the pytest thread takes them. A
+    violation recorded after the copy is taken stays in the list for the next
+    call, because only as many leading items as were copied are deleted.
+    """
+    found = violations[:]
+    del violations[: len(found)]
     return found
