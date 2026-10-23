@@ -240,10 +240,10 @@ function SessionConversationContent({
 
   // Uploads one file with the session token. A send uploads its files one
   // after another, and the file cards' retry buttons are disabled while any
-  // upload or send with files is in flight. A retry only counts as in flight
-  // once its token is ready, so a retry clicked while the token is still being
-  // renewed can overlap another upload; the bridge then shares or skips the
-  // token refresh after a 401.
+  // upload or send with files is in flight, a retry counting from the click
+  // (see handleRetryAttachment). The composer itself stays open while a task
+  // is running, so a send with files can still start beside an upload; the
+  // bridge then shares or skips the token refresh after a 401.
   const uploadAttachment = useCallback(async (file: File): Promise<SessionUploadedFile> => {
     const controller = new AbortController()
     uploadControllersRef.current.set(file, controller)
@@ -278,7 +278,11 @@ function SessionConversationContent({
     }
   }, [setAttachmentStatus, uploads])
 
+  // The retry counts as attachment work from the click, so the other cards'
+  // retry buttons are disabled while it waits for a token, not only once its
+  // upload has started.
   const handleRetryAttachment = useCallback(async (file: File) => {
+    setAttachmentWork((count) => count + 1)
     try {
       await uploads.ensureFreshSession()
       await uploadAttachment(file)
@@ -286,6 +290,8 @@ function SessionConversationContent({
       if (isAbortError(error)) return
       const code = readSendErrorCode(error) ?? "upload_failed"
       toast.error(t(clientErrorTranslationKey(code)))
+    } finally {
+      setAttachmentWork((count) => count - 1)
     }
   }, [t, uploadAttachment, uploads])
 

@@ -816,6 +816,30 @@ describe("SessionAgentChatPage", () => {
       expect(bridge.value.refreshSession).toHaveBeenCalledWith("st_current")
     })
 
+    it("counts a retry as busy from the click until its token is settled", async () => {
+      setBridge("active", withUploads())
+      render(<SessionAgentChatPage />)
+      expect(app.startProps?.attachmentsBusy).toBe(false)
+      let rejectToken!: (reason: unknown) => void
+      bridge.value.ensureFreshSession.mockReturnValueOnce(
+        new Promise((_resolve, reject) => { rejectToken = reject }),
+      )
+
+      let retrying!: Promise<void>
+      act(() => { retrying = retry(pdf()) })
+
+      expect(app.startProps?.attachmentsBusy).toBe(true)
+      expect(fetch).not.toHaveBeenCalled()
+
+      await act(async () => {
+        rejectToken(Object.assign(new Error("gone"), { errorCode: "upload_failed" }))
+        await retrying
+      })
+
+      expect(toastMock.error).toHaveBeenCalledWith("clientErrors.uploadFailed")
+      expect(app.startProps?.attachmentsBusy).toBe(false)
+    })
+
     it("passes no upload callbacks to the surfaces when uploads are not advertised", () => {
       setBridge("active", activeSession())
       app.state.taskId = 5
