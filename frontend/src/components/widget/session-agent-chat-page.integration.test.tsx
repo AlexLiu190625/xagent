@@ -722,6 +722,7 @@ describe("SessionAgentChatPage file attachments", () => {
       expect(signal.aborted).toBe(true)
       expect((failure as Error).name).toBe("AbortError")
       expect(failure).toMatchObject({ notificationHandled: true })
+      expect(screen.queryByRole("alert")).toBeNull()
       expect(statusOf(a)).toBeUndefined()
     })
 
@@ -799,12 +800,15 @@ describe("SessionAgentChatPage file attachments", () => {
       expect(surfaces.start?.isSending).toBe(true)
       expect(chatFrames(socket)).toHaveLength(0)
 
+      // Removing a file ends the send at once, without waiting for the socket.
       act(() => { surfaces.start?.onFilesChange([a]) })
-      act(() => socket.open("xagent-session-v1"))
       await act(async () => { await sending })
 
       expect((failure as Error).name).toBe("AbortError")
       expect(failure).toMatchObject({ notificationHandled: true })
+      expect(socket.readyState).not.toBe(MockWebSocket.OPEN)
+      expect(screen.queryByRole("alert")).toBeNull()
+      act(() => socket.open("xagent-session-v1"))
       expect(chatFrames(socket)).toHaveLength(0)
       await waitFor(() => expect(surfaces.start?.isSending).toBe(false))
     })

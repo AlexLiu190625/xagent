@@ -75,6 +75,34 @@ const isAbortError = (error: unknown): boolean =>
   typeof error === "object" && error !== null
   && (error as { name?: unknown }).name === "AbortError"
 
+// The error that ends a send whose file the visitor removed. The visitor did it
+// on purpose, so the composer must not announce a failure.
+const removedFileError = (): Error =>
+  Object.assign(
+    new DOMException("A file was removed before the message was sent.", "AbortError"),
+    { notificationHandled: true },
+  )
+
+// Resolves with `promise`, or rejects as soon as `signal` aborts. Only this
+// caller's wait ends; `promise` itself keeps running.
+const raceSend = <T,>(promise: Promise<T>, signal: AbortSignal): Promise<T> =>
+  new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(removedFileError())
+    if (signal.aborted) {
+      onAbort()
+      return
+    }
+    signal.addEventListener("abort", onAbort, { once: true })
+    promise.then(
+      (value) => { signal.removeEventListener("abort", onAbort); resolve(value) },
+      (error) => { signal.removeEventListener("abort", onAbort); reject(error) },
+    )
+  })
+
+const isNotificationHandled = (error: unknown): boolean =>
+  typeof error === "object" && error !== null
+  && (error as { notificationHandled?: unknown }).notificationHandled === true
+
 const userFacingError = (message: string, errorCode?: ClientErrorCode): Error =>
   Object.assign(new Error(message), {
     userFacing: true,
@@ -132,6 +160,9 @@ function SessionConversationContent({
   // same files (edited or not) reuses what already reached the server.
   const uploadedFilesRef = useRef(new WeakMap<File, SessionUploadedFile>())
   const uploadControllersRef = useRef(new Map<File, AbortController>())
+  // One entry per send with files that is still running; removing any of its
+  // files aborts that send.
+  const activeSendsRef = useRef(new Set<{ files: ReadonlySet<File>, controller: AbortController }>())
   const panelFilesRef = useRef<File[]>([])
   const [resetError, setResetError] = useState(false)
   // The failure is stored as a code, not as text, so the line is translated
@@ -174,6 +205,9 @@ function SessionConversationContent({
   const releaseAttachment = useCallback((file: File) => {
     uploadControllersRef.current.get(file)?.abort()
     uploadControllersRef.current.delete(file)
+    activeSendsRef.current.forEach((send) => {
+      if (send.files.has(file)) send.controller.abort()
+    })
     uploadedFilesRef.current.delete(file)
     setAttachmentStatus(file, null)
   }, [setAttachmentStatus])
@@ -186,6 +220,7 @@ function SessionConversationContent({
   const abortAllUploads = useCallback(() => {
     uploadControllersRef.current.forEach((controller) => controller.abort())
     uploadControllersRef.current.clear()
+    activeSendsRef.current.forEach((send) => send.controller.abort())
   }, [])
 
   useEffect(() => abortAllUploads, [abortAllUploads])
@@ -303,21 +338,20 @@ function SessionConversationContent({
     assertAttachmentsSendable(files, config, attachments)
 
     setAttachmentWork((count) => count + 1)
+    const send = { files: new Set(files), controller: new AbortController() }
+    activeSendsRef.current.add(send)
     try {
       const uploaded: SessionUploadedFile[] = []
       for (const file of files) {
+        if (send.controller.signal.aborted) throw removedFileError()
         const known = uploadedFilesRef.current.get(file)
         uploaded.push(known ?? await uploadAttachment(file))
       }
-      await uploads.waitForOpenConnection()
-      // A file the visitor removed while the socket was opening was released
-      // (its upload forgotten); it must not ride along on the frame, and the
-      // visitor who removed it needs no "not sent" notice.
+      await raceSend(uploads.waitForOpenConnection(), send.controller.signal)
+      // Removing a file aborts the send above; this check is the backstop for
+      // a file that was released without reaching the abort.
       if (files.some((file) => !uploadedFilesRef.current.has(file))) {
-        throw Object.assign(
-          new DOMException("A file was removed before the message was sent.", "AbortError"),
-          { notificationHandled: true },
-        )
+        throw removedFileError()
       }
 
       try {
@@ -337,6 +371,7 @@ function SessionConversationContent({
         setAttachmentStatus(file, null)
       })
     } finally {
+      activeSendsRef.current.delete(send)
       setAttachmentWork((count) => count - 1)
     }
   }, [
@@ -369,7 +404,11 @@ function SessionConversationContent({
       await sendWithAttachments(message, files, config)
       setStartFiles([])
     } catch (error) {
-      setStartMessageFailure({ code: readSendErrorCode(error) })
+      // An error that is already announced, or that the visitor caused, leaves
+      // no failure line behind.
+      if (!isNotificationHandled(error)) {
+        setStartMessageFailure({ code: readSendErrorCode(error) })
+      }
       throw error
     }
   }, [sendWithAttachments])
