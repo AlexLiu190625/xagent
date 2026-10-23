@@ -335,6 +335,16 @@ REJECTED_SETTINGS = [
         id="suffix-too-long",
     ),
     pytest.param(
+        [_entry(content_types={".tar.gz": "application/gzip"})],
+        f"{TYPES} keys must contain only one '.'",
+        id="suffix-two-dots",
+    ),
+    pytest.param(
+        [_entry(content_types={".": "application/pdf"})],
+        f"{TYPES} keys must have a suffix after '.'",
+        id="content-type-key-dot-only",
+    ),
+    pytest.param(
         [_entry(content_types={".pdf": ""})],
         f"{TYPES} values must be non-empty",
         id="mime-empty",

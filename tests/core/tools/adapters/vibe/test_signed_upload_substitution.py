@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
 import hashlib
+import inspect
 import json
 import logging
+import threading
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -24,8 +27,19 @@ from xagent.core.tools.adapters.vibe.mcp_adapter import (
     MCPToolAdapter,
     _build_mcp_tool_adapter,
     _delegated_authorization_failed_result,
+    _delegated_retry_failed_result,
+)
+from xagent.core.tools.adapters.vibe.mcp_approval_gate import (
+    GatedCall,
+    GateDecision,
+    ToolCallExecutionContext,
+    bind_tool_call_execution_context,
+    gate_mcp_tools,
+    register_mcp_approval_gate,
+    unregister_mcp_approval_gate,
 )
 from xagent.core.tools.adapters.vibe.signed_upload import SignedUploadBinding
+from xagent.core.tools.user_interaction import ToolInteractionSettlement
 from xagent.core.utils.public_http_transport import (
     PublicHttpTransport,
     UnsafePublicHttpTarget,
@@ -41,6 +55,7 @@ from xagent.web.models.user import User
 CONNECTION_URL = "https://mcp.example.test/mcp"
 CONNECTION_SECRET = "conn-secret-sample"
 CONNECTION_AUTH = f"Bearer {CONNECTION_SECRET}"
+FRESH_AUTH = "Bearer fresh-secret-sample"
 OUTER_TOOL = "attach_document"
 ISSUING_TOOL = "request_upload"
 FILE_ARGUMENT = "document"
@@ -85,6 +100,7 @@ SETTINGS = [
 
 _RUNTIME_KEY = mcp_adapter_module._RUNTIME_CONNECTION_REFRESH_KEY
 _RESOLVER_KEY = mcp_adapter_module._OAUTH_TOKEN_RESOLVER_REFRESH_KEY
+_SLACK_REFRESH_KEY = mcp_adapter_module._SLACK_ACTOR_RUNTIME_REFRESH_KEY
 _REAL_SIGNED_UPLOAD_TRANSPORT = mcp_adapter_module._signed_upload_transport
 
 _SCHEMA = {
@@ -164,12 +180,12 @@ class _Env:
         self.workspace = workspace
         self.now = NOW
         self.server_calls: list[tuple[str, dict[str, Any]]] = []
+        # The Authorization header of the connection each call was made with.
+        self.call_auth: list[tuple[str, str | None]] = []
         self.put_requests: list[dict[str, Any]] = []
         self.put_started = asyncio.Event()
-        self.issue: Callable[[dict[str, Any]], CallToolResult] = lambda args: _issued(
-            _ticket()
-        )
-        self.business: Callable[[dict[str, Any]], CallToolResult] = self._default_result
+        self.issue: Callable[[dict[str, Any]], Any] = lambda args: _issued(_ticket())
+        self.business: Callable[[dict[str, Any]], Any] = self._default_result
         self.put_behavior: Callable[[httpx.Request], Awaitable[httpx.Response]] = (
             self._put_ok
         )
@@ -180,18 +196,29 @@ class _Env:
         env = self
 
         class _Session:
+            def __init__(self, connection: Any) -> None:
+                headers = (
+                    connection.get("headers") if isinstance(connection, dict) else None
+                )
+                self.auth = (headers or {}).get("Authorization")
+
             async def initialize(self) -> None:
                 return None
 
             async def call_tool(self, name: str, arguments: Any, **kwargs: Any) -> Any:
                 env.server_calls.append((name, json.loads(json.dumps(arguments))))
+                env.call_auth.append((name, self.auth))
                 if name == ISSUING_TOOL:
-                    return env.issue(arguments)
-                return env.business(arguments)
+                    outcome = env.issue(arguments)
+                else:
+                    outcome = env.business(arguments)
+                if inspect.isawaitable(outcome):
+                    outcome = await outcome
+                return outcome
 
         @asynccontextmanager
         async def _create_session(connection: Any):
-            yield _Session()
+            yield _Session(connection)
 
         monkeypatch.setattr(mcp_adapter_module, "create_session", _create_session)
         monkeypatch.setattr(mcp_adapter_module, "_utcnow", lambda: self.now)
@@ -235,11 +262,12 @@ class _Env:
         binding: SignedUploadBinding | None = BINDING,
         connection: Any = None,
         with_workspace: bool = True,
+        schema: dict[str, Any] = _SCHEMA,
     ) -> MCPToolAdapter:
         tool = MCPTool(
             name=OUTER_TOOL,
             description="Attach a document to a record.",
-            inputSchema=_SCHEMA,
+            inputSchema=schema,
         )
         return MCPToolAdapter(
             mcp_tool=tool,
@@ -269,6 +297,19 @@ def _args(**overrides: Any) -> dict[str, Any]:
 
 def _text(result: dict[str, Any]) -> str:
     return result["content"][0]["text"]
+
+
+def _rejecting_the_initial_credential(
+    env: _Env, respond: Callable[[dict[str, Any]], Any]
+) -> Callable[[dict[str, Any]], Any]:
+    """A fake tool that answers 401 to a call made with ``CONNECTION_AUTH``."""
+
+    def call(args: dict[str, Any]) -> Any:
+        if env.call_auth[-1][1] == CONNECTION_AUTH:
+            raise _http_401()
+        return respond(args)
+
+    return call
 
 
 # --------------------------------------------------------------------------
@@ -656,14 +697,16 @@ async def test_signed_upload_put_shape(
 
     monkeypatch.setattr(mcp_adapter_module, "check_signed_upload_url", recording_check)
 
-    put_calls: list[tuple[Any, dict[str, Any]]] = []
-    original_put = httpx.AsyncClient.put
+    stream_calls: list[tuple[str, Any]] = []
+    original_stream = httpx.AsyncClient.stream
 
-    async def recording_put(self: httpx.AsyncClient, url: Any, **kwargs: Any):
-        put_calls.append((url, kwargs))
-        return await original_put(self, url, **kwargs)
+    def recording_stream(
+        self: httpx.AsyncClient, method: str, url: Any, **kwargs: Any
+    ) -> Any:
+        stream_calls.append((method, url))
+        return original_stream(self, method, url, **kwargs)
 
-    monkeypatch.setattr(httpx.AsyncClient, "put", recording_put)
+    monkeypatch.setattr(httpx.AsyncClient, "stream", recording_stream)
     env.issue = lambda args: _issued(
         _ticket(
             headers={
@@ -679,10 +722,10 @@ async def test_signed_upload_put_shape(
     assert result["is_error"] is False
     (request,) = env.put_requests
     assert request["method"] == "PUT"
-    assert len(checked) == 1 and len(put_calls) == 1
-    sent_url, sent_kwargs = put_calls[0]
+    assert len(checked) == 1 and len(stream_calls) == 1
+    sent_method, sent_url = stream_calls[0]
+    assert sent_method == "PUT"
     assert sent_url is checked[0]
-    assert sent_kwargs["follow_redirects"] is False
     headers = {name.lower(): value for name, value in request["headers"]}
     names = [name.lower() for name, _ in request["headers"]]
     assert headers["content-type"] == "application/pdf"
@@ -744,6 +787,101 @@ async def test_signed_upload_does_not_follow_a_redirect(env: _Env) -> None:
     assert len(env.put_requests) == 1
     assert env.calls_to(OUTER_TOOL) == []
     assert env.staging_leftovers() == []
+
+
+@pytest.mark.parametrize("status", [201, 204])
+async def test_signed_upload_any_2xx_put_status_is_success(
+    env: _Env, status: int
+) -> None:
+    async def behavior(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, request=request)
+
+    env.put_behavior = behavior
+
+    result = await env.adapter().run_json_async(_args())
+
+    assert result["is_error"] is False
+    assert env.calls_to(OUTER_TOOL) == [
+        {FILE_ARGUMENT: REMOTE_FILE_ID, "record_id": "r-1"}
+    ]
+
+
+class _BodyThatRecordsReads(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.read = False
+
+    async def __aiter__(self) -> Any:
+        self.read = True
+        yield b"x" * 1024
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def test_signed_upload_never_reads_the_put_response_body(env: _Env) -> None:
+    body = _BodyThatRecordsReads()
+
+    async def behavior(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=body, request=request)
+
+    env.put_behavior = behavior
+
+    result = await env.adapter().run_json_async(_args())
+
+    assert result["is_error"] is False
+    assert body.read is False
+
+
+async def test_signed_upload_sends_a_zero_byte_file(env: _Env) -> None:
+    env.source.write_bytes(b"")
+
+    result = await env.adapter().run_json_async(_args())
+
+    assert result["is_error"] is False
+    (issuing_args,) = env.calls_to(ISSUING_TOOL)
+    assert issuing_args["size_bytes"] == 0
+    assert issuing_args["sha256"] == hashlib.sha256(b"").hexdigest()
+    (request,) = env.put_requests
+    headers = {name.lower(): value for name, value in request["headers"]}
+    assert headers["content-length"] == "0"
+    assert "transfer-encoding" not in headers
+    assert request["body"] == b""
+
+
+async def test_signed_upload_reads_the_file_off_the_event_loop(
+    env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    read_threads: list[int] = []
+
+    class _RecordingFile:
+        def __init__(self, handle: Any) -> None:
+            self._handle = handle
+
+        def read(self, size: int = -1) -> bytes:
+            read_threads.append(threading.get_ident())
+            return self._handle.read(size)
+
+        def close(self) -> None:
+            self._handle.close()
+
+        def __enter__(self) -> _RecordingFile:
+            return self
+
+        def __exit__(self, *exc_info: Any) -> None:
+            self._handle.close()
+
+    def recording_open(path: Any, mode: str = "r") -> _RecordingFile:
+        return _RecordingFile(builtins.open(path, mode))
+
+    monkeypatch.setattr(mcp_adapter_module, "open", recording_open, raising=False)
+
+    result = await env.adapter().run_json_async(_args())
+
+    assert result["is_error"] is False
+    assert env.put_requests[0]["body"] == FILE_BYTES
+    # Both the hash and the upload read the file in several chunks.
+    assert len(read_threads) > 4
+    assert threading.get_ident() not in read_threads
 
 
 async def test_signed_upload_transport_is_public_only(
@@ -896,6 +1034,47 @@ async def test_signed_upload_issuing_401_with_failed_refresh_is_final(
     assert env.staging_leftovers() == []
 
 
+async def test_signed_upload_issuing_401_without_a_refresh_is_an_authorization_failure(
+    env: _Env,
+) -> None:
+    """A model-issued call that ends the same way gets the generic error."""
+
+    def unauthorized(args: dict[str, Any]) -> CallToolResult:
+        raise _http_401()
+
+    env.issue = unauthorized
+    env.business = unauthorized
+
+    upload = await env.adapter().run_json_async(_args())
+    model_call = await env.adapter(binding=None).run_json_async(_args())
+
+    assert upload == _delegated_authorization_failed_result()
+    assert _text(model_call) == "Error executing MCP tool."
+    assert env.put_requests == []
+    assert env.staging_leftovers() == []
+
+
+async def test_signed_upload_issuing_retry_failure_is_the_retry_result(
+    env: _Env,
+) -> None:
+    def refresh() -> dict[str, Any]:
+        return _connection(headers={"Authorization": FRESH_AUTH})
+
+    def issue(args: dict[str, Any]) -> CallToolResult:
+        raise RuntimeError(LEAKY_MESSAGE)
+
+    env.issue = _rejecting_the_initial_credential(env, issue)
+
+    result = await env.adapter(
+        connection=_connection(**{_RUNTIME_KEY: refresh})
+    ).run_json_async(_args())
+
+    assert result == _delegated_retry_failed_result()
+    assert env.put_requests == []
+    assert env.calls_to(OUTER_TOOL) == []
+    assert env.staging_leftovers() == []
+
+
 async def test_signed_upload_issuing_resolver_failure_keeps_its_failure_code(
     env: _Env,
 ) -> None:
@@ -922,22 +1101,18 @@ async def test_signed_upload_issuing_resolver_failure_keeps_its_failure_code(
 async def test_signed_upload_issuing_401_then_refresh_continues_the_upload(
     env: _Env,
 ) -> None:
+    """The tool call uses the connection the issuing call refreshed to."""
     refresh_calls = 0
-    issuing_calls = 0
 
     def refresh() -> dict[str, Any]:
         nonlocal refresh_calls
         refresh_calls += 1
-        return _connection(headers={"Authorization": "Bearer fresh-secret-sample"})
+        if refresh_calls > 1:
+            raise RuntimeError("refresh refused")
+        return _connection(headers={"Authorization": FRESH_AUTH})
 
-    def issue(args: dict[str, Any]) -> CallToolResult:
-        nonlocal issuing_calls
-        issuing_calls += 1
-        if issuing_calls == 1:
-            raise _http_401()
-        return _issued(_ticket())
-
-    env.issue = issue
+    env.issue = _rejecting_the_initial_credential(env, env.issue)
+    env.business = _rejecting_the_initial_credential(env, env.business)
 
     result = await env.adapter(
         connection=_connection(**{_RUNTIME_KEY: refresh})
@@ -945,13 +1120,97 @@ async def test_signed_upload_issuing_401_then_refresh_continues_the_upload(
 
     assert result["is_error"] is False
     assert refresh_calls == 1
-    assert [name for name, _ in env.server_calls] == [
-        ISSUING_TOOL,
-        ISSUING_TOOL,
-        OUTER_TOOL,
+    assert env.call_auth == [
+        (ISSUING_TOOL, CONNECTION_AUTH),
+        (ISSUING_TOOL, FRESH_AUTH),
+        (OUTER_TOOL, FRESH_AUTH),
     ]
     assert len(env.put_requests) == 1
     assert env.staging_leftovers() == []
+
+
+async def test_signed_upload_refuses_a_refreshed_issuing_connection_to_another_host(
+    env: _Env,
+) -> None:
+    def refresh() -> dict[str, Any]:
+        return _connection(
+            url="https://other.example.test/mcp",
+            headers={"Authorization": FRESH_AUTH},
+        )
+
+    env.issue = _rejecting_the_initial_credential(env, env.issue)
+
+    result = await env.adapter(
+        connection=_connection(**{_RUNTIME_KEY: refresh})
+    ).run_json_async(_args())
+
+    assert result["is_error"] is True
+    assert _text(result) == UNTRUSTED_CONNECTOR
+    assert env.put_requests == []
+    assert env.calls_to(OUTER_TOOL) == []
+    assert env.staging_leftovers() == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(f"file:{OUR_FILE_ID}", id="file-reference"),
+        # A UUID the workspace does not know is refused too: the host check
+        # runs before the workspace is asked.
+        pytest.param("0b8f5d2e-7c41-4a9e-9d3b-2f6e8a1c4b70", id="unknown-bare-uuid"),
+    ],
+)
+async def test_signed_upload_refuses_a_per_call_connection_to_another_host(
+    env: _Env, value: str
+) -> None:
+    connection = _connection(
+        **{
+            _SLACK_REFRESH_KEY: lambda: _connection(
+                url="https://other.example.test/mcp"
+            )
+        }
+    )
+
+    result = await env.adapter(connection=connection).run_json_async(
+        _args(**{FILE_ARGUMENT: value})
+    )
+
+    assert result["is_error"] is True
+    assert _text(result) == UNTRUSTED_CONNECTOR
+    assert env.server_calls == []
+    assert env.put_requests == []
+    assert env.staging_leftovers() == []
+
+
+async def test_signed_upload_tool_call_401_retries_without_a_second_upload(
+    env: _Env,
+) -> None:
+    refresh_calls = 0
+
+    def refresh() -> dict[str, Any]:
+        nonlocal refresh_calls
+        refresh_calls += 1
+        return _connection(headers={"Authorization": FRESH_AUTH})
+
+    env.business = _rejecting_the_initial_credential(env, env.business)
+
+    result = await env.adapter(
+        connection=_connection(**{_RUNTIME_KEY: refresh})
+    ).run_json_async(_args())
+
+    assert result["is_error"] is False
+    assert refresh_calls == 1
+    assert env.call_auth == [
+        (ISSUING_TOOL, CONNECTION_AUTH),
+        (OUTER_TOOL, CONNECTION_AUTH),
+        (OUTER_TOOL, FRESH_AUTH),
+    ]
+    assert (
+        env.calls_to(OUTER_TOOL)
+        == [{FILE_ARGUMENT: REMOTE_FILE_ID, "record_id": "r-1"}] * 2
+    )
+    assert len(env.put_requests) == 1
+    assert result["structured_content"]["document_id"] == f"file:{OUR_FILE_ID}"
 
 
 async def test_signed_upload_issuing_exception_text_stays_out_of_logs_and_result(
@@ -988,9 +1247,19 @@ async def test_signed_upload_issuing_result_is_checked_before_sending(
     assert env.calls_to(OUTER_TOOL) == []
 
 
-async def test_signed_upload_refusals(env: _Env, tmp_path: Path) -> None:
+async def test_signed_upload_refusals(
+    env: _Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     text_file = env.source.parent / "notes.txt"
     text_file.write_text("plain text")
+    hashed: list[str] = []
+    original_hash = mcp_adapter_module._file_size_and_sha256
+
+    def recording_hash(path: Path) -> tuple[int, str]:
+        hashed.append(path.name)
+        return original_hash(path)
+
+    monkeypatch.setattr(mcp_adapter_module, "_file_size_and_sha256", recording_hash)
 
     cases: list[tuple[str, MCPToolAdapter, str]] = [
         ("no workspace", env.adapter(with_workspace=False), FILE_UNAVAILABLE),
@@ -1015,11 +1284,13 @@ async def test_signed_upload_refusals(env: _Env, tmp_path: Path) -> None:
         assert env.server_calls == [], label
         assert env.put_requests == [], label
 
-    # An extension the binding has no content type for.
+    # An extension the binding has no content type for is refused before the
+    # file is hashed.
     env.source = text_file
     env.server_calls.clear()
     result = await env.adapter().run_json_async(_args())
     assert _text(result) == UNSUPPORTED_TYPE
+    assert hashed == []
     assert env.server_calls == []
     assert env.put_requests == []
     assert env.staging_leftovers() == []
@@ -1038,6 +1309,295 @@ async def test_signed_upload_refusals(env: _Env, tmp_path: Path) -> None:
     result = await env.adapter().run_json_async(_args())
     assert result["is_error"] is False
     assert len(env.put_requests) == 1
+
+
+@pytest.mark.parametrize(
+    "expires_at",
+    ["0001-01-01T00:00:00+00:00", "0001-01-01T00:00:00+14:00"],
+)
+async def test_signed_upload_expiry_at_the_earliest_date_is_an_upload_failure(
+    env: _Env, expires_at: str
+) -> None:
+    env.issue = lambda args: _issued(_ticket(url_expires_at=expires_at))
+
+    result = await env.adapter().run_json_async(_args())
+
+    assert result["is_error"] is True
+    assert _text(result) == UPLOAD_FAILED
+    assert env.put_requests == []
+    assert env.calls_to(OUTER_TOOL) == []
+
+
+async def test_signed_upload_refusal_text_is_cut_before_redaction(
+    env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    redacted_lengths: list[int] = []
+    original_redact = mcp_adapter_module.redact_urls_in_text
+
+    def recording_redact(text: str) -> str:
+        redacted_lengths.append(len(text))
+        return original_redact(text)
+
+    monkeypatch.setattr(mcp_adapter_module, "redact_urls_in_text", recording_redact)
+    env.issue = lambda args: CallToolResult(
+        content=[TextContent(type="text", text="denied " + "x" * 1_000_000)],
+        isError=True,
+    )
+
+    result = await env.adapter().run_json_async(_args())
+
+    assert _text(result).startswith(REFUSED_PREFIX + "denied ")
+    assert redacted_lengths
+    assert max(redacted_lengths) <= mcp_adapter_module._MCP_TOOL_ERROR_RAW_MAX_CHARS + 1
+
+
+# A URL whose query is dropped by redaction, sized so that the cut at
+# _MCP_TOOL_ERROR_RAW_MAX_CHARS lands 20 characters after it. Redaction then
+# shortens the text enough for the cut to fall inside the 200-character result.
+_LONG_QUERY_URL = "https://q.example.test/p?" + "q" * (
+    mcp_adapter_module._MCP_TOOL_ERROR_RAW_MAX_CHARS - 20 - 25
+)
+
+
+@pytest.mark.parametrize(
+    ("tail", "forbidden"),
+    [
+        # The cut falls between a password and its "@", leaving a legal
+        # host:port; the whole token must be redacted.
+        pytest.param(" https://alice:12345@up.example.test/x", "12345", id="cut-url"),
+        # The cut falls in plain text; the cut mark must not reach the model.
+        pytest.param(
+            " " + "y" * 200,
+            mcp_adapter_module._TEXT_TRUNCATION_MARK,
+            id="cut-text",
+        ),
+    ],
+)
+async def test_signed_upload_refusal_text_cut_keeps_redaction_whole(
+    env: _Env, tail: str, forbidden: str
+) -> None:
+    env.issue = lambda args: CallToolResult(
+        content=[TextContent(type="text", text=_LONG_QUERY_URL + tail)],
+        isError=True,
+    )
+
+    result = await env.adapter().run_json_async(_args())
+
+    text = _text(result)
+    assert text.startswith(REFUSED_PREFIX + "https://q.example.test/p ")
+    assert forbidden not in text
+
+
+_RUNTIME_BOUND_FILE_ARGUMENT = _connection(
+    runtime_bindings=[
+        {
+            "source": {"input_type": "context", "key": "document"},
+            "target": {"target_type": "tool_arguments", "key": FILE_ARGUMENT},
+        }
+    ],
+    connector_runtime={
+        "context": {"document": "rf_fromcontext"},
+        "secrets": {},
+        "auth_selector": {},
+    },
+)
+
+
+@pytest.mark.parametrize(
+    ("schema", "connection"),
+    [
+        pytest.param(
+            {"type": "object", "properties": {"record_id": {"type": "string"}}},
+            None,
+            id="not-in-the-input-schema",
+        ),
+        pytest.param(
+            _SCHEMA, _RUNTIME_BOUND_FILE_ARGUMENT, id="filled-by-a-runtime-binding"
+        ),
+    ],
+)
+async def test_signed_upload_binding_the_model_cannot_fill_is_ignored(
+    env: _Env,
+    caplog: pytest.LogCaptureFixture,
+    schema: dict[str, Any],
+    connection: Any,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="xagent")
+
+    adapter = env.adapter(schema=schema, connection=connection)
+    await adapter.run_json_async(_args())
+
+    assert adapter._signed_upload is None
+    assert "A registered workspace file" not in adapter.description
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if "signed-upload settings" in record.getMessage()
+    ] == [
+        "MCP tool attach_document ignores its signed-upload settings: "
+        "the model cannot fill the file argument"
+    ]
+    assert env.calls_to(ISSUING_TOOL) == []
+    assert env.put_requests == []
+
+
+@pytest.mark.parametrize(
+    "constraint",
+    [
+        pytest.param({"maxLength": 20}, id="max-length"),
+        pytest.param({"enum": ["a", "b"]}, id="enum"),
+    ],
+)
+async def test_signed_upload_local_validation_runs_before_the_upload(
+    env: _Env, constraint: dict[str, Any]
+) -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            FILE_ARGUMENT: {"type": "string", **constraint},
+            "record_id": {"type": "string"},
+        },
+    }
+
+    result = await env.adapter(schema=schema).run_json_async(_args())
+
+    assert result["is_error"] is True
+    assert _text(result).startswith("Invalid MCP tool arguments at document: ")
+    assert env.server_calls == []
+    assert env.put_requests == []
+    assert env.staging_leftovers() == []
+
+
+async def test_signed_upload_passes_a_bare_id_through_without_a_workspace(
+    env: _Env,
+) -> None:
+    result = await env.adapter(with_workspace=False).run_json_async(
+        _args(**{FILE_ARGUMENT: OUR_FILE_ID})
+    )
+
+    assert result["is_error"] is False
+    assert env.server_calls == [
+        (OUTER_TOOL, {FILE_ARGUMENT: OUR_FILE_ID, "record_id": "r-1"})
+    ]
+    assert env.put_requests == []
+
+
+@pytest.mark.parametrize("step", ["staging", "hashing"])
+async def test_signed_upload_os_error_before_the_issuing_call_is_generic(
+    env: _Env, monkeypatch: pytest.MonkeyPatch, step: str
+) -> None:
+    def fail(*_args: Any) -> Any:
+        raise OSError("disk unavailable")
+
+    if step == "staging":
+        monkeypatch.setattr(env.workspace, "stage_file_for_external_upload", fail)
+    else:
+        monkeypatch.setattr(mcp_adapter_module, "_file_size_and_sha256", fail)
+
+    result = await env.adapter().run_json_async(_args())
+
+    assert result["is_error"] is True
+    assert _text(result) == "Error executing MCP tool."
+    assert env.server_calls == []
+    assert env.put_requests == []
+    assert env.staging_leftovers() == []
+
+
+@pytest.mark.parametrize("step", ["staging", "hashing", "issuing"])
+async def test_signed_upload_cancellation_before_the_put_discards_the_copy(
+    env: _Env, monkeypatch: pytest.MonkeyPatch, step: str
+) -> None:
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    release = threading.Event()
+
+    def block_worker() -> None:
+        loop.call_soon_threadsafe(started.set)
+        release.wait(timeout=10)
+
+    if step == "staging":
+        original_stage = env.workspace.stage_file_for_external_upload
+
+        def blocking_stage(file_id: str) -> Any:
+            staged = original_stage(file_id)
+            block_worker()
+            return staged
+
+        monkeypatch.setattr(
+            env.workspace, "stage_file_for_external_upload", blocking_stage
+        )
+    elif step == "hashing":
+        original_hash = mcp_adapter_module._file_size_and_sha256
+
+        def blocking_hash(path: Path) -> tuple[int, str]:
+            block_worker()
+            return original_hash(path)
+
+        monkeypatch.setattr(mcp_adapter_module, "_file_size_and_sha256", blocking_hash)
+    else:
+
+        async def never_answers(args: dict[str, Any]) -> CallToolResult:
+            started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        env.issue = never_answers
+
+    task = asyncio.ensure_future(env.adapter().run_json_async(_args()))
+    await asyncio.wait_for(started.wait(), timeout=10)
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert env.staging_leftovers() == []
+    assert env.calls_to(OUTER_TOOL) == []
+    assert env.put_requests == []
+
+
+@pytest.fixture
+def approval_gate() -> Any:
+    async def gate(_call: GatedCall) -> GateDecision:
+        return GateDecision.require_approval("interaction-1")
+
+    async def resume(*, executor: Any, **_: Any) -> ToolInteractionSettlement:
+        return ToolInteractionSettlement.succeeded(await executor(_args()))
+
+    handle = register_mcp_approval_gate(task_source="slack", gate=gate, resume=resume)
+    yield
+    unregister_mcp_approval_gate(handle)
+
+
+async def test_signed_upload_runs_only_when_the_approved_call_is_replayed(
+    env: _Env, approval_gate: None
+) -> None:
+    (tool,) = gate_mcp_tools([env.adapter()], connection={"id": 41})
+    context = ToolCallExecutionContext(
+        task_source="slack",
+        task_id="1",
+        run_id="run-1",
+        turn_id="turn-1",
+        tool_call_id="call-1",
+        pattern="react",
+        react_step_id="react-1",
+        dag_step_id=None,
+    )
+
+    with bind_tool_call_execution_context(context):
+        paused = await tool.run_json_async(_args())
+        assert env.server_calls == []
+        assert env.put_requests == []
+        settled = await tool.resume_user_interaction(
+            interaction_id=paused["interaction_id"], response="approve"
+        )
+
+    assert settled.status == "succeeded"
+    assert len(env.calls_to(ISSUING_TOOL)) == 1
+    assert len(env.put_requests) == 1
+    assert env.calls_to(OUTER_TOOL) == [
+        {FILE_ARGUMENT: REMOTE_FILE_ID, "record_id": "r-1"}
+    ]
+    assert env.staging_leftovers() == []
 
 
 # --------------------------------------------------------------------------
@@ -1132,6 +1692,31 @@ async def test_signed_upload_respects_workspace_scope(
     assert _text(result) == FILE_UNAVAILABLE
     assert env.calls_to(ISSUING_TOOL) == []
     assert env.calls_to(OUTER_TOOL) == []
+    assert env.put_requests == []
+    assert env.staging_leftovers() == []
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        pytest.param("other_user", id="another-end-user"),
+        pytest.param("other_task", id="same-user-another-task"),
+        pytest.param("deleted", id="record-deleted"),
+    ],
+)
+async def test_signed_upload_passes_a_bare_id_the_task_cannot_use_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, record: str
+) -> None:
+    """Such a bare UUID is taken as the connector's own file id."""
+    env, ids = _scoped_env(tmp_path, monkeypatch)
+
+    result = await env.adapter().run_json_async(_args(**{FILE_ARGUMENT: ids[record]}))
+
+    assert result["is_error"] is False
+    assert env.calls_to(ISSUING_TOOL) == []
+    assert env.calls_to(OUTER_TOOL) == [
+        {FILE_ARGUMENT: ids[record], "record_id": "r-1"}
+    ]
     assert env.put_requests == []
     assert env.staging_leftovers() == []
 
