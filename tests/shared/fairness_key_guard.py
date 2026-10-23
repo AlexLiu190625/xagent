@@ -5,11 +5,14 @@ the only statement allowed to write it is the flush ``stage_task_command``
 issues for the command it is accepting. The guard listens on every engine
 through the ``Engine`` class and looks at each statement that mentions the key:
 
-* A compiled UPDATE of the command table counts when the columns it writes
-  include the key, so a statement that only reads the key (``SET x = (SELECT
-  fairness_key ...)``) passes.
-* A statement without a compiled UPDATE (raw SQL) counts when it starts with
-  UPDATE of the command table and its SET clause names the key.
+* A compiled UPDATE of the command table, or of an alias of it, counts when the
+  columns it writes include the key, so a statement that only reads the key
+  (``SET x = (SELECT fairness_key ...)``) passes.
+* A compiled INSERT into the command table counts when its ON CONFLICT DO UPDATE
+  sets the key. It is never allowed: it filters on no command id.
+* A statement without a compiled UPDATE (raw SQL) counts when, after leading
+  comments, it is an UPDATE of the command table (optionally behind a WITH clause
+  or as UPDATE OR <action>) and its SET clause names the key.
 
 A statement that counts is allowed only when ``stage_task_command``, found by
 its code object on the stack of the thread that runs the statement, is
@@ -37,7 +40,7 @@ from typing import Any
 from sqlalchemy import event
 from sqlalchemy.engine import Engine
 from sqlalchemy.sql import operators
-from sqlalchemy.sql.dml import Update
+from sqlalchemy.sql.dml import Insert, Update
 from sqlalchemy.sql.elements import BinaryExpression, BindParameter, BooleanClauseList
 
 TABLE = "task_execution_commands"
@@ -49,7 +52,8 @@ violations: list[tuple[str, str, Any]] = []
 current_test = ""
 
 _RAW_UPDATE = re.compile(
-    r'^\s*UPDATE\s+(?:ONLY\s+)?(?:"?\w+"?\.)?"?' + TABLE + r'"?\b(?P<rest>.*)',
+    r"^(?:WITH\b.*?\bUPDATE|UPDATE)(?:\s+OR\s+\w+)?\s+(?:ONLY\s+)?"
+    r'(?:"?\w+"?\.)?"?' + TABLE + r'"?\b(?P<rest>.*)',
     re.IGNORECASE | re.DOTALL,
 )
 _SET_CLAUSE = re.compile(
@@ -59,19 +63,49 @@ _SET_CLAUSE = re.compile(
 _KEY_WORD = re.compile(r"\b" + KEY + r"\b")
 
 
+def _without_leading_comments(statement: str) -> str:
+    while True:
+        statement = statement.lstrip()
+        if statement.startswith("/*") and "*/" in statement:
+            statement = statement[statement.index("*/") + 2 :]
+        elif statement.startswith("--") and "\n" in statement:
+            statement = statement[statement.index("\n") + 1 :]
+        else:
+            return statement
+
+
 def raw_update_writes_key(statement: str) -> bool:
     """Whether raw SQL is an UPDATE of the command table that names the key in SET."""
-    update = _RAW_UPDATE.match(statement)
+    update = _RAW_UPDATE.match(_without_leading_comments(statement))
     if update is None:
         return False
     clause = _SET_CLAUSE.search(update.group("rest"))
     return clause is not None and _KEY_WORD.search(clause.group("set")) is not None
 
 
+def _base_table(table: Any) -> Any:
+    """The table behind an alias, or the table itself."""
+    while hasattr(table, "element"):
+        table = table.element
+    return table
+
+
+def insert_updates_key(compiled: Any) -> bool:
+    """Whether a compiled INSERT into the command table sets the key on conflict."""
+    statement = compiled.statement
+    if not isinstance(statement, Insert) or _base_table(statement.table).name != TABLE:
+        return False
+    clause = getattr(statement, "_post_values_clause", None)
+    return any(
+        getattr(column, "key", column) == KEY
+        for column, _ in getattr(clause, "update_values_to_set", None) or ()
+    )
+
+
 def compiled_update_writes_key(compiled: Any) -> bool:
     """Whether a compiled UPDATE of the command table writes the key column."""
     statement = compiled.statement
-    if not isinstance(statement, Update) or statement.table.name != TABLE:
+    if not isinstance(statement, Update) or _base_table(statement.table).name != TABLE:
         return False
     written = set(compiled.column_keys or ())
     state = getattr(compiled, "compile_state", None)
@@ -146,7 +180,8 @@ def before_cursor_execute(conn, cursor, statement, parameters, context, executem
     if KEY not in statement:
         return
     compiled = None if context is None else context.compiled
-    if compiled is not None and isinstance(compiled.statement, Update):
+    target = None if compiled is None else compiled.statement
+    if isinstance(target, Update):
         if not compiled_update_writes_key(compiled):
             return
         if every_parameter_set_targets(
@@ -154,6 +189,9 @@ def before_cursor_execute(conn, cursor, statement, parameters, context, executem
             where_id_parameter(compiled),
             _command_being_accepted(),
         ):
+            return
+    elif isinstance(target, Insert):
+        if not insert_updates_key(compiled):
             return
     elif not raw_update_writes_key(statement):
         return

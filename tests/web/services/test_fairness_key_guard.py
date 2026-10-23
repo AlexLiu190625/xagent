@@ -4,6 +4,7 @@ import itertools
 
 import pytest
 import sqlalchemy as sa
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import sessionmaker
 
 from tests.shared import fairness_key_guard as guard
@@ -120,6 +121,18 @@ def test_other_statements_are_let_through(host) -> None:
             .where(command_table.c.id == command.id)
             .values(error="done")
         )
+        # An upsert that leaves the key alone.
+        db.execute(
+            sqlite_insert(command_table)
+            .values(
+                id=command.id,
+                task_id=command.task_id,
+                command_id="again",
+                kind="start",
+                payload={},
+            )
+            .on_conflict_do_update(index_elements=["id"], set_={"error": "again"})
+        )
         # Reads the key without writing it.
         db.execute(
             sa.update(command_table)
@@ -141,6 +154,11 @@ def test_assigning_the_key_of_a_stored_command_is_refused(host) -> None:
     assert "UPDATE task_execution_commands" in refused_once()
 
 
+def aliased_update(table, command):
+    alias = table.alias("a")
+    return sa.update(alias).where(alias.c.id == command.id).values(fairness_key="x")
+
+
 @pytest.mark.parametrize(
     "write",
     [
@@ -154,8 +172,48 @@ def test_assigning_the_key_of_a_stored_command_is_refused(host) -> None:
         lambda t, c: sa.text(
             f"update task_execution_commands set fairness_key='x' where id = {c.id}"
         ),
+        lambda t, c: aliased_update(t, c),
+        lambda t, c: (
+            sqlite_insert(t)
+            .values(
+                id=c.id,
+                task_id=c.task_id,
+                command_id="again",
+                kind="start",
+                payload={},
+            )
+            .on_conflict_do_update(index_elements=["id"], set_={"fairness_key": "x"})
+        ),
+        lambda t, c: sa.text(
+            "/* a note */ UPDATE task_execution_commands SET fairness_key = 'x' "
+            f"WHERE id = {c.id}"
+        ),
+        lambda t, c: sa.text(
+            "-- a note\nUPDATE task_execution_commands SET fairness_key = 'x' "
+            f"WHERE id = {c.id}"
+        ),
+        lambda t, c: sa.text(
+            "WITH q AS (SELECT 1) UPDATE task_execution_commands "
+            f"SET fairness_key = 'x' WHERE id = {c.id}"
+        ),
+        lambda t, c: sa.text(
+            "UPDATE OR REPLACE task_execution_commands SET fairness_key = 'x' "
+            f"WHERE id = {c.id}"
+        ),
     ],
-    ids=["keyword", "unpacked", "mapping", "quoted_raw", "lowercase_raw"],
+    ids=[
+        "keyword",
+        "unpacked",
+        "mapping",
+        "quoted_raw",
+        "lowercase_raw",
+        "alias",
+        "upsert",
+        "block_comment",
+        "line_comment",
+        "with_clause",
+        "or_replace",
+    ],
 )
 def test_other_ways_to_write_the_key_are_refused(host, write) -> None:
     with host.sessions_() as db:
@@ -281,3 +339,34 @@ def test_a_write_is_allowed_only_when_every_parameter_set_names_the_command(
 
 def test_outside_the_acceptance_no_command_is_being_accepted() -> None:
     assert guard._command_being_accepted() is None
+
+
+def test_a_refusal_that_the_code_under_test_swallows_still_fails_the_test(
+    pytester,
+) -> None:
+    pytester.makeconftest('pytest_plugins = ["tests.shared.fairness_key_guard_plugin"]')
+    pytester.makepyfile(
+        """
+        import sqlalchemy as sa
+
+        def test_swallows_the_refusal():
+            engine = sa.create_engine("sqlite://")
+            with engine.begin() as connection:
+                connection.exec_driver_sql(
+                    "CREATE TABLE task_execution_commands (id INTEGER, fairness_key TEXT)"
+                )
+            try:
+                with engine.begin() as connection:
+                    connection.exec_driver_sql(
+                        "UPDATE task_execution_commands SET fairness_key = 'x'"
+                    )
+            except Exception:
+                pass  # what a broad handler in production code would do
+        """
+    )
+
+    result = pytester.runpytest_inprocess("-p", "no:cacheprovider")
+
+    # The test body passes; the check when the test ends reports the refusal.
+    result.assert_outcomes(passed=1, errors=1)
+    assert any("rewrote" in line or "tenant key" in line for line in result.outlines)
