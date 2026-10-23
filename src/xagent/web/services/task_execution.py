@@ -4991,7 +4991,10 @@ class BackgroundTaskManager:
         for task_id in [t for t in self._slot_keys if t not in active]:
             del self._slot_keys[task_id]
         snapshot = DispatchCapSnapshot(
-            policy=policy, active_ids=active, held=release_hold.closed
+            policy=policy,
+            active_ids=active,
+            held=release_hold.closed,
+            occupancy=dict(self._tenant_occupancy(active)),
         )
         self._cap_last_policy = policy
         self._record_cap_state(snapshot.closed, self._cap_clock())

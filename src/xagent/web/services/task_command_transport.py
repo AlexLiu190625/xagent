@@ -18,6 +18,7 @@ import asyncio
 import enum
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -30,6 +31,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Query, Session, aliased
 
 from ...config import (
+    DISPATCHER_FAIR_SHARE,
+    get_dispatcher_fair_share_enabled,
     get_shared_task_execution_enabled,
     get_task_lease_heartbeat_seconds,
     get_task_lease_ttl_seconds,
@@ -1881,6 +1884,28 @@ def _dispatcher_candidate_query(
     if shared:
         query = query.filter(_owner_lease_recovery_settled(runner_id, now))
     return query
+
+
+# The last raw value of the fair-share switch and what it parsed to.
+_fair_share_memo: tuple[str | None, bool] | None = None
+
+
+def _fair_share_enabled() -> bool:
+    """Whether dispatch ranks tenants, parsed again only when the raw value changes.
+
+    Each call reads the environment variable once. A value equal to the one the
+    last parse saw returns that parse's result without parsing or warning, so a
+    wrong value is reported once however often it is read. Threads that read a
+    new value at the same moment may each parse it, which at worst repeats the
+    warning.
+    """
+    global _fair_share_memo
+    raw = os.getenv(DISPATCHER_FAIR_SHARE)
+    memo = _fair_share_memo
+    if memo is None or memo[0] != raw:
+        memo = (raw, get_dispatcher_fair_share_enabled())
+        _fair_share_memo = memo
+    return memo[1]
 
 
 class CommandCandidate(NamedTuple):
