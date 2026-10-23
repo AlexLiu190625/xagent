@@ -432,6 +432,29 @@ def _replace_staged_upload_paths(value: Any, replacements: Mapping[str, str]) ->
     return value
 
 
+def _replace_exact_string_values(value: Any, replacements: Mapping[str, str]) -> Any:
+    """Replace string values that equal a key of ``replacements`` exactly.
+
+    Only whole values are replaced, never substrings and never mapping keys.
+    With no replacements the argument itself is returned.
+    """
+
+    if not replacements:
+        return value
+    if isinstance(value, str):
+        return replacements.get(value, value)
+    if isinstance(value, Mapping):
+        return {
+            key: _replace_exact_string_values(item, replacements)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_replace_exact_string_values(item, replacements) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_replace_exact_string_values(item, replacements) for item in value)
+    return value
+
+
 # Hard ceiling on how many exception nodes either walk over a failed call
 # visits, so a wide or cyclic __cause__/__context__ graph cannot spin.
 # Three consumers read it: _bounded_exception_nodes (the 401 resolver's
