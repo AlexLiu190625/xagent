@@ -84,7 +84,7 @@ from .sandboxed_tool.sandboxed_mcp_tool_helper import (
     load_sandboxed_mcp_tools,
     should_sandbox_mcp_connection,
 )
-from .signed_upload import is_signed_upload_issuing_tool
+from .signed_upload import connection_signed_uploads
 from .tool_naming_limits import MAX_AGENT_TOOL_NAME_LENGTH
 
 _DESCRIPTION_BOUND_ARGS_MAX_CHARS = 4096
@@ -97,6 +97,10 @@ class MCPFailurePhase(str, Enum):
     transport raised an ``httpx.HTTPStatusError`` with status 401 or 403:
     the server, or whatever answers in front of it, refused the request
     outright.
+
+    ``INVALID_CONFIGURATION`` is recorded when the connection carries
+    signed-upload settings that are not valid; it is found before any session
+    is opened.
     """
 
     SESSION_START = "session_start"
@@ -107,6 +111,7 @@ class MCPFailurePhase(str, Enum):
     SANDBOX_TOOL_WRAP = "sandbox_tool_wrap"
     NO_TOOLS_RETURNED = "no_tools_returned"
     AUTH_REJECTED = "auth_rejected"
+    INVALID_CONFIGURATION = "invalid_configuration"
 
 
 _DEFAULT_UNAVAILABLE_MCP_MESSAGE = "MCP server credentials are unavailable."
@@ -121,6 +126,7 @@ _MCP_LOAD_FAILURE_MESSAGES: dict[MCPFailurePhase, str] = {
     MCPFailurePhase.SANDBOX_TOOL_WRAP: ("Some MCP server tools could not be prepared."),
     MCPFailurePhase.NO_TOOLS_RETURNED: "MCP server returned no available tools.",
     MCPFailurePhase.AUTH_REJECTED: "MCP server refused the connection.",
+    MCPFailurePhase.INVALID_CONFIGURATION: "MCP server upload settings are invalid.",
 }
 # HTTP statuses that end a load's retries. A 401 means the credentials were
 # not accepted, and every attempt of a load sends the same credentials, so a
@@ -4144,7 +4150,33 @@ async def _load_direct_mcp_tools(
     ``create_session``; tool adapters always receive ``connection`` itself.
     Once the recorder is sealed (the caller abandoned this load), no further
     attempt starts, whatever the transport.
+
+    The connection's signed-upload settings are read once, before any session
+    is opened.  Settings that are not valid end the load with an
+    ``INVALID_CONFIGURATION`` failure and the server is never contacted.
     """
+    try:
+        signed_uploads = connection_signed_uploads(connection)
+    except ValueError as exc:
+        logger.warning(
+            "Not loading tools from MCP server %s: its signed-upload settings "
+            "are invalid",
+            server_name,
+        )
+        return MCPLoadResult(
+            tools=(),
+            loaded_servers=(),
+            failures=(
+                MCPServerLoadFailure(
+                    server_name=server_name,
+                    phase=MCPFailurePhase.INVALID_CONFIGURATION,
+                    error_type=type(exc).__name__,
+                    attempts=0,
+                ),
+            ),
+        )
+    issuing_tool_names = {binding.issuing_tool_name for binding in signed_uploads}
+
     agent_tools: list[AbstractBaseTool] = []
     mcp_tools: list[MCPTool] = []
     transport = connection.get("transport", "")
@@ -4260,7 +4292,7 @@ async def _load_direct_mcp_tools(
 
     adapter_error_type: str | None = None
     for mcp_tool in mcp_tools:
-        if is_signed_upload_issuing_tool(connection, mcp_tool.name):
+        if mcp_tool.name in issuing_tool_names:
             # The host calls this tool itself while preparing a signed upload
             # set up for this connector; the model never receives the URL it
             # returns.
@@ -4574,10 +4606,7 @@ async def load_mcp_tools_as_agent_tools(
             # fixed-format message with no secret) or a genuine bug escaping
             # the loop -- per-server session/initialize/list-tools failures
             # for direct transports are handled, and logged, inside
-            # _load_direct_mcp_tools's retry loop instead. It also receives
-            # the ValueError raised when a connection carries invalid
-            # signed-upload settings; that failure is reported under the
-            # session-start phase. Opt-in: set
+            # _load_direct_mcp_tools's retry loop instead. Opt-in: set
             # XAGENT_LOG_LEVEL=DEBUG (or run with --debug) to capture it.
             logger.debug(
                 "MCP server load failure detail for server %s",

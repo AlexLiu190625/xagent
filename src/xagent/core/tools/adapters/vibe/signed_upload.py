@@ -11,6 +11,15 @@ The owner of a connector describes such tools in the connector's own
 mapping.  A connection without that setting behaves exactly as it does without
 this module.
 
+The settings are trusted as the connector owner's own.  On a shared connector
+only the connector's owner or a platform administrator may change them.  This
+module only reads the setting and does not enforce that rule; whatever writes
+the setting must.  The upload-host rules below check only the form of a name:
+they accept names such as ``localhost`` or a single label and never look at
+the address a name resolves to.  The upload request must therefore be sent
+through ``PublicHttpTransport`` (``xagent.core.utils.public_http_transport``),
+which resolves the host and refuses any address that is not public.
+
 A binding replaces one scalar string argument of one tool.  A list value in
 that argument is passed through unchanged.
 """
@@ -33,7 +42,7 @@ import httpx
 # other transport are never read.
 SIGNED_UPLOAD_TRANSPORTS = frozenset({"sse", "streamable_http"})
 _MAX_SETTINGS_ENTRIES = 20
-_MAX_NAME_LENGTH = 255
+_MAX_STRING_LENGTH = 255
 _MAX_HOSTNAME_LENGTH = 253
 _MAX_UPLOAD_HOSTS = 20
 _MAX_CONTENT_TYPES = 50
@@ -65,7 +74,10 @@ _FORBIDDEN_URL_PATH_ESCAPES = ("%2e", "%2f", "%5c")
 class SignedUploadBinding:
     """One tool of one remote connector whose file argument is uploaded by the host."""
 
-    # hostname of the connection URL; filled in when settings are parsed
+    # Hostname of the URL of the connection the settings were read from,
+    # filled in when settings are parsed.  Settings apply to a connection only
+    # because that connection carries them, so this field may be used to
+    # refuse a binding but never to grant one.
     connection_host: str
     tool_name: str  # tool whose argument is replaced
     file_argument: str  # scalar argument carrying file:<id>
@@ -98,8 +110,8 @@ def _validate_hostname(host: Any, label: str) -> None:
 def _validate_string(value: Any, label: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{label} must be a non-empty string")
-    if len(value) > _MAX_NAME_LENGTH:
-        raise ValueError(f"{label} must not be longer than {_MAX_NAME_LENGTH}")
+    if len(value) > _MAX_STRING_LENGTH:
+        raise ValueError(f"{label} must not be longer than {_MAX_STRING_LENGTH}")
     return value
 
 
@@ -144,8 +156,8 @@ def _validate_entry(
         raise ValueError(f"{prefix_label} must start and end with '/'")
     if ".." in prefix:
         raise ValueError(f"{prefix_label} must not contain '..'")
-    if len(prefix) > _MAX_NAME_LENGTH:
-        raise ValueError(f"{prefix_label} must not be longer than {_MAX_NAME_LENGTH}")
+    if len(prefix) > _MAX_STRING_LENGTH:
+        raise ValueError(f"{prefix_label} must not be longer than {_MAX_STRING_LENGTH}")
 
     types_label = f"{label}.content_types"
     content_types = entry["content_types"]
@@ -168,9 +180,9 @@ def _validate_entry(
             )
         if not isinstance(mime, str) or not mime:
             raise ValueError(f"{types_label} values must be non-empty")
-        if len(mime) > _MAX_NAME_LENGTH:
+        if len(mime) > _MAX_STRING_LENGTH:
             raise ValueError(
-                f"{types_label} values must not be longer than {_MAX_NAME_LENGTH}"
+                f"{types_label} values must not be longer than {_MAX_STRING_LENGTH}"
             )
 
     return SignedUploadBinding(
@@ -206,12 +218,13 @@ def parse_signed_upload_settings(
     ``None`` and an empty list mean no settings and give an empty tuple.  Any
     other value must be a list of entries with exactly the documented keys, and
     the connection needs a hostname (``connection_host``, the lower-case
-    hostname of the connection URL, taken as given).  The error text is fixed
-    and never carries a stored value.
+    hostname of the connection URL, taken as given; ``None`` and an empty
+    string both mean it has none).  The error text is fixed and never carries
+    a stored value.
     """
     if raw is None or (isinstance(raw, list) and not raw):
         return ()
-    if connection_host is None:
+    if not connection_host:
         raise ValueError("the connection URL has no hostname")
     if not isinstance(raw, list):
         raise ValueError("signed_uploads must be a list")
@@ -250,7 +263,7 @@ def signed_upload_settings_error(raw: Any, *, transport: Any, url: Any) -> str |
     return None
 
 
-def _connection_signed_uploads(connection: Any) -> tuple[SignedUploadBinding, ...]:
+def connection_signed_uploads(connection: Any) -> tuple[SignedUploadBinding, ...]:
     """Read and validate the settings carried by ``connection``.
 
     A connection that is not a mapping, or whose transport does not take part,
@@ -262,8 +275,6 @@ def _connection_signed_uploads(connection: Any) -> tuple[SignedUploadBinding, ..
     if not isinstance(transport, str) or transport not in SIGNED_UPLOAD_TRANSPORTS:
         return ()
     raw = connection.get("signed_uploads")
-    if raw is None or (isinstance(raw, list) and not raw):
-        return ()
     return parse_signed_upload_settings(
         raw, connection_host=_url_hostname(connection.get("url"))
     )
@@ -277,22 +288,10 @@ def find_signed_upload_binding(
     The binding is read from the connection's own ``signed_uploads`` setting.
     Raises ``ValueError`` when that setting is present but not valid.
     """
-    for binding in _connection_signed_uploads(connection):
+    for binding in connection_signed_uploads(connection):
         if binding.tool_name == tool_name:
             return binding
     return None
-
-
-def is_signed_upload_issuing_tool(connection: Any, tool_name: str) -> bool:
-    """Whether ``tool_name`` is the issuing tool of a binding on ``connection``.
-
-    The bindings are read from the connection's own ``signed_uploads`` setting.
-    Raises ``ValueError`` when that setting is present but not valid.
-    """
-    return any(
-        binding.issuing_tool_name == tool_name
-        for binding in _connection_signed_uploads(connection)
-    )
 
 
 @dataclass(frozen=True)

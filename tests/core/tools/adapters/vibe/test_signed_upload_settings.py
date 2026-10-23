@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import re
 from contextlib import asynccontextmanager
 from types import MappingProxyType, SimpleNamespace
 from typing import Any
@@ -10,13 +11,16 @@ import pytest
 from xagent.core.tools.adapters.vibe import mcp_adapter as mcp_adapter_module
 from xagent.core.tools.adapters.vibe import signed_upload
 from xagent.core.tools.adapters.vibe.mcp_adapter import (
+    MCPFailurePhase,
+    MCPServerLoadFailure,
     _build_mcp_tool_adapter,
     load_mcp_tools_as_agent_tools,
+    mcp_load_failure_message,
 )
 from xagent.core.tools.adapters.vibe.signed_upload import (
     SignedUploadBinding,
+    connection_signed_uploads,
     find_signed_upload_binding,
-    is_signed_upload_issuing_tool,
     parse_signed_upload_settings,
     signed_upload_settings_error,
 )
@@ -91,127 +95,267 @@ def _many_entries(count: int) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
+def _exactly(message: str) -> str:
+    return f"^{re.escape(message)}$"
+
+
+NOT_A_LIST = "signed_uploads must be a list"
+NOT_AN_OBJECT = "signed_uploads[0] must be an object"
+KEYS = "signed_uploads[0] must have exactly the documented keys"
+CLASH = "a tool cannot be both an issuing tool and a replaced tool"
+HOSTS = "signed_uploads[0].allowed_upload_hosts"
+HOST = f"{HOSTS} entry"
+NOT_EXACT_HOST = f"{HOST} must be an exact hostname"
+PREFIX = "signed_uploads[0].upload_path_prefix"
+TYPES = "signed_uploads[0].content_types"
+
+
 def _name_field_cells(field: str) -> list[Any]:
+    label = f"signed_uploads[0].{field}"
+    empty = f"{label} must be a non-empty string"
     return [
-        pytest.param([_entry(**{field: ""})], id=f"{field}-empty"),
-        pytest.param([_entry(**{field: 7})], id=f"{field}-not-a-string"),
-        pytest.param([_entry(**{field: None})], id=f"{field}-none"),
-        pytest.param([_entry(**{field: "x" * 256})], id=f"{field}-too-long"),
+        pytest.param([_entry(**{field: ""})], empty, id=f"{field}-empty"),
+        pytest.param([_entry(**{field: 7})], empty, id=f"{field}-not-a-string"),
+        pytest.param([_entry(**{field: None})], empty, id=f"{field}-none"),
+        pytest.param(
+            [_entry(**{field: "x" * 256})],
+            f"{label} must not be longer than 255",
+            id=f"{field}-too-long",
+        ),
     ]
 
 
+# Each case names the exact error it must raise, so a case that a different
+# rule happens to reject fails.
 REJECTED_SETTINGS = [
     # not a list
-    pytest.param({"tool_name": "attach_document"}, id="value-is-a-dict"),
-    pytest.param("attach_document", id="value-is-a-string"),
-    pytest.param(7, id="value-is-a-number"),
-    pytest.param(False, id="value-is-false"),
-    pytest.param("", id="value-is-an-empty-string"),
-    pytest.param({}, id="value-is-an-empty-dict"),
-    pytest.param((_entry(),), id="value-is-a-tuple"),
+    pytest.param({"tool_name": "attach_document"}, NOT_A_LIST, id="value-is-a-dict"),
+    pytest.param("attach_document", NOT_A_LIST, id="value-is-a-string"),
+    pytest.param(7, NOT_A_LIST, id="value-is-a-number"),
+    pytest.param(False, NOT_A_LIST, id="value-is-false"),
+    pytest.param("", NOT_A_LIST, id="value-is-an-empty-string"),
+    pytest.param({}, NOT_A_LIST, id="value-is-an-empty-dict"),
+    pytest.param((_entry(),), NOT_A_LIST, id="value-is-a-tuple"),
     # too many entries
-    pytest.param(_many_entries(21), id="too-many-entries"),
+    pytest.param(
+        _many_entries(21),
+        "signed_uploads must not have more than 20 entries",
+        id="too-many-entries",
+    ),
     # entry shape
-    pytest.param(["attach_document"], id="entry-is-a-string"),
-    pytest.param([None], id="entry-is-none"),
-    pytest.param([[_entry()]], id="entry-is-a-list"),
-    pytest.param([_entry(), 7], id="second-entry-is-a-number"),
-    pytest.param([{}], id="entry-is-empty"),
-    *[pytest.param([_without(key)], id=f"missing-{key}") for key in _entry()],
-    pytest.param([_entry(extra="x")], id="extra-key"),
+    pytest.param(["attach_document"], NOT_AN_OBJECT, id="entry-is-a-string"),
+    pytest.param([None], NOT_AN_OBJECT, id="entry-is-none"),
+    pytest.param([[_entry()]], NOT_AN_OBJECT, id="entry-is-a-list"),
+    pytest.param(
+        [_entry(), 7],
+        "signed_uploads[1] must be an object",
+        id="second-entry-is-a-number",
+    ),
+    pytest.param([{}], KEYS, id="entry-is-empty"),
+    *[pytest.param([_without(key)], KEYS, id=f"missing-{key}") for key in _entry()],
+    pytest.param([_entry(extra="x")], KEYS, id="extra-key"),
     # names
     *_name_field_cells("tool_name"),
     *_name_field_cells("file_argument"),
     *_name_field_cells("issuing_tool_name"),
     # clashes between entries
     pytest.param(
-        [_entry(), _entry(issuing_tool_name="other_issuer")], id="duplicate-tool-name"
+        [_entry(), _entry(issuing_tool_name="other_issuer")],
+        "signed_uploads[1].tool_name repeats an earlier entry",
+        id="duplicate-tool-name",
     ),
     pytest.param(
         [
             _entry(),
             _entry(tool_name="attach_image", issuing_tool_name="attach_document"),
         ],
+        CLASH,
         id="issuing-tool-of-a-later-entry-is-an-earlier-tool",
     ),
     pytest.param(
         [_entry(), _entry(tool_name="request_upload", issuing_tool_name="issue_other")],
+        CLASH,
         id="tool-of-a-later-entry-is-an-earlier-issuing-tool",
     ),
     pytest.param(
-        [_entry(issuing_tool_name="attach_document")], id="issuing-tool-is-the-tool"
+        [_entry(issuing_tool_name="attach_document")],
+        CLASH,
+        id="issuing-tool-is-the-tool",
     ),
     # allowed_upload_hosts
     pytest.param(
-        [_entry(allowed_upload_hosts="uploads.example.test")], id="hosts-is-a-string"
+        [_entry(allowed_upload_hosts="uploads.example.test")],
+        f"{HOSTS} must be a list of hostnames",
+        id="hosts-is-a-string",
     ),
     pytest.param(
         [_entry(allowed_upload_hosts=frozenset({"uploads.example.test"}))],
+        f"{HOSTS} must be a list of hostnames",
         id="hosts-is-a-frozenset",
     ),
-    pytest.param([_entry(allowed_upload_hosts=None)], id="hosts-is-none"),
-    pytest.param([_entry(allowed_upload_hosts=[])], id="hosts-empty"),
+    pytest.param(
+        [_entry(allowed_upload_hosts=None)],
+        f"{HOSTS} must be a list of hostnames",
+        id="hosts-is-none",
+    ),
+    pytest.param(
+        [_entry(allowed_upload_hosts=[])],
+        f"{HOSTS} must not be empty",
+        id="hosts-empty",
+    ),
     pytest.param(
         [_entry(allowed_upload_hosts=[f"h{i}.example.test" for i in range(21)])],
+        f"{HOSTS} must not have more than 20 entries",
         id="hosts-too-many",
     ),
-    pytest.param([_entry(allowed_upload_hosts=["*.example.test"])], id="host-star"),
-    pytest.param([_entry(allowed_upload_hosts=["192.168.1.5"])], id="host-ip"),
-    pytest.param([_entry(allowed_upload_hosts=["::1"])], id="host-ipv6"),
     pytest.param(
-        [_entry(allowed_upload_hosts=["Uploads.example.test"])], id="host-uppercase"
+        [_entry(allowed_upload_hosts=["*.example.test"])],
+        NOT_EXACT_HOST,
+        id="host-star",
+    ),
+    pytest.param(
+        [_entry(allowed_upload_hosts=["192.168.1.5"])],
+        f"{HOST} must be a hostname, not an IP address",
+        id="host-ip",
+    ),
+    # An IPv6 literal always contains ":", so the character rule rejects it
+    # before the IP-address rule is reached.
+    pytest.param(
+        [_entry(allowed_upload_hosts=["::1"])], NOT_EXACT_HOST, id="host-ipv6-colon"
+    ),
+    pytest.param(
+        [_entry(allowed_upload_hosts=["Uploads.example.test"])],
+        f"{HOST} must be lower-case",
+        id="host-uppercase",
     ),
     pytest.param(
         [_entry(allowed_upload_hosts=["uploads.example.test."])],
+        f"{HOST} must not end with a dot",
         id="host-trailing-dot",
     ),
     pytest.param(
-        [_entry(allowed_upload_hosts=["uploads.example.test:8443"])], id="host-colon"
+        [_entry(allowed_upload_hosts=["uploads.example.test:8443"])],
+        NOT_EXACT_HOST,
+        id="host-colon",
     ),
-    pytest.param([_entry(allowed_upload_hosts=[""])], id="host-empty"),
-    pytest.param([_entry(allowed_upload_hosts=[7])], id="host-not-a-string"),
+    pytest.param(
+        [_entry(allowed_upload_hosts=["user@uploads.example.test"])],
+        NOT_EXACT_HOST,
+        id="host-at",
+    ),
+    pytest.param(
+        [_entry(allowed_upload_hosts=["uploads.example.test/x"])],
+        NOT_EXACT_HOST,
+        id="host-slash",
+    ),
+    pytest.param(
+        [_entry(allowed_upload_hosts=["uploads example.test"])],
+        NOT_EXACT_HOST,
+        id="host-space",
+    ),
+    pytest.param(
+        [_entry(allowed_upload_hosts=["uploads.example.test\t"])],
+        NOT_EXACT_HOST,
+        id="host-tab",
+    ),
+    pytest.param(
+        [_entry(allowed_upload_hosts=[""])],
+        f"{HOST} must be a non-empty string",
+        id="host-empty",
+    ),
+    pytest.param(
+        [_entry(allowed_upload_hosts=[7])],
+        f"{HOST} must be a non-empty string",
+        id="host-not-a-string",
+    ),
     pytest.param(
         [_entry(allowed_upload_hosts=["uploads.example.test", "a" * 254])],
+        f"{HOST} must not be longer than 253",
         id="host-too-long",
     ),
     # upload_path_prefix
-    pytest.param([_entry(upload_path_prefix="staged/")], id="prefix-no-leading-slash"),
-    pytest.param([_entry(upload_path_prefix="/staged")], id="prefix-no-trailing-slash"),
-    pytest.param([_entry(upload_path_prefix="/staged/../x/")], id="prefix-dotdot"),
     pytest.param(
-        [_entry(upload_path_prefix="/" + "p" * 254 + "/")], id="prefix-too-long"
+        [_entry(upload_path_prefix="staged/")],
+        f"{PREFIX} must start and end with '/'",
+        id="prefix-no-leading-slash",
     ),
-    pytest.param([_entry(upload_path_prefix=None)], id="prefix-not-a-string"),
+    pytest.param(
+        [_entry(upload_path_prefix="/staged")],
+        f"{PREFIX} must start and end with '/'",
+        id="prefix-no-trailing-slash",
+    ),
+    pytest.param(
+        [_entry(upload_path_prefix="/staged/../x/")],
+        f"{PREFIX} must not contain '..'",
+        id="prefix-dotdot",
+    ),
+    pytest.param(
+        [_entry(upload_path_prefix="/" + "p" * 254 + "/")],
+        f"{PREFIX} must not be longer than 255",
+        id="prefix-too-long",
+    ),
+    pytest.param(
+        [_entry(upload_path_prefix=None)],
+        f"{PREFIX} must start and end with '/'",
+        id="prefix-not-a-string",
+    ),
     # content_types
-    pytest.param([_entry(content_types=None)], id="content-types-none"),
+    pytest.param(
+        [_entry(content_types=None)],
+        f"{TYPES} must be an object",
+        id="content-types-none",
+    ),
     pytest.param(
         [_entry(content_types=[(".pdf", "application/pdf")])],
+        f"{TYPES} must be an object",
         id="content-types-not-a-dict",
     ),
-    pytest.param([_entry(content_types={})], id="content-types-empty"),
+    pytest.param(
+        [_entry(content_types={})],
+        f"{TYPES} must not be empty",
+        id="content-types-empty",
+    ),
     pytest.param(
         [_entry(content_types={f".t{i}": "text/plain" for i in range(51)})],
+        f"{TYPES} must not have more than 50 entries",
         id="content-types-too-many",
     ),
     pytest.param(
-        [_entry(content_types={"pdf": "application/pdf"})], id="suffix-no-dot"
+        [_entry(content_types={"pdf": "application/pdf"})],
+        f"{TYPES} keys must start with '.'",
+        id="suffix-no-dot",
     ),
     pytest.param(
-        [_entry(content_types={".PDF": "application/pdf"})], id="suffix-uppercase"
+        [_entry(content_types={".PDF": "application/pdf"})],
+        f"{TYPES} keys must be lower-case",
+        id="suffix-uppercase",
     ),
     pytest.param(
         [_entry(content_types={"." + "s" * 16: "application/pdf"})],
+        f"{TYPES} keys must not be longer than 16",
         id="suffix-too-long",
     ),
-    pytest.param([_entry(content_types={".pdf": ""})], id="mime-empty"),
-    pytest.param([_entry(content_types={".pdf": 7})], id="mime-not-a-string"),
-    pytest.param([_entry(content_types={".pdf": "m" * 256})], id="mime-too-long"),
+    pytest.param(
+        [_entry(content_types={".pdf": ""})],
+        f"{TYPES} values must be non-empty",
+        id="mime-empty",
+    ),
+    pytest.param(
+        [_entry(content_types={".pdf": 7})],
+        f"{TYPES} values must be non-empty",
+        id="mime-not-a-string",
+    ),
+    pytest.param(
+        [_entry(content_types={".pdf": "m" * 256})],
+        f"{TYPES} values must not be longer than 255",
+        id="mime-too-long",
+    ),
 ]
 
 
-@pytest.mark.parametrize("raw", REJECTED_SETTINGS)
-def test_parse_signed_upload_settings_rejects(raw: Any) -> None:
-    with pytest.raises(ValueError):
+@pytest.mark.parametrize(("raw", "message"), REJECTED_SETTINGS)
+def test_parse_signed_upload_settings_rejects(raw: Any, message: str) -> None:
+    with pytest.raises(ValueError, match=_exactly(message)):
         _parse(raw)
 
 
@@ -322,9 +466,15 @@ def test_parse_signed_upload_settings_empty_value(
     assert _parse(raw, connection_host=connection_host) == ()
 
 
-def test_parse_signed_upload_settings_non_empty_needs_a_connection_host() -> None:
-    with pytest.raises(ValueError):
-        _parse([_entry()], connection_host=None)
+NO_HOSTNAME = "the connection URL has no hostname"
+
+
+@pytest.mark.parametrize("connection_host", [None, ""], ids=["none", "empty"])
+def test_parse_signed_upload_settings_non_empty_needs_a_connection_host(
+    connection_host: str | None,
+) -> None:
+    with pytest.raises(ValueError, match=_exactly(NO_HOSTNAME)):
+        _parse([_entry()], connection_host=connection_host)
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +535,12 @@ def test_signed_upload_settings_error_never_raises(
 # ---------------------------------------------------------------------------
 # Lookup functions
 # ---------------------------------------------------------------------------
+
+
+def _issuing_tools(connection: Any) -> set[str]:
+    return {
+        binding.issuing_tool_name for binding in connection_signed_uploads(connection)
+    }
 
 
 def _with_settings(connection: dict[str, Any]) -> dict[str, Any]:
@@ -507,10 +663,10 @@ def test_find_signed_upload_binding(
         ),
     ],
 )
-def test_is_signed_upload_issuing_tool(
+def test_connection_signed_uploads_issuing_tools(
     connection: Any, tool_name: str, expected: bool
 ) -> None:
-    assert is_signed_upload_issuing_tool(connection, tool_name) is expected
+    assert (tool_name in _issuing_tools(connection)) is expected
 
 
 @pytest.mark.parametrize(
@@ -531,24 +687,31 @@ def test_lookups_raise_for_settings_on_a_connection_without_hostname(
         "signed_uploads": [_entry()],
     }
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=_exactly(NO_HOSTNAME)):
         find_signed_upload_binding(connection, "attach_document")
-    with pytest.raises(ValueError):
-        is_signed_upload_issuing_tool(connection, "request_upload")
+    with pytest.raises(ValueError, match=_exactly(NO_HOSTNAME)):
+        connection_signed_uploads(connection)
 
 
 @pytest.mark.parametrize(
-    "raw",
-    [{"tool_name": "x"}, [{}], [_entry(allowed_upload_hosts=["10.0.0.1"])]],
+    ("raw", "message"),
+    [
+        ({"tool_name": "x"}, NOT_A_LIST),
+        ([{}], KEYS),
+        (
+            [_entry(allowed_upload_hosts=["10.0.0.1"])],
+            f"{HOST} must be a hostname, not an IP address",
+        ),
+    ],
     ids=["not-a-list", "missing-keys", "ip-upload-host"],
 )
-def test_lookups_raise_for_invalid_settings(raw: Any) -> None:
+def test_lookups_raise_for_invalid_settings(raw: Any, message: str) -> None:
     connection = _connection(signed_uploads=raw)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=_exactly(message)):
         find_signed_upload_binding(connection, "attach_document")
-    with pytest.raises(ValueError):
-        is_signed_upload_issuing_tool(connection, "request_upload")
+    with pytest.raises(ValueError, match=_exactly(message)):
+        connection_signed_uploads(connection)
 
 
 @pytest.mark.parametrize("transport", ["stdio", "websocket"])
@@ -556,7 +719,7 @@ def test_lookups_ignore_invalid_settings_on_other_transports(transport: str) -> 
     connection = _connection(transport, signed_uploads={"tool_name": "x"})
 
     assert find_signed_upload_binding(connection, "attach_document") is None
-    assert is_signed_upload_issuing_tool(connection, "request_upload") is False
+    assert connection_signed_uploads(connection) == ()
 
 
 def test_settings_of_two_connections_do_not_interact() -> None:
@@ -571,26 +734,22 @@ def test_settings_of_two_connections_do_not_interact() -> None:
 
     assert find_signed_upload_binding(first, "attach_document") == _binding()
     assert find_signed_upload_binding(first, "request_upload") is None
-    assert is_signed_upload_issuing_tool(first, "request_upload") is True
-    assert is_signed_upload_issuing_tool(first, "issue_other") is False
+    assert _issuing_tools(first) == {"request_upload"}
     assert find_signed_upload_binding(second, "request_upload") == _binding(
         connection_host="other.example.test",
         tool_name="request_upload",
         issuing_tool_name="issue_other",
     )
     assert find_signed_upload_binding(second, "attach_document") is None
-    assert is_signed_upload_issuing_tool(second, "request_upload") is False
-    assert is_signed_upload_issuing_tool(second, "issue_other") is True
+    assert _issuing_tools(second) == {"issue_other"}
 
 
 def test_two_connections_on_one_host_keep_their_own_settings() -> None:
     first = _connection(signed_uploads=[_entry()])
     second = _connection(signed_uploads=[_entry(issuing_tool_name="issue_other")])
 
-    assert is_signed_upload_issuing_tool(first, "request_upload") is True
-    assert is_signed_upload_issuing_tool(first, "issue_other") is False
-    assert is_signed_upload_issuing_tool(second, "request_upload") is False
-    assert is_signed_upload_issuing_tool(second, "issue_other") is True
+    assert _issuing_tools(first) == {"request_upload"}
+    assert _issuing_tools(second) == {"issue_other"}
 
 
 # ---------------------------------------------------------------------------
@@ -609,13 +768,17 @@ def _server_tool(name: str) -> SimpleNamespace:
     )
 
 
-def _serve_tools(monkeypatch: pytest.MonkeyPatch, *tool_names: str) -> None:
+def _serve_tools(monkeypatch: pytest.MonkeyPatch, *tool_names: str) -> list[Any]:
+    """Serve ``tool_names`` from every server; return the sessions' connections."""
+    opened: list[Any] = []
+
     class FakeSession:
         async def initialize(self) -> None:
             return None
 
     @asynccontextmanager
-    async def fake_create_session(_connection: Any):
+    async def fake_create_session(connection: Any):
+        opened.append(connection)
         yield FakeSession()
 
     async def fake_load_mcp_tools(_session: Any) -> list[SimpleNamespace]:
@@ -623,6 +786,7 @@ def _serve_tools(monkeypatch: pytest.MonkeyPatch, *tool_names: str) -> None:
 
     monkeypatch.setattr(mcp_adapter_module, "create_session", fake_create_session)
     monkeypatch.setattr(mcp_adapter_module, "load_mcp_tools", fake_load_mcp_tools)
+    return opened
 
 
 def _describe(tool: Any) -> tuple[str, str, dict[str, Any]]:
@@ -690,7 +854,7 @@ def test_no_signed_uploads_keeps_tool_list_for_non_mapping_connection(
     connection: Any,
 ) -> None:
     assert find_signed_upload_binding(connection, "attach_document") is None
-    assert is_signed_upload_issuing_tool(connection, "request_upload") is False
+    assert connection_signed_uploads(connection) == ()
 
 
 @pytest.mark.asyncio
@@ -841,6 +1005,7 @@ async def test_invalid_settings_fail_closed(
 
     failures_of_a = [f for f in result.failures if f.server_name == "A"]
     assert len(failures_of_a) == 1
+    assert failures_of_a[0].phase is MCPFailurePhase.INVALID_CONFIGURATION
     assert failures_of_a[0].error_type == "ValueError"
     assert not [tool for tool in result.tools if tool.name.startswith("mcp_A_")]
     assert "A" not in result.loaded_servers
@@ -851,6 +1016,54 @@ async def test_invalid_settings_fail_closed(
     ]
     assert "B" in result.loaded_servers
     assert _MARKER not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "served", [pytest.param(_ALL_TOOLS, id="tools"), pytest.param((), id="no-tools")]
+)
+async def test_invalid_settings_are_found_before_any_session(
+    monkeypatch: pytest.MonkeyPatch, served: tuple[str, ...]
+) -> None:
+    opened = _serve_tools(monkeypatch, *served)
+
+    result = await _load({"A": _connection(signed_uploads={"tool_name": "x"})})
+
+    assert opened == []
+    assert result.tools == ()
+    assert result.loaded_servers == ()
+    assert result.failures == (
+        MCPServerLoadFailure(
+            server_name="A",
+            phase=MCPFailurePhase.INVALID_CONFIGURATION,
+            error_type="ValueError",
+            attempts=0,
+        ),
+    )
+    assert mcp_load_failure_message(result.failures[0].phase) == (
+        "MCP server upload settings are invalid."
+    )
+
+
+@pytest.mark.asyncio
+async def test_settings_are_read_once_per_load(monkeypatch: pytest.MonkeyPatch) -> None:
+    _serve_tools(monkeypatch, *_ALL_TOOLS)
+    parse = signed_upload.parse_signed_upload_settings
+    reads: list[Any] = []
+
+    def counting_parse(raw: Any, *, connection_host: str | None) -> Any:
+        reads.append(raw)
+        return parse(raw, connection_host=connection_host)
+
+    monkeypatch.setattr(signed_upload, "parse_signed_upload_settings", counting_parse)
+
+    result = await _load({"docs": _connection(signed_uploads=[_entry()])})
+
+    assert [tool.name for tool in result.tools] == [
+        "mcp_docs_attach_document",
+        "mcp_docs_other",
+    ]
+    assert len(reads) == 1
 
 
 # ---------------------------------------------------------------------------
