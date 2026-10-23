@@ -10,6 +10,7 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/app/widget/chat/[[]token[]]/page-client.tsx",
         "src/components/chat/ChatInput.tsx",
         "src/components/chat/ChatMessage.tsx",
+        "src/components/chat/ChatStartScreen.tsx",
         "src/components/chat/clarification-form.tsx",
         "src/components/chat/connector-runtime-dialog.tsx",
         "src/components/chat/connector-runtime-dialog-state.ts",
@@ -128,6 +129,7 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/components/pages/oidc-callback.tsx": { statements: 75, branches: 45, functions: 95, lines: 75 },
         "src/components/chat/ChatInput.tsx": { statements: 60, branches: 60, functions: 40, lines: 60 },
         "src/components/chat/ChatMessage.tsx": { statements: 50, branches: 50, functions: 40, lines: 50 },
+        "src/components/chat/ChatStartScreen.tsx": { statements: 100, branches: 95, functions: 90, lines: 100 },
         "src/components/chat/clarification-form.tsx": {
           statements: 76, branches: 68, functions: 62, lines: 76,
         },
@@ -182,6 +184,7 @@ export default defineConfig({
       "src/components/chat/FileChip.test.tsx",
       "src/components/chat/chat-input-public-file-access.test.tsx",
       "src/components/chat/ChatMessage.test.tsx",
+      "src/components/chat/ChatStartScreen.test.tsx",
       "src/components/chat/TraceEventRenderer.test.tsx",
       "src/components/chat/trace-event-processing.test.ts",
       "src/components/chat/clarification-form.test.tsx",

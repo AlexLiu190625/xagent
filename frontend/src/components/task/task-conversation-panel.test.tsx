@@ -1,7 +1,8 @@
 import React from "react"
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
+import type { ComposerAttachmentStatus } from "@/components/chat/ChatInput"
 import type { SessionStopState } from "@/contexts/app-context-chat"
 
 type PanelTraceEvent = {
@@ -52,6 +53,9 @@ const chatInputProps = vi.hoisted(() => ({
     hideFileUpload?: boolean
     isLoading?: boolean
     currentInteractionRequestId?: string
+    attachments?: { accept: string; maxFiles: number; maxFileBytes: number }
+    attachmentStatuses?: ReadonlyMap<File, string>
+    onRetryAttachment?: (file: File) => void
     onFilesChange?: (files: File[]) => void
     onPause?: () => void
     onResume?: () => void
@@ -1860,6 +1864,103 @@ describe("TaskConversationPanel", () => {
       expect(container.querySelectorAll("svg[data-icon='interrupted']")).toHaveLength(1)
       expect(container.querySelector(".animate-spin")).not.toBeNull()
       expect(container.querySelector(".text-red-500")).toBeNull()
+    })
+  })
+  describe("upload-only attachments", () => {
+    const attachments = { accept: ".txt", maxFiles: 3, maxFileBytes: 100 }
+
+    it("keeps staged files and the upload control while files stay disabled", () => {
+      appControls.filesDisabled = true
+      render(<TaskConversationPanel mode="page" hideFileUpload={false} attachments={attachments} />)
+
+      fireEvent.click(screen.getByRole("button", { name: "stage file" }))
+
+      expect(chatInputProps.current?.files).toHaveLength(1)
+      expect(chatInputProps.current?.onFilesChange).toEqual(expect.any(Function))
+      expect(chatInputProps.current?.hideFileUpload).toBe(false)
+      expect(chatInputProps.current?.filesDisabled).toBe(true)
+      expect(chatInputProps.current?.attachments).toBe(attachments)
+      expect(screen.queryByTestId("task-file-manager")).not.toBeInTheDocument()
+      expect(screen.queryByTestId("file-preview-content")).not.toBeInTheDocument()
+    })
+
+    it("still hides the upload control when the caller hides it", () => {
+      appControls.filesDisabled = true
+      render(<TaskConversationPanel mode="page" hideFileUpload attachments={attachments} />)
+
+      expect(chatInputProps.current?.hideFileUpload).toBe(true)
+    })
+
+    it("hands the staged files to onSend and clears them only after it succeeds", async () => {
+      appControls.filesDisabled = true
+      const onSend = vi.fn().mockResolvedValue(undefined)
+      render(<TaskConversationPanel mode="page" attachments={attachments} onSend={onSend} />)
+      fireEvent.click(screen.getByRole("button", { name: "stage file" }))
+      const staged = chatInputProps.current?.files ?? []
+
+      await act(async () => {
+        await chatInputProps.current?.onSend("send draft", { mode: "balanced" })
+      })
+
+      expect(staged).toHaveLength(1)
+      expect(onSend).toHaveBeenCalledWith("send draft", { mode: "balanced" }, staged)
+      expect(sendMessageMock).not.toHaveBeenCalled()
+      expect(chatInputProps.current?.files).toEqual([])
+    })
+
+    it("keeps the staged files when onSend fails", async () => {
+      appControls.filesDisabled = true
+      const onSend = vi.fn().mockRejectedValue(new Error("not sent"))
+      render(<TaskConversationPanel mode="page" attachments={attachments} onSend={onSend} />)
+      fireEvent.click(screen.getByRole("button", { name: "stage file" }))
+
+      await act(async () => {
+        await expect(chatInputProps.current?.onSend("send draft")).rejects.toThrow("not sent")
+      })
+
+      expect(chatInputProps.current?.files).toHaveLength(1)
+    })
+
+    it("reports the staged files to the caller as the visitor changes them", async () => {
+      appControls.filesDisabled = true
+      const onAttachmentFilesChange = vi.fn()
+      render(
+        <TaskConversationPanel
+          mode="page"
+          attachments={attachments}
+          onAttachmentFilesChange={onAttachmentFilesChange}
+          onSend={vi.fn().mockResolvedValue(undefined)}
+        />,
+      )
+
+      fireEvent.click(screen.getByRole("button", { name: "stage file" }))
+      expect(onAttachmentFilesChange).toHaveBeenLastCalledWith([expect.any(File)])
+      await act(async () => {
+        await chatInputProps.current?.onSend("send draft")
+      })
+
+      expect(onAttachmentFilesChange).toHaveBeenLastCalledWith([])
+    })
+
+    it("locks the composer while the caller reports it busy and passes the statuses through", () => {
+      appControls.filesDisabled = true
+      const statuses = new Map<File, ComposerAttachmentStatus>()
+      const onRetryAttachment = vi.fn()
+      const { rerender } = render(
+        <TaskConversationPanel
+          mode="page"
+          attachments={attachments}
+          attachmentStatuses={statuses}
+          onRetryAttachment={onRetryAttachment}
+        />,
+      )
+      expect(chatInputProps.current?.isLoading).toBe(false)
+      expect(chatInputProps.current?.attachmentStatuses).toBe(statuses)
+      expect(chatInputProps.current?.onRetryAttachment).toBe(onRetryAttachment)
+
+      rerender(<TaskConversationPanel mode="page" attachments={attachments} isBusy />)
+
+      expect(chatInputProps.current?.isLoading).toBe(true)
     })
   })
 })

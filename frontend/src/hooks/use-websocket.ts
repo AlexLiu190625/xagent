@@ -1664,6 +1664,8 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         { errorCode: "connection_not_ready" },
       )
     }
+    // Raw File objects cannot be delivered on this kind of connection; files
+    // uploaded beforehand travel as ids through `attachments`.
     if (connection.chatTaskIdMode === "omit" && files && files.length > 0) {
       throw deliveryError("File delivery is not supported for this connection.", "not_sent")
     }

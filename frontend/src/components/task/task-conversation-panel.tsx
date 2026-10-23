@@ -3,7 +3,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { CheckCircle2, AlertCircle, FolderOpen, Loader2 } from "lucide-react"
 import dagre from "dagre"
-import { ChatInput } from "@/components/chat/ChatInput"
+import { ChatInput, type ComposerAttachmentStatus } from "@/components/chat/ChatInput"
 import { ChatMessage } from "@/components/chat/ChatMessage"
 import type { AgentExecutionSummary } from "@/components/chat/TraceEventRenderer"
 import { CompactionNotice } from "@/components/chat/CompactionNotice"
@@ -15,7 +15,7 @@ import { TaskFileManager } from "@/components/file/task-file-manager"
 import { CenterPanel } from "@/components/layout/center-panel"
 import { PreviewSheet } from "@/components/preview-sheet"
 import { Button } from "@/components/ui/button"
-import { useApp, type TaskAutoResume } from "@/contexts/app-context-chat"
+import { useApp, type SessionAttachmentsConfig, type TaskAutoResume } from "@/contexts/app-context-chat"
 import { useFileAccess } from "@/contexts/file-access-context"
 import { useI18n, type Translate } from "@/contexts/i18n-context"
 import { isStreamingFinalAnswerMessage } from "@/lib/streaming-final-answer"
@@ -43,6 +43,17 @@ interface TaskConversationPanelProps {
   uploadFile?: (file: File, params: { taskType: string }) => Promise<{ file_id: string }>
   deferFileUpload?: boolean
   onSend?: (message: string, config?: any, files?: File[]) => Promise<void> | void
+  // Upload-only mode (see ChatInput): the composer collects files although
+  // file reads stay disabled, and hands them to `onSend`.
+  attachments?: SessionAttachmentsConfig
+  attachmentStatuses?: ReadonlyMap<File, ComposerAttachmentStatus>
+  onRetryAttachment?: (file: File) => void
+  // Called with the collected files every time the visitor adds or removes
+  // one, and with an empty list once a send has completed.
+  onAttachmentFilesChange?: (files: File[]) => void
+  // Extra "busy" signal from the caller (for example, files uploading before
+  // the send); it locks the composer like a message in flight does.
+  isBusy?: boolean
   onAgentExecutionClick?: (execution: AgentExecutionSummary) => void
 }
 
@@ -243,6 +254,11 @@ export function TaskConversationPanel({
   uploadFile,
   deferFileUpload = false,
   onSend,
+  attachments,
+  attachmentStatuses,
+  onRetryAttachment,
+  onAttachmentFilesChange,
+  isBusy = false,
   onAgentExecutionClick,
 }: TaskConversationPanelProps) {
   const {
@@ -324,10 +340,19 @@ export function TaskConversationPanel({
     setDagPreviewOpen(true)
   }, [closeFilePreview])
 
+  // Upload-only mode keeps collecting files although `filesDisabled` closes
+  // every request that reads a file back.
+  const filesBlocked = filesDisabled && !attachments
+
+  const updateFiles = (next: File[]) => {
+    setFiles(next)
+    onAttachmentFilesChange?.(next)
+  }
+
   const handleSend = async (message: string, config?: any, filesToSend?: File[]) => {
-    const outboundFiles = filesDisabled ? [] : (filesToSend || files)
+    const outboundFiles = filesBlocked ? [] : (filesToSend || files)
     await (onSend ?? sendMessage)(message, config, outboundFiles)
-    setFiles([])
+    updateFiles([])
   }
 
   const messageItems = useMemo<CombinedItem[]>(() => {
@@ -1039,9 +1064,10 @@ export function TaskConversationPanel({
                 || isConversationResetPending
                 || isMessageDeliveryPending
                 || isSessionInteractionLocked
+                || isBusy
               }
-              files={filesDisabled ? [] : files}
-              onFilesChange={filesDisabled ? undefined : setFiles}
+              files={filesBlocked ? [] : files}
+              onFilesChange={filesBlocked ? undefined : updateFiles}
               showModeToggle={false}
               hideConfig={hideConfig}
               taskStatus={state.currentTask?.status}
@@ -1058,8 +1084,11 @@ export function TaskConversationPanel({
               } : undefined}
               readOnlyConfig={true}
               filesDisabled={filesDisabled}
+              attachments={attachments}
+              attachmentStatuses={attachmentStatuses}
+              onRetryAttachment={onRetryAttachment}
               voiceInputEnabled={voiceInputEnabled}
-              hideFileUpload={hideFileUpload || filesDisabled}
+              hideFileUpload={hideFileUpload || filesBlocked}
               compact={compactInput}
               minHeightClass={compactInput ? "min-h-[44px]" : undefined}
               autoFocus={autoFocusInput}

@@ -1,13 +1,16 @@
 "use client"
 
-import React, { useCallback, useMemo, useState } from "react"
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Loader2 } from "lucide-react"
+import type { ComposerAttachmentStatus } from "@/components/chat/ChatInput"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
+import { toast } from "@/components/ui/sonner"
 import { WidgetChromeControls } from "@/components/widget/widget-chrome-controls"
 import {
   AppProvider,
   type AppProviderTransportConfig,
+  type SessionAttachmentsConfig,
   useApp,
 } from "@/contexts/app-context-chat"
 import { useI18n } from "@/contexts/i18n-context"
@@ -18,9 +21,15 @@ import {
   type ClientErrorCode,
 } from "@/lib/client-errors"
 import {
+  uploadWidgetSessionFile,
+  type SessionUploadedFile,
+} from "@/lib/widget-session-upload"
+import {
   buildWidgetSessionWebSocketUrl,
   useWidgetSession,
+  type WidgetSession,
   type WidgetSessionAgent,
+  type WidgetSessionFileUploads,
   type WidgetSessionStatus,
 } from "./use-widget-session"
 
@@ -46,6 +55,32 @@ const getSessionTerminalPresentation = (code: string | null): SessionTerminalPre
   code ? SESSION_TERMINAL_PRESENTATION[code] ?? "unavailable" : "unavailable"
 )
 
+// What the page needs from the bridge to upload files before a send.
+interface SessionUploadControls {
+  ensureFreshSession: () => Promise<WidgetSession>
+  refreshSession: () => Promise<WidgetSession>
+  waitForOpenConnection: () => Promise<void>
+}
+
+// While any of these holds, sendMessage itself refuses the turn; an upload
+// started before it would be wasted.
+const SEND_BLOCKED_PHASES: ReadonlySet<string> = new Set([
+  "reset_requested",
+  "reload_required",
+  "replacement_sending",
+  "replacement_awaiting_task",
+])
+
+const isAbortError = (error: unknown): boolean =>
+  typeof error === "object" && error !== null
+  && (error as { name?: unknown }).name === "AbortError"
+
+const userFacingError = (message: string, errorCode?: ClientErrorCode): Error =>
+  Object.assign(new Error(message), {
+    userFacing: true,
+    ...(errorCode ? { errorCode } : {}),
+  })
+
 interface SessionConversationContentProps {
   status: WidgetSessionStatus
   agent: WidgetSessionAgent | null
@@ -58,6 +93,9 @@ interface SessionConversationContentProps {
   // the panel itself is still actually expanded.
   isExpanded: boolean
   onExpandedChange: (expanded: boolean) => void
+  // Present only while the session server advertises file uploads.
+  attachments?: SessionAttachmentsConfig
+  uploads: SessionUploadControls
 }
 
 function SessionConversationContent({
@@ -67,6 +105,8 @@ function SessionConversationContent({
   isAbsoluteExpiryWarningVisible,
   isExpanded,
   onExpandedChange,
+  attachments,
+  uploads,
 }: SessionConversationContentProps) {
   const {
     state,
@@ -81,6 +121,16 @@ function SessionConversationContent({
     sessionConversationState,
   } = useApp()
   const { t } = useI18n()
+  const [startFiles, setStartFiles] = useState<File[]>([])
+  const [attachmentStatuses, setAttachmentStatuses] =
+    useState<ReadonlyMap<File, ComposerAttachmentStatus>>(() => new Map())
+  const [uploadsInFlight, setUploadsInFlight] = useState(0)
+  const isUploading = uploadsInFlight > 0
+  // Keyed by the File the visitor picked, so a message sent again with the
+  // same files (edited or not) reuses what already reached the server.
+  const uploadedFilesRef = useRef(new WeakMap<File, SessionUploadedFile>())
+  const uploadControllersRef = useRef(new Map<File, AbortController>())
+  const panelFilesRef = useRef<File[]>([])
   const [resetError, setResetError] = useState(false)
   // The failure is stored as a code, not as text, so the line is translated
   // at render time and follows a locale switch. It is only a note on the
@@ -103,6 +153,190 @@ function SessionConversationContent({
     setStartMessageFailure(null)
   }
 
+  const setAttachmentStatus = useCallback((
+    file: File,
+    next: ComposerAttachmentStatus | null,
+  ) => {
+    setAttachmentStatuses((current) => {
+      const updated = new Map(current)
+      if (next === null) updated.delete(file)
+      else updated.set(file, next)
+      return updated
+    })
+  }, [])
+
+  // Forgets everything held for a file the visitor no longer wants: cancels a
+  // request still in flight and drops what was already uploaded. A request
+  // that had reached the server may still leave the file stored there; it is
+  // never attached to a message.
+  const releaseAttachment = useCallback((file: File) => {
+    uploadControllersRef.current.get(file)?.abort()
+    uploadControllersRef.current.delete(file)
+    uploadedFilesRef.current.delete(file)
+    setAttachmentStatus(file, null)
+  }, [setAttachmentStatus])
+
+  const releaseRemovedAttachments = useCallback((previous: File[], next: File[]) => {
+    const kept = new Set(next)
+    previous.filter((file) => !kept.has(file)).forEach(releaseAttachment)
+  }, [releaseAttachment])
+
+  const abortAllUploads = useCallback(() => {
+    uploadControllersRef.current.forEach((controller) => controller.abort())
+    uploadControllersRef.current.clear()
+  }, [])
+
+  useEffect(() => abortAllUploads, [abortAllUploads])
+  useEffect(() => {
+    if (status === "terminal" || status === "degraded") abortAllUploads()
+  }, [abortAllUploads, status])
+
+  const handleStartFilesChange = useCallback((next: File[]) => {
+    releaseRemovedAttachments(startFiles, next)
+    setStartFiles(next)
+  }, [releaseRemovedAttachments, startFiles])
+
+  const handlePanelFilesChange = useCallback((next: File[]) => {
+    releaseRemovedAttachments(panelFilesRef.current, next)
+    panelFilesRef.current = next
+  }, [releaseRemovedAttachments])
+
+  // Uploads one file with the session token. Requests are never concurrent:
+  // callers await each file before starting the next.
+  const uploadAttachment = useCallback(async (file: File): Promise<SessionUploadedFile> => {
+    const controller = new AbortController()
+    uploadControllersRef.current.set(file, controller)
+    setUploadsInFlight((count) => count + 1)
+    setAttachmentStatus(file, "uploading")
+    try {
+      const uploaded = await uploadWidgetSessionFile({
+        origin: window.location.origin,
+        getToken: async () => (await uploads.ensureFreshSession()).token,
+        refreshToken: async () => (await uploads.refreshSession()).token,
+        file,
+        signal: controller.signal,
+      })
+      uploadedFilesRef.current.set(file, uploaded)
+      setAttachmentStatus(file, "uploaded")
+      return uploaded
+    } catch (error) {
+      // A released file has no card left to mark.
+      if (!controller.signal.aborted) setAttachmentStatus(file, "failed")
+      throw error
+    } finally {
+      if (uploadControllersRef.current.get(file) === controller) {
+        uploadControllersRef.current.delete(file)
+      }
+      setUploadsInFlight((count) => count - 1)
+    }
+  }, [setAttachmentStatus, uploads])
+
+  const handleRetryAttachment = useCallback(async (file: File) => {
+    try {
+      await uploads.ensureFreshSession()
+      await uploadAttachment(file)
+    } catch (error) {
+      if (isAbortError(error)) return
+      const code = readSendErrorCode(error) ?? "upload_failed"
+      toast.error(t(clientErrorTranslationKey(code)))
+    }
+  }, [t, uploadAttachment, uploads])
+
+  // The checks that cost nothing: a send that is certain to be refused is
+  // refused before any file leaves the browser.
+  const assertAttachmentsSendable = useCallback((
+    files: File[],
+    config: Record<string, unknown> | undefined,
+    limits: SessionAttachmentsConfig,
+  ) => {
+    const metadata = config?.metadata as { request_id?: unknown } | undefined
+    if (typeof metadata?.request_id === "string" && metadata.request_id) {
+      throw userFacingError(t("widgetSession.attachments.noFilesOnAnswer"))
+    }
+    const allowedExtensions = limits.accept.split(",")
+    for (const file of files) {
+      const dot = file.name.lastIndexOf(".")
+      const extension = dot >= 0 ? file.name.slice(dot).toLowerCase() : ""
+      if (!allowedExtensions.includes(extension)) {
+        throw userFacingError(t("widgetSession.attachments.typeNotSupported"))
+      }
+      if (file.size > limits.maxFileBytes) {
+        throw userFacingError(t(clientErrorTranslationKey("upload_too_large")), "upload_too_large")
+      }
+    }
+    if (files.length > limits.maxFiles) {
+      throw userFacingError(
+        t("widgetSession.attachments.tooManyFiles", { count: limits.maxFiles }),
+      )
+    }
+  }, [t])
+
+  // Sends a message with the files the visitor attached. Files go to the
+  // session first, one after another, and the chat frame then names them by id.
+  const sendWithAttachments = useCallback(async (
+    message: string,
+    files: File[],
+    config?: Record<string, unknown>,
+  ) => {
+    if (files.length === 0 || !attachments) {
+      await sendMessage(message, config, files)
+      return
+    }
+    if (
+      SEND_BLOCKED_PHASES.has(sessionConversationState)
+      || isSessionInteractionLocked
+      || isConversationResetPending
+    ) {
+      // sendMessage refuses these states with its own error.
+      await sendMessage(message, config, [])
+      return
+    }
+    assertAttachmentsSendable(files, config, attachments)
+
+    await uploads.ensureFreshSession()
+    const uploaded: SessionUploadedFile[] = []
+    for (const file of files) {
+      const known = uploadedFilesRef.current.get(file)
+      uploaded.push(known ?? await uploadAttachment(file))
+    }
+    await uploads.waitForOpenConnection()
+
+    try {
+      await sendMessage(message, config, [], { uploadedFiles: uploaded })
+    } catch (error) {
+      if (readSendErrorCode(error) === "message_attachment_unavailable") {
+        // The server no longer has one of these files: upload them all again.
+        files.forEach((file) => {
+          uploadedFilesRef.current.delete(file)
+          setAttachmentStatus(file, null)
+        })
+      }
+      throw error
+    }
+    files.forEach((file) => {
+      uploadedFilesRef.current.delete(file)
+      setAttachmentStatus(file, null)
+    })
+  }, [
+    assertAttachmentsSendable,
+    attachments,
+    isConversationResetPending,
+    isSessionInteractionLocked,
+    sendMessage,
+    sessionConversationState,
+    setAttachmentStatus,
+    uploadAttachment,
+    uploads,
+  ])
+
+  const handlePanelSend = useCallback(async (
+    message: string,
+    config?: Record<string, unknown>,
+    files?: File[],
+  ) => {
+    await sendWithAttachments(message, files ?? [], config)
+  }, [sendWithAttachments])
+
   const handleStartMessage = useCallback(async (
     message: string,
     files: File[],
@@ -110,12 +344,13 @@ function SessionConversationContent({
   ) => {
     setStartMessageFailure(null)
     try {
-      await sendMessage(message, config, files)
+      await sendWithAttachments(message, files, config)
+      setStartFiles([])
     } catch (error) {
       setStartMessageFailure({ code: readSendErrorCode(error) })
       throw error
     }
-  }, [sendMessage])
+  }, [sendWithAttachments])
 
   const handleStartNewConversation = useCallback(async () => {
     setResetError(false)
@@ -162,7 +397,10 @@ function SessionConversationContent({
 
   const reloadRequired = isSessionInteractionLocked
   const resetDisabled =
-    reloadRequired || isConversationResetPending || isMessageDeliveryPending
+    reloadRequired
+    || isConversationResetPending
+    || isMessageDeliveryPending
+    || isUploading
 
   return (
     <div className="flex h-screen flex-col bg-background">
@@ -243,6 +481,12 @@ function SessionConversationContent({
             hideConfig={true}
             compactInput={true}
             deferFileUpload={true}
+            onSend={attachments ? handlePanelSend : undefined}
+            attachments={attachments}
+            attachmentStatuses={attachments ? attachmentStatuses : undefined}
+            onRetryAttachment={attachments ? handleRetryAttachment : undefined}
+            onAttachmentFilesChange={attachments ? handlePanelFilesChange : undefined}
+            isBusy={isUploading}
           />
         ) : (
           <div className="h-full overflow-y-auto">
@@ -257,9 +501,13 @@ function SessionConversationContent({
                   || isConversationResetPending
                   || isMessageDeliveryPending
                   || reloadRequired
+                  || isUploading
                 }
-                files={[]}
-                onFilesChange={() => undefined}
+                files={attachments ? startFiles : []}
+                onFilesChange={attachments ? handleStartFilesChange : () => undefined}
+                attachments={attachments}
+                attachmentStatuses={attachments ? attachmentStatuses : undefined}
+                onRetryAttachment={attachments ? handleRetryAttachment : undefined}
                 readOnlyConfig={true}
                 hideConfig={true}
                 compactInput={true}
@@ -277,9 +525,37 @@ function SessionConversationContent({
   )
 }
 
+const toAttachments = (
+  fileUploads: WidgetSessionFileUploads | undefined,
+): SessionAttachmentsConfig | undefined => fileUploads
+  ? {
+    accept: fileUploads.allowedExtensions.join(","),
+    maxFiles: fileUploads.maxFilesPerMessage,
+    maxFileBytes: fileUploads.maxFileBytes,
+  }
+  : undefined
+
 export function SessionAgentChatPage() {
   const bridge = useWidgetSession()
   const [isExpanded, setIsExpanded] = useState(false)
+
+  // The advertised capabilities follow every session_update. While the bridge
+  // refreshes the token it has no session, and the composer keeps the last
+  // advertisement so the visitor's files do not disappear for the refresh.
+  const advertisedUploads = bridge.session?.capabilities?.fileUploads
+  const [heldUploads, setHeldUploads] = useState(advertisedUploads)
+  if (bridge.session && heldUploads !== advertisedUploads) {
+    setHeldUploads(advertisedUploads)
+  }
+  const fileUploads = bridge.session
+    ? advertisedUploads
+    : bridge.status === "refreshing" ? heldUploads : undefined
+  const attachments = useMemo(() => toAttachments(fileUploads), [fileUploads])
+  const uploads = useMemo<SessionUploadControls>(() => ({
+    ensureFreshSession: bridge.ensureFreshSession,
+    refreshSession: bridge.refreshSession,
+    waitForOpenConnection: bridge.waitForOpenConnection,
+  }), [bridge.ensureFreshSession, bridge.refreshSession, bridge.waitForOpenConnection])
 
   const connection = useMemo<WebSocketConnection | null>(() => {
     if (bridge.status !== "active" || !bridge.session) return null
@@ -315,12 +591,16 @@ export function SessionAgentChatPage() {
       allowTasklessChat: true,
       supportsConversationReset: true,
       history: "none",
+      // Uploading is the separate `attachments` option: "disabled" here keeps
+      // previews, downloads and file mentions closed.
       files: "disabled",
+      ...(attachments ? { attachments } : {}),
       agentCards: "disabled",
       voice: "disabled",
       taskControls: "disabled",
     },
   }), [
+    attachments,
     bridge.handleConnectionClose,
     bridge.handleConnectionFailure,
     bridge.handleConnectionOpen,
@@ -338,6 +618,8 @@ export function SessionAgentChatPage() {
         }
         isExpanded={isExpanded}
         onExpandedChange={setIsExpanded}
+        attachments={attachments}
+        uploads={uploads}
       />
     </AppProvider>
   )

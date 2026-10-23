@@ -15,8 +15,15 @@ const bridge = vi.hoisted(() => ({
     requestReconnect: vi.fn(),
     handleConnectionClose: vi.fn(() => "handled" as const),
     handleConnectionFailure: vi.fn(),
+    ensureFreshSession: vi.fn(),
+    refreshSession: vi.fn(),
+    waitForOpenConnection: vi.fn(),
   },
 }))
+
+const toastMock = vi.hoisted(() => ({ error: vi.fn() }))
+
+vi.mock("@/components/ui/sonner", () => ({ toast: toastMock }))
 
 const i18n = vi.hoisted(() => ({ locale: "en" }))
 
@@ -162,6 +169,10 @@ describe("SessionAgentChatPage", () => {
     bridge.value.isAbsoluteExpiryWarningVisible = false
     bridge.value.handleConnectionClose.mockClear()
     bridge.value.handleConnectionFailure.mockClear()
+    bridge.value.ensureFreshSession.mockReset()
+    bridge.value.refreshSession.mockReset()
+    bridge.value.waitForOpenConnection.mockReset()
+    toastMock.error.mockReset()
     app.provider = null
     app.startProps = null
     app.panelProps = null
@@ -689,4 +700,108 @@ describe("SessionAgentChatPage", () => {
       expect(app.provider?.transport?.session?.files).toBe("disabled")
     },
   )
+  describe("file attachments", () => {
+    const withUploads = (overrides: Record<string, unknown> = {}) => activeSession({
+      capabilities: {
+        fileUploads: {
+          allowedExtensions: [".pdf", ".png"],
+          maxFileBytes: 4096,
+          maxFilesPerMessage: 3,
+          ...overrides,
+        },
+      },
+    })
+    type StartSend = (message: string, files: File[], config?: Record<string, unknown>) => Promise<void>
+    const startSend = () => app.startProps?.onSend as StartSend
+    const pdf = () => new File(["x"], "a.pdf", { type: "application/pdf" })
+    const retry = (file: File) =>
+      (app.startProps?.onRetryAttachment as (file: File) => Promise<void>)(file)
+
+    it("adds an attachments option to the transport only when uploads are advertised", () => {
+      setBridge("active", withUploads())
+      const { unmount } = render(<SessionAgentChatPage />)
+
+      expect(app.provider?.transport?.session?.attachments).toEqual({
+        accept: ".pdf,.png",
+        maxFiles: 3,
+        maxFileBytes: 4096,
+      })
+      expect(app.provider?.transport?.session?.files).toBe("disabled")
+      expect(app.startProps?.attachments).toEqual({ accept: ".pdf,.png", maxFiles: 3, maxFileBytes: 4096 })
+      unmount()
+
+      setBridge("active", activeSession())
+      render(<SessionAgentChatPage />)
+      expect(app.provider?.transport?.session).not.toHaveProperty("attachments")
+      expect(app.startProps?.attachments).toBeUndefined()
+      expect(app.startProps?.files).toEqual([])
+    })
+
+    it("keeps the last advertisement while refreshing and drops it once the session degrades", () => {
+      setBridge("active", withUploads())
+      const { rerender } = render(<SessionAgentChatPage />)
+
+      setBridge("refreshing", null)
+      bridge.value.agent = activeSession().agent
+      rerender(<SessionAgentChatPage />)
+      expect(app.provider?.transport?.session?.attachments).toBeDefined()
+
+      setBridge("degraded", null)
+      rerender(<SessionAgentChatPage />)
+      expect(app.provider?.transport?.session).not.toHaveProperty("attachments")
+    })
+
+    it.each([
+      ["reset_requested", false, false],
+      ["reload_required", false, false],
+      ["replacement_sending", false, false],
+      ["replacement_awaiting_task", false, false],
+      ["unbound", true, false],
+      ["unbound", false, true],
+    ])("lets sendMessage refuse a send made in the %s phase without uploading", async (phase, locked, resetPending) => {
+      setBridge("active", withUploads())
+      app.sessionConversationState = phase
+      app.isSessionInteractionLocked = locked
+      app.isConversationResetPending = resetPending
+      render(<SessionAgentChatPage />)
+
+      await startSend()("hello", [pdf()], {})
+
+      expect(app.sendMessage).toHaveBeenCalledWith("hello", {}, [])
+      expect(bridge.value.ensureFreshSession).not.toHaveBeenCalled()
+      expect(fetch).not.toHaveBeenCalled()
+    })
+
+    it("tells the visitor why a retried upload failed and stays quiet when it was cancelled", async () => {
+      setBridge("active", withUploads())
+      render(<SessionAgentChatPage />)
+
+      bridge.value.ensureFreshSession.mockRejectedValueOnce(
+        Object.assign(new Error("gone"), { errorCode: "upload_failed" }),
+      )
+      await act(async () => { await retry(pdf()) })
+      expect(toastMock.error).toHaveBeenLastCalledWith("clientErrors.uploadFailed")
+
+      bridge.value.ensureFreshSession.mockRejectedValueOnce(new Error("plain"))
+      await act(async () => { await retry(pdf()) })
+      expect(toastMock.error).toHaveBeenCalledTimes(2)
+      expect(toastMock.error).toHaveBeenLastCalledWith("clientErrors.uploadFailed")
+
+      bridge.value.ensureFreshSession.mockRejectedValueOnce(
+        Object.assign(new Error("cancelled"), { name: "AbortError" }),
+      )
+      await act(async () => { await retry(pdf()) })
+      expect(toastMock.error).toHaveBeenCalledTimes(2)
+    })
+
+    it("passes no upload callbacks to the surfaces when uploads are not advertised", () => {
+      setBridge("active", activeSession())
+      app.state.taskId = 5
+      render(<SessionAgentChatPage />)
+
+      expect(app.panelProps?.onSend).toBeUndefined()
+      expect(app.panelProps?.attachments).toBeUndefined()
+      expect(app.panelProps?.onAttachmentFilesChange).toBeUndefined()
+    })
+  })
 })
