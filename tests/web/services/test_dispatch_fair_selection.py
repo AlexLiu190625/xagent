@@ -654,7 +654,7 @@ def test_follow_ups_of_one_task_that_fill_a_tenants_window_make_it_miss(
     newer tasks behind them: the window is a known limit of the selection."""
     running = world.add("A", status="processing")
     task = world.task_of(running)
-    for _ in range(transport.FAIR_SHARE_WINDOW):
+    for _ in range(16):
         world.follow_up(task, "A")
     world.add("A")  # behind the window
     b_new = world.add("B")
