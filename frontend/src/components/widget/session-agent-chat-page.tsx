@@ -124,8 +124,10 @@ function SessionConversationContent({
   const [startFiles, setStartFiles] = useState<File[]>([])
   const [attachmentStatuses, setAttachmentStatuses] =
     useState<ReadonlyMap<File, ComposerAttachmentStatus>>(() => new Map())
-  const [uploadsInFlight, setUploadsInFlight] = useState(0)
-  const isUploading = uploadsInFlight > 0
+  // Counts attachment work that must keep the composer locked: each upload and
+  // each send with files, from its first upload until its chat frame is out.
+  const [attachmentWork, setAttachmentWork] = useState(0)
+  const isAttachmentBusy = attachmentWork > 0
   // Keyed by the File the visitor picked, so a message sent again with the
   // same files (edited or not) reuses what already reached the server.
   const uploadedFilesRef = useRef(new WeakMap<File, SessionUploadedFile>())
@@ -206,7 +208,7 @@ function SessionConversationContent({
   const uploadAttachment = useCallback(async (file: File): Promise<SessionUploadedFile> => {
     const controller = new AbortController()
     uploadControllersRef.current.set(file, controller)
-    setUploadsInFlight((count) => count + 1)
+    setAttachmentWork((count) => count + 1)
     setAttachmentStatus(file, "uploading")
     try {
       const uploaded = await uploadWidgetSessionFile({
@@ -233,7 +235,7 @@ function SessionConversationContent({
       if (uploadControllersRef.current.get(file) === controller) {
         uploadControllersRef.current.delete(file)
       }
-      setUploadsInFlight((count) => count - 1)
+      setAttachmentWork((count) => count - 1)
     }
   }, [setAttachmentStatus, uploads])
 
@@ -300,29 +302,43 @@ function SessionConversationContent({
     }
     assertAttachmentsSendable(files, config, attachments)
 
-    const uploaded: SessionUploadedFile[] = []
-    for (const file of files) {
-      const known = uploadedFilesRef.current.get(file)
-      uploaded.push(known ?? await uploadAttachment(file))
-    }
-    await uploads.waitForOpenConnection()
-
+    setAttachmentWork((count) => count + 1)
     try {
-      await sendMessage(message, config, [], { uploadedFiles: uploaded })
-    } catch (error) {
-      if (readSendErrorCode(error) === "message_attachment_unavailable") {
-        // The server no longer has one of these files: upload them all again.
-        files.forEach((file) => {
-          uploadedFilesRef.current.delete(file)
-          setAttachmentStatus(file, null)
-        })
+      const uploaded: SessionUploadedFile[] = []
+      for (const file of files) {
+        const known = uploadedFilesRef.current.get(file)
+        uploaded.push(known ?? await uploadAttachment(file))
       }
-      throw error
+      await uploads.waitForOpenConnection()
+      // A file the visitor removed while the socket was opening was released
+      // (its upload forgotten); it must not ride along on the frame, and the
+      // visitor who removed it needs no "not sent" notice.
+      if (files.some((file) => !uploadedFilesRef.current.has(file))) {
+        throw Object.assign(
+          new DOMException("A file was removed before the message was sent.", "AbortError"),
+          { notificationHandled: true },
+        )
+      }
+
+      try {
+        await sendMessage(message, config, [], { uploadedFiles: uploaded })
+      } catch (error) {
+        if (readSendErrorCode(error) === "message_attachment_unavailable") {
+          // The server no longer has one of these files: upload them all again.
+          files.forEach((file) => {
+            uploadedFilesRef.current.delete(file)
+            setAttachmentStatus(file, null)
+          })
+        }
+        throw error
+      }
+      files.forEach((file) => {
+        uploadedFilesRef.current.delete(file)
+        setAttachmentStatus(file, null)
+      })
+    } finally {
+      setAttachmentWork((count) => count - 1)
     }
-    files.forEach((file) => {
-      uploadedFilesRef.current.delete(file)
-      setAttachmentStatus(file, null)
-    })
   }, [
     assertAttachmentsSendable,
     attachments,
@@ -406,7 +422,7 @@ function SessionConversationContent({
     reloadRequired
     || isConversationResetPending
     || isMessageDeliveryPending
-    || isUploading
+    || isAttachmentBusy
 
   return (
     <div className="flex h-screen flex-col bg-background">
@@ -492,7 +508,7 @@ function SessionConversationContent({
             attachmentStatuses={attachments ? attachmentStatuses : undefined}
             onRetryAttachment={attachments ? handleRetryAttachment : undefined}
             onAttachmentFilesChange={attachments ? handlePanelFilesChange : undefined}
-            isBusy={isUploading}
+            isBusy={isAttachmentBusy}
           />
         ) : (
           <div className="h-full overflow-y-auto">
@@ -507,7 +523,7 @@ function SessionConversationContent({
                   || isConversationResetPending
                   || isMessageDeliveryPending
                   || reloadRequired
-                  || isUploading
+                  || isAttachmentBusy
                 }
                 files={attachments ? startFiles : []}
                 onFilesChange={attachments ? handleStartFilesChange : () => undefined}

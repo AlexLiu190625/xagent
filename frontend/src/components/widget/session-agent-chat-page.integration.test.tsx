@@ -689,8 +689,12 @@ describe("SessionAgentChatPage file attachments", () => {
       expect(screen.getByRole("menuitem", { name: "widgetSession.startNewConversation" })).toBeDisabled()
 
       await act(async () => { pending.resolve(created(FILE_A)) })
+      await waitFor(() => expect(chatFrames(socket)).toHaveLength(1))
+      // The lock holds until the send has gone out and been answered.
+      expect(surfaces.panel?.isBusy).toBe(true)
+      accept(socket, "cid-lock")
+      await act(async () => { await sending })
       await waitFor(() => expect(surfaces.panel?.isBusy).toBe(false))
-      void sending
     })
 
     it("aborts an in-flight upload when the visitor removes the file", async () => {
@@ -767,6 +771,42 @@ describe("SessionAgentChatPage file attachments", () => {
       await sending
 
       expect(signal.aborted).toBe(true)
+    })
+
+    it("keeps the composer locked while the socket opens and drops a file removed in that wait", async () => {
+      render(<SessionAgentChatPage />)
+      dispatchSession({ capabilities })
+      await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+      const socket = MockWebSocket.instances[0]
+      fetchMock
+        .mockImplementationOnce(async () => created(FILE_A, "a.pdf"))
+        .mockImplementationOnce(async () => created(FILE_B, "b.pdf"))
+      const [a, b] = [pdf("a.pdf"), pdf("b.pdf")]
+      let failure: unknown
+      let sending!: Promise<unknown>
+
+      act(() => {
+        surfaces.start?.onFilesChange([a, b])
+      })
+      act(() => {
+        sending = surfaces.start?.onSend("hello", [a, b], { clientMessageId: "cid-wait" })
+          .then(() => null, (error: unknown) => { failure = error })
+      })
+      await waitFor(() => expect(uploadCalls()).toHaveLength(2))
+      await waitFor(() => expect(statusOf(b)).toBe("uploaded"))
+
+      // Every upload is done; only the socket is missing.
+      expect(surfaces.start?.isSending).toBe(true)
+      expect(chatFrames(socket)).toHaveLength(0)
+
+      act(() => { surfaces.start?.onFilesChange([a]) })
+      act(() => socket.open("xagent-session-v1"))
+      await act(async () => { await sending })
+
+      expect((failure as Error).name).toBe("AbortError")
+      expect(failure).toMatchObject({ notificationHandled: true })
+      expect(chatFrames(socket)).toHaveLength(0)
+      await waitFor(() => expect(surfaces.start?.isSending).toBe(false))
     })
 
     it("uploads again after the server reports an attached file as unavailable", async () => {
