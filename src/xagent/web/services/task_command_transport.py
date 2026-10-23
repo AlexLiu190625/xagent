@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, NamedTuple, cast
 
-from sqlalchemy import and_, exists, false, or_, select, true
+from sqlalchemy import and_, exists, false, func, or_, select, text, true
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Query, Session, aliased
 
@@ -1873,6 +1873,105 @@ def _fair_share_enabled() -> bool:
         memo = (raw, get_dispatcher_fair_share_enabled())
         _fair_share_memo = memo
     return memo[1]
+
+
+# With the fair-share switch on, a scan with room asks each of the FAIR_SHARE_TENANTS
+# first-ranked tenants for the oldest command it can claim among the
+# FAIR_SHARE_WINDOW oldest queued commands of one (tenant key, dispatch class).
+FAIR_SHARE_WINDOW = 16
+
+# The oldest queued command of each (tenant key, dispatch class), by skipping from
+# one pair to the next through ix_task_commands_claimable_fair; a scan of the queue
+# would read every queued row. Queued means pending or processing, claimable or not.
+_LIST_QUEUED_TENANTS_POSTGRESQL = text(
+    """
+    WITH RECURSIVE s(k, c, id) AS (
+      (SELECT fairness_key, dispatch_class, id FROM task_execution_commands
+        WHERE status IN ('pending', 'processing')
+        ORDER BY fairness_key, dispatch_class, id LIMIT 1)
+      UNION ALL
+      SELECT n.k, n.c, n.id FROM s CROSS JOIN LATERAL (
+        SELECT fairness_key AS k, dispatch_class AS c, id
+          FROM task_execution_commands
+         WHERE status IN ('pending', 'processing')
+           AND (fairness_key, dispatch_class) > (s.k, s.c)
+         ORDER BY fairness_key, dispatch_class, id LIMIT 1) n)
+    SELECT k, c, id FROM s
+    """
+)
+
+
+def _list_queued_tenants(db: Session) -> dict[str, dict[str, int]]:
+    """The oldest queued command of each class, for each tenant key that has one."""
+    if db.get_bind().dialect.name == "postgresql":
+        rows = db.execute(_LIST_QUEUED_TENANTS_POSTGRESQL).all()
+    else:
+        rows = db.execute(
+            select(
+                TaskExecutionCommand.fairness_key,
+                TaskExecutionCommand.dispatch_class,
+                func.min(TaskExecutionCommand.id),
+            )
+            .where(
+                TaskExecutionCommand.status.in_((COMMAND_PENDING, COMMAND_PROCESSING))
+            )
+            .group_by(
+                TaskExecutionCommand.fairness_key, TaskExecutionCommand.dispatch_class
+            )
+        ).all()
+    tenants: dict[str, dict[str, int]] = {}
+    for key, dispatch_class, oldest in rows:
+        tenants.setdefault(str(key), {})[str(dispatch_class)] = int(oldest)
+    return tenants
+
+
+def _tenants_in_band(
+    tenants: dict[str, dict[str, int]], cap: DispatchCapSnapshot | None
+) -> dict[str, dict[str, int]]:
+    """The tenants a scan can take a new slot for under ``cap``.
+
+    Between the batch line and the limit only interactive commands may open an
+    execution, so only the interactive class of each tenant counts and a tenant
+    without one drops out.
+    """
+    if cap is None or not cap.batch_closed:
+        return tenants
+    interactive: dict[str, dict[str, int]] = {
+        key: {DISPATCH_CLASS_INTERACTIVE: classes[DISPATCH_CLASS_INTERACTIVE]}
+        for key, classes in tenants.items()
+        if DISPATCH_CLASS_INTERACTIVE in classes
+    }
+    return interactive
+
+
+def _queued_tenant_window(key: str, dispatch_class: str) -> Any:
+    """The ids of the oldest queued commands of one tenant key and class.
+
+    The key is bounded with ``>=`` and ``<=`` rather than ``=``: with an equality
+    PostgreSQL prefers the primary-key order to the index on (key, class, id).
+    """
+    return (
+        select(TaskExecutionCommand.id)
+        .where(
+            TaskExecutionCommand.status.in_((COMMAND_PENDING, COMMAND_PROCESSING)),
+            TaskExecutionCommand.fairness_key >= key,
+            TaskExecutionCommand.fairness_key <= key,
+            TaskExecutionCommand.dispatch_class == dispatch_class,
+        )
+        .order_by(
+            TaskExecutionCommand.fairness_key,
+            TaskExecutionCommand.dispatch_class,
+            TaskExecutionCommand.id,
+        )
+        .limit(FAIR_SHARE_WINDOW)
+    )
+
+
+def _in_tenant_window(query: Query[Any], key: str, dispatch_class: str) -> Query[Any]:
+    """``query`` narrowed to the oldest queued commands of one tenant key and class."""
+    return query.filter(
+        TaskExecutionCommand.id.in_(_queued_tenant_window(key, dispatch_class))
+    )
 
 
 class CommandCandidate(NamedTuple):
