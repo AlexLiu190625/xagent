@@ -4733,12 +4733,13 @@ class WebToolConfig(BaseToolConfig):
                     "connector_runtime",
                 ):
                     config.pop(key, None)
-            # Signed-upload settings travel with the connector row and are read
-            # here, before any credential is fetched.  Settings that cannot be
-            # used make the whole connector unavailable instead of being
-            # dropped: without them the issuing tool would reach the model and
-            # the replaced tool would forward file references unchanged.
-            # Actor-run catalog connectors never carry them.
+            # Signed-upload settings travel with the connector row and are
+            # checked here, before a token is resolved or a runtime connection
+            # is built.  Settings that cannot be used make the whole connector
+            # unavailable instead of being dropped: without them the issuing
+            # tool would reach the model and the replaced tool would forward
+            # file references unchanged.  Actor-run built-in and remote OAuth
+            # catalog connectors never carry them.
             signed_uploads = getattr(server, "signed_uploads", None)
             if (
                 not actor_builtin
