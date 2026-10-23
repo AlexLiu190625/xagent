@@ -1890,17 +1890,23 @@ FAIR_SHARE_FALLBACK_EVERY = 8
 # The oldest queued command of each (tenant key, dispatch class), by skipping from
 # one pair to the next through ix_task_commands_claimable_fair; a scan of the queue
 # would read every queued row. Queued means pending or processing, claimable or not.
+# Only commands that open an execution count (_OPENING_KINDS_SQL): a pause or cancel
+# needs no slot, and the key it carries may be one its task no longer has, so it must
+# not make a tenant of its own. The scan still reaches it, through the step that
+# takes an older command needing no new slot.
+_OPENING_KINDS_SQL = ", ".join(f"'{kind}'" for kind in sorted(EXECUTION_OPENING_KINDS))
 _LIST_QUEUED_TENANTS_POSTGRESQL = text(
-    """
+    f"""
     WITH RECURSIVE s(k, c, id) AS (
       (SELECT fairness_key, dispatch_class, id FROM task_execution_commands
-        WHERE status IN ('pending', 'processing')
+        WHERE status IN ('pending', 'processing') AND kind IN ({_OPENING_KINDS_SQL})
         ORDER BY fairness_key, dispatch_class, id LIMIT 1)
       UNION ALL
       SELECT n.k, n.c, n.id FROM s CROSS JOIN LATERAL (
         SELECT fairness_key AS k, dispatch_class AS c, id
           FROM task_execution_commands
          WHERE status IN ('pending', 'processing')
+           AND kind IN ({_OPENING_KINDS_SQL})
            AND (fairness_key, dispatch_class) > (s.k, s.c)
          ORDER BY fairness_key, dispatch_class, id LIMIT 1) n)
     SELECT k, c, id FROM s
@@ -1909,7 +1915,7 @@ _LIST_QUEUED_TENANTS_POSTGRESQL = text(
 
 
 def _list_queued_tenants(db: Session) -> dict[str, dict[str, int]]:
-    """The oldest queued command of each class, for each tenant key that has one."""
+    """The oldest queued command that opens an execution, per class, per tenant key."""
     if db.get_bind().dialect.name == "postgresql":
         rows = db.execute(_LIST_QUEUED_TENANTS_POSTGRESQL).all()
     else:
@@ -1920,7 +1926,8 @@ def _list_queued_tenants(db: Session) -> dict[str, dict[str, int]]:
                 func.min(TaskExecutionCommand.id),
             )
             .where(
-                TaskExecutionCommand.status.in_((COMMAND_PENDING, COMMAND_PROCESSING))
+                TaskExecutionCommand.status.in_((COMMAND_PENDING, COMMAND_PROCESSING)),
+                TaskExecutionCommand.kind.in_(sorted(EXECUTION_OPENING_KINDS)),
             )
             .group_by(
                 TaskExecutionCommand.fairness_key, TaskExecutionCommand.dispatch_class
