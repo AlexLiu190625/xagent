@@ -5701,6 +5701,63 @@ describe("AppProvider websocket message routing", () => {
       expect(sendChatMessageMock).not.toHaveBeenCalled()
     })
 
+    it("refuses uploaded files from a send made before the transport withdrew attachments", async () => {
+      const { rerender } = render(
+        <AppProvider token="token" transport={withAttachments()}>
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onConnect?.())
+      const sendFromEarlierRender = getSessionControls().sendMessage
+
+      rerender(
+        <AppProvider token="token" transport={makeSessionTransport()}>
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+
+      await expect(sendFromEarlierRender(
+        "late", { clientMessageId: "late-1" }, [], { uploadedFiles: uploaded },
+      )).rejects.toThrow("Attachments are not available")
+      expect(sendChatMessageMock).not.toHaveBeenCalled()
+    })
+
+    it.each([
+      ["lowers the per-message limit", { ...attachments, maxFiles: 1 }, 1],
+      ["withdraws attachments", undefined, undefined],
+    ])("checks a resent frame against the attachments current at the resend when the new session %s", async (_name, next, limitAtResend) => {
+      sendChatMessageMock.mockRejectedValueOnce(
+        new MessageDeliveryError("lost", "outcome_unknown", { connectionLost: true }),
+      )
+      const tree = (identity: string, current?: typeof attachments) => {
+        const transport = makeSessionTransport(makeSessionConnection(identity))
+        return (
+          <AppProvider
+            token="token"
+            transport={{ ...transport, session: { ...transport.session, ...(current ? { attachments: current } : {}) } }}
+          >
+            <SessionControlsProbe />
+          </AppProvider>
+        )
+      }
+      const { rerender } = render(tree("session-one", attachments))
+      act(() => webSocketOptions.current?.onConnect?.())
+      const outcome = getSessionControls().sendMessage(
+        "see attached", { clientMessageId: "resent" }, [], { uploadedFiles: uploaded },
+      ).then(() => "ok", (error: Error) => error)
+      await act(async () => {})
+
+      rerender(tree("session-two", next))
+      act(() => webSocketOptions.current?.onConnect?.())
+      await act(async () => { await outcome })
+
+      const fileIds = uploaded.map((file) => file.fileId)
+      expect(sendChatMessageMock.mock.calls.map((call) => call[5])).toEqual([
+        { fileIds, maxFileIds: 3 },
+        { fileIds, maxFileIds: limitAtResend },
+      ])
+    })
+
     it("rejects uploaded files when the transport does not offer attachments", async () => {
       render(
         <AppProvider token="token" transport={makeSessionTransport()}>

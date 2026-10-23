@@ -687,6 +687,7 @@ const zh = {
       typeNotSupported: "此处不支持该文件类型。",
       tooManyFiles: "每条消息最多附带 {count} 个文件。",
       noFilesOnAnswer: "回答问题时不能附带文件，请先发送回答，再附带文件。",
+      notAvailable: "此对话暂不支持附带文件。",
       uploading: "上传中…",
       uploadFailedRetry: "上传失败，点击重试",
     },

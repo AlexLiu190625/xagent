@@ -331,6 +331,21 @@ describe("SessionAgentChatPage file attachments", () => {
     const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise })
     return { promise, resolve }
   }
+  // An upload request that never answers and fails only when it is aborted.
+  const pendingUntilAborted = (_url: string, init: RequestInit) =>
+    new Promise<Response>((_resolve, reject) => {
+      init.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")))
+    })
+  const tightened = {
+    file_uploads: { ...capabilities.file_uploads, max_files_per_message: 1 },
+  }
+  // [what the replacing session does, its update, the failure message, the
+  // start-page files afterwards]. Without a capability the page hides the
+  // cards but keeps the files.
+  const replacements: Array<[string, Record<string, unknown>, string, (a: File, b: File) => File[]]> = [
+    ["lowers the per-message limit", { capabilities: tightened }, "widgetSession.attachments.tooManyFiles", (a, b) => [a, b]],
+    ["withdraws the capability", {}, "widgetSession.attachments.notAvailable", () => []],
+  ]
 
   const mountActive = async (overrides: Record<string, unknown> = { capabilities }) => {
     render(<SessionAgentChatPage />)
@@ -713,6 +728,30 @@ describe("SessionAgentChatPage file attachments", () => {
       expect(uploadCalls()).toHaveLength(2)
     })
 
+    it("fails the send when the session issued after a 401 no longer advertises uploads", async () => {
+      vi.spyOn(window, "postMessage").mockImplementation((message) => {
+        if ((message as { type?: string }).type === "reconnect_request") {
+          queueMicrotask(() => dispatchSession({
+            session_delivery_id: "delivery-after-401",
+            session_token: "st_after_401",
+          }))
+        }
+      })
+      const socket = await mountActive()
+      fetchMock.mockImplementationOnce(async () => errorResponse(401, "invalid_api_key"))
+      const a = pdf("a.pdf")
+      let failure: unknown
+
+      await act(async () => {
+        failure = await settle(surfaces.start?.onSend("hello", [a], { clientMessageId: "cid-401-cap" }))
+      })
+
+      expect(failure).toMatchObject({ message: "widgetSession.attachments.notAvailable", userFacing: true })
+      expect(uploadCalls()).toHaveLength(1)
+      expect(chatFrames(socket)).toHaveLength(0)
+      expect(MockWebSocket.instances.flatMap((instance) => chatFrames(instance))).toHaveLength(0)
+    })
+
     it("locks the start page, the conversation panel and new-conversation while files upload", async () => {
       const socket = await mountActive()
       const pending = deferred<Response>()
@@ -857,30 +896,158 @@ describe("SessionAgentChatPage file attachments", () => {
       await waitFor(() => expect(surfaces.start?.isSending).toBe(false))
     })
 
-    it("does not start another upload once a file of the send was removed", async () => {
+    it("ends the send at once when an uploaded file is removed, cancelling the upload it waits on", async () => {
       const socket = await mountActive()
-      const second = deferred<Response>()
       fetchMock
         .mockImplementationOnce(async () => created(FILE_A, "a.pdf"))
-        .mockReturnValueOnce(second.promise)
+        .mockImplementationOnce(pendingUntilAborted)
       const [a, b, c] = [pdf("a.pdf"), pdf("b.pdf"), pdf("c.pdf")]
       let failure: unknown
-      let sending!: Promise<unknown>
       act(() => { surfaces.start?.onFilesChange([a, b, c]) })
       act(() => {
-        sending = surfaces.start?.onSend("hello", [a, b, c], { clientMessageId: "cid-rm2" })
+        void surfaces.start?.onSend("hello", [a, b, c], { clientMessageId: "cid-rm2" })
           .then(() => null, (error: unknown) => { failure = error })
       })
       await waitFor(() => expect(uploadCalls()).toHaveLength(2))
+      const signalB = uploadCalls()[1][1].signal as AbortSignal
+      expect(statusOf(b)).toBe("uploading")
 
       act(() => { surfaces.start?.onFilesChange([b, c]) })
-      await act(async () => { second.resolve(created(FILE_B, "b.pdf")) })
+      await waitFor(() => expect(failure).toBeDefined())
+
+      expect(signalB.aborted).toBe(true)
+      expect((failure as Error).name).toBe("AbortError")
+      expect(failure).toMatchObject({ notificationHandled: true })
+      expect(uploadCalls()).toHaveLength(2)
+      expect(statusOf(b)).toBeUndefined()
+      expect(chatFrames(socket)).toHaveLength(0)
+      await waitFor(() => expect(surfaces.start?.isSending).toBe(false))
+      expect(surfaces.start?.attachmentsBusy).toBe(false)
+      expect(surfaces.start?.files).toEqual([b, c])
+    })
+
+    it("does not upload a retried file removed while the retry waits for a token, and the refresh still serves another upload", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] })
+      const parentPostMessage = vi.spyOn(window, "postMessage").mockImplementation(() => {})
+      const socket = await mountActive({
+        capabilities,
+        session_token_expires_at: new Date(Date.now() + 61_000).toISOString(),
+      })
+      const [a, b] = [pdf("a.pdf"), pdf("b.pdf")]
+      act(() => { surfaces.start?.onFilesChange([a]) })
+      fetchMock.mockImplementationOnce(async () => errorResponse(500, "server_error"))
+      await act(async () => {
+        await settle(surfaces.start?.onSend("first", [a], { clientMessageId: "cid-r0" }))
+      })
+      expect(statusOf(a)).toBe("failed")
+      toastError.mockReset()
+
+      vi.setSystemTime(Date.now() + 31_000)
+      act(() => { surfaces.start?.onFilesChange([a, b]) })
+      let retrying!: Promise<unknown>
+      act(() => { retrying = surfaces.start?.onRetryAttachment(a) })
+      await waitFor(() => expect(reconnectRequests(parentPostMessage)).toHaveLength(1))
+      expect(statusOf(a)).toBe("uploading")
+      let sending!: Promise<unknown>
+      act(() => {
+        sending = surfaces.start?.onSend("second", [b], { clientMessageId: "cid-r1" })
+      })
+
+      act(() => { surfaces.start?.onFilesChange([b]) })
+      await act(async () => { await retrying })
+      expect(statusOf(a)).toBeUndefined()
+
+      fetchMock.mockImplementation(async () => created(FILE_B, "b.pdf"))
+      dispatchSession({
+        session_delivery_id: "delivery-b",
+        session_token: "st_renewed_token",
+        capabilities,
+      })
+      await waitFor(() => expect(MockWebSocket.instances).toHaveLength(2))
+      const next = MockWebSocket.instances[1]
+      act(() => next.open("xagent-session-v1"))
+      await waitFor(() => expect(chatFrames(next)).toHaveLength(1))
+      expect(chatFrames(next)[0].file_ids).toEqual([FILE_B])
+      accept(next, "cid-r1")
       await act(async () => { await sending })
 
       expect(uploadCalls()).toHaveLength(2)
-      expect((failure as Error).name).toBe("AbortError")
+      expect(uploadCalls()[1][1].headers.Authorization).toBe("Bearer st_renewed_token")
+      expect(statusOf(a)).toBeUndefined()
+      expect(toastError).not.toHaveBeenCalled()
+      expect(reconnectRequests(parentPostMessage)).toHaveLength(1)
       expect(chatFrames(socket)).toHaveLength(0)
+      expect(surfaces.start?.attachmentsBusy).toBe(false)
     })
+
+    it.each(replacements)(
+      "fails the send before any upload when the refreshed session %s",
+      async (_name, update, message, filesAfter) => {
+        vi.useFakeTimers({ toFake: ["Date"] })
+        const parentPostMessage = vi.spyOn(window, "postMessage").mockImplementation(() => {})
+        const socket = await mountActive({
+          capabilities,
+          session_token_expires_at: new Date(Date.now() + 61_000).toISOString(),
+        })
+        vi.setSystemTime(Date.now() + 31_000)
+        fetchMock.mockImplementation(async () => created(FILE_A))
+        const [a, b] = [pdf("a.pdf"), pdf("b.pdf")]
+        let failure: unknown
+        act(() => { surfaces.start?.onFilesChange([a, b]) })
+        act(() => {
+          void surfaces.start?.onSend("hello", [a, b], { clientMessageId: "cid-cap-upload" })
+            .then(() => null, (error: unknown) => { failure = error })
+        })
+        await waitFor(() => expect(reconnectRequests(parentPostMessage)).toHaveLength(1))
+
+        dispatchSession({ session_delivery_id: "delivery-b", session_token: "st_renewed_token", ...update })
+        await waitFor(() => expect(failure).toBeDefined())
+
+        expect(failure).toMatchObject({ message, userFacing: true })
+        expect(uploadCalls()).toHaveLength(0)
+        expect(statusOf(a)).toBeUndefined()
+        expect(statusOf(b)).toBeUndefined()
+        await waitFor(() => expect(MockWebSocket.instances).toHaveLength(2))
+        act(() => MockWebSocket.instances[1].open("xagent-session-v1"))
+        expect(chatFrames(socket)).toHaveLength(0)
+        expect(chatFrames(MockWebSocket.instances[1])).toHaveLength(0)
+        expect(surfaces.start?.files).toEqual(filesAfter(a, b))
+        await waitFor(() => expect(surfaces.start?.isSending).toBe(false))
+      },
+    )
+
+    it.each(replacements)(
+      "fails the send after its uploads when the session whose socket opens %s",
+      async (_name, update, message, filesAfter) => {
+        render(<SessionAgentChatPage />)
+        dispatchSession({ capabilities })
+        await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+        fetchMock
+          .mockImplementationOnce(async () => created(FILE_A, "a.pdf"))
+          .mockImplementationOnce(async () => created(FILE_B, "b.pdf"))
+        const [a, b] = [pdf("a.pdf"), pdf("b.pdf")]
+        let failure: unknown
+        act(() => { surfaces.start?.onFilesChange([a, b]) })
+        act(() => {
+          void surfaces.start?.onSend("hello", [a, b], { clientMessageId: "cid-cap-frame" })
+            .then(() => null, (error: unknown) => { failure = error })
+        })
+        await waitFor(() => expect(uploadCalls()).toHaveLength(2))
+        await waitFor(() => expect(statusOf(b)).toBe("uploaded"))
+
+        dispatchSession({ session_delivery_id: "delivery-b", ...update })
+        await waitFor(() => expect(MockWebSocket.instances).toHaveLength(2))
+        const next = MockWebSocket.instances[1]
+        act(() => next.open("xagent-session-v1"))
+        await waitFor(() => expect(failure).toBeDefined())
+
+        expect(failure).toMatchObject({ message, userFacing: true })
+        expect(chatFrames(MockWebSocket.instances[0])).toHaveLength(0)
+        expect(chatFrames(next)).toHaveLength(0)
+        expect(surfaces.start?.files).toEqual(filesAfter(a, b))
+        await waitFor(() => expect(surfaces.start?.isSending).toBe(false))
+      },
+    )
 
     it("uploads again after the server reports an attached file as unavailable", async () => {
       const socket = await mountActive()
@@ -1021,6 +1188,42 @@ describe("SessionAgentChatPage file attachments", () => {
 
       expect(chatFrames(socket)[0]).not.toHaveProperty("file_ids")
       expect(uploadCalls()).toHaveLength(0)
+    })
+
+    it("ends a send whose file was removed without cancelling a retry running beside it", async () => {
+      const socket = await mountActive()
+      bindTask(socket)
+      await waitFor(() => expect(screen.getByTestId("session-conversation")).toBeInTheDocument())
+      const retryReply = deferred<Response>()
+      fetchMock
+        .mockReturnValueOnce(retryReply.promise)
+        .mockImplementationOnce(async () => created(FILE_A, "a.pdf"))
+        .mockImplementationOnce(pendingUntilAborted)
+      const [r, a, b] = [pdf("r.pdf"), pdf("a.pdf"), pdf("b.pdf")]
+      act(() => { surfaces.panel?.onAttachmentFilesChange([r, a, b]) })
+      let retrying!: Promise<unknown>
+      act(() => { retrying = surfaces.panel?.onRetryAttachment(r) })
+      await waitFor(() => expect(uploadCalls()).toHaveLength(1))
+      let failure: unknown
+      act(() => {
+        void surfaces.panel?.onSend("from panel", { clientMessageId: "cid-beside" }, [a, b])
+          .then(() => null, (error: unknown) => { failure = error })
+      })
+      await waitFor(() => expect(uploadCalls()).toHaveLength(3))
+      const retrySignal = uploadCalls()[0][1].signal as AbortSignal
+      const signalB = uploadCalls()[2][1].signal as AbortSignal
+
+      act(() => { surfaces.panel?.onAttachmentFilesChange([r, b]) })
+      await waitFor(() => expect(failure).toBeDefined())
+
+      expect(signalB.aborted).toBe(true)
+      expect(retrySignal.aborted).toBe(false)
+      await act(async () => {
+        retryReply.resolve(created(FILE_B, "r.pdf"))
+        await retrying
+      })
+      expect(surfaces.panel?.attachmentStatuses?.get(r)).toBe("uploaded")
+      expect(chatFrames(socket)).toHaveLength(0)
     })
 
     it("stops tracking a file the visitor removed from the panel", async () => {

@@ -2595,6 +2595,11 @@ export function AppProvider({
     transport?.capabilities?.files,
   )
   const sessionAttachments = sessionTransport?.attachments ?? null
+  // sendMessage reads the attachments through this ref, so a send that
+  // started under an earlier render checks its file ids against the ones
+  // current when its frame goes out.
+  const sessionAttachmentsRef = useRef(sessionAttachments)
+  sessionAttachmentsRef.current = sessionAttachments
   const rejectDisabledFileUpload = useCallback(async () => {
     throw new Error("Files are disabled for this conversation.")
   }, [])
@@ -7160,7 +7165,7 @@ export function AppProvider({
       throw new Error("Files are disabled for this conversation.")
     }
     const uploadedFiles = options?.uploadedFiles ?? []
-    if (uploadedFiles.length > 0 && !sessionAttachments) {
+    if (uploadedFiles.length > 0 && !sessionAttachmentsRef.current) {
       throw new Error("Attachments are not available for this conversation.")
     }
     if (sessionTransport && sessionConversationRef.current.phase === "reset_requested") {
@@ -7315,26 +7320,24 @@ export function AppProvider({
           taskId: state.taskId, clientMessageId, text: message, files: files ?? [],
         })
       }
+      const fileIds = uploadedFiles.map(file => file.fileId)
+      const chatArgs: Parameters<typeof sendChatMessage> =
+        [message, files, config?.force, clientMessageId, requestId]
       beginSessionMessageDelivery()
       try {
         await sendChatWithResend(
-          uploadedFiles.length > 0 && sessionAttachments
-            ? [
-              message,
-              files,
-              config?.force,
-              clientMessageId,
-              requestId,
-              {
-                fileIds: uploadedFiles.map(file => file.fileId),
-                maxFileIds: sessionAttachments.maxFiles,
-              },
-            ]
-            : [message, files, config?.force, clientMessageId, requestId],
+          chatArgs,
           () => {
             // A resend runs on the connection that replaced the lost one.
             sessionDeliveryOwner.connectionIdentity =
               sessionConnectionIdentityRef.current ?? sessionDeliveryOwner.connectionIdentity
+            // The ids are checked against the attachments current at each
+            // attempt, a resend included: the session that replaced a lost
+            // connection may have lowered the limit or withdrawn attachments,
+            // and with no limit the frame check refuses the ids.
+            if (fileIds.length > 0) {
+              chatArgs[5] = { fileIds, maxFileIds: sessionAttachmentsRef.current?.maxFiles }
+            }
           },
         )
         if (startsReplacementConversation) {

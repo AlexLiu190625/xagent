@@ -109,6 +109,16 @@ const userFacingError = (message: string, errorCode?: ClientErrorCode): Error =>
     ...(errorCode ? { errorCode } : {}),
   })
 
+const isUserFacingError = (error: unknown): error is Error =>
+  error instanceof Error && (error as { userFacing?: unknown }).userFacing === true
+
+// A send with files that is still running. Removing any of its files aborts
+// `controller`, which ends the send and the upload it is waiting on.
+interface AttachmentSend {
+  files: readonly File[]
+  controller: AbortController
+}
+
 interface SessionConversationContentProps {
   status: WidgetSessionStatus
   agent: WidgetSessionAgent | null
@@ -161,9 +171,14 @@ function SessionConversationContent({
   const uploadedFilesRef = useRef(new WeakMap<File, SessionUploadedFile>())
   const uploadControllersRef = useRef(new Map<File, AbortController>())
   // One entry per send with files that is still running; removing any of its
-  // files aborts that send.
-  const activeSendsRef = useRef(new Set<{ files: ReadonlySet<File>, controller: AbortController }>())
+  // files aborts that send and the upload it is waiting on.
+  const activeSendsRef = useRef(new Set<AttachmentSend>())
   const panelFilesRef = useRef<File[]>([])
+  // The capability of the latest accepted session. A send reads it right
+  // before its chat frame goes out, because the `attachments` it captured
+  // when it started may belong to a session replaced since.
+  const latestAttachmentsRef = useRef(attachments)
+  latestAttachmentsRef.current = attachments
   const [resetError, setResetError] = useState(false)
   // The failure is stored as a code, not as text, so the line is translated
   // at render time and follows a locale switch. It is only a note on the
@@ -198,15 +213,16 @@ function SessionConversationContent({
     })
   }, [])
 
-  // Forgets everything held for a file the visitor no longer wants: cancels a
-  // request still in flight and drops what was already uploaded. A request
-  // that had reached the server may still leave the file stored there; it is
-  // never attached to a message.
+  // Forgets everything held for a file the visitor no longer wants: cancels
+  // its upload, including one still waiting for a token, ends every send that
+  // includes it together with the upload that send is waiting on, and drops
+  // what was already uploaded. A request that had reached the server may
+  // still leave the file stored there; it is never attached to a message.
   const releaseAttachment = useCallback((file: File) => {
     uploadControllersRef.current.get(file)?.abort()
     uploadControllersRef.current.delete(file)
     activeSendsRef.current.forEach((send) => {
-      if (send.files.has(file)) send.controller.abort()
+      if (send.files.includes(file)) send.controller.abort()
     })
     uploadedFilesRef.current.delete(file)
     setAttachmentStatus(file, null)
@@ -238,74 +254,14 @@ function SessionConversationContent({
     panelFilesRef.current = next
   }, [releaseRemovedAttachments])
 
-  // Uploads one file with the session token. A send uploads its files one
-  // after another, and the file cards' retry buttons are disabled while any
-  // upload or send with files is in flight, a retry counting from the click
-  // (see handleRetryAttachment). The composer itself stays open while a task
-  // is running, so a send with files can still start beside an upload; the
-  // bridge then shares or skips the token refresh after a 401.
-  const uploadAttachment = useCallback(async (file: File): Promise<SessionUploadedFile> => {
-    const controller = new AbortController()
-    uploadControllersRef.current.set(file, controller)
-    setAttachmentWork((count) => count + 1)
-    setAttachmentStatus(file, "uploading")
-    try {
-      const uploaded = await uploadWidgetSessionFile({
-        origin: window.location.origin,
-        getToken: async () => (await uploads.ensureFreshSession()).token,
-        refreshToken: async (rejected) => (await uploads.refreshSession(rejected)).token,
-        file,
-        signal: controller.signal,
-      })
-      uploadedFilesRef.current.set(file, uploaded)
-      setAttachmentStatus(file, "uploaded")
-      return uploaded
-    } catch (error) {
-      // A released file has no card left to mark, and the visitor who removed
-      // it needs no "not sent" notice for it.
-      if (controller.signal.aborted) {
-        throw typeof error === "object" && error !== null
-          ? Object.assign(error, { notificationHandled: true })
-          : error
-      }
-      setAttachmentStatus(file, "failed")
-      throw error
-    } finally {
-      if (uploadControllersRef.current.get(file) === controller) {
-        uploadControllersRef.current.delete(file)
-      }
-      setAttachmentWork((count) => count - 1)
-    }
-  }, [setAttachmentStatus, uploads])
-
-  // The retry counts as attachment work from the click, so the other cards'
-  // retry buttons are disabled while it waits for a token, not only once its
-  // upload has started.
-  const handleRetryAttachment = useCallback(async (file: File) => {
-    setAttachmentWork((count) => count + 1)
-    try {
-      await uploads.ensureFreshSession()
-      await uploadAttachment(file)
-    } catch (error) {
-      if (isAbortError(error)) return
-      const code = readSendErrorCode(error) ?? "upload_failed"
-      toast.error(t(clientErrorTranslationKey(code)))
-    } finally {
-      setAttachmentWork((count) => count - 1)
-    }
-  }, [t, uploadAttachment, uploads])
-
-  // The checks that cost nothing: a send that is certain to be refused is
-  // refused before any file leaves the browser.
-  const assertAttachmentsSendable = useCallback((
-    files: File[],
-    config: Record<string, unknown> | undefined,
-    limits: SessionAttachmentsConfig,
+  // Checks files against a capability the session server advertised:
+  // extension, per-file size and per-message count. With no capability
+  // advertised, no file may be uploaded or sent.
+  const assertCapabilityAccepts = useCallback((
+    files: readonly File[],
+    limits: SessionAttachmentsConfig | undefined,
   ) => {
-    const metadata = config?.metadata as { request_id?: unknown } | undefined
-    if (typeof metadata?.request_id === "string" && metadata.request_id) {
-      throw userFacingError(t("widgetSession.attachments.noFilesOnAnswer"))
-    }
+    if (!limits) throw userFacingError(t("widgetSession.attachments.notAvailable"))
     const allowedExtensions = limits.accept.split(",")
     for (const file of files) {
       const dot = file.name.lastIndexOf(".")
@@ -324,8 +280,119 @@ function SessionConversationContent({
     }
   }, [t])
 
+  // Uploads one file with the session token. A send passes itself as `send`:
+  // aborting the send aborts this upload, and every token the upload uses
+  // must come from a session whose capability still accepts all of the
+  // send's files. A retry passes no `send`, so only removing its file, the
+  // session ending or the page unmounting stops it, and its tokens are
+  // checked against that one file. The abort controller is registered before
+  // the first token wait, so every wait of the upload can be cancelled.
+  // Uploading counts as attachment work from the call, token wait included,
+  // and the file cards' retry buttons are disabled while any upload or send
+  // with files is in flight. The composer itself stays open while a task is
+  // running, so a send with files can still start beside an upload; the
+  // bridge then shares or skips the token refresh after a 401.
+  const uploadAttachment = useCallback(async (
+    file: File,
+    send?: AttachmentSend,
+  ): Promise<SessionUploadedFile> => {
+    const controller = new AbortController()
+    uploadControllersRef.current.set(file, controller)
+    const abortWithSend = () => controller.abort()
+    send?.controller.signal.addEventListener("abort", abortWithSend, { once: true })
+    if (send?.controller.signal.aborted) controller.abort()
+    setAttachmentWork((count) => count + 1)
+    setAttachmentStatus(file, "uploading")
+    const checkedFiles: readonly File[] = send ? send.files : [file]
+    // The upload helper reports any failure of the token callbacks as
+    // upload_failed, so a refusal is kept here and rethrown as it was raised.
+    const refusal: { error?: Error } = {}
+    const acceptedToken = (session: WidgetSession): string => {
+      try {
+        assertCapabilityAccepts(checkedFiles, toAttachments(session.capabilities?.fileUploads))
+      } catch (error) {
+        refusal.error = error as Error
+        throw error
+      }
+      return session.token
+    }
+    try {
+      const uploaded = await uploadWidgetSessionFile({
+        origin: window.location.origin,
+        getToken: async () => acceptedToken(await uploads.ensureFreshSession()),
+        refreshToken: async (rejected) => acceptedToken(await uploads.refreshSession(rejected)),
+        file,
+        signal: controller.signal,
+      })
+      uploadedFilesRef.current.set(file, uploaded)
+      setAttachmentStatus(file, "uploaded")
+      return uploaded
+    } catch (error) {
+      if (controller.signal.aborted) {
+        // A removed file has no card left to mark. A file still selected,
+        // whose upload ended with its send, goes back to not uploaded so it
+        // can be sent again. Neither needs a "not sent" notice.
+        if (uploadControllersRef.current.get(file) === controller) {
+          setAttachmentStatus(file, null)
+        }
+        throw typeof error === "object" && error !== null
+          ? Object.assign(error, { notificationHandled: true })
+          : error
+      }
+      if (refusal.error) {
+        // Nothing of this file was uploaded; it stays selected, so the visitor
+        // can remove it or send again.
+        setAttachmentStatus(file, null)
+        throw refusal.error
+      }
+      setAttachmentStatus(file, "failed")
+      throw error
+    } finally {
+      send?.controller.signal.removeEventListener("abort", abortWithSend)
+      if (uploadControllersRef.current.get(file) === controller) {
+        uploadControllersRef.current.delete(file)
+      }
+      setAttachmentWork((count) => count - 1)
+    }
+  }, [assertCapabilityAccepts, setAttachmentStatus, uploads])
+
+  // A retry uploads only this file and belongs to no send. Its upload counts
+  // as attachment work from the click, token wait included, so the other
+  // cards' retry buttons stay disabled until it settles.
+  const handleRetryAttachment = useCallback(async (file: File) => {
+    try {
+      await uploadAttachment(file)
+    } catch (error) {
+      if (isAbortError(error)) return
+      const code = readSendErrorCode(error)
+      toast.error(code
+        ? t(clientErrorTranslationKey(code))
+        : isUserFacingError(error)
+          ? error.message
+          : t(clientErrorTranslationKey("upload_failed")))
+    }
+  }, [t, uploadAttachment])
+
+  // The checks that cost nothing: a send that is certain to be refused is
+  // refused before any file leaves the browser.
+  const assertAttachmentsSendable = useCallback((
+    files: File[],
+    config: Record<string, unknown> | undefined,
+    limits: SessionAttachmentsConfig,
+  ) => {
+    const metadata = config?.metadata as { request_id?: unknown } | undefined
+    if (typeof metadata?.request_id === "string" && metadata.request_id) {
+      throw userFacingError(t("widgetSession.attachments.noFilesOnAnswer"))
+    }
+    assertCapabilityAccepts(files, limits)
+  }, [assertCapabilityAccepts, t])
+
   // Sends a message with the files the visitor attached. Files go to the
-  // session first, one after another, and the chat frame then names them by id.
+  // session first, one after another, and the chat frame then names them by
+  // id. The session can be replaced while this runs, so each upload checks
+  // the capability of the session its token comes from, and the files are
+  // checked once more against the latest capability right before the frame
+  // goes out. A failed check fails the send; the text never goes out alone.
   const sendWithAttachments = useCallback(async (
     message: string,
     files: File[],
@@ -348,14 +415,14 @@ function SessionConversationContent({
     assertAttachmentsSendable(files, config, attachments)
 
     setAttachmentWork((count) => count + 1)
-    const send = { files: new Set(files), controller: new AbortController() }
+    const send: AttachmentSend = { files, controller: new AbortController() }
     activeSendsRef.current.add(send)
     try {
       const uploaded: SessionUploadedFile[] = []
       for (const file of files) {
         if (send.controller.signal.aborted) throw removedFileError()
         const known = uploadedFilesRef.current.get(file)
-        uploaded.push(known ?? await uploadAttachment(file))
+        uploaded.push(known ?? await uploadAttachment(file, send))
       }
       await raceSend(uploads.waitForOpenConnection(), send.controller.signal)
       // Removing a file aborts the send above; this check is the backstop for
@@ -363,6 +430,8 @@ function SessionConversationContent({
       if (files.some((file) => !uploadedFilesRef.current.has(file))) {
         throw removedFileError()
       }
+      // The socket that just opened belongs to the latest accepted session.
+      assertCapabilityAccepts(files, latestAttachmentsRef.current)
 
       try {
         await sendMessage(message, config, [], { uploadedFiles: uploaded })
@@ -386,6 +455,7 @@ function SessionConversationContent({
     }
   }, [
     assertAttachmentsSendable,
+    assertCapabilityAccepts,
     attachments,
     isConversationResetPending,
     isSessionInteractionLocked,

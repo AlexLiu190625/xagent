@@ -797,7 +797,7 @@ describe("SessionAgentChatPage", () => {
     it("passes the token the upload server rejected to refreshSession", async () => {
       setBridge("active", withUploads())
       render(<SessionAgentChatPage />)
-      const session = activeSession()
+      const session = withUploads()
       bridge.value.ensureFreshSession.mockResolvedValue({ ...session, token: "st_current" })
       bridge.value.refreshSession.mockResolvedValue({ ...session, token: "st_refreshed" })
       vi.mocked(fetch)
@@ -838,6 +838,19 @@ describe("SessionAgentChatPage", () => {
 
       expect(toastMock.error).toHaveBeenCalledWith("clientErrors.uploadFailed")
       expect(app.startProps?.attachmentsBusy).toBe(false)
+    })
+
+    it("tells the visitor a retry was refused because the latest session withdrew uploads", async () => {
+      setBridge("active", withUploads())
+      render(<SessionAgentChatPage />)
+      const file = pdf()
+      bridge.value.ensureFreshSession.mockResolvedValueOnce(activeSession())
+
+      await act(async () => { await retry(file) })
+
+      expect(toastMock.error).toHaveBeenLastCalledWith("widgetSession.attachments.notAvailable")
+      expect(fetch).not.toHaveBeenCalled()
+      expect((app.startProps?.attachmentStatuses as ReadonlyMap<File, string>).get(file)).toBeUndefined()
     })
 
     it("offers the conversation panel's upload entry while uploads are advertised", () => {
