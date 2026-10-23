@@ -94,6 +94,12 @@ interface ChatInputProps {
   /** Upload state of each collected file, kept by the caller in this mode. */
   attachmentStatuses?: ReadonlyMap<File, ComposerAttachmentStatus>;
   onRetryAttachment?: (file: File) => void;
+  /**
+   * True while the caller is uploading files or sending a message with files.
+   * Retrying a failed file is refused until it is false again, so a retry never
+   * starts beside work that is already in flight.
+   */
+  attachmentsBusy?: boolean;
 }
 
 type ExecutionMode = "auto" | "flash" | "balanced" | "think";
@@ -156,6 +162,7 @@ export function ChatInput({
   attachments,
   attachmentStatuses,
   onRetryAttachment,
+  attachmentsBusy = false,
 }: ChatInputProps) {
   const router = useRouter();
   const [internalMessage, setInternalMessage] = useState("");
@@ -1233,7 +1240,8 @@ export function ChatInput({
                       <button
                         type="button"
                         onClick={() => onRetryAttachment?.(file)}
-                        className="text-xs font-medium underline underline-offset-2"
+                        disabled={attachmentsBusy}
+                        className="text-xs font-medium underline underline-offset-2 disabled:pointer-events-none disabled:opacity-50"
                       >
                         {t("widgetSession.attachments.uploadFailedRetry")}
                       </button>

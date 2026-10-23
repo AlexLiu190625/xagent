@@ -239,8 +239,11 @@ function SessionConversationContent({
   }, [releaseRemovedAttachments])
 
   // Uploads one file with the session token. A send uploads its files one
-  // after another; a retry started from a file card may run beside it, and
-  // the bridge then shares or skips the token refresh after a 401.
+  // after another, and the file cards' retry buttons are disabled while any
+  // upload or send with files is in flight. A retry only counts as in flight
+  // once its token is ready, so a retry clicked while the token is still being
+  // renewed can overlap another upload; the bridge then shares or skips the
+  // token refresh after a 401.
   const uploadAttachment = useCallback(async (file: File): Promise<SessionUploadedFile> => {
     const controller = new AbortController()
     uploadControllersRef.current.set(file, controller)
@@ -547,6 +550,7 @@ function SessionConversationContent({
             attachments={attachments}
             attachmentStatuses={attachments ? attachmentStatuses : undefined}
             onRetryAttachment={attachments ? handleRetryAttachment : undefined}
+            attachmentsBusy={isAttachmentBusy}
             onAttachmentFilesChange={attachments ? handlePanelFilesChange : undefined}
             isBusy={isAttachmentBusy}
           />
@@ -570,6 +574,7 @@ function SessionConversationContent({
                 attachments={attachments}
                 attachmentStatuses={attachments ? attachmentStatuses : undefined}
                 onRetryAttachment={attachments ? handleRetryAttachment : undefined}
+                attachmentsBusy={isAttachmentBusy}
                 readOnlyConfig={true}
                 hideConfig={true}
                 compactInput={true}

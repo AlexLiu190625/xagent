@@ -83,6 +83,7 @@ type ChatStartScreenProps = {
   attachments?: SessionAttachmentsConfig;
   attachmentStatuses?: ReadonlyMap<File, ComposerAttachmentStatus>;
   onRetryAttachment?: (file: File) => void;
+  attachmentsBusy?: boolean;
   voiceInputEnabled?: boolean;
   taskConfig?: React.ComponentProps<typeof ChatInput>["taskConfig"];
   autoFocus?: boolean;
@@ -117,6 +118,7 @@ export function ChatStartScreen({
   attachments,
   attachmentStatuses,
   onRetryAttachment,
+  attachmentsBusy = false,
   voiceInputEnabled = true,
   taskConfig,
   autoFocus = false,
@@ -200,6 +202,7 @@ export function ChatStartScreen({
             attachments={attachments}
             attachmentStatuses={attachmentStatuses}
             onRetryAttachment={onRetryAttachment}
+            attachmentsBusy={attachmentsBusy}
             voiceInputEnabled={voiceInputEnabled}
             hideFileUpload={filesBlocked}
             taskConfig={taskConfig}

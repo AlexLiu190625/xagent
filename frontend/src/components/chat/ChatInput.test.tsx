@@ -2473,6 +2473,30 @@ describe("ChatInput upload-only attachments", () => {
     expect(onRetryAttachment).toHaveBeenCalledWith(failed)
   })
 
+  it("disables the retry button of a failed file while attachments are busy and enables it again afterwards", () => {
+    const failed = pdf("broken.pdf")
+    const onRetryAttachment = vi.fn()
+    const props = {
+      attachments,
+      initialFiles: [failed],
+      attachmentStatuses: new Map([[failed, "failed" as const]]),
+      onRetryAttachment,
+    }
+    const { rerender } = render(<Harness {...props} attachmentsBusy />)
+    const retryButton = screen.getByRole("button", { name: "widgetSession.attachments.uploadFailedRetry" })
+
+    expect(retryButton).toBeDisabled()
+    fireEvent.click(retryButton)
+    expect(onRetryAttachment).not.toHaveBeenCalled()
+
+    rerender(<Harness {...props} attachmentsBusy={false} />)
+    const enabledButton = screen.getByRole("button", { name: "widgetSession.attachments.uploadFailedRetry" })
+    expect(enabledButton).toBeEnabled()
+    fireEvent.click(enabledButton)
+    expect(onRetryAttachment).toHaveBeenCalledTimes(1)
+    expect(onRetryAttachment).toHaveBeenCalledWith(failed)
+  })
+
   it("does not let a draft with a file still uploading be submitted", () => {
     const uploading = pdf("busy.pdf")
     const onSend = vi.fn()

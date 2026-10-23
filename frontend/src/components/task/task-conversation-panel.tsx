@@ -48,6 +48,7 @@ interface TaskConversationPanelProps {
   attachments?: SessionAttachmentsConfig
   attachmentStatuses?: ReadonlyMap<File, ComposerAttachmentStatus>
   onRetryAttachment?: (file: File) => void
+  attachmentsBusy?: boolean
   // Called with the collected files every time the visitor adds or removes
   // one, and with an empty list once a send has completed.
   onAttachmentFilesChange?: (files: File[]) => void
@@ -257,6 +258,7 @@ export function TaskConversationPanel({
   attachments,
   attachmentStatuses,
   onRetryAttachment,
+  attachmentsBusy = false,
   onAttachmentFilesChange,
   isBusy = false,
   onAgentExecutionClick,
@@ -1087,6 +1089,7 @@ export function TaskConversationPanel({
               attachments={attachments}
               attachmentStatuses={attachmentStatuses}
               onRetryAttachment={onRetryAttachment}
+              attachmentsBusy={attachmentsBusy}
               voiceInputEnabled={voiceInputEnabled}
               hideFileUpload={hideFileUpload || filesBlocked}
               compact={compactInput}

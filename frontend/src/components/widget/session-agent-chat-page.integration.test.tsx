@@ -591,6 +591,50 @@ describe("SessionAgentChatPage file attachments", () => {
       await act(async () => { await sending })
     })
 
+    it("keeps the retry of a failed file disabled while another file uploads, and enables it afterwards", async () => {
+      await mountActive()
+      const failed = pdf("failed.pdf")
+      const other = pdf("other.pdf")
+      fetchMock.mockImplementationOnce(async () => errorResponse(500, "server_error"))
+      await act(async () => {
+        await settle(surfaces.start?.onSend("hello", [failed], { clientMessageId: "cid-busy" }))
+      })
+      expect(statusOf(failed)).toBe("failed")
+      expect(surfaces.start?.attachmentsBusy).toBe(false)
+
+      const reply = deferred<Response>()
+      fetchMock.mockImplementationOnce(() => reply.promise)
+      let retrying!: Promise<unknown>
+      act(() => { retrying = surfaces.start?.onRetryAttachment(other) })
+      await waitFor(() => expect(statusOf(other)).toBe("uploading"))
+
+      expect(statusOf(failed)).toBe("failed")
+      expect(surfaces.start?.attachmentsBusy).toBe(true)
+
+      reply.resolve(created(FILE_A, "other.pdf"))
+      await act(async () => { await retrying })
+
+      expect(statusOf(other)).toBe("uploaded")
+      expect(surfaces.start?.attachmentsBusy).toBe(false)
+    })
+
+    it("passes the busy state to the conversation panel as well", async () => {
+      const socket = await mountActive()
+      bindTask(socket)
+      await waitFor(() => expect(screen.getByTestId("session-conversation")).toBeInTheDocument())
+      expect(surfaces.panel?.attachmentsBusy).toBe(false)
+
+      const reply = deferred<Response>()
+      fetchMock.mockImplementationOnce(() => reply.promise)
+      let retrying!: Promise<unknown>
+      act(() => { retrying = surfaces.panel?.onRetryAttachment(pdf("again.pdf")) })
+      await waitFor(() => expect(surfaces.panel?.attachmentsBusy).toBe(true))
+
+      reply.resolve(created(FILE_A, "again.pdf"))
+      await act(async () => { await retrying })
+      expect(surfaces.panel?.attachmentsBusy).toBe(false)
+    })
+
     it("shows the file as uploading while a rate-limited request waits, then offers a per-file retry", async () => {
       const socket = await mountActive()
       vi.useFakeTimers()
