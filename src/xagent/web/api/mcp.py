@@ -248,9 +248,9 @@ class MCPServerResponse(BaseModel):
     env_source: Optional[Literal["own", "shared", "platform"]] = None
     runtime_input_schema: Optional[dict]
     runtime_bindings: Optional[list[dict]]
-    # The stored settings, or null when signed_uploads_error says why they
-    # cannot be used.  Typed loosely so a malformed stored value cannot fail
-    # the response.
+    # The stored settings as they are; signed_uploads_error alone says whether
+    # the connector can use them.  Typed loosely so a malformed stored value
+    # cannot fail the response.
     signed_uploads: Optional[Any]
     signed_uploads_error: Optional[str]
     allow_delegated_authorization: bool
@@ -2175,7 +2175,9 @@ def _validate_mcp_runtime_config(
 
 
 _SIGNED_UPLOADS_TRANSPORT_ERROR = (
-    "signed_uploads are supported only for the sse and streamable_http transports"
+    "signed_uploads are supported only for the "
+    f"{' and '.join(sorted(SIGNED_UPLOAD_TRANSPORTS))} transports; to use "
+    "another transport, set signed_uploads to [] in the same request"
 )
 
 
@@ -2399,14 +2401,11 @@ def _global_config_tampered(server_data: MCPServerUpdate, server: MCPServer) -> 
         and server_data.runtime_bindings != server.runtime_bindings
     ):
         return True
-    if "signed_uploads" in fields_set:
-        # NULL and an empty list both mean no settings.
-        incoming_uploads = (
-            [] if server_data.signed_uploads is None else server_data.signed_uploads
-        )
-        current_uploads = [] if server.signed_uploads is None else server.signed_uploads
-        if incoming_uploads != current_uploads:
-            return True
+    # NULL and an empty list both mean no settings; no other value does.
+    if "signed_uploads" in fields_set and (
+        [] if server_data.signed_uploads is None else server_data.signed_uploads
+    ) != ([] if server.signed_uploads is None else server.signed_uploads):
+        return True
     if "allow_delegated_authorization" in fields_set and bool(
         server_data.allow_delegated_authorization
     ) != bool(server.allow_delegated_authorization):
@@ -2508,9 +2507,7 @@ def _db_server_to_response(
         env_source=getattr(user_mcp, "env_source", None),
         runtime_input_schema=server.runtime_input_schema,
         runtime_bindings=server.runtime_bindings,
-        signed_uploads=(
-            stored_signed_uploads if signed_uploads_error is None else None
-        ),
+        signed_uploads=stored_signed_uploads,
         signed_uploads_error=signed_uploads_error,
         allow_delegated_authorization=bool(server.allow_delegated_authorization),
         can_edit_global=_check_mcp_permission(user_mcp, is_admin, require="edit"),
@@ -4961,7 +4958,13 @@ def update_mcp_server(
                 # this request changes them, the transport or the URL, so a
                 # stored value that stopped being valid does not block unrelated
                 # edits; the runtime marks such a connector unavailable and the
-                # response reports why.
+                # response reports why.  This differs on purpose from
+                # runtime_input_schema and runtime_bindings above, which are
+                # checked on every definition-row write: the upload rules may be
+                # tightened later, and re-checking stored settings here would
+                # then reject every rename or description edit of a connector
+                # that carries them, while the runtime already refuses to use
+                # them.
                 if (
                     signed_uploads_in_request
                     or config.transport != server.transport

@@ -7,7 +7,6 @@ from typing import Any
 
 import pytest
 
-from xagent.core.tools.adapters.vibe.signed_upload import signed_upload_settings_error
 from xagent.web.models.custom_api import CustomApi, UserCustomApi
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.user import User
@@ -31,8 +30,14 @@ SIGNED_UPLOADS = [
 ]
 TRANSPORT_DETAIL = (
     "Invalid configuration: signed_uploads are supported only for the sse and "
-    "streamable_http transports"
+    "streamable_http transports; to use another transport, set signed_uploads "
+    "to [] in the same request"
 )
+# The errors signed_upload_settings_error gives for the values used below,
+# written out so a change of wording shows up here.
+MISSING_KEYS_ERROR = "signed_uploads[0] must have exactly the documented keys"
+NOT_A_LIST_ERROR = "signed_uploads must be a list"
+NO_HOST_ERROR = "the connection URL has no hostname"
 OWNER_ONLY_DETAIL = "Only the server owner can change the shared configuration"
 
 
@@ -42,9 +47,7 @@ def _without_content_types() -> list[dict[str, Any]]:
     return [entry]
 
 
-def _invalid_detail(raw: Any, *, transport: str, url: str) -> str:
-    error = signed_upload_settings_error(raw, transport=transport, url=url)
-    assert isinstance(error, str) and error
+def _invalid_detail(error: str) -> str:
     return "Invalid configuration: " + error
 
 
@@ -164,8 +167,9 @@ def _reject_on_create(case: str, owner: dict[str, str]) -> None:
         raw = _without_content_types()
         resp = _create(owner, signed_uploads=raw)
         assert resp.status_code == 400, resp.text
-        assert resp.json()["detail"] == _invalid_detail(
-            raw, transport="streamable_http", url=URL
+        assert resp.json()["detail"] == (
+            "Invalid configuration: "
+            "signed_uploads[0] must have exactly the documented keys"
         )
     elif case == "create-stdio":
         resp = _create(
@@ -189,8 +193,8 @@ def _reject_on_create(case: str, owner: dict[str, str]) -> None:
         no_host = "https:///mcp"
         resp = _create(owner, config={"url": no_host}, signed_uploads=SIGNED_UPLOADS)
         assert resp.status_code == 400, resp.text
-        assert resp.json()["detail"] == _invalid_detail(
-            SIGNED_UPLOADS, transport="streamable_http", url=no_host
+        assert resp.json()["detail"] == (
+            "Invalid configuration: the connection URL has no hostname"
         )
 
     db = _direct_db_session()
@@ -216,7 +220,7 @@ def _reject_on_update(case: str, owner: dict[str, str]) -> None:
     elif case == "update-missing-key":
         raw = _without_content_types()
         payload = {"signed_uploads": raw}
-        expected_detail = _invalid_detail(raw, transport="streamable_http", url=URL)
+        expected_detail = _invalid_detail(MISSING_KEYS_ERROR)
     elif case == "update-transport-to-stdio":
         payload = {"transport": "stdio", "config": {"command": "python"}}
         expected_detail = TRANSPORT_DETAIL
@@ -226,9 +230,7 @@ def _reject_on_update(case: str, owner: dict[str, str]) -> None:
     else:
         no_host = "https:///mcp"
         payload = {"config": {"url": no_host}}
-        expected_detail = _invalid_detail(
-            SIGNED_UPLOADS, transport="streamable_http", url=no_host
-        )
+        expected_detail = _invalid_detail(NO_HOST_ERROR)
 
     resp = client.put(f"/api/mcp/servers/{server_id}", json=payload, headers=owner)
     assert resp.status_code == expected_status, resp.text
@@ -253,6 +255,7 @@ def test_save_rejects_invalid_signed_uploads(case: str) -> None:
     "case",
     [
         "create-valid",
+        "create-valid-sse",
         "create-omitted",
         "update-to-stdio-clearing",
         "update-clear-to-null",
@@ -262,10 +265,12 @@ def test_save_accepts_signed_uploads(case: str) -> None:
     _admin_headers()
     owner = _register_second_user("bob", "bobpass1")
 
-    if case == "create-valid":
-        resp = _create(owner, signed_uploads=SIGNED_UPLOADS)
+    if case in ("create-valid", "create-valid-sse"):
+        transport = "sse" if case == "create-valid-sse" else "streamable_http"
+        resp = _create(owner, transport=transport, signed_uploads=SIGNED_UPLOADS)
         assert resp.status_code == 201, resp.text
         body = resp.json()
+        assert body["transport"] == transport
         assert body["signed_uploads"] == SIGNED_UPLOADS
         assert body["signed_uploads_error"] is None
         assert _row(body["id"])["signed_uploads"] == SIGNED_UPLOADS
@@ -296,6 +301,29 @@ def test_save_accepts_signed_uploads(case: str) -> None:
         )
         assert resp.status_code == 200, resp.text
         assert _row(server_id)["signed_uploads_is_null"] is True
+
+
+@pytest.mark.parametrize(
+    ("created", "switched"),
+    [("streamable_http", "sse"), ("sse", "streamable_http")],
+)
+def test_switching_between_sse_and_streamable_http_keeps_valid_settings(
+    created: str, switched: str
+) -> None:
+    _admin_headers()
+    owner = _register_second_user("bob", "bobpass1")
+    server_id = _create_ok(owner, transport=created, signed_uploads=SIGNED_UPLOADS)
+
+    resp = client.put(
+        f"/api/mcp/servers/{server_id}", json={"transport": switched}, headers=owner
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["signed_uploads"] == SIGNED_UPLOADS
+    assert resp.json()["signed_uploads_error"] is None
+    row = _row(server_id)
+    assert row["transport"] == switched
+    assert row["signed_uploads"] == SIGNED_UPLOADS
 
 
 @pytest.mark.parametrize(
@@ -337,9 +365,7 @@ def test_save_checks_signed_uploads_only_when_they_or_the_connection_change(
 
     if case == "owner-new-url":
         assert resp.status_code == 400, resp.text
-        assert resp.json()["detail"] == _invalid_detail(
-            BAD, transport="streamable_http", url="https://other.example.test/mcp"
-        )
+        assert resp.json()["detail"] == _invalid_detail(NOT_A_LIST_ERROR)
         assert _row(server_id)["url"] == URL
         return
 
@@ -349,11 +375,8 @@ def test_save_checks_signed_uploads_only_when_they_or_the_connection_change(
     if case == "owner-rename":
         assert row["name"] == "upload-connector-renamed"
         body = resp.json()
-        assert body["signed_uploads"] is None
-        assert body["signed_uploads_error"] == signed_upload_settings_error(
-            BAD, transport="streamable_http", url=URL
-        )
-        assert body["signed_uploads_error"]
+        assert body["signed_uploads"] == BAD
+        assert body["signed_uploads_error"] == NOT_A_LIST_ERROR
 
 
 @pytest.mark.parametrize(
@@ -392,6 +415,31 @@ def test_non_owner_cannot_change_signed_uploads(
     assert _row(server_id) == before
 
 
+def test_non_owner_resending_stored_invalid_signed_uploads_is_not_checked() -> None:
+    _admin_headers()
+    owner = _register_second_user("bob", "bobpass1")
+    server_id = _create_ok(owner)
+    stored = [{"tool_name": "attach_document"}]
+    _store(server_id, stored)
+    other = _register_second_user("carol", "carolpass1")
+    _link_non_owner("carol", server_id)
+    before = _row(server_id)
+
+    resp = client.put(
+        f"/api/mcp/servers/{server_id}",
+        json={"signed_uploads": stored},
+        headers=other,
+    )
+
+    # A non-owner's copy is only compared with the stored value and never
+    # saved, so it is not checked.  The owner sending the same value gets 400:
+    # test_owner_saving_the_stored_invalid_signed_uploads_is_still_checked.
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["signed_uploads"] == stored
+    assert resp.json()["signed_uploads_error"] == MISSING_KEYS_ERROR
+    assert _row(server_id) == before
+
+
 @pytest.mark.parametrize("case", ["admin-valid", "admin-missing-key"])
 def test_platform_admin_can_change_signed_uploads(case: str) -> None:
     admin = _admin_headers()
@@ -417,9 +465,7 @@ def test_platform_admin_can_change_signed_uploads(case: str) -> None:
             headers=admin,
         )
         assert resp.status_code == 400, resp.text
-        assert resp.json()["detail"] == _invalid_detail(
-            raw, transport="streamable_http", url=URL
-        )
+        assert resp.json()["detail"] == _invalid_detail(MISSING_KEYS_ERROR)
         assert _row(server_id) == before
 
 
@@ -439,9 +485,7 @@ def test_owner_saving_the_stored_invalid_signed_uploads_is_still_checked() -> No
     )
 
     assert resp.status_code == 400, resp.text
-    assert resp.json()["detail"] == _invalid_detail(
-        stored, transport="streamable_http", url=URL
-    )
+    assert resp.json()["detail"] == _invalid_detail(MISSING_KEYS_ERROR)
     assert _row(server_id) == before
 
 
@@ -467,27 +511,27 @@ def _add_custom_api(owner_name: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "stored",
-    [{"tool_name": "attach_document"}, [{"tool_name": "attach_document"}]],
+    ("stored", "expected_error"),
+    [
+        ({"tool_name": "attach_document"}, NOT_A_LIST_ERROR),
+        ([{"tool_name": "attach_document"}], MISSING_KEYS_ERROR),
+    ],
     ids=["not-an-array", "missing-keys"],
 )
-def test_list_and_detail_echo_invalid_signed_uploads(stored: Any) -> None:
+def test_list_and_detail_echo_invalid_signed_uploads(
+    stored: Any, expected_error: str
+) -> None:
     _admin_headers()
     owner = _register_second_user("bob", "bobpass1")
     server_id = _create_ok(owner)
     _store(server_id, stored)
     _add_custom_api("bob")
 
-    expected_error = signed_upload_settings_error(
-        stored, transport="streamable_http", url=URL
-    )
-    assert isinstance(expected_error, str) and expected_error
-
     listing = client.get("/api/mcp/servers", headers=owner)
     assert listing.status_code == 200, listing.text
     items = listing.json()
     listed = _server_named(items, server_id)
-    assert listed["signed_uploads"] is None
+    assert listed["signed_uploads"] == stored
     assert listed["signed_uploads_error"] == expected_error
 
     custom = [item for item in items if item["transport"] == "custom_api"]
