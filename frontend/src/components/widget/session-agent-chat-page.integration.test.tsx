@@ -24,9 +24,13 @@ vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({ t: (key: string) => key }),
 }))
 
+// The page's toast proxy (@/components/ui/sonner) calls this mock's
+// toast.error, so a test can assert on what the visitor was told.
+const toastError = vi.hoisted(() => vi.fn())
+
 vi.mock("sonner", () => ({
   toast: {
-    error: vi.fn(),
+    error: toastError,
     success: vi.fn(),
     info: vi.fn(),
     warning: vi.fn(),
@@ -310,7 +314,6 @@ describe("SessionAgentChatPage file attachments", () => {
     },
   }
   const fetchMock = vi.fn()
-  const toastError = vi.hoisted(() => vi.fn())
 
   const created = (fileId: string, name = "a.pdf") =>
     new Response(JSON.stringify({
