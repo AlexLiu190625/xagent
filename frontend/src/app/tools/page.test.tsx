@@ -282,6 +282,8 @@ describe("ToolsPage connector delete from the edit dialog", () => {
       runtime_bindings: null,
       allow_delegated_authorization: false,
       can_edit_global: server.can_edit_global ?? false,
+      signed_uploads: null,
+      signed_uploads_error: null,
     }
   }
 
