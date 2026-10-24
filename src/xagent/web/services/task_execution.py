@@ -2628,7 +2628,11 @@ async def execute_task_background(
             else:
                 agent_context.pop("task_source", None)
                 agent_context.pop("run_id", None)
-            if prompt_context_block is not None and not _has_display_message_override(
+            # The model text may carry server-added context (uploaded files, the
+            # prompt-context block). Whenever it differs from the transcript text,
+            # record the transcript text as the display message for the
+            # user_message trace event; a display message the caller set wins.
+            if task_for_agent != user_message and not _has_display_message_override(
                 agent_context
             ):
                 agent_context["display_message"] = user_message
