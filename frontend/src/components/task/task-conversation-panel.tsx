@@ -48,6 +48,11 @@ interface TaskConversationPanelProps {
   attachments?: SessionAttachmentsConfig
   attachmentStatuses?: ReadonlyMap<File, ComposerAttachmentStatus>
   onRetryAttachment?: (file: File) => void
+  // Attachment work is in progress (an upload, or a send with files until it
+  // has gone out and been accepted). It disables every file retry and counts
+  // as a message in flight, which locks the composer only while the task is
+  // pending or there is no task: while it is running, paused, waiting for an
+  // answer, completed or failed, the composer stays open.
   attachmentsBusy?: boolean
   // The collected files, when the caller holds them so that they outlive this
   // panel. The panel then shows these and reports every change through
@@ -56,9 +61,6 @@ interface TaskConversationPanelProps {
   // Called with the collected files every time they change: when the visitor
   // adds or removes one, and once a send has completed.
   onAttachmentFilesChange?: (files: File[]) => void
-  // Extra "busy" signal from the caller (for example, files uploading before
-  // the send); it locks the composer like a message in flight does.
-  isBusy?: boolean
   onAgentExecutionClick?: (execution: AgentExecutionSummary) => void
 }
 
@@ -265,7 +267,6 @@ export function TaskConversationPanel({
   attachmentsBusy = false,
   attachmentFiles,
   onAttachmentFilesChange,
-  isBusy = false,
   onAgentExecutionClick,
 }: TaskConversationPanelProps) {
   const {
@@ -1083,7 +1084,7 @@ export function TaskConversationPanel({
                 || isConversationResetPending
                 || isMessageDeliveryPending
                 || isSessionInteractionLocked
-                || isBusy
+                || attachmentsBusy
               }
               files={filesBlocked ? [] : selectedFiles}
               onFilesChange={filesBlocked ? undefined : updateFiles}

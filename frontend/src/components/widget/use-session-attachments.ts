@@ -28,14 +28,21 @@ export interface SessionUploadControls {
   waitForOpenConnection: () => Promise<void>
 }
 
-// While any of these holds, sendMessage itself refuses the turn; an upload
-// started before it would be wasted.
-const SEND_BLOCKED_PHASES: ReadonlySet<string> = new Set([
-  "reset_requested",
-  "reload_required",
-  "replacement_sending",
-  "replacement_awaiting_task",
-])
+type AppControls = ReturnType<typeof useApp>
+
+// Whether sendMessage itself refuses a turn in each conversation phase; an
+// upload started before such a turn would be wasted. Every phase is listed, so
+// a phase the provider adds or renames fails to compile until it is decided
+// here.
+const SEND_BLOCKED_IN_PHASE: Readonly<Record<AppControls["sessionConversationState"], boolean>> = {
+  unbound: false,
+  bound: false,
+  reset_requested: true,
+  replacement_ready: false,
+  replacement_sending: true,
+  replacement_awaiting_task: true,
+  reload_required: true,
+}
 
 const isAbortError = (error: unknown): boolean =>
   typeof error === "object" && error !== null
@@ -91,8 +98,6 @@ export const toAttachments = (
   }
   : undefined
 
-type AppControls = ReturnType<typeof useApp>
-
 export interface SessionAttachmentsOptions {
   // Present only while the session server advertises file uploads.
   attachments: SessionAttachmentsConfig | undefined
@@ -125,8 +130,11 @@ export function useSessionAttachments({
   const [startFiles, setStartFiles] = useState<File[]>([])
   const [attachmentStatuses, setAttachmentStatuses] =
     useState<ReadonlyMap<File, ComposerAttachmentStatus>>(() => new Map())
-  // Counts attachment work that must keep the composer locked: each upload and
-  // each send with files, from its first upload until its chat frame is out.
+  // Counts attachment work: each upload, and each send with files from its
+  // first upload until its chat frame has gone out and been accepted. While it
+  // is above zero the start page and "new conversation" are locked and every
+  // file retry is disabled; the conversation panel's composer is locked only
+  // while the task is pending or there is no task.
   const [attachmentWork, setAttachmentWork] = useState(0)
   const isAttachmentBusy = attachmentWork > 0
   // Keyed by the File the visitor picked, so a message sent again with the
@@ -245,13 +253,14 @@ export function useSessionAttachments({
   // must come from a session whose capability still accepts all of the
   // send's files. A retry passes no `send`, so only removing its own file,
   // the session becoming unavailable or ending, or the page unmounting stops
-  // it, and its tokens are checked against that one file. The abort controller is registered before
-  // the first token wait, so every wait of the upload can be cancelled.
+  // it, and its tokens are checked against that one file. The abort
+  // controller is registered before the first token wait, so every wait of
+  // the upload can be cancelled.
   // Uploading counts as attachment work from the call, token wait included,
   // and the file cards' retry buttons are disabled while any upload or send
-  // with files is in flight. The composer itself stays open while a task is
-  // running, but the file being uploaded shows as uploading, so the composer
-  // refuses to submit until it settles.
+  // with files is in flight. The conversation panel's composer stays open
+  // while the task is running, paused, waiting for an answer, completed or
+  // failed, but it refuses to submit while a file shows as uploading.
   const uploadAttachment = useCallback(async (
     file: File,
     send?: AttachmentSend,
@@ -363,7 +372,7 @@ export function useSessionAttachments({
       return
     }
     if (
-      SEND_BLOCKED_PHASES.has(sessionConversationState)
+      SEND_BLOCKED_IN_PHASE[sessionConversationState]
       || isSessionInteractionLocked
       || isConversationResetPending
     ) {

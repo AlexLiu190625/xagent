@@ -5615,7 +5615,7 @@ describe("AppProvider websocket message routing", () => {
       }
     }
 
-    it("keeps files disabled and previews closed while exposing the attachments capability", () => {
+    it("keeps files disabled and previews closed with the attachments option", () => {
       render(
         <AppProvider token="token" transport={withAttachments()}>
           <SessionControlsProbe />
@@ -5623,21 +5623,10 @@ describe("AppProvider websocket message routing", () => {
       )
 
       expect(screen.getByTestId("files-disabled").textContent).toBe("true")
-      expect(getSessionControls().sessionAttachments).toEqual(attachments)
       expect(() => getSessionControls().getFilePreviewUrl("manual-file")).toThrow(
         "Files are disabled for this conversation.",
       )
       expect(() => getSessionControls().getFileDownloadUrl("manual-file")).toThrow()
-    })
-
-    it("exposes no attachments capability without the transport option", () => {
-      render(
-        <AppProvider token="token" transport={makeSessionTransport()}>
-          <SessionControlsProbe />
-        </AppProvider>
-      )
-
-      expect(getSessionControls().sessionAttachments).toBeNull()
     })
 
     it("sends the uploaded file ids and the per-message limit and shows the file names in the bubble", async () => {

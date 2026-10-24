@@ -292,7 +292,6 @@ function SessionConversationContent({
             attachmentsBusy={isAttachmentBusy}
             attachmentFiles={attachments ? panelFiles : []}
             onAttachmentFilesChange={attachments ? onPanelFilesChange : undefined}
-            isBusy={isAttachmentBusy}
           />
         ) : (
           <div className="h-full overflow-y-auto">

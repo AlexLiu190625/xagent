@@ -763,13 +763,15 @@ describe("SessionAgentChatPage", () => {
       app.sessionConversationState = phase
       app.isSessionInteractionLocked = locked
       app.isConversationResetPending = resetPending
+      bridge.value.ensureFreshSession.mockResolvedValue(withUploads())
       render(<SessionAgentChatPage />)
 
-      await expect(startSend()("hello", [pdf()], {})).rejects.toThrow("not ready for attachments")
+      const failure = await startSend()("hello", [pdf()], {}).then(() => null, (error: unknown) => error)
 
-      expect(app.sendMessage).not.toHaveBeenCalled()
       expect(bridge.value.ensureFreshSession).not.toHaveBeenCalled()
       expect(fetch).not.toHaveBeenCalled()
+      expect(app.sendMessage).not.toHaveBeenCalled()
+      expect((failure as Error | null)?.message).toContain("not ready for attachments")
     })
 
     it("tells the visitor why a retried upload failed and stays quiet when it was cancelled", async () => {

@@ -2355,8 +2355,6 @@ interface AppContextType {
   state: AppState
   dispatch: React.Dispatch<AppAction>
   filesDisabled: boolean
-  // Non-null only on a Session transport that offers upload-only attachments.
-  sessionAttachments: SessionAttachmentsConfig | null
   agentCardsEnabled: boolean
   voiceInputEnabled: boolean
   taskControlsEnabled: boolean
@@ -8121,7 +8119,6 @@ export function AppProvider({
           state,
           dispatch,
           filesDisabled,
-          sessionAttachments,
           agentCardsEnabled,
           voiceInputEnabled,
           taskControlsEnabled,

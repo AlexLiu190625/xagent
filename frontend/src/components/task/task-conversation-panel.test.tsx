@@ -2031,7 +2031,7 @@ describe("TaskConversationPanel", () => {
       expect(onAttachmentFilesChange).toHaveBeenLastCalledWith([])
     })
 
-    it("locks the composer while the caller reports it busy and passes the statuses through", () => {
+    it("counts the caller's attachment work as a message in flight and passes the statuses through", () => {
       appControls.filesDisabled = true
       const statuses = new Map<File, ComposerAttachmentStatus>()
       const onRetryAttachment = vi.fn()
@@ -2047,7 +2047,7 @@ describe("TaskConversationPanel", () => {
       expect(chatInputProps.current?.attachmentStatuses).toBe(statuses)
       expect(chatInputProps.current?.onRetryAttachment).toBe(onRetryAttachment)
 
-      rerender(<TaskConversationPanel mode="page" attachments={attachments} isBusy />)
+      rerender(<TaskConversationPanel mode="page" attachments={attachments} attachmentsBusy />)
 
       expect(chatInputProps.current?.isLoading).toBe(true)
     })

@@ -770,7 +770,7 @@ describe("SessionAgentChatPage file attachments", () => {
       expect(MockWebSocket.instances.flatMap((instance) => chatFrames(instance))).toHaveLength(0)
     })
 
-    it("locks the start page, the conversation panel and new-conversation while files upload", async () => {
+    it("locks the start page and new-conversation and marks the conversation panel busy while files upload", async () => {
       const socket = await mountActive()
       const pending = deferred<Response>()
       fetchMock.mockReturnValueOnce(pending.promise)
@@ -785,17 +785,17 @@ describe("SessionAgentChatPage file attachments", () => {
 
       bindTask(socket)
       await waitFor(() => expect(screen.getByTestId("session-conversation")).toBeInTheDocument())
-      expect(surfaces.panel?.isBusy).toBe(true)
+      expect(surfaces.panel?.attachmentsBusy).toBe(true)
       fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
       expect(screen.getByRole("menuitem", { name: "widgetSession.startNewConversation" })).toBeDisabled()
 
       await act(async () => { pending.resolve(created(FILE_A)) })
       await waitFor(() => expect(chatFrames(socket)).toHaveLength(1))
-      // The lock holds until the send has gone out and been answered.
-      expect(surfaces.panel?.isBusy).toBe(true)
+      // The panel stays marked busy until the send has gone out and been answered.
+      expect(surfaces.panel?.attachmentsBusy).toBe(true)
       accept(socket, "cid-lock")
       await act(async () => { await sending })
-      await waitFor(() => expect(surfaces.panel?.isBusy).toBe(false))
+      await waitFor(() => expect(surfaces.panel?.attachmentsBusy).toBe(false))
     })
 
     it("aborts an in-flight upload when the visitor removes the file", async () => {
@@ -853,7 +853,7 @@ describe("SessionAgentChatPage file attachments", () => {
       expect(socket.close).toHaveBeenCalled()
     })
 
-    it("lets a selected file be sent again after the session was unavailable and came back", async () => {
+    it("lets a start-page file be sent again after the session was unavailable and came back", async () => {
       await mountActive()
       fetchMock.mockImplementationOnce(pendingUntilAborted)
       const a = pdf("a.pdf")
