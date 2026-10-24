@@ -299,7 +299,8 @@ def test_postgresql_fallback_claim_lookup_uses_the_partial_index(
         session.commit()
 
     # Settled history with a near-empty queue and no claimable reply, so the
-    # reply-first lookup finds nothing and the fallback statement is issued.
+    # presence precheck skips the reply lookup and the fallback statement is
+    # issued.
     # The open commands are pauses because the legacy claim excludes starts.
     with engine.connect() as connection:
         connection.execute(
@@ -330,7 +331,7 @@ def test_postgresql_fallback_claim_lookup_uses_the_partial_index(
 
     assert found is not None
     assert found[2] is transport.TaskCommandKind.PAUSE
-    # Reply-first lookup, then the fallback this index serves.
+    # Presence precheck, then the fallback this index serves.
     assert len(captured) == 2, [statement for statement, _ in captured]
     statement, parameters = captured[-1]
     with engine.connect() as connection:
