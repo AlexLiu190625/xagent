@@ -3150,14 +3150,17 @@ def _local_mcp_can_configure(
 ) -> bool:
     """Whether this viewer's configuration route would resolve for a local entry.
 
-    One rule for both local branches: the four routes the picker's Configure
-    button reaches all take the same first gate -- a personal association row
-    for the calling user -- and answer 404 without one. ``GET``/``PUT
-    /api/mcp/servers/{id}`` (mcp.py) and ``GET``/``PUT /api/custom-apis/{id}``
-    (custom_api.py) each query by ``user_id`` + connector id and raise 404 on
-    an empty result, which is why a team-owned connector reaching a member
-    through the visibility overlay alone (``association is None``) is not
-    configurable however visible or attachable it is.
+    One rule for both local branches: this reads only whether the calling
+    user has a personal association row, which is the first thing each of the
+    four routes the picker's Configure button reaches looks up --
+    ``GET``/``PUT /api/mcp/servers/{id}`` (mcp.py) and ``GET``/``PUT
+    /api/custom-apis/{id}`` (custom_api.py), each by ``user_id`` + connector
+    id. ``PUT /api/mcp/servers/{id}`` answers 404 without that row. The other
+    three can still answer a caller without one from the installed connector
+    access hook's team verdict, but this field does not ask the hook, so a
+    team-owned connector reaching a member through the visibility overlay
+    alone (``association is None``) is reported not configurable however
+    visible or attachable it is -- for an MCP connector, its save would 404.
 
     Deliberately reads nothing but the association's existence:
 
@@ -3734,20 +3737,23 @@ def get_mcp_server(
             # Without one, only a team access verdict makes the definition
             # readable; no verdict is the same 404 as a missing id.
             server = db.query(MCPServer).filter(MCPServer.id == server_id).first()
-            access = None
-            if server is not None:
-                from ..services.connector_team_scope import (
-                    resolve_one_connector_access_or_raise,
+            if server is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="MCP server not found",
                 )
+            from ..services.connector_team_scope import (
+                resolve_one_connector_access_or_raise,
+            )
 
-                try:
-                    access = resolve_one_connector_access_or_raise(
-                        db, int(user_id), ("mcp", int(server.id))
-                    )
-                except ConnectorRuntimeError as exc:
-                    raise HTTPException(
-                        status_code=exc.status_code, detail=exc.safe_message
-                    ) from exc
+            try:
+                access = resolve_one_connector_access_or_raise(
+                    db, int(user_id), ("mcp", int(server.id))
+                )
+            except ConnectorRuntimeError as exc:
+                raise HTTPException(
+                    status_code=exc.status_code, detail=exc.safe_message
+                ) from exc
             if access is None:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,

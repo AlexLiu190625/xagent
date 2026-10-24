@@ -150,43 +150,37 @@ def test_a_team_member_without_a_personal_row_reads_the_same_projection_the_list
         assert detail.config["auth"][field] == MASKED_SECRET_VALUE
 
 
+def _answers_nothing(db, user_id, refs):
+    return {}
+
+
+def _must_not_be_asked(db, user_id, refs):
+    raise AssertionError("the access hook must not be asked")
+
+
 @pytest.mark.parametrize(
-    "case",
+    ("access", "visibility_lists_it", "id_offset"),
     [
-        "hook_answers_empty",
-        "no_hook_installed",
-        "unknown_id",
-        "listed_by_visibility_only",
+        pytest.param(_answers_nothing, False, 0, id="hook_answers_empty"),
+        pytest.param(None, False, 0, id="no_hook_installed"),
+        pytest.param(_must_not_be_asked, False, 1000, id="unknown_id"),
+        pytest.param(_answers_nothing, True, 0, id="listed_by_visibility_only"),
     ],
 )
-def test_detail_404s_without_a_personal_row_or_a_team_verdict(db, case):
+def test_detail_404s_without_a_personal_row_or_a_team_verdict(
+    db, access, visibility_lists_it, id_offset
+):
     server = _make_shared_server(db)
     member = _make_user(db, 2)
-    asked_id = server.id
-    access_hook = _recording_access_hook()
+    visibility = _visibility_listing(server.id) if visibility_lists_it else None
 
     with snapshot_connector_team_hooks():
-        if case == "hook_answers_empty":
-            access_hook = lambda db, user_id, refs: {}  # noqa: E731
-            set_connector_team_hooks(access=access_hook)
-        elif case == "no_hook_installed":
-            set_connector_team_hooks()
-        elif case == "unknown_id":
-            asked_id = server.id + 1000
-            set_connector_team_hooks(access=access_hook)
-        else:
-            access_hook = lambda db, user_id, refs: {}  # noqa: E731
-            set_connector_team_hooks(
-                visibility=_visibility_listing(server.id), access=access_hook
-            )
-
+        set_connector_team_hooks(visibility=visibility, access=access)
         with pytest.raises(HTTPException) as exc:
-            _detail(asked_id, member, db)
+            _detail(server.id + id_offset, member, db)
 
     assert exc.value.status_code == 404
     assert exc.value.detail == "MCP server not found"
-    if case == "unknown_id":
-        assert access_hook.calls == []
 
 
 def test_detail_is_decided_by_the_access_hook_not_the_visibility_hook(db):
@@ -236,15 +230,16 @@ def test_a_personal_row_decides_the_detail_without_asking_the_hook(
 
 
 @pytest.mark.parametrize(
-    ("failure", "expected_status"),
+    ("failure", "expected_status", "expected_detail"),
     [
-        ("generic_exception", 503),
-        ("connector_runtime_error", 418),
-        ("malformed_answer", 503),
+        ("generic_exception", 503, "Connector access is unavailable."),
+        ("connector_runtime_error", 418, "short and stout"),
+        ("malformed_answer", 503, "Connector access is unavailable."),
+        ("verdict_for_another_server", 503, "Connector access is unavailable."),
     ],
 )
 def test_a_failing_access_hook_surfaces_its_status_not_a_500_or_a_404(
-    db, failure, expected_status
+    db, failure, expected_status, expected_detail
 ):
     server = _make_shared_server(db)
     member = _make_user(db, 2)
@@ -254,6 +249,9 @@ def test_a_failing_access_hook_surfaces_its_status_not_a_500_or_a_404(
             raise RuntimeError("team service down")
         if failure == "connector_runtime_error":
             raise ConnectorRuntimeError("teapot", "short and stout", status_code=418)
+        if failure == "verdict_for_another_server":
+            grant = ConnectorAccess(team_owned=True, can_edit=False)
+            return {("mcp", server.id + 1): grant}
         return {ref: ConnectorAccess(team_owned=False, can_edit=False) for ref in refs}
 
     with snapshot_connector_team_hooks():
@@ -262,3 +260,4 @@ def test_a_failing_access_hook_surfaces_its_status_not_a_500_or_a_404(
             _detail(server.id, member, db)
 
     assert exc.value.status_code == expected_status
+    assert exc.value.detail == expected_detail
