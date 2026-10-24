@@ -4,6 +4,7 @@ import datetime
 import os
 import socket
 import ssl
+import time
 from typing import Any
 from unittest.mock import Mock
 
@@ -261,6 +262,9 @@ def test_shared_context_is_reused_for_same_key(
         "file_replaced_inode",
         "dir_path_when_no_file",
         "unset_both",
+        "file_rewritten_in_place_preserving_mtime",
+        "dir_entry_added",
+        "dir_entry_removed",
     ],
 )
 def test_shared_context_rebuilds_when_ca_source_changes(
@@ -278,7 +282,14 @@ def test_shared_context_rebuilds_when_ca_source_changes(
     old_dir.mkdir()
     new_dir.mkdir()
 
-    if change == "dir_path_when_no_file":
+    if change == "dir_entry_removed":
+        (old_dir / "entry.0").write_bytes(b"entry")
+    uses_dir = change in {
+        "dir_path_when_no_file",
+        "dir_entry_added",
+        "dir_entry_removed",
+    }
+    if uses_dir:
         monkeypatch.setenv("SSL_CERT_DIR", str(old_dir))
     else:
         monkeypatch.setenv("SSL_CERT_FILE", str(first))
@@ -286,6 +297,8 @@ def test_shared_context_rebuilds_when_ca_source_changes(
     assert before is security.shared_ca_bundle_ssl_context()
     assert len(create_ssl_context_calls) == 1
 
+    # Coarse filesystem clocks must not hide the change from the key.
+    time.sleep(0.05)
     if change == "file_path":
         second = tmp_path / "second.pem"
         second.write_bytes(new_pem)
@@ -306,8 +319,22 @@ def test_shared_context_rebuilds_when_ca_source_changes(
             old_stat.st_mtime_ns,
         )
         assert new_stat.st_ino != old_stat.st_ino
+    elif change == "file_rewritten_in_place_preserving_mtime":
+        old_stat = first.stat()
+        first.write_bytes(new_pem)
+        os.utime(first, ns=(old_stat.st_mtime_ns,) * 2)
+        new_stat = first.stat()
+        assert (new_stat.st_ino, new_stat.st_size, new_stat.st_mtime_ns) == (
+            old_stat.st_ino,
+            old_stat.st_size,
+            old_stat.st_mtime_ns,
+        )
     elif change == "dir_path_when_no_file":
         monkeypatch.setenv("SSL_CERT_DIR", str(new_dir))
+    elif change == "dir_entry_added":
+        (old_dir / "entry.0").write_bytes(b"entry")
+    elif change == "dir_entry_removed":
+        (old_dir / "entry.0").unlink()
     else:
         monkeypatch.delenv("SSL_CERT_FILE")
 
@@ -317,7 +344,7 @@ def test_shared_context_rebuilds_when_ca_source_changes(
     assert len(create_ssl_context_calls) == 2
     trusted_before = before.get_ca_certs(binary_form=True)
     trusted_after = after.get_ca_certs(binary_form=True)
-    if change == "dir_path_when_no_file":
+    if uses_dir:
         assert trusted_before == trusted_after == []
     elif change == "unset_both":
         assert old_der in trusted_before
@@ -349,7 +376,14 @@ def test_shared_context_failure_is_not_cached(
 
 @pytest.mark.parametrize(
     "operation",
-    ["alpn_change", "load_cert_chain", "load_verify_locations", "set_ciphers"],
+    [
+        "alpn_change",
+        "load_cert_chain",
+        "load_verify_locations",
+        "load_default_certs",
+        "set_default_verify_paths",
+        "set_ciphers",
+    ],
 )
 def test_shared_context_rejects_mutation(operation, shared_ca_slot):
     context = security.shared_ca_bundle_ssl_context()
@@ -357,12 +391,65 @@ def test_shared_context_rejects_mutation(operation, shared_ca_slot):
         "alpn_change": lambda: context.set_alpn_protocols(["h2", "http/1.1"]),
         "load_cert_chain": lambda: context.load_cert_chain("cert.pem", "key.pem"),
         "load_verify_locations": lambda: context.load_verify_locations("ca.pem"),
+        "load_default_certs": lambda: context.load_default_certs(),
+        "set_default_verify_paths": lambda: context.set_default_verify_paths(),
         "set_ciphers": lambda: context.set_ciphers("DEFAULT"),
     }
 
-    with pytest.raises(RuntimeError, match="shared CA context is immutable"):
+    with pytest.raises(
+        RuntimeError, match="shared CA context is guarded against mutation"
+    ):
         operations[operation]()
 
     context.set_alpn_protocols(["http/1.1"])
     context.set_alpn_protocols(("http/1.1",))
     assert type(context) is ssl.SSLContext
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "both_set_dir_change_does_not_rebuild",
+        "empty_file_falls_back_to_dir",
+        "empty_file_and_unset_dir_falls_back_to_certifi",
+    ],
+)
+def test_shared_context_key_follows_httpx_precedence(
+    case, tmp_path, monkeypatch, shared_ca_slot, create_ssl_context_calls
+):
+    first_dir, second_dir = tmp_path / "first-dir", tmp_path / "second-dir"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    capaths: list[Any] = []
+    real_create = ssl.create_default_context
+
+    def spy(*args: Any, **kwargs: Any) -> ssl.SSLContext:
+        capaths.append(kwargs.get("capath"))
+        return real_create(*args, **kwargs)
+
+    monkeypatch.setattr(ssl, "create_default_context", spy)
+
+    if case == "both_set_dir_change_does_not_rebuild":
+        ca = tmp_path / "ca.pem"
+        ca.write_bytes(_generate_test_ca_pem())
+        monkeypatch.setenv("SSL_CERT_FILE", str(ca))
+        monkeypatch.setenv("SSL_CERT_DIR", str(first_dir))
+        before = security.shared_ca_bundle_ssl_context()
+        monkeypatch.setenv("SSL_CERT_DIR", str(second_dir))
+        after = security.shared_ca_bundle_ssl_context()
+        assert after is before
+        assert len(create_ssl_context_calls) == 1
+    elif case == "empty_file_falls_back_to_dir":
+        monkeypatch.setenv("SSL_CERT_FILE", "")
+        monkeypatch.setenv("SSL_CERT_DIR", str(first_dir))
+        before = security.shared_ca_bundle_ssl_context()
+        monkeypatch.setenv("SSL_CERT_DIR", str(second_dir))
+        after = security.shared_ca_bundle_ssl_context()
+        assert after is not before
+        assert capaths == [str(first_dir), str(second_dir)]
+    else:
+        before = security.shared_ca_bundle_ssl_context()
+        monkeypatch.setenv("SSL_CERT_FILE", "")
+        after = security.shared_ca_bundle_ssl_context()
+        assert after is before
+        assert len(create_ssl_context_calls) == 1

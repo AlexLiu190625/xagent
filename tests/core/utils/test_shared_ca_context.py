@@ -51,6 +51,11 @@ class _Handler(BaseHTTPRequestHandler):
         pass
 
 
+class _QueuedServer(ThreadingHTTPServer):
+    # Read by server_activate() while the server is constructed.
+    request_queue_size = 64
+
+
 @pytest.fixture
 def tls_server(tmp_path, monkeypatch):
     """A local HTTPS server whose self-signed cert is the only trusted CA."""
@@ -84,7 +89,7 @@ def tls_server(tmp_path, monkeypatch):
     monkeypatch.setenv("SSL_CERT_FILE", str(cert_path))
     monkeypatch.delenv("SSL_CERT_DIR", raising=False)
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    server = _QueuedServer(("127.0.0.1", 0), _Handler)
     server.daemon_threads = True
     server.socket = server_context.wrap_socket(server.socket, server_side=True)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -159,18 +164,17 @@ async def test_async_connect_survives_saturated_anyio_thread_pool(tls_server):
             started += 1
         release.wait(30)
 
-    try:
-        async with anyio.create_task_group() as group:
-            for _ in range(40):
-                group.start_soon(anyio.to_thread.run_sync, block)
+    async with anyio.create_task_group() as group:
+        for _ in range(40):
+            group.start_soon(anyio.to_thread.run_sync, block)
+        try:
             with anyio.fail_after(5):
                 while started < 40:
                     await anyio.sleep(0.01)
             async with _async_client(connect=0.5) as client:
                 response = await client.get(tls_server)
+        finally:
             release.set()
-    finally:
-        release.set()
 
     assert response.content == b"ok"
 
