@@ -36,7 +36,7 @@ from ...config import (
 )
 from ..models.task import Task, TaskStatus, task_status_predicate
 from ..models.task_admission import TaskAdmissionTicket
-from ..models.task_command import TaskExecutionCommand
+from ..models.task_command import CLAIMABLE_COMMAND_STATUSES, TaskExecutionCommand
 from ..models.user import User
 from .db_runtime import (
     await_task_settlement,
@@ -874,7 +874,7 @@ def enqueue_task_command(
 def _claim_availability_predicate(now: datetime) -> Any:
     if get_shared_task_execution_enabled():
         return and_(
-            TaskExecutionCommand.status.in_((COMMAND_PENDING, COMMAND_PROCESSING)),
+            TaskExecutionCommand.status.in_(CLAIMABLE_COMMAND_STATUSES),
             or_(
                 TaskExecutionCommand.retry_available_at.is_(None),
                 TaskExecutionCommand.retry_available_at <= now,
