@@ -862,6 +862,29 @@ describe("SessionAgentChatPage", () => {
       expect(app.panelProps?.attachments).toEqual({ accept: ".pdf,.png", maxFiles: 3, maxFileBytes: 4096 })
     })
 
+    it("holds the panel's files, hides them while uploads are not advertised, and drops them with the conversation", () => {
+      const a = pdf()
+      const panelFiles = () => app.panelProps?.attachmentFiles
+      setBridge("active", withUploads())
+      app.state.taskId = 5
+      const { rerender } = render(<SessionAgentChatPage />)
+      act(() => { (app.panelProps?.onAttachmentFilesChange as (files: File[]) => void)([a]) })
+      expect(panelFiles()).toEqual([a])
+
+      setBridge("active", activeSession())
+      rerender(<SessionAgentChatPage />)
+      expect(panelFiles()).toEqual([])
+      setBridge("active", withUploads())
+      rerender(<SessionAgentChatPage />)
+      expect(panelFiles()).toEqual([a])
+
+      app.state.taskId = null
+      rerender(<SessionAgentChatPage />)
+      app.state.taskId = 5
+      rerender(<SessionAgentChatPage />)
+      expect(panelFiles()).toEqual([])
+    })
+
     it("passes no upload callbacks to the surfaces when uploads are not advertised", () => {
       setBridge("active", activeSession())
       app.state.taskId = 5

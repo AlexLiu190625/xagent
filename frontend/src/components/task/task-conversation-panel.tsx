@@ -49,6 +49,10 @@ interface TaskConversationPanelProps {
   attachmentStatuses?: ReadonlyMap<File, ComposerAttachmentStatus>
   onRetryAttachment?: (file: File) => void
   attachmentsBusy?: boolean
+  // The collected files, when the caller holds them so that they outlive this
+  // panel. The panel then shows these and reports every change through
+  // `onAttachmentFilesChange`.
+  attachmentFiles?: File[]
   // Called with the collected files every time they change: when the visitor
   // adds or removes one, and once a send has completed.
   onAttachmentFilesChange?: (files: File[]) => void
@@ -259,6 +263,7 @@ export function TaskConversationPanel({
   attachmentStatuses,
   onRetryAttachment,
   attachmentsBusy = false,
+  attachmentFiles,
   onAttachmentFilesChange,
   isBusy = false,
   onAgentExecutionClick,
@@ -346,10 +351,11 @@ export function TaskConversationPanel({
   // every request that reads a file back.
   const filesBlocked = filesDisabled && !attachments
 
+  const selectedFiles = attachmentFiles ?? files
   // The newest selection. A send reads it once it has completed, because the
   // visitor may have changed the files while it was in flight.
-  const latestFilesRef = useRef(files)
-  latestFilesRef.current = files
+  const latestFilesRef = useRef(selectedFiles)
+  latestFilesRef.current = selectedFiles
 
   const updateFiles = (next: File[]) => {
     latestFilesRef.current = next
@@ -358,7 +364,7 @@ export function TaskConversationPanel({
   }
 
   const handleSend = async (message: string, config?: any, filesToSend?: File[]) => {
-    const outboundFiles = filesBlocked ? [] : (filesToSend || files)
+    const outboundFiles = filesBlocked ? [] : (filesToSend || selectedFiles)
     await (onSend ?? sendMessage)(message, config, outboundFiles)
     // In session mode only the files this send carried leave the selection:
     // files added while it was in flight, and files kept hidden while uploads
@@ -1079,7 +1085,7 @@ export function TaskConversationPanel({
                 || isSessionInteractionLocked
                 || isBusy
               }
-              files={filesBlocked ? [] : files}
+              files={filesBlocked ? [] : selectedFiles}
               onFilesChange={filesBlocked ? undefined : updateFiles}
               showModeToggle={false}
               hideConfig={hideConfig}

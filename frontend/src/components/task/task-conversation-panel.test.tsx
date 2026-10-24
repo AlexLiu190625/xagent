@@ -1981,6 +1981,35 @@ describe("TaskConversationPanel", () => {
       expect(chatInputProps.current?.files).toEqual([])
     })
 
+    it("shows the files the caller holds and reports every change to it", async () => {
+      appControls.filesDisabled = true
+      const { onSend, finish } = pendingSend()
+      const onAttachmentFilesChange = vi.fn()
+      const [a, b, c] = [txt("a.txt"), txt("b.txt"), txt("c.txt")]
+      const panel = (held: File[]) => (
+        <TaskConversationPanel
+          mode="page"
+          attachments={attachments}
+          attachmentFiles={held}
+          onAttachmentFilesChange={onAttachmentFilesChange}
+          onSend={onSend}
+        />
+      )
+      const { rerender } = render(panel([a]))
+      expect(chatInputProps.current?.files).toEqual([a])
+      pick([a, b])
+      expect(onAttachmentFilesChange).toHaveBeenLastCalledWith([a, b])
+      expect(chatInputProps.current?.files).toEqual([a])
+
+      let sending!: Promise<void> | void
+      act(() => { sending = chatInputProps.current?.onSend("draft") })
+      rerender(panel([a, b, c]))
+      await act(async () => { finish(); await sending })
+
+      expect(onSend).toHaveBeenCalledWith("draft", undefined, [a])
+      expect(onAttachmentFilesChange).toHaveBeenLastCalledWith([b, c])
+    })
+
     it("reports the staged files to the caller as the visitor changes them", async () => {
       appControls.filesDisabled = true
       const onAttachmentFilesChange = vi.fn()

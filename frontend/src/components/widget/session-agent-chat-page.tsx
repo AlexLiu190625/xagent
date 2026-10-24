@@ -173,6 +173,10 @@ function SessionConversationContent({
   // One entry per send with files that is still running; removing any of its
   // files aborts that send and the upload it is waiting on.
   const activeSendsRef = useRef(new Set<AttachmentSend>())
+  // The conversation panel's files live here rather than in the panel, which
+  // is unmounted while the session is unavailable, so they are still selected
+  // when it comes back, as the start page's files are.
+  const [panelFiles, setPanelFiles] = useState<File[]>([])
   const panelFilesRef = useRef<File[]>([])
   // The capability of the latest accepted session. A send reads it right
   // before its chat frame goes out, because the `attachments` it captured
@@ -259,7 +263,16 @@ function SessionConversationContent({
   const handlePanelFilesChange = useCallback((next: File[]) => {
     releaseRemovedAttachments(panelFilesRef.current, next)
     panelFilesRef.current = next
+    setPanelFiles(next)
   }, [releaseRemovedAttachments])
+
+  // The panel's files belong to the conversation: they are released once it
+  // returns to the start page.
+  useEffect(() => {
+    if (!conversationEstablished && panelFilesRef.current.length > 0) {
+      handlePanelFilesChange([])
+    }
+  }, [conversationEstablished, handlePanelFilesChange])
 
   // Checks files against a capability the session server advertised:
   // extension, per-file size and per-message count. With no capability
@@ -637,6 +650,7 @@ function SessionConversationContent({
             attachmentStatuses={attachments ? attachmentStatuses : undefined}
             onRetryAttachment={attachments ? handleRetryAttachment : undefined}
             attachmentsBusy={isAttachmentBusy}
+            attachmentFiles={attachments ? panelFiles : []}
             onAttachmentFilesChange={attachments ? handlePanelFilesChange : undefined}
             isBusy={isAttachmentBusy}
           />

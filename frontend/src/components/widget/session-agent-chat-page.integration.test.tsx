@@ -1306,6 +1306,45 @@ describe("SessionAgentChatPage file attachments", () => {
       expect(chatFrames(socket)).toHaveLength(0)
     })
 
+    it("keeps the panel's files while the session is unavailable and sends them once it is back", async () => {
+      const socket = await mountActive()
+      bindTask(socket)
+      await waitFor(() => expect(screen.getByTestId("session-conversation")).toBeInTheDocument())
+      fetchMock.mockImplementationOnce(pendingUntilAborted)
+      const a = pdf("a.pdf")
+      let failure: unknown
+      act(() => { surfaces.panel?.onAttachmentFilesChange([a]) })
+      act(() => {
+        void surfaces.panel?.onSend("hello", { clientMessageId: "cid-panel-away" }, [a])
+          .then(() => null, (error: unknown) => { failure = error })
+      })
+      await waitFor(() => expect(uploadCalls()).toHaveLength(1))
+
+      dispatchDegradedSession()
+      await waitFor(() => expect(failure).toBeDefined())
+      expect(screen.queryByTestId("session-conversation")).toBeNull()
+      // Forget the props the panel had before it unmounted, so the checks below
+      // see the panel the page mounts again.
+      act(() => { surfaces.panel = null })
+      dispatchSession({ session_delivery_id: "delivery-back", capabilities })
+      await waitFor(() => expect(MockWebSocket.instances).toHaveLength(2))
+      const next = MockWebSocket.instances[1]
+      act(() => next.open("xagent-session-v1"))
+
+      await waitFor(() => expect(surfaces.panel?.attachmentFiles).toEqual([a]))
+      expect(surfaces.panel?.attachmentStatuses?.get(a)).toBeUndefined()
+      expect(surfaces.panel?.attachmentsBusy).toBe(false)
+      fetchMock.mockImplementationOnce(async () => created(FILE_A, "a.pdf"))
+      let sending!: Promise<unknown>
+      act(() => {
+        sending = surfaces.panel?.onSend("hello", { clientMessageId: "cid-panel-back" }, [a])
+      })
+      await waitFor(() => expect(chatFrames(next)).toHaveLength(1))
+      expect(chatFrames(next)[0].file_ids).toEqual([FILE_A])
+      accept(next, "cid-panel-back")
+      await act(async () => { await sending })
+    })
+
     it("stops tracking a file the visitor removed from the panel", async () => {
       const socket = await mountActive()
       bindTask(socket)
@@ -1454,6 +1493,24 @@ describe("SessionAgentChatPage file attachments", () => {
       acceptLast(next)
       await waitFor(() => expect(editor().textContent).toBe(""))
       dispatchSession({ session_delivery_id: "delivery-back", capabilities })
+
+      await waitFor(() => expect(selected("a.pdf")).toBe(true))
+    })
+
+    it("keeps a panel file while the session is unavailable and shows it once the session is back", async () => {
+      const socket = await mountActive()
+      bindTaskWithStatus(socket, "running")
+      await waitFor(() => expect(editor()).toBeInTheDocument())
+      pick(pdf("a.pdf"))
+      expect(selected("a.pdf")).toBe(true)
+
+      dispatchDegradedSession()
+      await waitFor(() => expect(screen.getByText("widgetSession.unavailable.title")).toBeInTheDocument())
+      expect(screen.queryByRole("textbox")).toBeNull()
+      dispatchSession({ session_delivery_id: "delivery-back", capabilities })
+      await waitFor(() => expect(MockWebSocket.instances).toHaveLength(2))
+      act(() => MockWebSocket.instances[1].open("xagent-session-v1"))
+      await waitFor(() => expect(editor()).toBeInTheDocument())
 
       await waitFor(() => expect(selected("a.pdf")).toBe(true))
     })
