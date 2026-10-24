@@ -2877,6 +2877,14 @@ async def execute_task_background(
         # Clean up background task record
         _clear_task_pause_accepted(task_id)
         background_task_manager.cleanup_task(task_id)
+        try:
+            agent_manager.note_runtime_settled(task_id)
+        except Exception:
+            logger.warning(
+                "Settling the cached runtime for task %s failed",
+                task_id,
+                exc_info=True,
+            )
 
 
 def _latest_result_user_turn_id(result: Dict[str, Any]) -> str | None:
@@ -4727,6 +4735,16 @@ async def execute_resume_background(
                     task_id,
                     expected_task=resume_owner_task,
                 )
+                try:
+                    from .agent_service_manager import get_agent_manager
+
+                    get_agent_manager().note_runtime_settled(task_id)
+                except Exception:
+                    logger.warning(
+                        "Settling the cached runtime for task %s failed",
+                        task_id,
+                        exc_info=True,
+                    )
 
         cleanup_task = asyncio.create_task(finalize_resume_resources())
         await drain_async_task_cancellation_safe(cleanup_task)
