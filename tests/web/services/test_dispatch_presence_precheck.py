@@ -101,7 +101,8 @@ def command_selects(host: CapHost) -> Iterator[list[str]]:
 
 
 def _migration_predicate(path: Path, name: str) -> str:
-    # The variable is the partial-index WHERE clause every claimable-index migration builds.
+    # The variable is the partial-index WHERE clause every claimable-index
+    # migration builds.
     return str(load_migration_module(path, name).PREDICATE.text)
 
 

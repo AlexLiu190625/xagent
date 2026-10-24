@@ -266,6 +266,9 @@ def test_postgresql_fallback_claim_lookup_uses_the_partial_index(
 ) -> None:
     """EXPLAIN the fallback statement the real ``_find_command_candidate`` issues.
 
+    Also EXPLAIN both presence statements, which must be served by one of the
+    claimable partial indexes.
+
     A partial index only applies when the planner can prove the query's WHERE
     implies the index predicate, and the claim predicate's status filter is
     built separately from ``_CLAIMABLE_STATUS_CLAUSE``: an ``IN`` list with
@@ -336,6 +339,7 @@ def test_postgresql_fallback_claim_lookup_uses_the_partial_index(
 
     assert found is not None
     assert found[2] is transport.TaskCommandKind.PAUSE
+    assert len(presence) == 1, presence
     # Presence precheck, then the fallback this index serves.
     assert len(scan) == 2, [statement for statement, _ in scan]
 
