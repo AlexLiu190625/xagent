@@ -7,7 +7,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from xagent.core.agent import Agent, ExecutionContext
+from xagent.core.agent import Agent, ExecutionContext, TraceEventCallback
 from xagent.core.agent.runner import AgentRunner
 from xagent.core.agent.trace import get_display_user_message
 from xagent.core.file_storage.factory import get_unscoped_file_storage
@@ -29,7 +29,9 @@ from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services import task_execution_host, task_start
 from xagent.web.services.file_turn import (
     append_prompt_context_block,
+    append_uploaded_files_context,
     build_prompt_context_block,
+    build_uploaded_files_context,
 )
 from xagent.web.services.task_command_execution import (
     _append_uploaded_files_context_to_message,
@@ -1189,9 +1191,11 @@ async def test_execute_task_background_preserves_existing_display_override(
 
 
 @pytest.mark.asyncio
-async def test_execute_task_background_without_block_adds_no_display_message(
+async def test_execute_task_background_sets_display_message_when_llm_text_differs(
     db_session, monkeypatch
 ):
+    # The model receives the enriched text, but the user's turn must be shown
+    # as what they typed: any server-added context makes the two differ.
     captured: dict = {}
 
     await _run_execute_task_background(
@@ -1204,7 +1208,168 @@ async def test_execute_task_background_without_block_adds_no_display_message(
         captured=captured,
     )
 
+    assert captured["agent_task"] == "Hello\n\nenriched"
+    assert captured["agent_context"]["display_message"] == "Hello"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("llm_user_message", [None, "Hello"])
+async def test_execute_task_background_plain_turn_adds_no_display_message(
+    db_session, monkeypatch, llm_user_message
+):
+    # Nothing was added for the model, so the message itself is the display
+    # text and no separate display message is recorded.
+    captured: dict = {}
+
+    await _run_execute_task_background(
+        db_session,
+        monkeypatch,
+        task_id=10,
+        user_message="Hello",
+        llm_user_message=llm_user_message,
+        agent_config=None,
+        captured=captured,
+    )
+
+    assert captured["agent_task"] == "Hello"
     assert "display_message" not in captured["agent_context"]
+
+
+_UPLOADED_FILE_INFO = {
+    "file_id": "fid-report",
+    "name": "report.pdf",
+    "size": 1024,
+    "type": "application/pdf",
+    "path": "/workspace/input/report.pdf",
+}
+
+
+class _UserMessageTraceRecorder:
+    def __init__(self) -> None:
+        self.events: list[dict] = []
+
+    async def trace_event(self, event_type, *, task_id=None, data=None, **_):
+        self.events.append(
+            {
+                "event_type": getattr(event_type, "value", str(event_type)),
+                "data": data or {},
+            }
+        )
+        return str(len(self.events))
+
+    def user_messages(self) -> list[dict]:
+        return [
+            event["data"]
+            for event in self.events
+            if event["event_type"] == "task_start_message"
+            and "message" in event["data"]
+        ]
+
+
+class _CompletingPattern:
+    async def run(self, **kwargs):
+        return {"success": True, "output": "ok"}
+
+
+async def _run_agent_and_record_user_messages(
+    tmp_path, *, task: str, request_context: dict
+) -> list[dict]:
+    """Start a real run with the context execute_task_background handed over.
+
+    The runner adds the initial user message and the trace callback emits the
+    user_message event exactly as in production; only the pattern is stubbed.
+    """
+    tracer = _UserMessageTraceRecorder()
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[_CompletingPattern()]),
+        tracer=tracer,
+        callbacks=[TraceEventCallback()],
+    )
+    await runner.run(
+        task=task,
+        execution_id="exec-display-message",
+        metadata={"request_context": request_context},
+        base_dir=str(tmp_path),
+    )
+    return tracer.user_messages()
+
+
+@pytest.mark.asyncio
+async def test_uploaded_files_turn_traces_the_typed_text(
+    db_session, monkeypatch, tmp_path
+):
+    # A turn with files sends the model the typed text plus the uploaded-files
+    # context; the user_message trace event must carry only the typed text.
+    enriched = append_uploaded_files_context(
+        "Summarize this", build_uploaded_files_context([_UPLOADED_FILE_INFO])
+    )
+    assert enriched != "Summarize this"
+    captured: dict = {}
+
+    await _run_execute_task_background(
+        db_session,
+        monkeypatch,
+        task_id=10,
+        user_message="Summarize this",
+        llm_user_message=enriched,
+        agent_config=None,
+        captured=captured,
+        context={"turn_id": "turn-files"},
+    )
+
+    assert captured["agent_task"] == enriched
+    user_messages = await _run_agent_and_record_user_messages(
+        tmp_path,
+        task=captured["agent_task"],
+        request_context=captured["agent_context"],
+    )
+
+    assert [event["message"] for event in user_messages] == ["Summarize this"]
+    assert user_messages[0]["turn_id"] == "turn-files"
+
+
+@pytest.mark.asyncio
+async def test_file_only_turn_traces_files_without_model_text(
+    db_session, monkeypatch, tmp_path
+):
+    # The user sent files without typing anything. The turn is still traced,
+    # identified by its file chips, and its message is empty rather than the
+    # uploaded-files context written for the model.
+    enriched = append_uploaded_files_context(
+        "", build_uploaded_files_context([_UPLOADED_FILE_INFO])
+    )
+    assert enriched
+    captured: dict = {}
+
+    await _run_execute_task_background(
+        db_session,
+        monkeypatch,
+        task_id=10,
+        user_message="",
+        llm_user_message=enriched,
+        agent_config=None,
+        captured=captured,
+        context={"turn_id": "turn-file-only", "file_info": [_UPLOADED_FILE_INFO]},
+    )
+
+    assert captured["agent_task"] == enriched
+    assert captured["agent_context"]["display_message"] == ""
+    user_messages = await _run_agent_and_record_user_messages(
+        tmp_path,
+        task=captured["agent_task"],
+        request_context=captured["agent_context"],
+    )
+
+    assert len(user_messages) == 1
+    assert user_messages[0]["message"] == ""
+    assert user_messages[0]["files"] == [
+        {
+            "file_id": "fid-report",
+            "name": "report.pdf",
+            "size": 1024,
+            "type": "application/pdf",
+        }
+    ]
 
 
 @pytest.mark.asyncio
