@@ -145,6 +145,7 @@ async def test_fake_database_clock_advances_through_cached_predicate(host, monke
         )
         db.commit()
 
+    predicate = admission.admission_eligible()
     for instant, waits in [
         (100.0, True),
         (100.999, True),
@@ -154,3 +155,5 @@ async def test_fake_database_clock_advances_through_cached_predicate(host, monke
         now[0] = instant
         with host.sessions() as db:
             assert admission.waiting_for_capacity(db, command.command_id) is waits
+        # The clock advanced through the same shared expression, not a rebuild.
+        assert admission.admission_eligible() is predicate
