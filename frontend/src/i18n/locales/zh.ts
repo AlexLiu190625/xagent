@@ -1284,6 +1284,31 @@ const zh = {
           authorizationRequiresDelegated: "Authorization 绑定需要开启委托授权。"
         }
       },
+      signedUploads: {
+        title: "文件上传",
+        description: "为接收文件的工具配置此项。调用这类工具之前，会先调用签发工具获取上传地址，再把文件上传到该地址。",
+        toolName: "接收文件的工具",
+        fileArgument: "文件参数",
+        issuingToolName: "签发工具",
+        toolNamesHint: "请使用连接器提供方文档中的工具名称。",
+        namesNotCheckedHint: "保存时不会向连接器核对这些名称。名称不匹配时，该工具不会代为上传文件。",
+        allowedUploadHosts: "允许的上传主机",
+        allowedUploadHostsHint: "每行一个主机名。",
+        uploadPathPrefix: "上传路径前缀",
+        contentTypes: "文件类型",
+        extension: "扩展名",
+        contentType: "内容类型",
+        addContentType: "添加文件类型",
+        removeContentType: "移除文件类型",
+        addTool: "添加工具",
+        removeTool: "移除工具",
+        newTool: "新工具",
+        empty: "暂无上传设置",
+        invalid: "这些上传设置无法使用，该连接器当前不可用：{error}",
+        willBeCleared: "上传设置将被清空。",
+        invalidBadge: "上传设置无效",
+        invalidBadgeDescription: "上传设置无效，该连接器当前不可用。",
+      },
       // Account identifier step before a builtin OAuth popup, for providers
       // hosted on the customer's own account (oauth-account-dialog.tsx).
       accountStep: {
