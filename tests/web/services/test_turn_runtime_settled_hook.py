@@ -358,7 +358,10 @@ async def test_many_settled_turns_stay_bounded() -> None:
         return service
 
     manager.get_agent_for_task = get_agent_for_task  # type: ignore[method-assign]
-    peak = 0
+    floor = agent_service_manager._IDLE_RUNTIME_SOFT_CAP_MIN_AGE_SECONDS
+    max_age = agent_service_manager._IDLE_RUNTIME_MAX_AGE_SECONDS
+    cap = agent_service_manager._IDLE_RUNTIME_SOFT_CAP
+    peak_unexpired = 0
 
     with _Patches(_common_patches(MagicMock(), None)):
         for task_id in range(1, 501):
@@ -372,10 +375,15 @@ async def test_many_settled_turns_stay_bounded() -> None:
                 task_lease=lease(),
                 resolved_execution_scope=None,
             )
-            peak = max(peak, len(manager._agents))
-            now[0] += 1
+            idle = [now[0] - manager._agent_last_active_at[t] for t in manager._agents]
+            # Only runtimes past the soft cap's age floor are bounded by it.
+            assert sum(1 for i in idle if floor <= i < max_age) <= cap
+            peak_unexpired = max(peak_unexpired, sum(1 for i in idle if i < max_age))
+            now[0] += 0.5
 
-    assert peak <= 128
+    # The age rule alone would keep every runtime younger than ``max_age``;
+    # holding more than the cap proves the cap is what bounds the older ones.
+    assert peak_unexpired > cap
     now[0] += 120
     manager._sweep_idle_runtimes(reason="test")
     assert manager._agents == {}

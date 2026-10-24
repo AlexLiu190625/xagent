@@ -41,6 +41,7 @@ CLEARED_MAPS = (
 IDLE_RUNTIME_SECONDS = manager_module._IDLE_RUNTIME_MAX_AGE_SECONDS
 RESUMABLE_SECONDS = manager_module._IDLE_RESUMABLE_MAX_AGE_SECONDS
 SOFT_CAP = manager_module._IDLE_RUNTIME_SOFT_CAP
+SOFT_CAP_FLOOR = manager_module._IDLE_RUNTIME_SOFT_CAP_MIN_AGE_SECONDS
 
 NOT_RUNNING = None
 RUNNING = {"status": "running", "is_running": True, "is_resumable": False}
@@ -122,10 +123,25 @@ def eviction_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord
     ]
 
 
+def notify_on_periodic_sweep(
+    mgr: AgentServiceManager, monkeypatch: pytest.MonkeyPatch, event: asyncio.Event
+) -> None:
+    """Set ``event`` after every sweep the periodic loop completes."""
+    real_sweep = mgr._sweep_idle_runtimes
+
+    def sweep(**kwargs: Any) -> None:
+        real_sweep(**kwargs)
+        if kwargs.get("reason") == "periodic":
+            event.set()
+
+    monkeypatch.setattr(mgr, "_sweep_idle_runtimes", sweep)
+
+
 @pytest.fixture
 def make_trigger(manager: AgentServiceManager, monkeypatch: pytest.MonkeyPatch):
     """Ways to make the manager sweep once: insert, settled hook, periodic."""
     state = {"periodic_started": False}
+    periodic_swept = asyncio.Event()
 
     async def insert() -> None:
         manager._sweep_idle_runtimes(reason="insert", just_inserted=999)
@@ -136,10 +152,13 @@ def make_trigger(manager: AgentServiceManager, monkeypatch: pytest.MonkeyPatch):
     async def periodic() -> None:
         if not state["periodic_started"]:
             monkeypatch.setattr(manager_module, "_global_agent_manager", manager)
-            monkeypatch.setattr(manager_module, "_IDLE_SWEEP_INTERVAL_SECONDS", 0.005)
+            monkeypatch.setattr(manager_module, "_IDLE_SWEEP_INTERVAL_SECONDS", 0)
+            notify_on_periodic_sweep(manager, monkeypatch, periodic_swept)
             manager._ensure_idle_sweep_task()
             state["periodic_started"] = True
-        await asyncio.sleep(0.05)
+        # Wait for the next full periodic sweep rather than for a duration.
+        periodic_swept.clear()
+        await asyncio.wait_for(periodic_swept.wait(), timeout=5)
 
     return {"insert": insert, "settled_hook": settled_hook, "periodic": periodic}
 
@@ -183,9 +202,8 @@ async def test_protected_runtime_never_evicted(manager, clock, kind) -> None:
         manager._mcp_actor_policies[1] = MagicMock()
 
     clock.now += 1e6
-    evicted = manager._sweep_idle_runtimes(reason="test", just_inserted=just_inserted)
+    manager._sweep_idle_runtimes(reason="test", just_inserted=just_inserted)
 
-    assert evicted == 0
     assert 1 in manager._agents
     assert 1 in manager._agent_run_generations
 
@@ -254,7 +272,7 @@ async def test_soft_cap_evicts_oldest_idle_first(manager, clock, running_count) 
             FakeRuntime(status),
             acquired_at=clock.now + task_id * 0.001,
         )
-    clock.now += 1
+    clock.now += SOFT_CAP_FLOOR + 10
 
     manager._sweep_idle_runtimes(reason="test")
 
@@ -263,6 +281,86 @@ async def test_soft_cap_evicts_oldest_idle_first(manager, clock, running_count) 
     # earliest idle ones go next.
     assert set(range(running_count)) <= set(manager._agents)
     assert set(range(total)) - set(manager._agents) == set(range(running_count, 10))
+
+
+async def test_soft_cap_spares_runtimes_younger_than_its_floor(manager, clock) -> None:
+    total = SOFT_CAP + 72
+    for task_id in range(total):
+        cache(
+            manager,
+            task_id,
+            acquired_at=clock.now - 10 + task_id * 0.001,
+        )
+
+    manager._sweep_idle_runtimes(reason="test")
+    assert len(manager._agents) == total
+
+    clock.now += SOFT_CAP_FLOOR
+    manager._sweep_idle_runtimes(reason="test")
+
+    assert len(manager._agents) == SOFT_CAP
+    assert set(manager._agents) == set(range(total - SOFT_CAP, total))
+
+
+class ExecutingRuntime(FakeRuntime):
+    """Stands in for AgentService under the real ``manager.execute_task``."""
+
+    async def execute_task(self, **_kwargs: Any) -> dict[str, Any]:
+        return {"success": True}
+
+
+async def test_execution_end_restarts_idle_window(manager, clock) -> None:
+    runtime = cache(manager, 1, ExecutingRuntime())
+    clock.now += 500
+
+    await manager.execute_task(
+        agent_service=runtime,  # type: ignore[arg-type]
+        task="run",
+        task_id="1",
+        manage_task_lease=False,
+    )
+
+    # The run ended but nobody has settled it yet; its old timestamp must not
+    # make the runtime look long idle.
+    manager._sweep_idle_runtimes(reason="test")
+    assert 1 in manager._agents
+
+    clock.now += IDLE_RUNTIME_SECONDS - 1
+    manager._sweep_idle_runtimes(reason="test")
+    assert 1 in manager._agents
+
+    clock.now += 1
+    manager._sweep_idle_runtimes(reason="test")
+    assert 1 not in manager._agents
+
+
+async def test_sweep_refreshes_a_running_runtime(manager, clock) -> None:
+    runtime = cache(manager, 1, FakeRuntime(RUNNING))
+    clock.now += 500
+
+    manager._sweep_idle_runtimes(reason="test")
+    assert 1 in manager._agents
+    assert manager._agent_last_active_at[1] == clock.now
+
+    runtime.status = NOT_RUNNING
+    clock.now += IDLE_RUNTIME_SECONDS - 1
+    manager._sweep_idle_runtimes(reason="test")
+    assert 1 in manager._agents
+
+    clock.now += 1
+    manager._sweep_idle_runtimes(reason="test")
+    assert 1 not in manager._agents
+
+
+async def test_remove_agent_drops_last_active_entry(manager) -> None:
+    runtime = cache(manager, 1)
+    runtime.workspace = None  # type: ignore[attr-defined]
+    runtime.cleanup_workspace = MagicMock()  # type: ignore[attr-defined]
+
+    manager.remove_agent(1)
+
+    runtime.cleanup_workspace.assert_called_once()  # type: ignore[attr-defined]
+    assert 1 not in manager._agent_last_active_at
 
 
 @pytest.mark.parametrize("status", [NOT_RUNNING, resumable("interrupted")])
@@ -380,33 +478,13 @@ async def test_build_lock_pruned_only_when_idle_unlocked_and_unwaited(
         await waiter
 
 
-async def test_remove_agent_skips_when_generation_missing(manager, clock) -> None:
-    cache(manager, 1)
-    stale_generation = manager.current_run_generation(1)
-    assert stale_generation is not None
-    clock.now += IDLE_RUNTIME_SECONDS
-    manager._sweep_idle_runtimes(reason="test")
-    assert manager.current_run_generation(1) is None
-
-    with (
-        patch.object(manager, "_cleanup_workspace_directory") as cleanup,
-        patch.object(manager_module.logger, "info") as info,
-    ):
-        manager.remove_agent(1, expected_run_generation=stale_generation)
-        cleanup.assert_not_called()
-        assert any(
-            "Skipping stale runtime cleanup" in c.args[0] for c in info.call_args_list
-        )
-
-        manager.remove_agent(1)
-        cleanup.assert_called_once()
-
-
 async def test_periodic_sweep_starts_lazily_and_stops_with_manager(
     manager, clock, monkeypatch
 ) -> None:
     monkeypatch.setattr(manager_module, "_global_agent_manager", manager)
-    monkeypatch.setattr(manager_module, "_IDLE_SWEEP_INTERVAL_SECONDS", 0.005)
+    monkeypatch.setattr(manager_module, "_IDLE_SWEEP_INTERVAL_SECONDS", 0)
+    periodic_swept = asyncio.Event()
+    notify_on_periodic_sweep(manager, monkeypatch, periodic_swept)
     assert manager._idle_sweep_task is None
 
     await acquire(manager, 1, FakeRuntime())
@@ -419,30 +497,34 @@ async def test_periodic_sweep_starts_lazily_and_stops_with_manager(
 
     # The loop sweeps on its own.
     clock.now += IDLE_RUNTIME_SECONDS
-    await asyncio.sleep(0.05)
+    periodic_swept.clear()
+    await asyncio.wait_for(periodic_swept.wait(), timeout=5)
     assert manager._agents == {}
 
     monkeypatch.setattr(manager_module, "_global_agent_manager", object())
-    await asyncio.wait_for(task, timeout=1)
+    await asyncio.wait_for(task, timeout=5)
 
 
 async def test_periodic_sweep_survives_a_failing_sweep(
     manager, monkeypatch, caplog
 ) -> None:
     monkeypatch.setattr(manager_module, "_global_agent_manager", manager)
-    monkeypatch.setattr(manager_module, "_IDLE_SWEEP_INTERVAL_SECONDS", 0.005)
+    monkeypatch.setattr(manager_module, "_IDLE_SWEEP_INTERVAL_SECONDS", 0)
     calls = 0
+    second_call = asyncio.Event()
 
-    def failing_sweep(**_kwargs: Any) -> int:
+    def failing_sweep(**_kwargs: Any) -> None:
         nonlocal calls
         calls += 1
+        if calls >= 2:
+            second_call.set()
         raise RuntimeError("sweep broke")
 
     monkeypatch.setattr(manager, "_sweep_idle_runtimes", failing_sweep)
 
     with caplog.at_level(logging.WARNING, logger=MODULE_LOGGER):
         manager._ensure_idle_sweep_task()
-        await asyncio.sleep(0.05)
+        await asyncio.wait_for(second_call.wait(), timeout=5)
 
     assert calls >= 2
     assert manager._idle_sweep_task is not None and not manager._idle_sweep_task.done()

@@ -1233,16 +1233,19 @@ _INVALIDATION_LOCK_ACQUIRE_TIMEOUT = 0.05
 _agent_run_generation_counter = count(1)
 
 # A cached runtime that no execution is using is dropped once this long has
-# passed since it was last acquired or its turn last settled. The window
-# comfortably covers the gap between ``get_agent_for_task`` returning and the
-# execution registering itself, and keeps a quick follow-up turn on the warm
-# instance.
+# passed since it was last acquired, its execution last ended, or its turn last
+# settled. The window keeps a quick follow-up turn on the warm instance.
 _IDLE_RUNTIME_MAX_AGE_SECONDS = 120.0
+# The soft cap never drops a runtime active within this many seconds, which
+# covers the gap between ``get_agent_for_task`` returning and the execution
+# registering itself.
+_IDLE_RUNTIME_SOFT_CAP_MIN_AGE_SECONDS = 30.0
 # A paused or waiting-for-user execution still owns its slot for a later
 # resume, so its runtime is kept much longer.
 _IDLE_RESUMABLE_MAX_AGE_SECONDS = 1800.0
-# Most idle-but-not-yet-expired runtimes one process keeps; the least
-# recently active go first once the count is exceeded.
+# Most idle-but-not-yet-expired runtimes one process keeps once they are older
+# than ``_IDLE_RUNTIME_SOFT_CAP_MIN_AGE_SECONDS``; the least recently active go
+# first once the count is exceeded.
 _IDLE_RUNTIME_SOFT_CAP = 128
 _IDLE_SWEEP_INTERVAL_SECONDS = 60.0
 
@@ -1274,9 +1277,10 @@ class AgentServiceManager:
         # a process-local sequence rather than this removable per-task map, so
         # eviction and manager replacement cannot make an old token current.
         self._agent_run_generations: Dict[int, int] = {}
-        # ``_monotonic()`` of each task's latest acquisition or settled turn.
-        # The idle sweep measures a runtime's idle time from it; a missing
-        # entry counts as idle forever.
+        # ``_monotonic()`` of each task's latest acquisition, execution end,
+        # settled turn, or sweep that saw it running. The idle sweep measures
+        # a runtime's idle time from it; a missing entry counts as idle
+        # forever.
         self._agent_last_active_at: Dict[int, float] = {}
         # Clock used for idle accounting; replaceable so tests need not sleep.
         self._monotonic: Callable[[], float] = time.monotonic
@@ -3079,7 +3083,17 @@ class AgentServiceManager:
                         execution_metadata=memory_policy.execution_metadata(),
                         system_prompt=system_prompt,  # Pass agent builder instructions
                     )
-                    self._sweep_idle_runtimes(reason="insert", just_inserted=task_id)
+                    try:
+                        self._sweep_idle_runtimes(
+                            reason="insert", just_inserted=task_id
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Idle runtime sweep after building the runtime for "
+                            "task %s failed",
+                            task_id,
+                            exc_info=True,
+                        )
 
                     selected_file_ids = _selected_file_ids_from_agent_config(
                         task.agent_config if task is not None else None
@@ -3464,26 +3478,31 @@ class AgentServiceManager:
                 deferred_task_ids,
             )
 
-    def _forget_runtime(self, task_id: int) -> bool:
+    def _runtime_bookkeeping_maps(self) -> tuple[dict[int, Any], ...]:
+        """Per-task maps stored alongside a cached runtime, besides the idle clock."""
+        return (
+            self._agents,
+            self._agent_owner_ids,
+            self._agent_sandbox_keys,
+            self._agent_sandbox_providers,
+            self._agent_scope_fingerprints,
+            self._agent_model_overrides,
+            self._agent_run_ids,
+            self._agent_run_generations,
+            self._agent_evicted_scope_fingerprints,
+        )
+
+    def _forget_runtime(self, task_id: int) -> None:
         """Drop every per-task cache entry for a runtime this process is done with.
 
         Clears the cached ``AgentService`` and all bookkeeping stored with it,
         but neither the workspace nor ``_agent_cleanup_owner_ids`` (a failed
         workspace cleanup still needs its owner) nor ``_mcp_actor_policies``
         and ``_agent_build_locks`` (their own owners decide when those go).
-        Returns whether an ``AgentService`` was cached.
         """
-        had_agent = self._agents.pop(task_id, None) is not None
-        self._agent_owner_ids.pop(task_id, None)
-        self._agent_sandbox_keys.pop(task_id, None)
-        self._agent_sandbox_providers.pop(task_id, None)
-        self._agent_scope_fingerprints.pop(task_id, None)
-        self._agent_model_overrides.pop(task_id, None)
-        self._agent_run_ids.pop(task_id, None)
-        self._agent_run_generations.pop(task_id, None)
-        self._agent_evicted_scope_fingerprints.pop(task_id, None)
+        for bookkeeping in self._runtime_bookkeeping_maps():
+            bookkeeping.pop(task_id, None)
         self._agent_last_active_at.pop(task_id, None)
-        return had_agent
 
     def _prune_build_lock(self, task_id: int) -> None:
         """Drop a task's build lock once nothing can still depend on it.
@@ -3508,7 +3527,7 @@ class AgentServiceManager:
 
     def _sweep_idle_runtimes(
         self, *, reason: str, just_inserted: Optional[int] = None
-    ) -> int:
+    ) -> None:
         """Drop cached runtimes that nothing in this process is using.
 
         Synchronous and never awaits, so the decision and the removal are one
@@ -3516,22 +3535,22 @@ class AgentServiceManager:
         is the one just inserted, an MCP actor task (those are released only
         by ``remove_agent``), holds its build lock, has an execution running,
         or reports a status that cannot be read. Otherwise it is dropped once
-        it has been idle -- measured from its latest acquisition or settled
-        turn -- for ``_IDLE_RUNTIME_MAX_AGE_SECONDS``, or
+        it has been idle -- measured from its latest acquisition, execution
+        end or settled turn -- for ``_IDLE_RUNTIME_MAX_AGE_SECONDS``, or
         ``_IDLE_RESUMABLE_MAX_AGE_SECONDS`` when a paused or waiting execution
-        may still resume on it.
+        may still resume on it. A running runtime's idle clock is refreshed by
+        every sweep that observes it.
 
         After that, if more than ``_IDLE_RUNTIME_SOFT_CAP`` runtimes remain
-        that are droppable but not yet old enough, the least recently active
-        among them are dropped as well. Runtimes protected above or resumable
-        and younger than their limit never count towards the cap and are never
-        dropped by it.
+        that are droppable, not yet old enough to expire and idle for at least
+        ``_IDLE_RUNTIME_SOFT_CAP_MIN_AGE_SECONDS``, the least recently active
+        among them are dropped as well. Runtimes protected above, resumable, or
+        more recently active than that floor never count towards the cap and
+        are never dropped by it.
 
         Leftover per-task bookkeeping of tasks without a cached runtime (for
         example after sandbox eviction) is cleared under the same lock and
         idle-age conditions, and unused build locks are pruned last.
-
-        Returns the number of cached runtimes dropped.
         """
         now = self._monotonic()
 
@@ -3543,7 +3562,6 @@ class AgentServiceManager:
             lock = self._agent_build_locks.get(task_id)
             return lock is not None and lock.locked()
 
-        evicted = 0
         young_droppable: List[tuple[float, int]] = []
         for task_id, agent in list(self._agents.items()):
             if task_id == just_inserted or task_id in self._mcp_actor_policies:
@@ -3561,6 +3579,7 @@ class AgentServiceManager:
                 )
                 continue
             if status and status.get("is_running"):
+                self._agent_last_active_at[task_id] = now
                 continue
             resumable = bool(status and status.get("is_resumable"))
             max_age = (
@@ -3571,14 +3590,13 @@ class AgentServiceManager:
             idle = idle_seconds(task_id)
             if idle >= max_age:
                 self._forget_runtime(task_id)
-                evicted += 1
                 logger.info(
                     "Evicted idle cached AgentService for task %s (idle %.0fs, %s)",
                     task_id,
                     idle,
                     reason,
                 )
-            elif not resumable:
+            elif not resumable and idle >= _IDLE_RUNTIME_SOFT_CAP_MIN_AGE_SECONDS:
                 young_droppable.append((self._agent_last_active_at[task_id], task_id))
 
         overflow = len(young_droppable) - _IDLE_RUNTIME_SOFT_CAP
@@ -3587,7 +3605,6 @@ class AgentServiceManager:
             for _, task_id in young_droppable[:overflow]:
                 idle = idle_seconds(task_id)
                 self._forget_runtime(task_id)
-                evicted += 1
                 logger.info(
                     "Evicted idle cached AgentService for task %s (idle %.0fs, %s)",
                     task_id,
@@ -3595,16 +3612,8 @@ class AgentServiceManager:
                     f"{reason}, soft cap",
                 )
 
-        leftover_task_ids = (
-            set(self._agent_owner_ids)
-            | set(self._agent_sandbox_keys)
-            | set(self._agent_sandbox_providers)
-            | set(self._agent_scope_fingerprints)
-            | set(self._agent_model_overrides)
-            | set(self._agent_run_ids)
-            | set(self._agent_run_generations)
-            | set(self._agent_evicted_scope_fingerprints)
-            | set(self._agent_last_active_at)
+        leftover_task_ids = set().union(
+            *self._runtime_bookkeeping_maps(), self._agent_last_active_at
         ) - set(self._agents)
         for task_id in leftover_task_ids:
             if (
@@ -3616,12 +3625,9 @@ class AgentServiceManager:
             self._forget_runtime(task_id)
 
         for task_id in [
-            task_id
-            for task_id in self._agent_build_locks
-            if task_id not in self._agents
+            t for t in list(self._agent_build_locks) if t not in self._agents
         ]:
             self._prune_build_lock(task_id)
-        return evicted
 
     def note_runtime_settled(self, task_id: int) -> None:
         """Run one idle sweep because a turn for ``task_id`` just finished.
@@ -3648,9 +3654,8 @@ class AgentServiceManager:
         self._idle_sweep_task = loop.create_task(self._idle_sweep_loop())
 
     async def _idle_sweep_loop(self) -> None:
-        """Sweep periodically until the loop closes or the manager is replaced."""
-        loop = asyncio.get_running_loop()
-        while not loop.is_closed() and _global_agent_manager is self:
+        """Sweep periodically until the manager is replaced."""
+        while True:
             await asyncio.sleep(_IDLE_SWEEP_INTERVAL_SECONDS)
             if _global_agent_manager is not self:
                 return
@@ -3692,11 +3697,10 @@ class AgentServiceManager:
         # Checked before the run-id comparison and independently of it: within
         # one run, the generation is the only thing that distinguishes the
         # acquisition that scheduled this cleanup from a later one that now
-        # owns the runtime. A missing generation means the idle sweep already
-        # dropped that runtime, so there is nothing left for this cleanup to
-        # own and the workspace must be kept.
+        # owns the runtime.
         if (
             expected_run_generation is not None
+            and current_generation is not None
             and current_generation != expected_run_generation
         ):
             logger.info(
@@ -3756,6 +3760,7 @@ class AgentServiceManager:
             self._agent_owner_ids.pop(task_id, None)
             self._agent_run_ids.pop(task_id, None)
             self._agent_run_generations.pop(task_id, None)
+            self._agent_last_active_at.pop(task_id, None)
             self._agent_sandbox_keys.pop(task_id, None)
             self._agent_sandbox_providers.pop(task_id, None)
             self._agent_scope_fingerprints.pop(task_id, None)
@@ -4166,6 +4171,17 @@ class AgentServiceManager:
             async def finalize_execution_resources() -> None:
                 nonlocal lease_ownership_lost
 
+                # The execution has ended; restart the idle window so the
+                # runtime survives until the entrypoint settles it.
+                try:
+                    finished_task_key = (
+                        int(tracker_task_id) if tracker_task_id else None
+                    )
+                except (TypeError, ValueError):
+                    finished_task_key = None
+                if finished_task_key is not None and finished_task_key in self._agents:
+                    self._agent_last_active_at[finished_task_key] = self._monotonic()
+
                 tracker_pool_timeout: Exception | None = None
                 heartbeat_pool_timeout: BaseException | None = None
                 heartbeat_lost = False
@@ -4441,7 +4457,14 @@ class AgentServiceManager:
                     memory_availability_reason=memory_policy.public_availability_reason,
                     execution_metadata=memory_policy.execution_metadata(),
                 )
-            self._sweep_idle_runtimes(reason="insert", just_inserted=task_id)
+            try:
+                self._sweep_idle_runtimes(reason="insert", just_inserted=task_id)
+            except Exception:
+                logger.warning(
+                    "Idle runtime sweep after building the runtime for task %s failed",
+                    task_id,
+                    exc_info=True,
+                )
 
             agent_service = self._agents[task_id]
             await agent_service.reconstruct_from_history(
