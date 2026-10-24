@@ -1921,6 +1921,66 @@ describe("TaskConversationPanel", () => {
       expect(chatInputProps.current?.files).toHaveLength(1)
     })
 
+    const txt = (name: string) => new File([name], name, { type: "text/plain" })
+    const pick = (next: File[]) => act(() => { chatInputProps.current?.onFilesChange?.(next) })
+    const pendingSend = () => {
+      let finish!: () => void
+      const onSend = vi.fn(() => new Promise<void>((resolve) => { finish = resolve }))
+      return { onSend, finish: () => finish() }
+    }
+
+    it.each([
+      ["with files", (a: File) => [a], (a: File) => [a]],
+      ["text-only", () => [], () => []],
+    ])("keeps files added while a %s send is in flight and removes only the files it carried", async (_kind, before, sent) => {
+      appControls.filesDisabled = true
+      const { onSend, finish } = pendingSend()
+      render(<TaskConversationPanel mode="page" attachments={attachments} onSend={onSend} />)
+      const [a, b] = [txt("a.txt"), txt("b.txt")]
+      pick(before(a))
+      let sending!: Promise<void> | void
+      act(() => { sending = chatInputProps.current?.onSend("draft") })
+      pick([...(chatInputProps.current?.files ?? []), b])
+
+      await act(async () => { finish(); await sending })
+
+      expect(onSend).toHaveBeenCalledWith("draft", undefined, sent(a))
+      expect(chatInputProps.current?.files).toEqual([b])
+    })
+
+    it("keeps files hidden while uploads are not offered through a text-only send", async () => {
+      appControls.filesDisabled = true
+      const onSend = vi.fn().mockResolvedValue(undefined)
+      const { rerender } = render(
+        <TaskConversationPanel mode="page" attachments={attachments} onSend={onSend} />,
+      )
+      const a = txt("a.txt")
+      pick([a])
+      rerender(<TaskConversationPanel mode="page" />)
+      expect(chatInputProps.current?.files).toEqual([])
+
+      await act(async () => { await chatInputProps.current?.onSend("text only") })
+      rerender(<TaskConversationPanel mode="page" attachments={attachments} onSend={onSend} />)
+
+      expect(sendMessageMock).toHaveBeenCalledWith("text only", undefined, [])
+      expect(chatInputProps.current?.files).toEqual([a])
+    })
+
+    it("still clears every file after a send when files are enabled", async () => {
+      const { onSend, finish } = pendingSend()
+      render(<TaskConversationPanel mode="page" onSend={onSend} />)
+      const [a, b] = [txt("a.txt"), txt("b.txt")]
+      pick([a])
+      let sending!: Promise<void> | void
+      act(() => { sending = chatInputProps.current?.onSend("draft") })
+      pick([a, b])
+
+      await act(async () => { finish(); await sending })
+
+      expect(onSend).toHaveBeenCalledWith("draft", undefined, [a])
+      expect(chatInputProps.current?.files).toEqual([])
+    })
+
     it("reports the staged files to the caller as the visitor changes them", async () => {
       appControls.filesDisabled = true
       const onAttachmentFilesChange = vi.fn()

@@ -49,8 +49,8 @@ interface TaskConversationPanelProps {
   attachmentStatuses?: ReadonlyMap<File, ComposerAttachmentStatus>
   onRetryAttachment?: (file: File) => void
   attachmentsBusy?: boolean
-  // Called with the collected files every time the visitor adds or removes
-  // one, and with an empty list once a send has completed.
+  // Called with the collected files every time they change: when the visitor
+  // adds or removes one, and once a send has completed.
   onAttachmentFilesChange?: (files: File[]) => void
   // Extra "busy" signal from the caller (for example, files uploading before
   // the send); it locks the composer like a message in flight does.
@@ -346,7 +346,13 @@ export function TaskConversationPanel({
   // every request that reads a file back.
   const filesBlocked = filesDisabled && !attachments
 
+  // The newest selection. A send reads it once it has completed, because the
+  // visitor may have changed the files while it was in flight.
+  const latestFilesRef = useRef(files)
+  latestFilesRef.current = files
+
   const updateFiles = (next: File[]) => {
+    latestFilesRef.current = next
     setFiles(next)
     onAttachmentFilesChange?.(next)
   }
@@ -354,7 +360,12 @@ export function TaskConversationPanel({
   const handleSend = async (message: string, config?: any, filesToSend?: File[]) => {
     const outboundFiles = filesBlocked ? [] : (filesToSend || files)
     await (onSend ?? sendMessage)(message, config, outboundFiles)
-    updateFiles([])
+    // In session mode only the files this send carried leave the selection:
+    // files added while it was in flight, and files kept hidden while uploads
+    // are not offered, stay. Other modes clear the selection after a send.
+    updateFiles(filesDisabled
+      ? latestFilesRef.current.filter((file) => !outboundFiles.includes(file))
+      : [])
   }
 
   const messageItems = useMemo<CombinedItem[]>(() => {

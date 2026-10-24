@@ -38,25 +38,40 @@ vi.mock("sonner", () => ({
 }))
 
 // The latest props each mocked surface was rendered with, so a test can act as
-// the visitor through the callbacks the page hands them.
+// the visitor through the callbacks the page hands them. A test that sets
+// `real` renders the actual start screen and panel instead, with the real
+// composer inside, and acts through the DOM.
 const surfaces = vi.hoisted(() => ({
   start: null as null | Record<string, any>,
   panel: null as null | Record<string, any>,
+  real: false,
 }))
 
-vi.mock("@/components/chat/ChatStartScreen", () => ({
-  ChatStartScreen: (props: Record<string, any>) => {
-    surfaces.start = props
-    return <div data-testid="session-start">{props.title}</div>
-  },
-}))
+vi.mock("@/components/chat/ChatStartScreen", async () => {
+  const actual = await vi.importActual<typeof import("@/components/chat/ChatStartScreen")>(
+    "@/components/chat/ChatStartScreen",
+  )
+  return {
+    ChatStartScreen: (props: Record<string, any>) => {
+      surfaces.start = props
+      if (surfaces.real) return <actual.ChatStartScreen {...(props as any)} />
+      return <div data-testid="session-start">{props.title}</div>
+    },
+  }
+})
 
-vi.mock("@/components/task/task-conversation-panel", () => ({
-  TaskConversationPanel: (props: Record<string, any>) => {
-    surfaces.panel = props
-    return <div data-testid="session-conversation" />
-  },
-}))
+vi.mock("@/components/task/task-conversation-panel", async () => {
+  const actual = await vi.importActual<typeof import("@/components/task/task-conversation-panel")>(
+    "@/components/task/task-conversation-panel",
+  )
+  return {
+    TaskConversationPanel: (props: Record<string, any>) => {
+      surfaces.panel = props
+      if (surfaces.real) return <actual.TaskConversationPanel {...(props as any)} />
+      return <div data-testid="session-conversation" />
+    },
+  }
+})
 
 import { SessionAgentChatPage } from "./session-agent-chat-page"
 
@@ -872,6 +887,29 @@ describe("SessionAgentChatPage file attachments", () => {
       await act(async () => { await sending })
     })
 
+    it("keeps start-page files hidden while uploads are not advertised through a text-only send", async () => {
+      await mountActive()
+      const a = pdf("a.pdf")
+      act(() => { surfaces.start?.onFilesChange([a]) })
+      dispatchSession({ session_delivery_id: "delivery-withdrawn" })
+      await waitFor(() => expect(MockWebSocket.instances).toHaveLength(2))
+      const next = MockWebSocket.instances[1]
+      act(() => next.open("xagent-session-v1"))
+      expect(surfaces.start?.files).toEqual([])
+
+      let sending!: Promise<unknown>
+      act(() => {
+        sending = surfaces.start?.onSend("text only", [], { clientMessageId: "cid-hidden" })
+      })
+      await waitFor(() => expect(chatFrames(next)).toHaveLength(1))
+      accept(next, "cid-hidden")
+      await act(async () => { await sending })
+      dispatchSession({ session_delivery_id: "delivery-back", capabilities })
+
+      expect(chatFrames(next)[0]).not.toHaveProperty("file_ids")
+      await waitFor(() => expect(surfaces.start?.files).toEqual([a]))
+    })
+
     it("aborts uploads in flight when the page unmounts", async () => {
       const { unmount } = render(<SessionAgentChatPage />)
       dispatchSession({ capabilities })
@@ -1289,6 +1327,135 @@ describe("SessionAgentChatPage file attachments", () => {
       await act(async () => { await sending })
 
       expect(signal.aborted).toBe(true)
+    })
+  })
+
+  describe("with the real start screen, panel and composer", () => {
+    const bindTaskWithStatus = (socket: MockWebSocket, status: string) =>
+      receive(socket, {
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:00Z",
+        data: {
+          event_id: "task-info-42",
+          event_type: "task_info",
+          data: {
+            id: 42,
+            title: "Task 42",
+            status,
+            description: "Session task",
+            created_at: "2026-05-27T05:00:00Z",
+            updated_at: "2026-05-27T05:00:00Z",
+          },
+        },
+      })
+    const pick = (file: File) => {
+      const input = document.querySelector('input[type="file"]') as HTMLInputElement
+      act(() => { fireEvent.change(input, { target: { files: [file] } }) })
+    }
+    const editor = () => screen.getByRole("textbox")
+    const submit = (text: string) => {
+      act(() => { editor().textContent = text; fireEvent.input(editor()) })
+      act(() => { fireEvent.submit(editor().closest("form")!) })
+    }
+    // Whether the composer shows a card for the file. The sent message's
+    // bubble also names its files, so only the composer form is searched.
+    const selected = (name: string) => {
+      const form = document.querySelector("form")
+      return !!form && Array.from(form.querySelectorAll("*"))
+        .some((element) => element.children.length === 0 && element.textContent === name)
+    }
+    const acceptLast = (socket: MockWebSocket) =>
+      accept(socket, chatFrames(socket).at(-1)!.client_message_id as string)
+    // Replaces the session with one that advertises nothing and opens its
+    // socket, then returns that socket.
+    const withdraw = async () => {
+      dispatchSession({ session_delivery_id: "delivery-withdrawn" })
+      await waitFor(() => expect(MockWebSocket.instances).toHaveLength(2))
+      const next = MockWebSocket.instances[1]
+      act(() => next.open("xagent-session-v1"))
+      return next
+    }
+
+    beforeEach(() => {
+      surfaces.real = true
+      fetchMock.mockImplementation(async () => new Response("{}", { status: 404 }))
+    })
+
+    afterEach(() => {
+      surfaces.real = false
+    })
+
+    it.each(["running", "completed"])(
+      "keeps a panel file added while a send with files is in flight (task %s)",
+      async (status) => {
+        const socket = await mountActive()
+        bindTaskWithStatus(socket, status)
+        await waitFor(() => expect(editor()).toBeInTheDocument())
+        const upload = deferred<Response>()
+        fetchMock.mockReturnValueOnce(upload.promise)
+        pick(pdf("a.pdf"))
+        submit("with a")
+        await waitFor(() => expect(uploadCalls()).toHaveLength(1))
+        pick(pdf("b.pdf"))
+        expect(selected("b.pdf")).toBe(true)
+
+        await act(async () => { upload.resolve(created(FILE_A)) })
+        await waitFor(() => expect(chatFrames(socket)).toHaveLength(1))
+        acceptLast(socket)
+        await waitFor(() => expect(selected("a.pdf")).toBe(false))
+
+        expect(chatFrames(socket)[0].file_ids).toEqual([FILE_A])
+        expect(selected("b.pdf")).toBe(true)
+      },
+    )
+
+    it("keeps a panel file added while a text-only send is in flight", async () => {
+      const socket = await mountActive()
+      bindTaskWithStatus(socket, "running")
+      await waitFor(() => expect(editor()).toBeInTheDocument())
+      submit("text only")
+      await waitFor(() => expect(chatFrames(socket)).toHaveLength(1))
+      pick(pdf("b.pdf"))
+
+      acceptLast(socket)
+      // The composer clears the sent draft only after the panel's send settles.
+      await waitFor(() => expect(editor().textContent).toBe(""))
+
+      expect(selected("b.pdf")).toBe(true)
+    })
+
+    it("keeps a start-page file hidden while uploads are not advertised through a text-only send", async () => {
+      await mountActive()
+      await waitFor(() => expect(editor()).toBeInTheDocument())
+      pick(pdf("a.pdf"))
+      const next = await withdraw()
+      await waitFor(() => expect(selected("a.pdf")).toBe(false))
+
+      submit("text only")
+      await waitFor(() => expect(chatFrames(next)).toHaveLength(1))
+      acceptLast(next)
+      await waitFor(() => expect(editor().textContent).toBe(""))
+      dispatchSession({ session_delivery_id: "delivery-back", capabilities })
+
+      expect(chatFrames(next)[0]).not.toHaveProperty("file_ids")
+      await waitFor(() => expect(selected("a.pdf")).toBe(true))
+    })
+
+    it("keeps a panel file hidden while uploads are not advertised through a text-only send", async () => {
+      const socket = await mountActive()
+      bindTaskWithStatus(socket, "running")
+      await waitFor(() => expect(editor()).toBeInTheDocument())
+      pick(pdf("a.pdf"))
+      const next = await withdraw()
+      await waitFor(() => expect(selected("a.pdf")).toBe(false))
+
+      submit("text only")
+      await waitFor(() => expect(chatFrames(next)).toHaveLength(1))
+      acceptLast(next)
+      await waitFor(() => expect(editor().textContent).toBe(""))
+      dispatchSession({ session_delivery_id: "delivery-back", capabilities })
+
+      await waitFor(() => expect(selected("a.pdf")).toBe(true))
     })
   })
 })

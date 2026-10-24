@@ -490,7 +490,9 @@ function SessionConversationContent({
     setStartMessageFailure(null)
     try {
       await sendWithAttachments(message, files, config)
-      setStartFiles([])
+      // Files this send did not carry stay selected, including files hidden
+      // while no capability is advertised.
+      setStartFiles((current) => current.filter((file) => !files.includes(file)))
     } catch (error) {
       // An error that is already announced, or that the visitor caused, leaves
       // no failure line behind.
