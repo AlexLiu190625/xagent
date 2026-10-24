@@ -12,6 +12,8 @@ import logging
 import math
 import os
 import re
+import threading
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Coroutine, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -303,6 +305,144 @@ class MCPLoadResult:
 
 class EmptyArgsModel(BaseModel):
     pass
+
+
+# Return model shared by every MCP tool adapter. Kept without a docstring
+# so that its JSON schema carries no description.
+class MCPToolResult(BaseModel):
+    content: List[Dict[str, Any]] = Field(
+        default_factory=list, description="Tool execution result content"
+    )
+    structured_content: Any = Field(
+        default=None,
+        description=(
+            "Structured JSON result of the tool call, if the server returned one."
+        ),
+    )
+    runtime_bound_arguments: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Redacted runtime-bound arguments supplied with this call",
+    )
+    is_error: bool = Field(
+        default=False,
+        description="Whether the tool execution resulted in an error",
+    )
+
+
+# A log entry a build wants emitted: (level, %-style template, arguments). The
+# build hands entries back instead of logging, so each adapter emits its own
+# records, in its own logging context, whether it built the classes or reused
+# them.
+_BuildDiagnostic = tuple[int, str, tuple[Any, ...]]
+
+
+class _GeneratedArgumentClasses(NamedTuple):
+    """The argument model and validator generated for one tool."""
+
+    args_type: Type[BaseModel]
+    args_validator: Any | None
+    diagnostics: tuple[_BuildDiagnostic, ...]
+
+
+class _ArgsModelBuild(NamedTuple):
+    """Outcome of building an argument model.
+
+    ``cacheable`` is False when the build fell back after an unexpected
+    exception: that outcome depends on the interpreter state at the time (for
+    example how deep the call stack already was), not only on the schema.
+    """
+
+    model: Type[BaseModel]
+    diagnostics: list[_BuildDiagnostic]
+    cacheable: bool
+
+
+_MCP_CLASS_CACHE_MAX_ENTRIES = 1024
+# Oversized schemas are built per adapter, not cached.
+_MCP_CLASS_CACHE_MAX_SCHEMA_CHARS = 256 * 1024
+_McpClassCacheKey = tuple[type, str, str, frozenset[str]]
+# Insertion-ordered: the oldest entry is evicted first. Entries are only ever
+# read through ``_generated_argument_classes``.
+_MCP_CLASS_CACHE: OrderedDict[_McpClassCacheKey, _GeneratedArgumentClasses] = (
+    OrderedDict()
+)
+_MCP_CLASS_CACHE_LOCK = threading.Lock()
+
+
+def _generated_argument_classes(
+    adapter: "MCPToolAdapter",
+) -> _GeneratedArgumentClasses:
+    """Return the argument model and validator for ``adapter``'s tool.
+
+    The classes depend only on the adapter class, the tool name, the input
+    schema and which of its properties the runtime binds, so adapters with the
+    same four share one set. The schema is keyed in the order it arrived,
+    because the nested-schema budget is spent in property order and a
+    reordered schema can therefore emit a different model. Generation runs on
+    a private copy of the schema so a cached class never refers to an object
+    the caller still owns.
+
+    Only outcomes that the key fully determines are cached: a build that fell
+    back after an unexpected exception is rebuilt on the next adapter. A
+    schema that cannot be serialized, or is too large to keep, is built for
+    this adapter alone.
+    """
+    tool_name = adapter.mcp_tool.name
+    schema = adapter.mcp_tool.inputSchema
+    try:
+        schema_json = json.dumps(schema, separators=(",", ":"), allow_nan=True)
+    except (TypeError, ValueError, RecursionError) as exc:
+        logger.debug(
+            "MCP tool %s input schema is not cached: %s", tool_name, type(exc).__name__
+        )
+        return _build_argument_classes(adapter, schema)[0]
+    if len(schema_json) > _MCP_CLASS_CACHE_MAX_SCHEMA_CHARS:
+        logger.debug("MCP tool %s input schema is too large to cache", tool_name)
+        return _build_argument_classes(adapter, schema)[0]
+
+    key = (
+        type(adapter),
+        tool_name,
+        hashlib.sha256(schema_json.encode("ascii")).hexdigest(),
+        frozenset(
+            adapter._runtime_bound_tool_argument_names(
+                adapter._input_schema_properties()
+            )
+        ),
+    )
+    with _MCP_CLASS_CACHE_LOCK:
+        cached = _MCP_CLASS_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    built, cacheable = _build_argument_classes(adapter, json.loads(schema_json))
+    if not cacheable:
+        return built
+    with _MCP_CLASS_CACHE_LOCK:
+        existing = _MCP_CLASS_CACHE.setdefault(key, built)
+        while len(_MCP_CLASS_CACHE) > _MCP_CLASS_CACHE_MAX_ENTRIES:
+            _MCP_CLASS_CACHE.popitem(last=False)
+    return existing
+
+
+def _build_argument_classes(
+    adapter: "MCPToolAdapter", schema: Any
+) -> tuple[_GeneratedArgumentClasses, bool]:
+    """Generate the argument model and validator from ``schema``.
+
+    Returns the classes and whether the outcome is fully determined by the
+    inputs (see ``_ArgsModelBuild``).
+    """
+    args_build = adapter._build_args_model(schema)
+    validator, validator_diagnostics = adapter._build_args_validator(args_build.model)
+    return (
+        _GeneratedArgumentClasses(
+            args_build.model,
+            validator,
+            tuple(args_build.diagnostics) + tuple(validator_diagnostics),
+        ),
+        args_build.cacheable,
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -2089,9 +2229,14 @@ class MCPToolAdapter(AbstractBaseTool):
         # make unrelated tools of any server one repeated-action stream.
         self.decision_group = self.name
 
-        # Build models from MCP tool schema
-        self._args_type = self._build_args_model()
-        self._args_validator = self._build_args_validator()
+        # Models are generated from the MCP tool schema and shared with every
+        # adapter of the same tool; each adapter still emits its own build
+        # diagnostics.
+        generated = _generated_argument_classes(self)
+        self._args_type = generated.args_type
+        self._args_validator = generated.args_validator
+        for level, template, log_args in generated.diagnostics:
+            logger.log(level, template, *log_args)
         self._return_type = self._build_return_model()
         self._result_integrity = MCPResultIntegrityGuard(
             source_server=self.source_server,
@@ -2260,8 +2405,13 @@ class MCPToolAdapter(AbstractBaseTool):
         """MCP tools are always async."""
         return True
 
-    def _build_args_model(self) -> Type[BaseModel]:
-        """Build Pydantic model from MCP tool input schema.
+    def _build_args_model(self, schema: Any) -> _ArgsModelBuild:
+        """Build Pydantic model from an MCP tool input schema.
+
+        ``schema`` is the tool's ``inputSchema`` or an equivalent copy. The
+        build reads nothing else of the tool but its name and which input
+        properties the runtime binds, and it hands back the log entries it
+        would emit instead of logging them.
 
         Field-level metadata the connector author wrote (description, enum,
         pattern, format and the length/range bounds) is carried through to the
@@ -2283,20 +2433,23 @@ class MCPToolAdapter(AbstractBaseTool):
         from the arguments sent to the server instead of carrying a value no
         provider client can serialize.
         """
+        diagnostics: list[_BuildDiagnostic] = []
         try:
-            if not self.mcp_tool.inputSchema:
+            if not schema:
                 # No input parameters
-                return EmptyArgsModel
+                return _ArgsModelBuild(EmptyArgsModel, diagnostics, True)
 
             # Convert JSON schema to Pydantic model
-            schema = self.mcp_tool.inputSchema
-
             if not isinstance(schema, dict):
-                logger.warning(
-                    f"Invalid input schema for MCP tool {self.mcp_tool.name}"
+                diagnostics.append(
+                    (
+                        logging.WARNING,
+                        "Invalid input schema for MCP tool %s",
+                        (self.mcp_tool.name,),
+                    )
                 )
 
-                return EmptyArgsModel
+                return _ArgsModelBuild(EmptyArgsModel, diagnostics, True)
 
             # Extract properties and required fields
             properties = schema.get("properties", {})
@@ -2308,7 +2461,7 @@ class MCPToolAdapter(AbstractBaseTool):
             )
 
             if not isinstance(properties, Mapping) or not properties:
-                return EmptyArgsModel
+                return _ArgsModelBuild(EmptyArgsModel, diagnostics, True)
 
             # Build field definitions for create_model
             fields: Dict[str, Any] = {}
@@ -2381,35 +2534,49 @@ class MCPToolAdapter(AbstractBaseTool):
                 # One line per tool, whatever the connector declared. A
                 # malformed schema can drop keys on many fields at once, and
                 # a line per key would turn one bad connector into a flood.
-                logger.debug(
-                    "MCP tool %s dropped %d field schema metadata keys "
-                    "and %d unreadable field schemas",
-                    self.mcp_tool.name,
-                    tool_metadata.rejected_keys,
-                    tool_metadata.unreadable_fields,
+                diagnostics.append(
+                    (
+                        logging.DEBUG,
+                        "MCP tool %s dropped %d field schema metadata keys "
+                        "and %d unreadable field schemas",
+                        (
+                            self.mcp_tool.name,
+                            tool_metadata.rejected_keys,
+                            tool_metadata.unreadable_fields,
+                        ),
+                    )
                 )
 
             # Create the model
             model_name = f"{self.mcp_tool.name.title().replace('_', '')}Args"
-            return create_model(model_name, **fields)
-
-        except Exception as e:
-            logger.error(
-                f"Failed to build args model for MCP tool {self.mcp_tool.name}: {e}"
+            return _ArgsModelBuild(
+                create_model(model_name, **fields), diagnostics, True
             )
 
-            return EmptyArgsModel
+        except Exception as e:
+            diagnostics.append(
+                (
+                    logging.ERROR,
+                    "Failed to build args model for MCP tool %s: %s",
+                    (self.mcp_tool.name, str(e)),
+                )
+            )
 
-    def _build_args_validator(self) -> Any | None:
+            return _ArgsModelBuild(EmptyArgsModel, diagnostics, False)
+
+    def _build_args_validator(
+        self, args_type: Type[BaseModel]
+    ) -> tuple[Any | None, list[_BuildDiagnostic]]:
         """Compile the adapter-visible argument schema for local checks.
 
         A malformed remote schema must not make the whole connector unload.
         ``_build_args_model`` already drops unsupported fragments; if the
         remaining Pydantic schema is still invalid, preserve the historical
-        Pydantic-only validation path and log only the exception class.
+        Pydantic-only validation path and report only the exception class. The
+        validator holds no per-call state, so adapters may share one.
         """
         try:
-            schema = self._args_type.model_json_schema()
+            schema = args_type.model_json_schema()
             # Regexes supplied by an MCP server are model-facing hints, not a
             # safe event-loop validator. In particular, Python's backtracking
             # engine can be blocked by a pathological pattern, and ECMA-only
@@ -2417,15 +2584,16 @@ class MCPToolAdapter(AbstractBaseTool):
             # the provider schema but omit it from local pre-call checks.
             schema = _remove_schema_keyword(schema, "pattern")
             Draft202012Validator.check_schema(schema)
-            return Draft202012Validator(schema)
+            return Draft202012Validator(schema), []
         except (jsonschema_exceptions.SchemaError, TypeError, ValueError) as exc:
-            logger.warning(
-                "MCP tool %s argument schema could not be compiled for nested "
-                "validation: %s",
-                self.mcp_tool.name,
-                type(exc).__name__,
-            )
-            return None
+            return None, [
+                (
+                    logging.WARNING,
+                    "MCP tool %s argument schema could not be compiled for nested "
+                    "validation: %s",
+                    (self.mcp_tool.name, type(exc).__name__),
+                )
+            ]
 
     def _nested_argument_error(self, args: Mapping[str, Any]) -> Any | None:
         if self._args_validator is None:
@@ -2564,28 +2732,7 @@ class MCPToolAdapter(AbstractBaseTool):
         }
 
     def _build_return_model(self) -> Type[BaseModel]:
-        """Build return model for MCP tool output."""
-
-        # MCP tools return CallToolResult which contains content
-        class MCPToolResult(BaseModel):
-            content: List[Dict[str, Any]] = Field(
-                default_factory=list, description="Tool execution result content"
-            )
-            structured_content: Any = Field(
-                default=None,
-                description=(
-                    "Structured JSON result of the tool call, if the server returned one."
-                ),
-            )
-            runtime_bound_arguments: Dict[str, Any] = Field(
-                default_factory=dict,
-                description="Redacted runtime-bound arguments supplied with this call",
-            )
-            is_error: bool = Field(
-                default=False,
-                description="Whether the tool execution resulted in an error",
-            )
-
+        """Return the model for MCP tool output."""
         return MCPToolResult
 
     def _json_schema_to_python_type(self, schema: Dict[str, Any]) -> Type:
