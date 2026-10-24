@@ -26,12 +26,13 @@ from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.services import agent_service_manager as agent_runtime_service
 from xagent.web.services import task_execution as task_execution_service
-from xagent.web.services import task_execution_host, task_start
+from xagent.web.services import task_execution_host, task_orchestrator, task_start
 from xagent.web.services.file_turn import (
     append_prompt_context_block,
     append_uploaded_files_context,
     build_prompt_context_block,
     build_uploaded_files_context,
+    resolve_turn_file_infos,
 )
 from xagent.web.services.task_command_execution import (
     _append_uploaded_files_context_to_message,
@@ -48,6 +49,7 @@ from xagent.web.services.task_execution import (
     execute_task_background,
 )
 from xagent.web.services.task_lease_service import TaskLease
+from xagent.web.services.task_orchestrator import TaskTurnPayload
 from xagent.web.services.task_runtime import PROMPT_CONTEXT_AGENT_CONFIG_KEY
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
@@ -1329,12 +1331,21 @@ async def test_uploaded_files_turn_traces_the_typed_text(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        # What the web UI records for a turn with files and no typed text.
+        "Uploaded file(s)",
+        # A caller that builds the turn payload itself may leave it empty.
+        "",
+    ],
+)
 async def test_file_only_turn_traces_files_without_model_text(
-    db_session, monkeypatch, tmp_path
+    db_session, monkeypatch, tmp_path, transcript
 ):
     # The user sent files without typing anything. The turn is still traced,
-    # identified by its file chips, and its message is empty rather than the
-    # uploaded-files context written for the model.
+    # identified by its file chips, and its message is the transcript text
+    # rather than the uploaded-files context written for the model.
     enriched = append_uploaded_files_context(
         "", build_uploaded_files_context([_UPLOADED_FILE_INFO])
     )
@@ -1345,7 +1356,7 @@ async def test_file_only_turn_traces_files_without_model_text(
         db_session,
         monkeypatch,
         task_id=10,
-        user_message="",
+        user_message=transcript,
         llm_user_message=enriched,
         agent_config=None,
         captured=captured,
@@ -1353,7 +1364,7 @@ async def test_file_only_turn_traces_files_without_model_text(
     )
 
     assert captured["agent_task"] == enriched
-    assert captured["agent_context"]["display_message"] == ""
+    assert captured["agent_context"]["display_message"] == transcript
     user_messages = await _run_agent_and_record_user_messages(
         tmp_path,
         task=captured["agent_task"],
@@ -1361,7 +1372,7 @@ async def test_file_only_turn_traces_files_without_model_text(
     )
 
     assert len(user_messages) == 1
-    assert user_messages[0]["message"] == ""
+    assert user_messages[0]["message"] == transcript
     assert user_messages[0]["files"] == [
         {
             "file_id": "fid-report",
@@ -1370,6 +1381,117 @@ async def test_file_only_turn_traces_files_without_model_text(
             "type": "application/pdf",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_shared_start_turn_with_files_traces_the_transcript_text(
+    db_session, monkeypatch, tmp_path
+):
+    # With shared task execution, a turn with files reaches the scheduler from
+    # a START command, which carries only the transcript text, the model text
+    # and the file ids; no display message survives it. The scheduler resolves
+    # the files, and the user_message trace event must still show the
+    # transcript text with the file chips.
+    user = _create_user(db_session, 1, "owner")
+    lease = _task_lease(10)
+    _create_task(
+        db_session,
+        task_id=10,
+        user_id=1,
+        status=TaskStatus.RUNNING,
+        runner_id=lease.runner_id,
+        run_id=lease.run_id,
+    )
+    _create_uploaded_file(
+        db_session,
+        tmp_path,
+        file_id="fid-notes",
+        user_id=1,
+        task_id=10,
+        filename="notes.txt",
+    )
+    db_session.commit()
+    file_infos, missing = resolve_turn_file_infos(
+        file_ids=["fid-notes"], owner_user_id=1, db=db_session, task_id=10
+    )
+    assert missing == []
+    enriched = append_uploaded_files_context(
+        "Summarize this", build_uploaded_files_context(file_infos)
+    )
+    captured: dict = {}
+
+    class BroadcastManager:
+        async def broadcast_to_task(self, event, task_id):
+            pass
+
+    class AgentManager:
+        async def get_agent_for_task(self, task_id, db, **kwargs):
+            return _NoopAgentService()
+
+        async def execute_task(self, **kwargs):
+            captured["agent_task"] = kwargs.get("task")
+            captured["agent_context"] = kwargs.get("context")
+            return {"success": True, "output": "ok", "file_outputs": []}
+
+    class BackgroundTaskManager(_NoopBackgroundTaskManager):
+        def register_task(self, task_id, task, **kwargs):
+            pass
+
+        def cancel_was_requested(self, task_id):
+            return False
+
+    async def no_heartbeat(*args, **kwargs):
+        return None
+
+    _wire_execute_task_background(monkeypatch, db_session, BroadcastManager())
+    monkeypatch.setattr(
+        task_execution_service, "background_task_manager", BackgroundTaskManager()
+    )
+    monkeypatch.setattr(
+        task_orchestrator, "get_shared_task_execution_enabled", lambda: True
+    )
+    monkeypatch.setattr(task_orchestrator, "run_task_lease_heartbeat", no_heartbeat)
+    monkeypatch.setattr(
+        task_orchestrator,
+        "load_task_setup_snapshot_sync",
+        lambda *args, **kwargs: _task_setup_snapshot(
+            task_id=10,
+            user_id=int(user.id),
+            status=TaskStatus.RUNNING,
+            run_id=lease.run_id,
+        ),
+    )
+    monkeypatch.setattr(task_orchestrator, "_get_agent_manager", AgentManager)
+
+    await task_orchestrator._schedule_bg(
+        task_id=10,
+        task_owner_user_id=int(user.id),
+        task_source=None,
+        run_id=lease.run_id,
+        task_lease=lease,
+        payload=TaskTurnPayload(
+            transcript_message="Summarize this",
+            execution_message=enriched,
+            file_ids=("fid-notes",),
+            turn_id="turn-start",
+        ),
+        force_fresh=False,
+        context={},
+    )
+
+    assert captured["agent_task"] == enriched
+    agent_context = captured["agent_context"]
+    assert agent_context["display_message"] == "Summarize this"
+    assert [info["file_id"] for info in agent_context["file_info"]] == ["fid-notes"]
+    user_messages = await _run_agent_and_record_user_messages(
+        tmp_path,
+        task=captured["agent_task"],
+        request_context=agent_context,
+    )
+
+    assert [event["message"] for event in user_messages] == ["Summarize this"]
+    assert user_messages[0]["turn_id"] == "turn-start"
+    assert [chip["file_id"] for chip in user_messages[0]["files"]] == ["fid-notes"]
 
 
 @pytest.mark.asyncio

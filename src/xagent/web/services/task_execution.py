@@ -2628,18 +2628,10 @@ async def execute_task_background(
             else:
                 agent_context.pop("task_source", None)
                 agent_context.pop("run_id", None)
-            # ``user_message`` is the user-visible transcript text; ``task_for_agent``
-            # is what the model receives and may carry server-added context
-            # (uploaded-files context, the prompt-context block). Whenever the
-            # two differ, record the typed text as the display message so the
-            # user_message trace event -- and everything that renders it, such
-            # as the chat bubble, history replay and SDK steps -- shows what
-            # the user wrote rather than the model-facing text. A file-only
-            # turn records "": the trace treats a present empty display
-            # message as authoritative, so the event carries an empty message
-            # plus the file chips from ``file_info`` (and is not emitted when
-            # the context has no ``file_info``). A display message the caller
-            # already chose is kept as is.
+            # The model text may carry server-added context (uploaded files, the
+            # prompt-context block). Whenever it differs from the transcript text,
+            # record the transcript text as the display message for the
+            # user_message trace event; a display message the caller set wins.
             if task_for_agent != user_message and not _has_display_message_override(
                 agent_context
             ):
