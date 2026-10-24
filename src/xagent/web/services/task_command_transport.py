@@ -901,11 +901,11 @@ def _claim_availability_predicate(now: datetime) -> Any:
 
 # Presence prechecks: whether any command in a claimable status exists, so an
 # idle scan builds no candidate query. The status set is a superset of what
-# ``_claim_availability_predicate`` accepts in either mode (the claimable
-# statuses are one shared constant), which makes the precheck a necessary
-# condition for any candidate. Both read ``TaskExecutionCommand`` through the
-# ORM, so an unflushed command in the session is flushed first, as it is for a
-# ``Query.first()`` lookup, and both can use the claimable partial indexes.
+# ``_claim_availability_predicate`` accepts in either mode (a test guards
+# this), which makes the precheck a necessary condition for any candidate.
+# Both read ``TaskExecutionCommand`` through the ORM, so an unflushed command
+# in the session is flushed first, as it is for a ``Query.first()`` lookup, and
+# both can use the claimable partial indexes.
 _OPEN_COMMAND_PRESENCE = select(
     exists(select(1).select_from(TaskExecutionCommand).where(_CLAIMABLE_STATUS_CLAUSE))
 )

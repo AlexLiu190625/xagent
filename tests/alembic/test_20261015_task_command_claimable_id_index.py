@@ -9,6 +9,7 @@ behaviour differ between them.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -326,22 +327,33 @@ def test_postgresql_fallback_claim_lookup_uses_the_partial_index(
     event.listen(engine, "before_cursor_execute", record)
     try:
         found = transport._find_command_candidate(None)
+        scan = list(captured)
+        with Session(engine) as session:
+            session.execute(transport._OPEN_COMMAND_PRESENCE).scalar_one()
+        presence = captured[len(scan) :]
     finally:
         event.remove(engine, "before_cursor_execute", record)
 
     assert found is not None
     assert found[2] is transport.TaskCommandKind.PAUSE
     # Presence precheck, then the fallback this index serves.
-    assert len(captured) == 2, [statement for statement, _ in captured]
-    statement, parameters = captured[-1]
-    with engine.connect() as connection:
-        plan = "\n".join(
-            row[0]
-            for row in connection.exec_driver_sql(
-                "EXPLAIN " + statement, parameters
-            ).all()
-        )
+    assert len(scan) == 2, [statement for statement, _ in scan]
+
+    def plan_of(statement: str, parameters: object) -> str:
+        with engine.connect() as connection:
+            return "\n".join(
+                row[0]
+                for row in connection.exec_driver_sql(
+                    "EXPLAIN " + statement, parameters
+                ).all()
+            )
+
+    plan = plan_of(*scan[-1])
     assert INDEX in plan, plan
+    # Both presence statements are served by a claimable partial index too.
+    for statement, parameters in [scan[0], *presence]:
+        plan = plan_of(statement, parameters)
+        assert re.search(r"ix_task_commands_claimable_\w+", plan), plan
 
 
 # Each defect is a same-named index the upgrade must drop and rebuild:

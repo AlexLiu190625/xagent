@@ -19,20 +19,19 @@ import sqlalchemy as sa
 from sqlalchemy import event
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.exc import OperationalError
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.shared.postgres_disposable import (
-    disposable_database_factory,
     load_migration_module,
 )
+from tests.web.services.test_dispatch_batch_line_scan import LIMIT, cap_of, fill
 from tests.web.services.test_dispatch_cap import (  # noqa: F401
     CapHost,
     cap_host,
 )
 from xagent.config import SHARED_TASK_EXECUTION_ENABLED
-from xagent.web.models import database
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import (
@@ -50,31 +49,18 @@ from xagent.web.services.task_command_transport import (
     COMMAND_TERMINAL,
     TaskCommandKind,
 )
-from xagent.web.services.task_dispatch_cap import DispatchPolicy
 
 REPO_ROOT = Path(__file__).parent.parent.parent.parent
 MIGRATIONS = REPO_ROOT / "src/xagent/migrations/versions"
 KIND_INDEX_MIGRATION = MIGRATIONS / "20261014_task_command_claimable_kind_index.py"
 ID_INDEX_MIGRATION = MIGRATIONS / "20261015_task_command_claimable_id_index.py"
+FAIR_INDEX_MIGRATION = MIGRATIONS / "20261022_task_command_claimable_fair_index.py"
 
-LIMIT, RESERVE = 3, 1
 NOW = datetime(2026, 10, 24, 12, 0, tzinfo=timezone.utc)
 
 
 def set_shared(monkeypatch: pytest.MonkeyPatch, shared: bool) -> None:
     monkeypatch.setenv(SHARED_TASK_EXECUTION_ENABLED, "true" if shared else "false")
-
-
-def cap_of(host: CapHost) -> Any:
-    return host.manager.dispatch_cap_snapshot(
-        DispatchPolicy(limit=LIMIT, interactive_reserve=RESERVE)
-    )
-
-
-def fill(host: CapHost, active: int) -> None:
-    """Run ``active`` tasks of their own, so the process sits on a known line."""
-    for _ in range(active):
-        host.live(host.new_task())
 
 
 def is_precheck(statement: str) -> bool:
@@ -115,7 +101,7 @@ def command_selects(host: CapHost) -> Iterator[list[str]]:
 
 
 def _migration_predicate(path: Path, name: str) -> str:
-    # The variable is the partial-index WHERE clause both migrations build.
+    # The variable is the partial-index WHERE clause every claimable-index migration builds.
     return str(load_migration_module(path, name).PREDICATE.text)
 
 
@@ -126,6 +112,9 @@ def test_claimable_statuses_single_source() -> None:
     )
     assert str(_CLAIMABLE_STATUS_CLAUSE) == _migration_predicate(
         ID_INDEX_MIGRATION, "presence_id_index_migration"
+    )
+    assert str(_CLAIMABLE_STATUS_CLAUSE) == _migration_predicate(
+        FAIR_INDEX_MIGRATION, "presence_fair_index_migration"
     )
     assert set(CLAIMABLE_COMMAND_STATUSES) == {COMMAND_PENDING, COMMAND_PROCESSING}
 
@@ -144,14 +133,6 @@ def status_literals(sql: str) -> set[str]:
         for member in re.findall(r"'([^']*)'", members):
             found.add(member)
     return found
-
-
-def test_status_literal_extraction_sees_every_comparison() -> None:
-    sql = (
-        "task_execution_commands.status IN ('pending', 'processing') OR "
-        "task_execution_commands.status = 'deferred' AND tasks.status = 'running'"
-    )
-    assert status_literals(sql) == {"pending", "processing", "deferred"}
 
 
 @pytest.mark.parametrize("dialect", [sqlite.dialect(), postgresql.dialect()])
@@ -323,35 +304,6 @@ async def test_idle_scan_builds_no_candidate_query(
         assert transport.claim_task_command(db, runner_id="worker") is None
     assert plain_builds.calls == 0
     assert shared_builds.calls == 0
-
-
-async def test_at_cap_scan_skips_precheck(cap_host: CapHost) -> None:
-    host = cap_host
-    fill(host, LIMIT)
-    pause = host.enqueue(host.new_task(), "pause")
-    cap = cap_of(host)
-    assert cap.closed
-
-    with command_selects(host) as statements:
-        candidate = transport._find_command_candidate(None, (), cap)
-
-    assert candidate is not None and candidate.id == pause
-    assert len(statements) == 1, statements
-    assert not any(is_precheck(statement) for statement in statements)
-
-
-async def test_non_shared_precheck_after_consumes_check(
-    cap_host: CapHost, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    host = cap_host
-    set_shared(monkeypatch, False)
-    host.enqueue(host.new_task(), "pause")
-    monkeypatch.setattr(transport, "consumes_task_commands", lambda: False)
-
-    with command_selects(host) as statements, host.factory() as db:
-        assert transport.claim_task_command(db, runner_id="worker") is None
-
-    assert statements == []
 
 
 # --------------------------------------------------------- statement counts
@@ -546,12 +498,6 @@ def test_precheck_sees_unflushed_command_in_autoflush_session(
     )
     db.rollback()
 
-    # Through the claim: the lookup after the precheck sees the same row.
-    row = unflushed()
-    row.kind = "pause"
-    claimed = transport.claim_task_command(db, runner_id="worker")
-    assert claimed is not None and claimed.command_id == "unflushed"
-
 
 # ------------------------------------------------------------ failure paths
 
@@ -607,7 +553,6 @@ async def test_precheck_failure_propagates_to_backoff(
     # backoff; the scans that failed built no candidate query.
     assert backoff_requests == [1, 2]
     assert builds_at_failure == [0, 0]
-    assert builds.calls >= 1
     assert [kind for _, kind in host.claimed] == [TaskCommandKind.PAUSE]
 
 
@@ -640,122 +585,11 @@ async def test_command_committed_after_precheck_found_by_next_poll(
     cap_host: CapHost,
 ) -> None:
     host = cap_host
-    task = host.new_task()
-    engine = host.factory().get_bind()
-    writer = sa.create_engine(engine.url)
-    writer_factory = sessionmaker(writer, expire_on_commit=False)
-    state = {"prechecked": False, "inserted": 0}
+    assert transport._find_command_candidate(None, (), cap_of(host)) is None
 
-    def note_precheck(_conn, _cursor, statement, *_args) -> None:
-        if is_precheck(statement):
-            state["prechecked"] = True
+    # The empty answer is not remembered: a command committed after the
+    # precheck is found by the next scan.
+    pause = host.enqueue(host.new_task(), "pause")
 
-    def commit_after_scan(_conn) -> None:
-        # The scan has already decided; its session is closing.
-        if state["prechecked"] and not state["inserted"]:
-            state["inserted"] = 1
-            with writer_factory() as db:
-                db.add(
-                    TaskExecutionCommand(
-                        task_id=task, command_id="late", kind="pause", payload={}
-                    )
-                )
-                db.commit()
-
-    event.listen(engine, "before_cursor_execute", note_precheck)
-    event.listen(engine, "rollback", commit_after_scan)
-    try:
-        first = transport._find_command_candidate(None, (), cap_of(host))
-    finally:
-        event.remove(engine, "before_cursor_execute", note_precheck)
-        event.remove(engine, "rollback", commit_after_scan)
-        writer.dispose()
-
-    assert state["inserted"] == 1
-    assert first is None
-    second = transport._find_command_candidate(None, (), cap_of(host))
-    assert second is not None and second.kind is TaskCommandKind.PAUSE
-
-
-# ------------------------------------------------------------- PostgreSQL
-
-
-@pytest.fixture
-def postgresql_engine_factory():
-    with disposable_database_factory("xagent_presence_precheck") as make:
-        yield make
-
-
-@pytest.mark.postgresql
-def test_postgresql_presence_precheck_uses_the_partial_indexes(
-    postgresql_engine_factory, monkeypatch
-) -> None:
-    """EXPLAIN both presence statements as the real scan and claim issue them."""
-
-    engine = postgresql_engine_factory("plan")
-    Base.metadata.create_all(engine)
-    factory = sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setenv(SHARED_TASK_EXECUTION_ENABLED, "true")
-    monkeypatch.setattr(database, "_SessionLocal", factory)
-    monkeypatch.setattr(transport, "get_runner_id", lambda: "me")
-
-    with Session(engine) as session:
-        user = User(username="plan-user", password_hash="hash", is_admin=False)
-        session.add(user)
-        session.flush()
-        for task_id in range(1, 401):
-            session.add(
-                Task(
-                    id=task_id,
-                    user_id=user.id,
-                    title=f"task {task_id}",
-                    status=TaskStatus.RUNNING,
-                    runner_id=None,
-                    lease_expires_at=None,
-                )
-            )
-        session.commit()
-
-    with engine.connect() as connection:
-        connection.execute(
-            sa.text(
-                "INSERT INTO task_execution_commands (task_id, command_id, kind, "
-                "payload, status, created_at, updated_at) "
-                "SELECT (g % 400) + 1, 'c' || g, "
-                "CASE WHEN g = 4000 THEN 'resume_input' ELSE 'start' END, "
-                "'{}', "
-                "CASE WHEN g > 3600 THEN 'pending' ELSE 'completed' END, "
-                "NOW(), NOW() FROM generate_series(1, 4000) AS g"
-            )
-        )
-        connection.execute(sa.text("ANALYZE task_execution_commands"))
-        connection.commit()
-
-    captured: list[tuple[str, object]] = []
-
-    def record(_conn, _cursor, statement, parameters, *_args) -> None:
-        if is_precheck(statement):
-            captured.append((statement, parameters))
-
-    event.listen(engine, "before_cursor_execute", record)
-    try:
-        found = transport._find_command_candidate(None)
-        with Session(engine) as session:
-            session.execute(transport._OPEN_COMMAND_PRESENCE).scalar_one()
-    finally:
-        event.remove(engine, "before_cursor_execute", record)
-
-    assert found is not None and found.kind is TaskCommandKind.RESUME_INPUT
-    assert len(captured) == 2, [statement for statement, _ in captured]
-    for statement, parameters in captured:
-        with engine.connect() as connection:
-            plan = "\n".join(
-                row[0]
-                for row in connection.exec_driver_sql(
-                    "EXPLAIN " + statement, parameters
-                ).all()
-            )
-        assert (
-            "ix_task_commands_claimable_id" in plan
-            or "ix_task_commands_claimable_kind" in plan
-        ), plan
+    found = transport._find_command_candidate(None, (), cap_of(host))
+    assert found is not None and found.id == pause

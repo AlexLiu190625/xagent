@@ -17,8 +17,9 @@ from sqlalchemy.sql import func
 from .database import Base
 
 # Statuses a dispatcher can still claim. The partial indexes below, the
-# dispatcher's presence precheck and its claim condition all take their status
-# set from here, so a precheck cannot miss a command a claim would take.
+# dispatcher's presence precheck and the shared-mode claim condition take their
+# status set from here. The legacy claim arms name their statuses; a test keeps
+# them within this set, so a precheck cannot miss a command a claim would take.
 CLAIMABLE_COMMAND_STATUSES = ("pending", "processing")
 
 # Rows a dispatcher can still claim. Settled commands leave the partial index,
