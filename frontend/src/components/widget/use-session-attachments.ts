@@ -11,6 +11,7 @@ import {
   type ClientErrorCode,
 } from "@/lib/client-errors"
 import {
+  capabilityRefusal,
   uploadWidgetSessionFile,
   type SessionUploadedFile,
 } from "@/lib/widget-session-upload"
@@ -223,14 +224,12 @@ export function useSessionAttachments({
     limits: SessionAttachmentsConfig | undefined,
   ) => {
     if (!limits) throw userFacingError(t("widgetSession.attachments.notAvailable"))
-    const allowedExtensions = limits.accept.split(",")
     for (const file of files) {
-      const dot = file.name.lastIndexOf(".")
-      const extension = dot >= 0 ? file.name.slice(dot).toLowerCase() : ""
-      if (!allowedExtensions.includes(extension)) {
+      const refusal = capabilityRefusal(file, limits)
+      if (refusal === "type") {
         throw userFacingError(t("widgetSession.attachments.typeNotSupported"))
       }
-      if (file.size > limits.maxFileBytes) {
+      if (refusal === "size") {
         throw userFacingError(t(clientErrorTranslationKey("upload_too_large")), "upload_too_large")
       }
     }

@@ -14,6 +14,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { apiRequest, classifyUploadError, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper";
 import { clientErrorTranslationKey, readClientErrorCode } from "@/lib/client-errors";
 import { normalizeUploadFileIds } from "@/lib/upload-file-ids";
+import { capabilityRefusal } from "@/lib/widget-session-upload";
 import { sanitizeFilesDisabledPresentationText } from "@/lib/files-disabled-presentation";
 import { isPausableTaskStatus, isStoppedTaskStatus, normalizeTaskStatus, type TaskStatus } from "@/lib/task-status";
 import { useFileMention, FileItem } from "@/hooks/use-file-mention";
@@ -526,16 +527,12 @@ export function ChatInput({
     newFiles: File[],
     limits: SessionAttachmentsConfig,
   ): File[] => {
-    const allowedExtensions = limits.accept.split(",");
     const admitted: File[] = [];
     const refused = new Set<"type" | "size" | "count">();
     for (const file of newFiles) {
-      const dot = file.name.lastIndexOf(".");
-      const extension = dot >= 0 ? file.name.slice(dot).toLowerCase() : "";
-      if (!allowedExtensions.includes(extension)) {
-        refused.add("type");
-      } else if (file.size > limits.maxFileBytes) {
-        refused.add("size");
+      const refusal = capabilityRefusal(file, limits);
+      if (refusal) {
+        refused.add(refusal);
       } else if (filesRef.current.length + admitted.length >= limits.maxFiles) {
         refused.add("count");
       } else {
