@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, cast
 
-from sqlalchemy import func, text, update
+from sqlalchemy import func, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
@@ -46,7 +46,10 @@ from ...web.models.task import Task, TaskStatus
 from ...web.models.task import TraceEvent as DatabaseTraceEvent
 from ...web.models.task_interaction import TaskInteractionRequest
 from ...web.services.db_runtime import drain_async_task_cancellation_safe
-from ...web.services.db_write_retry import is_retryable_database_error
+from ...web.services.db_write_retry import (
+    bound_rerun_lock_wait_no_commit,
+    is_retryable_database_error,
+)
 from ...web.services.interaction_rollout import (
     COUNTER_CHECKPOINT_READ_PARTITION_WIDENED,
     increment_counter,
@@ -121,12 +124,6 @@ class CommitState:
     start_event_id: str | None = None
     # 1 for the first attempt; set by commit_event before each attempt.
     attempt: int = 0
-
-
-# A rerun's first statement waits for the task row lock. After a dropped
-# connection the server may still hold it in an abandoned transaction, so a
-# rerun waits a bounded time and then fails as a retryable lock timeout.
-_RERUN_LOCK_TIMEOUT = "5s"
 
 
 def _retryable_commit_failure(
@@ -1125,15 +1122,8 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 )
                 from .task_execution_event_writer import append_fact_no_commit
 
-                if (
-                    commit_state is not None
-                    and commit_state.attempt > 1
-                    and db.get_bind().dialect.name == "postgresql"
-                ):
-                    db.execute(
-                        text("SELECT set_config('lock_timeout', :lock, true)"),
-                        {"lock": _RERUN_LOCK_TIMEOUT},
-                    )
+                if commit_state is not None and commit_state.attempt > 1:
+                    bound_rerun_lock_wait_no_commit(db)
                 lock_task_execution_events_no_commit(db, self.task_id)
                 lease = current_task_lease()
                 if lease is not None:

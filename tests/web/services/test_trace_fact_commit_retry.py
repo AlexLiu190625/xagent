@@ -635,13 +635,13 @@ async def test_rerun_waits_a_bounded_time_for_the_task_lock(
 ):
     if engine.dialect.name != "postgresql":
         pytest.skip("lock_timeout is a PostgreSQL setting")
-    from xagent.web.services import trace_handlers
+    from xagent.web.services import db_write_retry
     from xagent.web.services.task_execution_event_store import (
         lock_task_execution_events_no_commit,
     )
 
     factory, task_id = canonical
-    monkeypatch.setattr(trace_handlers, "_RERUN_LOCK_TIMEOUT", "200ms")
+    monkeypatch.setattr(db_write_retry, "_RERUN_LOCK_TIMEOUT", "200ms")
     holder = factory()
 
     def abandon_lock():

@@ -20,6 +20,9 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Iterator, TypeVar
 
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
 from ...config import (
     get_db_write_retry_attempts,
     get_db_write_retry_base_delay_ms,
@@ -37,6 +40,10 @@ _QUERY_CANCELED_SQLSTATE = "57014"
 # SQLite reports BUSY only after waiting out its busy timeout, so a retry
 # already costs a full timeout; one is enough.
 _SQLITE_MAX_ATTEMPTS = 2
+# A rerun's first statement waits for the task row lock. After a dropped
+# connection the server may still hold it in an abandoned transaction, so a
+# rerun waits a bounded time and then fails as a retryable lock timeout.
+_RERUN_LOCK_TIMEOUT = "5s"
 
 
 def _cause_links(error: BaseException) -> Iterator[BaseException]:
@@ -88,6 +95,20 @@ def _is_sqlite_error(error: BaseException) -> bool:
         or isinstance(getattr(link, "orig", None), sqlite3.Error)
         for link in _cause_links(error)
     )
+
+
+def bound_rerun_lock_wait_no_commit(db: Session) -> None:
+    """Bound how long a rerun's transaction waits for a row lock.
+
+    Call it first in the transaction of every attempt after the first. Only
+    PostgreSQL needs it; its lock timeout (55P03) is retryable. The first
+    attempt keeps its unbounded wait, which a long legitimate holder may need.
+    """
+    if db.get_bind().dialect.name == "postgresql":
+        db.execute(
+            text("SELECT set_config('lock_timeout', :lock, true)"),
+            {"lock": _RERUN_LOCK_TIMEOUT},
+        )
 
 
 @dataclass(frozen=True)
