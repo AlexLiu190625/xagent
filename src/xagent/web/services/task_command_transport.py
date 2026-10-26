@@ -1922,9 +1922,9 @@ def _fair_share_enabled() -> bool:
 # (tenant key, class) that has none is not asked again for FAIR_SHARE_SKIP_SECONDS,
 # and of every FAIR_SHARE_FALLBACK_EVERY new slots that counted attempts open, one
 # is opened by a fallback round, which reads the queue as it always did, so a command
-# that only the full scan can reach is not left behind forever. The attempts that
-# scan together share one decision, so the share holds however many slots one wake-up
-# frees.
+# that only the full scan can reach is not left behind forever. A fallback round that
+# opens a slot takes FAIR_SHARE_FALLBACK_EVERY - 1 off the balance the fair rounds add
+# to, so the share holds however many slots one wake-up frees.
 FAIR_SHARE_WINDOW = 16
 FAIR_SHARE_TENANTS_PER_SCAN = 4
 FAIR_SHARE_SKIP_SECONDS = 2.0
@@ -2137,8 +2137,9 @@ class _FairState:
     def __init__(self) -> None:
         # The fallback rounds' balance: each new slot a counted fair round opens
         # adds one, each new slot a fallback round opens takes off
-        # FAIR_SHARE_FALLBACK_EVERY - 1. A scan is a fallback round when the
-        # balance has reached FAIR_SHARE_FALLBACK_EVERY - 1. It can be negative.
+        # FAIR_SHARE_FALLBACK_EVERY - 1. An attempt whose first scan has room is a
+        # fallback round when the balance has reached FAIR_SHARE_FALLBACK_EVERY - 1.
+        # It can be negative.
         self.since_fallback = 0
         # Until when (``_fair_clock``) a (tenant key, dispatch class) is not asked.
         self.skips: dict[tuple[str, str], float] = {}
@@ -2188,11 +2189,13 @@ def _fair_count_reservation(
     """Move the fallback balance for the new slot a counted attempt is about to use.
 
     Called on the event loop once the attempt holds its token and the task's
-    ownership check has passed, so a refused, released or failed attempt never
-    counts. A token that joined a task already holding a slot opened none and
-    does not count. A fallback round that opens a slot takes
-    FAIR_SHARE_FALLBACK_EVERY - 1 off the balance, any other round adds one; the
-    lock is held for the memory update only.
+    ownership check has passed. An attempt whose slot is refused or released, or
+    whose ownership check raises, never counts; once it gets this far it has used
+    the slot and counts even if applying the command then fails. A token that
+    joined a task already holding a slot opened none and does not count. A
+    fallback round that opens a slot takes FAIR_SHARE_FALLBACK_EVERY - 1 off the
+    balance, any other round adds one; the lock is held for the memory update
+    only.
     """
     if not (attempt.counted and reservation.opened):
         return

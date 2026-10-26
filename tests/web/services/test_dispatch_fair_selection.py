@@ -365,9 +365,7 @@ def slot(*, opened=True):
     return SimpleNamespace(opened=opened)
 
 
-def test_a_scan_only_reads_the_fallback_balance_and_a_new_slot_moves_it(
-    world, on, clock
-):
+def test_a_scan_only_reads_the_fallback_balance(world, on, clock):
     for _ in range(16):
         world.add("a", pinned=True)
     oldest_claimable = world.add("a")
@@ -375,7 +373,6 @@ def test_a_scan_only_reads_the_fallback_balance_and_a_new_slot_moves_it(
     for _ in range(19):
         world.add("b")
     cap = cap_of(occupancy={"b": 5})
-    closed = cap_of(active=range(100, 140))
     state = transport._fair_state
 
     # Scanning moves nothing, whatever the balance: an attempt is a fair round
@@ -384,14 +381,6 @@ def test_a_scan_only_reads_the_fallback_balance_and_a_new_slot_moves_it(
         one = attempt()
         assert scan(cap, attempt=one) == first_b
         assert one.counted and not one.fallback
-        # Not counted: an explicit id, or a cap with no room.
-        for other in (
-            lambda o: scan(cap, attempt=o, command_db_id=first_b),
-            lambda o: scan(closed, attempt=o),
-        ):
-            skipped = attempt()
-            other(skipped)
-            assert not skipped.counted
     assert state.since_fallback == 0
     state.since_fallback = EVERY - 1
     for _ in range(20):
@@ -399,14 +388,6 @@ def test_a_scan_only_reads_the_fallback_balance_and_a_new_slot_moves_it(
         assert scan(cap, attempt=one) == oldest_claimable
         assert one.counted and one.fallback
     assert state.since_fallback == EVERY - 1
-
-    # From a fresh balance, the slots the fair rounds open bring the fallback round.
-    state.since_fallback = 0
-    for _ in range(EVERY - 1):
-        one = attempt()
-        assert scan(cap, attempt=one) == first_b
-        transport._fair_count_reservation(one, slot())
-    assert scan(cap, attempt=attempt()) == oldest_claimable
 
 
 def test_attempts_that_decided_a_fallback_together_each_take_their_debt_off(
@@ -711,46 +692,6 @@ def test_with_the_switch_off_a_scan_lists_no_tenant_and_takes_the_oldest(
     assert scan(cap, attempt=attempt()) == ids[1]
 
 
-async def test_the_dispatch_loop_counts_the_slot_once_and_lists_the_queue_once_over_a_rescan(
-    world, on, clock, monkeypatch
-):
-    world.add("a")
-    world.add("b")
-    manager = BackgroundTaskManager()
-    monkeypatch.setattr(task_execution, "background_task_manager", manager)
-    monkeypatch.setattr(transport, "build_dispatch_cap_snapshot", lambda: cap_of())
-    ensured: list[int] = []
-
-    async def ensure(task_id):
-        ensured.append(task_id)
-        if len(ensured) == 1:
-            # A coordinator that still runs a command: the loop sets the task
-            # aside and scans again.
-            return SimpleNamespace(_command_tasks={object()})
-        return SimpleNamespace(
-            _command_tasks=set(),
-            execute_command=AsyncMock(return_value=False),
-            require_recovery=lambda: None,
-        )
-
-    registry = SimpleNamespace(busy_command_tasks=lambda: set(), ensure=ensure)
-    monkeypatch.setattr(runtime, "get_task_coordinator_registry", lambda: registry)
-
-    async def executor(command):
-        raise AssertionError("no command should be applied")
-
-    seen, stop = statements_of(world.engine)
-    try:
-        await transport.dispatch_one_task_command(executor)
-    finally:
-        stop()
-
-    assert transport._fair_state.since_fallback == 1
-    assert sum("GROUP BY" in statement for statement in seen) == 1
-    assert len(ensured) == 2 and ensured[0] != ensured[1]
-    assert not manager._dispatch_reservations
-
-
 @pytest.fixture
 def loop(world, on, monkeypatch):
     """The dispatch loop over a real slot manager and a coordinator that is told what to do."""
@@ -786,82 +727,82 @@ def loop(world, on, monkeypatch):
     return SimpleNamespace(manager=manager, plan=plan, run=run, world=world)
 
 
-def refuse_slots(loop, monkeypatch):
-    monkeypatch.setattr(loop.manager, "reserve_dispatch_slot", lambda *a, **k: None)
+# The steps a row of LOOP_ROWS takes; each gets the loop and monkeypatch, and one
+# that returns a dict gives the arguments of the attempt.
+def add(*args, **kwargs):
+    return lambda loop, mp: setattr(loop, "last", loop.world.add(*args, **kwargs))
 
 
-def ask_for_a_listing(loop, monkeypatch, times):
-    real = loop.manager.reserve_dispatch_slot
-    asked = []
-
-    def reserve(*args, **kwargs):
-        asked.append(1)
-        if len(asked) <= times:
-            raise TenantListingRequired
-        return real(*args, **kwargs)
-
-    monkeypatch.setattr(loop.manager, "reserve_dispatch_slot", reserve)
-
-
-def queue_one(loop, monkeypatch):
-    loop.world.add("a")
-
-
-def queue_one_and_ask_for_a_listing_once(loop, monkeypatch):
-    queue_one(loop, monkeypatch)
-    ask_for_a_listing(loop, monkeypatch, 1)
-
-
-def queue_one_and_ask_for_a_listing_twice(loop, monkeypatch):
-    queue_one(loop, monkeypatch)
-    ask_for_a_listing(loop, monkeypatch, 2)
-
-
-def queue_one_and_refuse_its_slot(loop, monkeypatch):
-    queue_one(loop, monkeypatch)
-    refuse_slots(loop, monkeypatch)
-
-
-def queue_nothing(loop, monkeypatch):
-    pass
-
-
-def queue_a_control_command(loop, monkeypatch):
-    loop.world.add("a", kind="pause")
-
-
-def queue_one_and_ask_for_it_by_id(loop, monkeypatch):
-    return {"command_db_id": loop.world.add("a")}
-
-
-def queue_a_follow_up_of_a_task_that_holds_a_slot(loop, monkeypatch):
-    command_id = loop.world.add("a", kind="message")
+def hold_a_slot_for_the_last_task(loop, mp):
     token = loop.manager.reserve_dispatch_slot(
-        loop.world.task_of(command_id), policy=LARGE, interactive=False
+        loop.world.task_of(loop.last), policy=LARGE, interactive=False
     )
     assert token is not None and token.opened
 
 
-# row: (what the world, manager and coordinator do, the balance before, the change
-# in the balance); a row that returns arguments passes them to the attempt.
+def ask_for_the_last_by_id(loop, mp):
+    return {"command_db_id": loop.last}
+
+
+def ask_for_a_listing(times):
+    def step(loop, mp):
+        real = loop.manager.reserve_dispatch_slot
+        asked = []
+
+        def reserve(*args, **kwargs):
+            asked.append(1)
+            if len(asked) <= times:
+                raise TenantListingRequired
+            return real(*args, **kwargs)
+
+        mp.setattr(loop.manager, "reserve_dispatch_slot", reserve)
+
+    return step
+
+
+def refuse_slots(loop, mp):
+    mp.setattr(loop.manager, "reserve_dispatch_slot", lambda *a, **k: None)
+
+
+def keep_the_coordinator_busy_once(loop, mp):
+    loop.plan.busy = 1
+
+
+def switch_off(loop, mp):
+    mp.setenv(SWITCH, "false")
+    mp.setattr(transport, "_fair_share_memo", None)
+
+
+# row: (steps, the balance before, the change in the balance)
 LOOP_ROWS = {
-    "a fair round that opens a slot": (queue_one, 0, 1),
-    "a fallback round that opens a slot": (queue_one, EVERY - 1, -(EVERY - 1)),
+    "a fair round that opens a slot": ([add("a")], 0, 1),
+    "a fallback round that opens a slot": ([add("a")], EVERY - 1, -(EVERY - 1)),
     "a slot opened after one more listing": (
-        queue_one_and_ask_for_a_listing_once,
+        [add("a"), ask_for_a_listing(1)],
         0,
         1,
     ),
-    "a second missing listing": (queue_one_and_ask_for_a_listing_twice, 0, 0),
-    "a refused slot": (queue_one_and_refuse_its_slot, 0, 0),
-    "nothing queued": (queue_nothing, 0, 0),
-    "a control command": (queue_a_control_command, 0, 0),
-    "a command asked for by id": (queue_one_and_ask_for_it_by_id, 0, 0),
+    "a second missing listing": ([add("a"), ask_for_a_listing(2)], 0, 0),
+    "a slot opened after a busy coordinator and a rescan": (
+        [add("a"), add("b"), keep_the_coordinator_busy_once],
+        0,
+        1,
+    ),
+    "a refused slot": ([add("a"), refuse_slots], 0, 0),
+    "nothing queued": ([], 0, 0),
+    "a control command": ([add("a", kind="pause")], 0, 0),
+    "a command asked for by id": ([add("a"), ask_for_the_last_by_id], 0, 0),
     "a follow-up of a task that holds a slot": (
-        queue_a_follow_up_of_a_task_that_holds_a_slot,
+        [add("a", kind="message"), hold_a_slot_for_the_last_task],
         0,
         0,
     ),
+    "a fallback round that picks a task that holds a slot": (
+        [add("a", kind="message"), hold_a_slot_for_the_last_task],
+        EVERY - 1,
+        0,
+    ),
+    "the switch off": ([add("a"), switch_off], 0, 0),
 }
 
 
@@ -869,11 +810,30 @@ LOOP_ROWS = {
 async def test_only_an_attempt_that_opens_a_new_slot_moves_the_fallback_balance(
     row, loop, monkeypatch
 ):
-    prepare, before, change = LOOP_ROWS[row]
-    kwargs = prepare(loop, monkeypatch) or {}
+    steps, before, change = LOOP_ROWS[row]
+    kwargs: dict = {}
+    for step in steps:
+        kwargs.update(step(loop, monkeypatch) or {})
     transport._fair_state.since_fallback = before
 
     assert await loop.run(**kwargs) == change
+
+
+async def test_a_rescan_after_a_busy_coordinator_lists_the_queue_once_and_takes_another_task(
+    loop, world
+):
+    world.add("a")
+    world.add("b")
+    loop.plan.busy = 1
+    seen, stop = statements_of(world.engine)
+    try:
+        await loop.run()
+    finally:
+        stop()
+
+    assert sum("GROUP BY" in statement for statement in seen) == 1
+    assert len(loop.plan.ensured) == 2 and loop.plan.ensured[0] != loop.plan.ensured[1]
+    assert not loop.manager._dispatch_reservations
 
 
 async def test_a_failing_ownership_check_leaves_the_balance_alone(loop):
@@ -885,16 +845,6 @@ async def test_a_failing_ownership_check_leaves_the_balance_alone(loop):
 
     assert transport._fair_state.since_fallback == 0
     assert not loop.manager._dispatch_reservations
-
-
-async def test_with_the_switch_off_the_dispatch_loop_keeps_no_balance(
-    loop, monkeypatch
-):
-    loop.world.add("a")
-    monkeypatch.setenv(SWITCH, "false")
-    monkeypatch.setattr(transport, "_fair_share_memo", None)
-
-    assert await loop.run() == 0
 
 
 class Wakeups:
@@ -911,8 +861,7 @@ class Wakeups:
 
     def __init__(self, world, monkeypatch) -> None:
         self.world = world
-        self.tenant_of_command: dict[int, str] = {}
-        self.tenant_of_task: dict[int, str] = {}
+        self.a_tasks: set[int] = set()
         self.free = 0
         self.held: set[int] = set()
         self.executing: list[int] = []
@@ -930,8 +879,8 @@ class Wakeups:
     def queue(self, tenant, count):
         for _ in range(count):
             command_id = self.world.add(tenant)
-            self.tenant_of_command[command_id] = tenant
-            self.tenant_of_task[self.world.task_of(command_id)] = tenant
+            if tenant == "a":
+                self.a_tasks.add(self.world.task_of(command_id))
 
     # What the dispatch loop asks of the slot manager and the coordinator.
     def reserve_dispatch_slot(self, task_id, **_kwargs):
@@ -971,7 +920,7 @@ class Wakeups:
             ordered = sorted(
                 self.waiting,
                 key=lambda entry: (
-                    entry[0] is None or self.tenant_of_command[entry[0].id] != "a"
+                    entry[0] is None or entry[0].task_id not in self.a_tasks
                 ),
             )
             self.waiting = []
@@ -985,7 +934,7 @@ class Wakeups:
         await asyncio.gather(
             *(transport.dispatch_one_task_command(None) for _ in range(self.ATTEMPTS))
         )
-        self.opened += [self.tenant_of_task[task] for task in self.executing]
+        self.opened += ["a" if task in self.a_tasks else "b" for task in self.executing]
         with self.world.sessions() as db:
             db.execute(
                 sa.update(TaskExecutionCommand)
@@ -1075,6 +1024,7 @@ def test_the_state_is_used_only_under_the_lock_and_no_statement_runs_under_it(
     monkeypatch.setattr(transport, "_fair_state_lock", lock)
     problems: list[str] = []
     fallbacks: list[bool] = []
+    THREADS, ROUNDS = 4, 200
 
     def hook(_conn, _cursor, statement, *_args):
         if lock.held_by_me():
@@ -1084,7 +1034,7 @@ def test_the_state_is_used_only_under_the_lock_and_no_statement_runs_under_it(
 
     def worker():
         try:
-            for _ in range(200):
+            for _ in range(ROUNDS):
                 one = attempt()
                 scan(cap_of(), attempt=one)
                 transport._fair_count_reservation(one, slot())
@@ -1094,7 +1044,7 @@ def test_the_state_is_used_only_under_the_lock_and_no_statement_runs_under_it(
         except BaseException as exc:  # noqa: BLE001
             problems.append(repr(exc))
 
-    threads = [threading.Thread(target=worker) for _ in range(4)]
+    threads = [threading.Thread(target=worker) for _ in range(THREADS)]
     try:
         for thread in threads:
             thread.start()
@@ -1106,9 +1056,10 @@ def test_the_state_is_used_only_under_the_lock_and_no_statement_runs_under_it(
     assert problems == []
     # Every slot counted once: one for a fair round, EVERY - 1 off for a fallback.
     assert sum(fallbacks) > 0
-    assert object.__getattribute__(state, "since_fallback") == (
-        800 - EVERY * sum(fallbacks)
-    )
+    balance = object.__getattribute__(state, "since_fallback")
+    assert balance == THREADS * ROUNDS - EVERY * sum(fallbacks)
+    # The balance stays within what the attempts in flight can move it.
+    assert (EVERY - 1) * (1 - THREADS) <= balance <= EVERY - 2 + THREADS
     assert object.__getattribute__(state, "misses") > 0
 
 
