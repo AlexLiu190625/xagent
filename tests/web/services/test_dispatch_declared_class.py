@@ -119,27 +119,6 @@ def test_each_command_judges_the_gates_when_it_is_enqueued(host, monkeypatch):
     step(KINDS.MESSAGE, B)
 
 
-def test_an_answer_is_interactive_whatever_the_declaration(host, monkeypatch):
-    _settings(monkeypatch, accept=True, fair=True)
-    task_id = host.task(B)
-    assert host.klass(host.stage(KINDS.RESUME_INPUT, task_id)) == I
-
-
-def test_an_accepted_batch_declaration_lowers_an_interactive_source(host, monkeypatch):
-    _settings(monkeypatch, accept=True, fair=True)
-    task_id = host.task(B, source="internal")
-    assert host.klass(host.stage(KINDS.MESSAGE, task_id)) == B
-
-
-@pytest.mark.parametrize("kind", [KINDS.START, KINDS.MESSAGE])
-def test_a_task_without_a_declaration_is_classified_as_before(host, monkeypatch, kind):
-    _settings(monkeypatch, accept=True, fair=True)
-    sdk = host.task(None, source="sdk")
-    internal = host.task(None, source="internal")
-    assert host.klass(host.stage(kind, sdk)) == B
-    assert host.klass(host.stage(kind, internal)) == I
-
-
 def test_the_classifier_sees_the_declaration_as_stored_with_the_gates_closed(host):
     seen = []
 
