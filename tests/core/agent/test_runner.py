@@ -14,8 +14,11 @@ import pytest
 from xagent.core.agent import (
     Agent,
     ContextManager,
+    DAGPattern,
     ExecutionContext,
+    ExecutionPlan,
     PatternRuntime,
+    PlanStep,
     TraceEventCallback,
 )
 from xagent.core.agent import runtime as runtime_module
@@ -31,12 +34,18 @@ from xagent.core.agent.context.execution import (
     TOOL_EVIDENCE_REMOVED_METADATA_KEY,
     tool_evidence_state,
 )
+from xagent.core.agent.context.memory_retrieval import (
+    MEMORY_CONTEXT_METADATA_KEY,
+    MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
+    RETRIEVED_MEMORIES_METADATA_KEY,
+)
 from xagent.core.agent.interruption import InterruptionReason
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
     reset_output_language_to_request_context,
 )
+from xagent.core.agent.pattern.dag import dag as dag_module
 from xagent.core.agent.runner import AgentRunner, UserMessageInjectionOutcome
 from xagent.core.agent.runtime import LLMCallInterrupted
 from xagent.core.model.chat.exceptions import (
@@ -183,6 +192,35 @@ class StatefulPattern:
             "output": self.state["output"],
             "message_count": len(kwargs["context"].messages),
         }
+
+
+class MemoryCheckpointPattern(StatefulPattern):
+    def __init__(self, *, nested_auto: bool = False) -> None:
+        super().__init__()
+        self.nested_auto = nested_auto
+        self.active_step_contexts: dict[str, dict[str, Any]] = {}
+        if nested_auto:
+            del self.active_step_contexts
+        self.dag_state: dict[str, Any] | None = None
+        self.child_system_context: str | None = None
+
+    def load_state(self, state: dict[str, Any]) -> None:
+        super().load_state(state)
+        if self.nested_auto:
+            self.dag_state = state.get("dag_state")
+        else:
+            self.active_step_contexts = dict(state.get("active_step_contexts", {}))
+
+    async def run(self, **kwargs: Any) -> dict[str, Any]:
+        contexts = (
+            (self.dag_state or {}).get("active_step_contexts", {})
+            if self.nested_auto
+            else self.active_step_contexts
+        )
+        child = ExecutionContext.from_dict(contexts["step_1"])
+        self.child_system_context = child._system_context()
+        self.calls.append(kwargs)
+        return {"success": True, "output": "ok"}
 
 
 class InjectingPattern:
@@ -2572,6 +2610,208 @@ async def test_run_resume_stays_silent_when_model_now_has_a_window(
 
     assert result["success"] is True
     assert not any("resumed task" in record.getMessage() for record in caplog.records)
+
+
+def _memory_checkpoint(*, nested_auto: bool = False) -> dict[str, Any]:
+    root = ExecutionContext(
+        execution_id="memory-resume",
+        metadata={
+            MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY: "scope-a",
+            MEMORY_CONTEXT_METADATA_KEY: "SCOPE_A_PRIVATE_NOTE",
+            RETRIEVED_MEMORIES_METADATA_KEY: {
+                "react": [{"content": "SCOPE_A_PRIVATE_NOTE"}]
+            },
+        },
+    )
+    root.add_user_message("Continue")
+    child = root.create_child_context(metadata={"dag_step_id": "step_1"})
+    state: dict[str, Any] = {
+        "output": "restored",
+        "active_step_contexts": {"step_1": child.to_dict()},
+    }
+    if nested_auto:
+        state = {"output": "restored", "dag_state": state}
+    return {
+        "context": root.to_dict(),
+        "pattern_state": state,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("trusted_scope", "expected_scope"),
+    [
+        ("scope-b", "scope-b"),
+        (None, None),
+        (12, None),
+    ],
+)
+async def test_resume_reconciles_root_and_active_dag_memory_before_prompt(
+    tmp_path: Path,
+    trusted_scope: object,
+    expected_scope: str | None,
+) -> None:
+    pattern = MemoryCheckpointPattern()
+    runner = AgentRunner(
+        agent=Agent(name="memory-resume", patterns=[pattern]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    result = await runner.run(
+        task=None,
+        execution_id="memory-resume",
+        checkpoint=_memory_checkpoint(),
+        metadata={MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY: trusted_scope},
+    )
+
+    assert result["success"] is True
+    assert pattern.child_system_context is not None
+    assert "SCOPE_A_PRIVATE_NOTE" not in pattern.child_system_context
+    for metadata in (
+        result["context"].metadata,
+        pattern.active_step_contexts["step_1"]["metadata"],
+    ):
+        assert MEMORY_CONTEXT_METADATA_KEY not in metadata
+        assert RETRIEVED_MEMORIES_METADATA_KEY not in metadata
+        assert metadata.get(MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY) == (
+            expected_scope
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("trusted_scope", "expect_private_memory"),
+    [
+        ("scope-b", False),
+        (None, False),
+        ("scope-a", True),
+    ],
+)
+async def test_resume_reconciles_real_dag_child_before_step_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    trusted_scope: str | None,
+    expect_private_memory: bool,
+) -> None:
+    root = ExecutionContext(
+        execution_id="real-dag-memory-resume",
+        metadata={
+            MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY: "scope-a",
+            MEMORY_CONTEXT_METADATA_KEY: "SCOPE_A_PRIVATE_NOTE",
+            RETRIEVED_MEMORIES_METADATA_KEY: {
+                "react": [{"content": "SCOPE_A_PRIVATE_NOTE"}]
+            },
+        },
+    )
+    root.add_user_message("Continue the waiting step")
+    step = PlanStep(id="step_1", task="Finish the private-memory task")
+    child = root.create_child_context(
+        metadata={"dag_step_id": step.id, "dag_step_name": step.task}
+    )
+    checkpoint_pattern = DAGPattern(lambda **_: None)
+    checkpoint_pattern.status = "waiting_for_user"
+    checkpoint_pattern.plan = ExecutionPlan(steps=[step])
+    step.status = "running"
+    checkpoint_pattern.active_step_ids = [step.id]
+    checkpoint_pattern.active_step_contexts[step.id] = child.to_dict()
+    checkpoint_pattern.active_step_pattern_states[step.id] = {}
+    checkpoint_pattern.planned_user_message_count = 1
+
+    captured_prompts: list[str] = []
+
+    class CapturingReAct:
+        def __init__(self, **_: Any) -> None:
+            self.state: dict[str, Any] = {}
+
+        def seed_memory_input(self, memory_text: str) -> None:
+            del memory_text
+
+        def load_state(self, state: dict[str, Any]) -> None:
+            self.state = dict(state)
+
+        def get_state(self) -> dict[str, Any]:
+            return dict(self.state)
+
+        async def run(self, *, context: ExecutionContext, **_: Any) -> dict[str, Any]:
+            captured_prompts.append(context._system_context())
+            return {"success": False, "status": "waiting_for_user"}
+
+    monkeypatch.setattr(dag_module, "ReActPattern", CapturingReAct)
+    resumed_pattern = DAGPattern(lambda **_: None)
+    runner = AgentRunner(
+        agent=Agent(
+            name="real-dag-memory-resume",
+            patterns=[resumed_pattern],
+            llm=MagicMock(),
+        ),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    result = await runner.run(
+        task=None,
+        execution_id=root.execution_id,
+        checkpoint={
+            "context": root.to_dict(),
+            "pattern_state": checkpoint_pattern.get_state(),
+        },
+        metadata={MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY: trusted_scope},
+    )
+
+    assert result["status"] == "waiting_for_user"
+    assert len(captured_prompts) == 1
+    assert ("SCOPE_A_PRIVATE_NOTE" in captured_prompts[0]) is expect_private_memory
+
+
+@pytest.mark.asyncio
+async def test_resume_preserves_same_scope_and_legacy_host_absence(
+    tmp_path: Path,
+) -> None:
+    for metadata in (
+        {MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY: "scope-a"},
+        {},
+    ):
+        pattern = MemoryCheckpointPattern()
+        runner = AgentRunner(
+            agent=Agent(name="memory-resume", patterns=[pattern]),
+            workspace_manager=FakeWorkspaceManager(tmp_path),
+        )
+        result = await runner.run(
+            task=None,
+            execution_id="memory-resume",
+            checkpoint=_memory_checkpoint(),
+            metadata=metadata,
+        )
+
+        assert result["context"].metadata[MEMORY_CONTEXT_METADATA_KEY] == (
+            "SCOPE_A_PRIVATE_NOTE"
+        )
+        assert "SCOPE_A_PRIVATE_NOTE" in (pattern.child_system_context or "")
+
+
+@pytest.mark.asyncio
+async def test_resume_reconciles_nested_auto_dag_children_before_prompt(
+    tmp_path: Path,
+) -> None:
+    pattern = MemoryCheckpointPattern(nested_auto=True)
+    runner = AgentRunner(
+        agent=Agent(name="memory-resume", patterns=[pattern]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    await runner.run(
+        task=None,
+        execution_id="memory-resume",
+        checkpoint=_memory_checkpoint(nested_auto=True),
+        metadata={MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY: "scope-b"},
+    )
+
+    assert "SCOPE_A_PRIVATE_NOTE" not in (pattern.child_system_context or "")
+    child_metadata = (pattern.dag_state or {})["active_step_contexts"]["step_1"][
+        "metadata"
+    ]
+    assert child_metadata[MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY] == (
+        "scope-b"
+    )
 
 
 @pytest.mark.asyncio

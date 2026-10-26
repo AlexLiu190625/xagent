@@ -32,6 +32,9 @@ from .context.execution import (
     MODEL_CONTEXT_WATERMARK_METADATA_KEY,
     TRANSCRIPT_WATERMARK_METADATA_KEY,
 )
+from .context.memory_retrieval import (
+    MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
+)
 from .trace import Tracer
 from .transcript import normalize_transcript_messages
 
@@ -436,16 +439,41 @@ class AgentService:
         execution. That is what lets a caller treat the swap as atomic with
         respect to the turn it is about to run.
         """
-        self.memory = inert_store
-        # Keep the compatibility shim in step with a freshly built service.
-        self.agent.memory_store = inert_store
-        self.memory_enabled = False
-        self.memory_available = False
+        AgentService.apply_memory_policy(
+            self,
+            memory=inert_store,
+            enabled=False,
+            available=False,
+            availability_reason=availability_reason,
+            execution_metadata=execution_metadata,
+        )
+
+    def apply_memory_policy(
+        self,
+        *,
+        memory: MemoryStore,
+        enabled: bool,
+        available: bool,
+        availability_reason: str | None,
+        execution_metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Atomically publish the current trusted memory policy to the runtime."""
+
+        self.memory = memory
+        self.agent.memory_store = memory
+        self.memory_enabled = enabled
+        self.memory_available = available
         self.memory_availability_reason = availability_reason
-        if execution_metadata:
+        for key in (
+            "memory_available",
+            "memory_availability_reason",
+            MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
+        ):
+            self.execution_metadata.pop(key, None)
+        if execution_metadata is not None:
             self.execution_metadata.update(execution_metadata)
         if self._execution_adapter is not None:
-            self._execution_adapter.config.memory_store = None
+            self._execution_adapter.config.memory_store = memory if enabled else None
             self._execution_adapter.config.execution_metadata = dict(
                 self.execution_metadata
             )

@@ -18,6 +18,9 @@ from ...config import (
     get_external_upload_dirs,
     get_shared_task_execution_enabled,
 )
+from ...core.agent.context.memory_retrieval import (
+    MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
+)
 from ...core.agent.service import AgentService
 from ...core.execution_scope import (
     EXECUTION_SCOPE_NOT_PROVIDED,
@@ -27,6 +30,10 @@ from ...core.execution_scope import (
     get_execution_scope,
     resolve_execution_scope,
     scope_fingerprint,
+)
+from ...core.memory.access_scope import (
+    MemoryAccessScope,
+    bind_memory_access_scope,
 )
 from ...core.memory.base import MemoryStore
 from ...core.memory.in_memory import InMemoryMemoryStore
@@ -109,7 +116,11 @@ from .memory_availability import (
     public_memory_availability_reason,
 )
 from .memory_policy import (
+    MEMORY_POLICY_BINDING_FAILURE_REASON,
+    MEMORY_POLICY_TASK_LOOKUP_FAILURE_REASON,
+    MEMORY_POLICY_TASK_MISSING_REASON,
     MemoryPolicyRequest,
+    memory_retrieval_scope_fingerprint,
     resolve_trusted_memory_policy,
 )
 from .task_execution_context_service import (
@@ -138,11 +149,13 @@ from .task_runtime import (
     registered_task_extensions,
 )
 from .task_setup_snapshot import (
+    MemoryPolicyTaskFields,
     RuntimeUserFields,
     TaskModelOverride,
     TaskOwnerMismatchError,
     TaskSetupSnapshot,
     detach_runtime_user_fields,
+    load_memory_policy_task_fields_sync,
     load_task_setup_snapshot_sync,
 )
 from .task_workspace_cleanup import (
@@ -166,6 +179,7 @@ logger = logging.getLogger(__name__)
 
 # Depth of the per-task recently evicted scope fingerprints used to detect cycles.
 _EVICTED_FINGERPRINT_MEMORY = 4
+_MEMORY_METADATA_INPUT_UNSET = object()
 
 
 def _is_published_agent(agent: Agent) -> bool:
@@ -232,13 +246,21 @@ class AgentServiceMemoryPolicy:
     memory_enabled: bool
     memory_available: bool = True
     memory_availability_reason: str | None = None
+    memory_access_scope: MemoryAccessScope | None = None
 
     @property
     def public_availability_reason(self) -> str | None:
         """The reason as a caller may see it."""
         return public_memory_availability_reason(self.memory_availability_reason)
 
-    def execution_metadata(self) -> dict[str, Any]:
+    def execution_metadata(
+        self,
+        *,
+        ambient_owner_user_id: int | None | object = _MEMORY_METADATA_INPUT_UNSET,
+        ambient_execution_scope: ExecutionScope | None | object = (
+            _MEMORY_METADATA_INPUT_UNSET
+        ),
+    ) -> dict[str, Any]:
         """Caller-safe availability for checkpoints and task trace metadata.
 
         Empty while memory is available, so an ordinary task's trace is
@@ -247,12 +269,35 @@ class AgentServiceMemoryPolicy:
         be folded before persistence. The raw reason remains available on this
         policy object for operator logging only.
         """
-        if self.memory_available:
-            return {}
-        return {
-            MEMORY_AVAILABLE_METADATA_KEY: False,
-            MEMORY_AVAILABILITY_REASON_METADATA_KEY: self.public_availability_reason,
-        }
+        metadata: dict[str, Any] = {}
+        if (
+            ambient_owner_user_id is not _MEMORY_METADATA_INPUT_UNSET
+            and ambient_execution_scope is not _MEMORY_METADATA_INPUT_UNSET
+        ):
+            metadata[MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY] = (
+                memory_retrieval_scope_fingerprint(
+                    enabled=self.memory_enabled and self.memory_available,
+                    access_scope=self.memory_access_scope,
+                    ambient_owner_user_id=cast(
+                        int | None,
+                        ambient_owner_user_id,
+                    ),
+                    ambient_execution_scope=cast(
+                        ExecutionScope | None,
+                        ambient_execution_scope,
+                    ),
+                )
+            )
+        if not self.memory_available:
+            metadata.update(
+                {
+                    MEMORY_AVAILABLE_METADATA_KEY: False,
+                    MEMORY_AVAILABILITY_REASON_METADATA_KEY: (
+                        self.public_availability_reason
+                    ),
+                }
+            )
+        return metadata
 
 
 def _optional_task_int(task: Any, field: str) -> int | None:
@@ -293,7 +338,7 @@ def resolve_agent_service_memory_policy(
         if override is not None and not override.available:
             logger.warning(
                 "Trusted memory policy made persistent memory unavailable (%s)",
-                override.reason,
+                public_memory_availability_reason(override.reason),
             )
         return AgentServiceMemoryPolicy(
             memory=InMemoryMemoryStore(),
@@ -303,7 +348,7 @@ def resolve_agent_service_memory_policy(
         )
 
     try:
-        memory = get_memory_store()
+        memory: MemoryStore = get_memory_store()
     except MemoryUnavailableError as error:
         # Persistent memory is fenced off -- blocked on repair, awaiting a
         # restart, or transiently unavailable. The task still starts; it simply
@@ -320,11 +365,25 @@ def resolve_agent_service_memory_policy(
             memory_availability_reason=error.status.state.value,
         )
 
+    access_scope = override.memory_access_scope if override is not None else None
+    if access_scope is not None:
+        try:
+            memory = bind_memory_access_scope(memory, access_scope)
+        except Exception:
+            logger.warning("Trusted memory access-scope binding failed")
+            return AgentServiceMemoryPolicy(
+                memory=InMemoryMemoryStore(),
+                memory_enabled=False,
+                memory_available=False,
+                memory_availability_reason=MEMORY_POLICY_BINDING_FAILURE_REASON,
+            )
+
     return AgentServiceMemoryPolicy(
         memory=memory,
         memory_enabled=enabled,
         memory_available=True if override is None else override.available,
         memory_availability_reason=None if override is None else override.reason,
+        memory_access_scope=access_scope,
     )
 
 
@@ -1226,6 +1285,22 @@ async def _load_task_setup_snapshot_for_agent(
 
     return await _run_agent_runtime_db_io(
         caller_db, lambda: load_task_setup_snapshot_sync(task_id, task_owner_user_id)
+    )
+
+
+async def _load_memory_policy_task_fields_for_agent(
+    task_id: int,
+    task_owner_user_id: int | None,
+    caller_db: Session | None,
+) -> MemoryPolicyTaskFields | None:
+    """Load the authoritative warm-cache policy projection off the loop."""
+
+    return await _run_agent_runtime_db_io(
+        caller_db,
+        lambda: load_memory_policy_task_fields_sync(
+            task_id,
+            task_owner_user_id,
+        ),
     )
 
 
@@ -3086,7 +3161,10 @@ class AgentServiceManager:
                         memory_enabled=memory_policy.memory_enabled,
                         memory_available=memory_policy.memory_available,
                         memory_availability_reason=memory_policy.public_availability_reason,
-                        execution_metadata=memory_policy.execution_metadata(),
+                        execution_metadata=memory_policy.execution_metadata(
+                            ambient_owner_user_id=runtime_user_id,
+                            ambient_execution_scope=scope,
+                        ),
                         system_prompt=system_prompt,  # Pass agent builder instructions
                         workspace=(
                             tool_config.get_task_runtime_workspace()
@@ -3163,14 +3241,43 @@ class AgentServiceManager:
                 raise
 
         if not rebuilt_this_call:
+            policy_task: Any | None
+            policy_lookup_failure_reason: str | None = None
+            if task_setup_snapshot is not None:
+                policy_task = task_setup_snapshot.task
+                persisted_agent_config = task_setup_snapshot.agent_config
+            else:
+                try:
+                    policy_task = await _load_memory_policy_task_fields_for_agent(
+                        task_id,
+                        runtime_user_id,
+                        db,
+                    )
+                    if policy_task is None:
+                        policy_lookup_failure_reason = MEMORY_POLICY_TASK_MISSING_REASON
+                        persisted_agent_config = None
+                    else:
+                        persisted_agent_config = policy_task.agent_config
+                except TaskOwnerMismatchError:
+                    raise
+                except Exception:
+                    logger.warning(
+                        "Failed to refresh memory eligibility for cached task %s; "
+                        "this turn runs with memory disabled",
+                        task_id,
+                    )
+                    policy_task = None
+                    persisted_agent_config = None
+                    policy_lookup_failure_reason = (
+                        MEMORY_POLICY_TASK_LOOKUP_FAILURE_REASON
+                    )
             await self._reconcile_cached_agent_memory_policy(
                 task_id,
-                task=(
-                    task_setup_snapshot.task
-                    if task_setup_snapshot is not None
-                    else None
-                ),
+                task=policy_task,
                 agent_config=persisted_agent_config,
+                ambient_owner_user_id=runtime_user_id,
+                ambient_execution_scope=scope,
+                lookup_failure_reason=policy_lookup_failure_reason,
             )
 
         self._agent_owner_ids[task_id] = runtime_user_id
@@ -3214,6 +3321,9 @@ class AgentServiceManager:
         *,
         task: Optional[Any],
         agent_config: Optional[Mapping[str, Any]],
+        ambient_owner_user_id: int | None,
+        ambient_execution_scope: ExecutionScope | None,
+        lookup_failure_reason: str | None = None,
     ) -> None:
         """Re-resolve memory policy for a cached AgentService before its turn.
 
@@ -3238,15 +3348,12 @@ class AgentServiceManager:
         path: ``RevocableMemoryStore._live()`` stays lock-free and never
         touches the database.
 
-        Reconciliation is one-directional and atomic with respect to the turn.
-        One-directional, because this path does not carry every input that
-        decided enablement when the service was built -- a preview or an
-        agent-backed task runs with memory off by configuration, not by
-        lifecycle -- so a policy that now reports memory as available never
-        turns memory back on. Atomic, because the policy is resolved first and
-        then applied without awaiting in between, under the per-task build
-        lock: the turn either runs with memory or runs disabled with a
-        recorded reason, never half-reconciled.
+        The minimal task projection passed here contains every field that
+        decides eligibility, so reconciliation is deliberately bidirectional:
+        preview and Agent Builder transitions can disable and later re-enable
+        memory without rebuilding the rest of the runtime.  Resolution awaits
+        first; applying the complete policy does not await and runs under the
+        per-task build lock.
 
         An operation already past its ``_live()`` check completes. That is
         inherent to any revocation boundary -- the check cannot un-issue a
@@ -3255,29 +3362,46 @@ class AgentServiceManager:
         nothing here tries to abort work in flight.
         """
         agent = self._agents.get(task_id)
-        if agent is None or not getattr(agent, "memory_enabled", False):
-            # Already running without memory. Nothing to reconcile, and this
-            # path never re-enables, so there is no reason to read anything.
+        if agent is None:
             return
 
-        policy = await resolve_agent_service_memory_policy_async(
-            task=task,
-            agent_config=agent_config,
+        if lookup_failure_reason is not None:
+            policy = AgentServiceMemoryPolicy(
+                memory=InMemoryMemoryStore(),
+                memory_enabled=False,
+                memory_available=False,
+                memory_availability_reason=lookup_failure_reason,
+            )
+        else:
+            policy = await resolve_agent_service_memory_policy_async(
+                task=task,
+                agent_config=agent_config,
+            )
+        execution_metadata = policy.execution_metadata(
+            ambient_owner_user_id=ambient_owner_user_id,
+            ambient_execution_scope=ambient_execution_scope,
         )
-        if policy.memory_available:
-            return
-
-        agent.revoke_memory(
-            inert_store=policy.memory,
-            availability_reason=policy.public_availability_reason,
-            execution_metadata=policy.execution_metadata(),
-        )
-        logger.warning(
-            "Reconciled cached AgentService for task %s onto an inert memory "
-            "store (%s); this turn runs with memory disabled",
-            task_id,
-            policy.memory_availability_reason,
-        )
+        if not policy.memory_available:
+            agent.revoke_memory(
+                inert_store=policy.memory,
+                availability_reason=policy.public_availability_reason,
+                execution_metadata=execution_metadata,
+            )
+        else:
+            agent.apply_memory_policy(
+                memory=policy.memory,
+                enabled=policy.memory_enabled,
+                available=True,
+                availability_reason=policy.public_availability_reason,
+                execution_metadata=execution_metadata,
+            )
+        if not policy.memory_available:
+            logger.warning(
+                "Reconciled cached AgentService for task %s onto an inert "
+                "memory store (%s); this turn runs with memory disabled",
+                task_id,
+                policy.memory_availability_reason,
+            )
 
     def _sync_connector_runtime_turn(
         self, task_id: int, connector_runtime_turn_id: Optional[str]
@@ -4466,7 +4590,10 @@ class AgentServiceManager:
                     memory_enabled=memory_policy.memory_enabled,
                     memory_available=memory_policy.memory_available,
                     memory_availability_reason=memory_policy.public_availability_reason,
-                    execution_metadata=memory_policy.execution_metadata(),
+                    execution_metadata=memory_policy.execution_metadata(
+                        ambient_owner_user_id=user_id,
+                        ambient_execution_scope=scope,
+                    ),
                     workspace=(
                         tool_config.get_task_runtime_workspace()
                         if tool_config is not None
