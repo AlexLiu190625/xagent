@@ -2,6 +2,7 @@
 
 import json
 import random
+import re
 from datetime import datetime, timezone
 
 import pytest
@@ -411,31 +412,37 @@ def test_the_plan_of_the_older_lookup_among_running_tasks_is_bounded_by_their_co
 
     units = read_units(explain_analyze(flood_table, statement))
 
-    assert any(UNFINISHED_INDEX in unit["indexes"] for unit in units)
+    assert any(
+        UNFINISHED_INDEX in unit["indexes"] and "running_task.id" in unit["conds"]
+        for unit in units
+    )
     assert not any(TASK_ORDER_INDEX in unit["indexes"] for unit in units)
     # An ordered scan that is not keyed by task walks the backlog until it meets a
     # row of a running task; the primary key and the claimable-id index are fine
     # only when they are entered at a given id.
     for unit in units:
         if unit["indexes"] & {ID_INDEX, PRIMARY_KEY_INDEX}:
-            assert "id" in unit["conds"], unit
+            assert re.search(r"\(id = ", unit["conds"]), unit
     assert not [unit for unit in units if unit["type"] == "Seq Scan"]
     # Bound, with R running tasks and U of their unfinished commands older than
-    # the cut-off (R = U = 10 here). Counted tightly: the lookup of each task reads
-    # its first unfinished command (U rows over all tasks at most); the check for an
-    # earlier unfinished command of the same task probes the index once per row a
-    # lookup returns and stops at its first hit (R rows); the outer query reads
-    # the chosen row by id (1 row) and probes once for it (1 row). That is
-    # U + R + 2. One more R is slack for a planner that reads one extra row per
-    # task, so the bound is U + 2R + 2 = 32. A scan of the backlog or of the
-    # settled history reads tens of thousands of rows and fails it either way.
+    # the cut-off (here every running task holds one unfinished command, its
+    # follow-up, so U = R = 10). Rows actually read: each task's lookup reads its
+    # first unfinished command (U rows over R loops); the check for an earlier
+    # unfinished command of the same task finds none before it (0 rows); the
+    # outer query reads the chosen row by id (1 row) and its check finds none
+    # (0 rows). That is U + 1. PostgreSQL reports Actual Rows and Rows Removed by
+    # Filter as per-loop averages rounded to an integer, so multiplied back by
+    # the loops each of the two counts of a node can overstate it by less than
+    # half its loops: under R for each of the two nodes that loop once per task,
+    # nothing for the outer nodes. The bound is U + 1 + 2R = 31. A scan of the
+    # backlog or of the settled history reads tens of thousands of rows.
     running, unfinished = len(RUNNING), len(RUNNING)
-    assert sum(unit["rows"] for unit in units) <= unfinished + 2 * running + 2
+    assert sum(unit["rows"] for unit in units) <= unfinished + 1 + 2 * running
 
 
 @pytest.mark.postgresql
 @pytest.mark.parametrize("shared", ["true", "false"])
-def test_the_plan_of_the_oldest_claimable_lookup_never_reads_a_tasks_history(
+def test_the_same_task_check_of_the_oldest_claimable_lookup_reads_the_unfinished_index(
     flood_table, monkeypatch, shared
 ) -> None:
     monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", shared)
@@ -449,7 +456,9 @@ def test_the_plan_of_the_oldest_claimable_lookup_never_reads_a_tasks_history(
     units = read_units(explain_analyze(flood_table, statement))
 
     # The check that a candidate has no earlier unfinished command of its task
-    # reads the index of unfinished commands, not every settled command of the task.
+    # goes through the index of unfinished commands and not through the index of
+    # every command of the task in order.
+    assert any(UNFINISHED_INDEX in unit["indexes"] for unit in units)
     assert not any(TASK_ORDER_INDEX in unit["indexes"] for unit in units)
 
 

@@ -25,10 +25,11 @@ from .database import Base
 # statuses; a test keeps them within this set, so a precheck cannot miss a
 # command a claim would take.
 #
-# Terminal: statuses a command never leaves. The unfinished-task partial index
-# below takes its status set from here, as every unfinished-command check
-# (``status NOT IN`` the terminal set) does; a test keeps the transport's and
-# the admission code's terminal tuples equal to it.
+# Terminal: statuses of a settled command. A retry may move a failed command
+# back to pending, which puts it back in the unfinished-task partial index
+# below. That index takes its status set from here, as the unfinished-command
+# checks in the transport and admission code (``status NOT IN`` the terminal
+# set) do; a test keeps their terminal tuples equal to it.
 CLAIMABLE_COMMAND_STATUSES = ("pending", "processing")
 TERMINAL_COMMAND_STATUSES = ("completed", "failed")
 
@@ -79,10 +80,11 @@ class TaskExecutionCommand(Base):  # type: ignore
             sqlite_where=_CLAIMABLE_STATUS_CLAUSE,
             postgresql_where=_CLAIMABLE_STATUS_CLAUSE,
         ),
-        # Serves two reads: the oldest unfinished id of one task (the dispatcher's
-        # lookup of what a running task has queued) and the check, in every
+        # Serves three reads: the oldest unfinished id of one task (the dispatcher's
+        # lookup of what a running task has queued), the check, in every
         # claimable query, that a task has no unfinished command before the
-        # candidate.
+        # candidate, and the admission code's check that no earlier command of the
+        # same task is still waiting (``_behind_own_task``).
         Index(
             "ix_task_commands_unfinished_task",
             "task_id",

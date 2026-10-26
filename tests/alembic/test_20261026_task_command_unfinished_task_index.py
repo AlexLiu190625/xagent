@@ -389,6 +389,10 @@ def test_postgresql_upgrade_is_retried_while_a_write_is_uncommitted(
     engine, holder_engine = pg
     migration = _migration(monkeypatch, "unfinished_index_pg_lock", **FAST)
     with engine.connect() as connection:
+        # An upgrade that skipped the retry helper would wait for the writer
+        # until the statement timeout cancels it.
+        connection.execute(text("SET statement_timeout = '10s'"))
+        connection.commit()
         with held_lock(holder_engine, TABLE) as held:
             with counting(engine) as attempts:
                 with pytest.raises(RuntimeError, match=f"could not lock {TABLE}"):

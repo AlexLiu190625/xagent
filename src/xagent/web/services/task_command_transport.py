@@ -2044,8 +2044,8 @@ def _older_of_tasks(
     smallest of those ids is taken, so each task's lookup reads
     ix_task_commands_unfinished_task in id order, and the check that a command
     has no earlier unfinished command of its task reads that index too. The
-    rows read are bounded by the unfinished commands of the running tasks,
-    whatever the length of the backlog or of the settled history.
+    command-index rows each lookup reads are its own task's unfinished
+    commands, whatever the length of the backlog or of the settled history.
     """
     running = aliased(Task, name="running_task")
     oldest_of_task = (
