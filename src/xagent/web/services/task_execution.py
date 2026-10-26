@@ -4851,11 +4851,14 @@ ANY_RESUME_RUN = AnyResumeRun()
 
 
 class DispatchReservation:
-    __slots__ = ("task_id", "released")
+    __slots__ = ("task_id", "released", "opened")
 
-    def __init__(self, task_id: int) -> None:
+    def __init__(self, task_id: int, opened: bool) -> None:
         self.task_id = task_id
         self.released = False
+        # Whether this token made its task enter the active set, that is, took a
+        # new slot rather than joining a task that already held one.
+        self.opened = opened
 
 
 def _running_loop_time() -> float:
@@ -5026,7 +5029,8 @@ class BackgroundTaskManager:
         ``TenantListingRequired`` is raised instead of taking a slot between
         the two lines, so that the caller selects again with the listing.
         Reads the active set and adds the token with no await in between, so
-        concurrent dispatch attempts cannot both take the last slot. Records
+        concurrent dispatch attempts cannot both take the last slot. The token
+        records whether it made the task enter the active set. Records
         ``fairness_key`` for a task that was not yet active; a task already in
         the active set keeps its recorded key. A refusal or a raise leaves no
         trace.
@@ -5043,10 +5047,11 @@ class BackgroundTaskManager:
                 capped = snapshot.capped_tenant(queued_tenants)
                 if capped is not None and fairness_key == capped:
                     return None
-        if fairness_key is not None and task_id not in snapshot.active_ids:
+        opened = task_id not in snapshot.active_ids
+        if fairness_key is not None and opened:
             self._slot_keys[task_id] = fairness_key
         self._dispatch_reservations[task_id] += 1
-        return DispatchReservation(task_id)
+        return DispatchReservation(task_id, opened)
 
     def release_dispatch_slot(self, token: DispatchReservation | None) -> None:
         if token is None or token.released:

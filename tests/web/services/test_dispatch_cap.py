@@ -400,6 +400,17 @@ async def test_one_notify_one_free_slot_admits_exactly_one(
         assert not host.manager._dispatch_reservations
 
 
+async def test_a_token_records_whether_it_made_its_task_active(
+    cap_host: CapHost,
+) -> None:
+    manager = cap_host.manager
+    first = manager.reserve_dispatch_slot(7, policy=policy_of(5), interactive=False)
+    second = manager.reserve_dispatch_slot(7, policy=policy_of(5), interactive=False)
+    other = manager.reserve_dispatch_slot(8, policy=policy_of(5), interactive=False)
+
+    assert (first.opened, second.opened, other.opened) == (True, False, True)
+
+
 async def test_dispatch_reservation_tokens_count_per_attempt(
     cap_host: CapHost,
 ) -> None:
