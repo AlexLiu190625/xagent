@@ -259,6 +259,18 @@ create sibling sandbox containers through the host Docker daemon. Treat this as
 a privileged deployment mode: Docker socket access is effectively host-level
 container control.
 
+When `DOCKER_HOST` points at a restricted Docker socket proxy instead, the
+proxy must permit daemon inspection through `GET /info`. For
+Tecnativa/docker-socket-proxy, set `INFO=1`; readiness fails closed if Xagent
+cannot verify the daemon's security mode.
+
+The backend process itself must run as effective uid 0, and the Docker daemon
+must be rootful with user-namespace remapping disabled. Xagent uses that host
+privilege only to prepare managed writable bind directories for sandbox uid
+1100/gid 1010; rootless Docker/Podman and non-root backend processes are not
+supported by this overlay. Existing deployments must satisfy these conditions
+before upgrading or readiness will fail before traffic is accepted.
+
 Docker sibling mode also resolves sandbox bind mounts on the Docker host. The
 overlay defaults `XAGENT_SANDBOX_HOST_PROJECT_ROOT` to the current project root
 and binds `${XAGENT_HOST_STORAGE_ROOT:-/root/.xagent}` to `/root/.xagent` in
@@ -286,7 +298,21 @@ docker compose \
 
 In Docker sibling mode, `SANDBOX_VOLUMES` sources are host-side paths. Use
 absolute host paths; relative paths and `~` are rejected instead of being
-expanded inside the backend container.
+expanded inside the backend container. A custom writable source must not equal
+or contain the managed uploads source, because that would let sandbox code
+replace an uploads path before the backend's privileged permission grant. This
+check is based on host sources, not guest destinations.
+
+Xagent changes ownership and mode only for the per-user/per-scope directories
+it manages below uploads. It does not change `XAGENT_EXTERNAL_UPLOAD_DIRS` or
+custom `SANDBOX_VOLUMES` sources. Before startup, operators must make every
+writable external source accessible to uid 1100/gid 1010 (normally group 1010,
+group `rwx`, and setgid on directories); otherwise tools fail when they first
+write there.
+
+`SANDBOX_PIDS_LIMIT` defaults to 1024 and accepts enabled values of 64 or more.
+Set it to `0` only on a Docker host without a pids cgroup controller to omit the
+limit; other invalid values fall back to 1024.
 
 Sandbox workspace guest paths are reserved below
 `<XAGENT_UPLOADS_DIR>/user_<id>`. A `SANDBOX_VOLUMES` destination or
@@ -306,8 +332,12 @@ service is running is unsupported.
 > `SANDBOX_ENABLED=true` and `SANDBOX_IMPLEMENTATION=docker` must provide
 > `XAGENT_SANDBOX_NAMESPACE` before upgrading. The Compose overlay below sets
 > it automatically; pip/systemd deployments must set their own stable, unique
-> deployment identifier (see `example.env`). Missing values stop backend
-> startup rather than falling back to unsafe daemon-global ownership.
+> deployment identifier (see `example.env`). The backend must also run with
+> effective uid 0 against a rootful Docker daemon with user-namespace
+> remapping disabled; a Docker socket proxy must permit `GET /info`
+> (`INFO=1` for Tecnativa/docker-socket-proxy). Missing or incompatible
+> settings stop backend startup rather than falling back to unsafe ownership
+> or an unverifiable daemon mode.
 
 The overlay sets `XAGENT_SANDBOX_NAMESPACE` on `backend`, `worker`, and
 `scheduler` from the resolved `${COMPOSE_PROJECT_NAME}`. Docker sibling mode
@@ -473,11 +503,16 @@ image.
 
 Custom `SANDBOX_IMAGE` images must stay runtime-compatible with `docker/Dockerfile.sandbox`. On `PATH` they need `python` and `node` (tool code runs as `python -c ...` and `node -e ...`, see `Sandbox.run_code` in `src/xagent/sandbox/base.py`), `pip` for run-time dependency installs, and `cat`, `rm`, `mkdir`, `/bin/sh` plus a writable `/tmp` for staging and cleanup; the Docker backend additionally needs `tail`, since it replaces the image `CMD` with `tail -f /dev/null`, and the Boxlite backend additionally needs `test`, `cp`, `mv` and a writable `/var/tmp`, which it stages file transfers through because it cannot copy into the tmpfs `/tmp`. `npx` and `uvx` are required only for sandboxed `npx`/`uvx` MCP connections — Xagent no longer installs `uv` dynamically. A custom image that additionally wants the built-in Chrome MCP connector (`chrome-devtools-mcp`) to work once enabled must also provide `stat`, Linux `/proc`, Unix sockets, and a browser resolvable at `/opt/google/chrome/chrome` — otherwise sandboxed calls to that connector fail. A warmed writable npx cache for the exact pinned `chrome-devtools-mcp@` version is not a substitute for the browser; the execution-scoped controller passes its cache path explicitly to the sandbox child.
 
+Both backends execute custom images as uid 1100/gid 1010. Custom images must
+define that identity, provide a writable `/home/sandbox`, and support Python
+user-site installs there; the Docker backend enforces the identity even when
+the image declares another `USER`.
+
 **Build args:**
 
 | Arg | Default | Effect |
 |-----|---------|--------|
-| `INSTALL_CHROME` | `true` | Installs Google Chrome (amd64) or Chromium (arm64), each with `fonts-liberation`/`fonts-noto-cjk` (headless Chrome with no fonts installed renders blank/tofu text, not an error), symlinked to the same `/opt/google/chrome/chrome` resolver path Dockerfile.backend's copy uses, plus a warmed `npx` cache for the built-in Chrome MCP connector — same effect and same reasoning as Dockerfile.backend's identical arg (see the Backend section's table row above); pass `--build-arg INSTALL_CHROME=false` to skip both for deployments that never enable the connector. **Runs as root under `DockerSandboxService`** (which always execs sandboxed commands as root regardless of the image's own `USER` directive), **but not under Boxlite** — this project's other sandbox backend, sharing this same image, execs as the image's declared `sandbox` user by default. The npx cache lives at a fixed `NPM_CONFIG_CACHE=/opt/npm-cache`; it is warmed with `umask 0022` and then owned by the image's uid 1100 sandbox user, so both Docker's root execution and Boxlite's unprivileged execution can reuse it and Boxlite can safely update npm metadata on a cache miss. The execution-scoped Chrome controller passes this cache path explicitly to its sandbox child together with `CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS=1`. The connector's launch config passes `--chrome-arg=--no-sandbox --chrome-arg=--disable-setuid-sandbox --chrome-arg=--disable-dev-shm-usage`, matching (not exceeding) the same root-Chrome exposure Dockerfile.backend already carries. |
+| `INSTALL_CHROME` | `true` | Installs Google Chrome (amd64) or Chromium (arm64), each with `fonts-liberation`/`fonts-noto-cjk` (headless Chrome with no fonts installed renders blank/tofu text, not an error), symlinked to the same `/opt/google/chrome/chrome` resolver path Dockerfile.backend's copy uses, plus a warmed `npx` cache for the built-in Chrome MCP connector — same effect and same reasoning as Dockerfile.backend's identical arg (see the Backend section's table row above); pass `--build-arg INSTALL_CHROME=false` to skip both for deployments that never enable the connector. Both Docker and Boxlite execute the image as its uid 1100/gid 1010 `sandbox` identity. The npx cache lives at a fixed `NPM_CONFIG_CACHE=/opt/npm-cache`; it is owned by that user so either backend can reuse it and safely update npm metadata on a cache miss. The execution-scoped Chrome controller passes this cache path explicitly together with `CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS=1`. Its launch config still passes `--chrome-arg=--no-sandbox --chrome-arg=--disable-setuid-sandbox --chrome-arg=--disable-dev-shm-usage`; the connector remains hidden pending security review. |
 
 ```bash
 docker buildx build \
