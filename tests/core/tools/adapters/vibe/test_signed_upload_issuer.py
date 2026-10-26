@@ -7,8 +7,8 @@ import json
 import logging
 import sys
 import threading
-from collections.abc import Callable
-from contextlib import asynccontextmanager
+from collections.abc import Callable, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -963,33 +963,43 @@ _UPLOAD_CHECKS = (
 )
 
 
-@pytest.mark.parametrize("path", ["replacement", "issuer"])
-async def test_signed_upload_checks_run_once_and_only_in_the_shared_upload(
-    env: _Env, monkeypatch: pytest.MonkeyPatch, path: str
-) -> None:
-    """Each check runs once per upload, called by the shared method alone."""
+@contextmanager
+def _recorded_upload_checks() -> Iterator[list[tuple[str, str]]]:
+    """Record each run of an upload check and the function that ran it.
+
+    The checks are found by their code objects, so a call through another name
+    for the same function is recorded too. The module's own names are read
+    here, after ``env`` has put its fake transport in place, so the recorded
+    transport function is the one the upload would have used.
+    """
+    codes = {
+        getattr(mcp_adapter_module, name).__code__: name for name in _UPLOAD_CHECKS
+    }
     calls: list[tuple[str, str]] = []
 
-    def counting(name: str, original: Callable[..., Any]) -> Callable[..., Any]:
-        def counted(*args: Any, **kwargs: Any) -> Any:
-            calls.append((name, sys._getframe(1).f_code.co_name))
-            return original(*args, **kwargs)
+    def profiler(frame: Any, event: str, _arg: Any) -> None:
+        if event == "call" and frame.f_code in codes:
+            calls.append((codes[frame.f_code], frame.f_back.f_code.co_name))
 
-        return counted
+    sys.setprofile(profiler)
+    try:
+        yield calls
+    finally:
+        sys.setprofile(None)
 
-    # Wrapped after ``env`` has put its fake transport in place, so the
-    # counted function is the one the upload would have used.
-    for name in _UPLOAD_CHECKS:
-        monkeypatch.setattr(
-            mcp_adapter_module, name, counting(name, getattr(mcp_adapter_module, name))
-        )
 
-    if path == "replacement":
-        result = await env.adapter().run_json_async(
-            {FILE_ARGUMENT: f"file:{OUR_FILE_ID}"}
-        )
-    else:
-        result = await _wrapper(env).run_json_async(_args())
+@pytest.mark.parametrize("path", ["replacement", "issuer"])
+async def test_signed_upload_checks_run_once_and_only_in_the_shared_upload(
+    env: _Env, path: str
+) -> None:
+    """Each check runs once per upload, called by the shared method alone."""
+    with _recorded_upload_checks() as calls:
+        if path == "replacement":
+            result = await env.adapter().run_json_async(
+                {FILE_ARGUMENT: f"file:{OUR_FILE_ID}"}
+            )
+        else:
+            result = await _wrapper(env).run_json_async(_args())
 
     assert result["is_error"] is False
     assert len(env.put_requests) == 1
