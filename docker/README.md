@@ -312,7 +312,13 @@ write there.
 
 `SANDBOX_PIDS_LIMIT` defaults to 1024 and accepts enabled values of 64 or more.
 Set it to `0` only on a Docker host without a pids cgroup controller to omit the
-limit; other invalid values fall back to 1024.
+limit; values from 1 through 63 and non-integers fall back to 1024.
+
+Managed user roots are group-traversable but not group-writable; only the task
+`input/`, `output/`, and `temp/` directories are writable by the sandbox
+identity. The Docker sibling overlay starts nginx workers with gid 1010 as
+their primary group so authorized X-Accel delivery can traverse these roots.
+Deployments that replace nginx must provide the same worker-group membership.
 
 Sandbox workspace guest paths are reserved below
 `<XAGENT_UPLOADS_DIR>/user_<id>`. A `SANDBOX_VOLUMES` destination or
@@ -327,6 +333,20 @@ to. Ordinary aliases are supported, but ambiguous spellings such as
 Xagent creates and owns each `<uploads>/user_<id>` directory as a normal
 directory; replacing one with a symlink or changing that topology while the
 service is running is unsupported.
+
+Docker does not filter private, metadata, or host-gateway destinations when
+networking is enabled; enforce public-only Docker egress in the host or network
+firewall.
+
+On first use after upgrading, each pre-existing task workspace is migrated once
+with a descriptor-safe walk: regular files and directories below `input/`,
+`output/`, and `temp/` are reassigned to gid 1010 and receive group permissions
+matching their owner permissions. Symlinks and special files are skipped. A
+regular file with more than one hard link is also skipped so migration cannot
+change a shared inode; replace such a legacy entry with a separately managed
+copy if the sandbox must read it. A private marker prevents repeating this
+potentially expensive task-local walk, and newly registered host-created
+deliverables are repaired individually.
 
 > **Required action on upgrade:** Every existing deployment with
 > `SANDBOX_ENABLED=true` and `SANDBOX_IMPLEMENTATION=docker` must provide
@@ -499,20 +519,21 @@ packages come only from the dedicated `[dependency-groups].sandbox` group in
 root and commit the updated `uv.lock`. `docker/Dockerfile.sandbox` exports the
 group from the lockfile and checks all supported imports during the image build.
 The build stage does not copy `pyproject.toml` or `uv.lock` into the runtime
-image.
+image. The default working directory is `/home/sandbox`; custom images must
+create it and make it writable by uid 1100/gid 1010.
 
-Custom `SANDBOX_IMAGE` images must stay runtime-compatible with `docker/Dockerfile.sandbox`. On `PATH` they need `python` and `node` (tool code runs as `python -c ...` and `node -e ...`, see `Sandbox.run_code` in `src/xagent/sandbox/base.py`), `pip` for run-time dependency installs, and `cat`, `rm`, `mkdir`, `/bin/sh` plus a writable `/tmp` for staging and cleanup; the Docker backend additionally needs `tail`, since it replaces the image `CMD` with `tail -f /dev/null`, and the Boxlite backend additionally needs `test`, `cp`, `mv` and a writable `/var/tmp`, which it stages file transfers through because it cannot copy into the tmpfs `/tmp`. `npx` and `uvx` are required only for sandboxed `npx`/`uvx` MCP connections — Xagent no longer installs `uv` dynamically. A custom image that additionally wants the built-in Chrome MCP connector (`chrome-devtools-mcp`) to work once enabled must also provide `stat`, Linux `/proc`, Unix sockets, and a browser resolvable at `/opt/google/chrome/chrome` — otherwise sandboxed calls to that connector fail. A warmed writable npx cache for the exact pinned `chrome-devtools-mcp@` version is not a substitute for the browser; the execution-scoped controller passes its cache path explicitly to the sandbox child.
+Custom `SANDBOX_IMAGE` images must stay runtime-compatible with `docker/Dockerfile.sandbox` and must provide uid 1100/gid 1010 with writable home/cache locations. On `PATH` they need `python` and `node` (tool code runs as `python -c ...` and `node -e ...`, see `Sandbox.run_code` in `src/xagent/sandbox/base.py`), `pip` for run-time dependency installs, and `cat`, `rm`, `mkdir`, `/bin/sh` plus a writable `/tmp` for staging and cleanup; the Docker backend additionally needs `tail`, since it replaces the image `CMD` with `tail -f /dev/null`, and the Boxlite backend additionally needs `test`, `cp`, `mv` and a writable `/var/tmp`, which it stages file transfers through because it cannot copy into the tmpfs `/tmp`. `npx` and `uvx` are required only for sandboxed `npx`/`uvx` MCP connections — Xagent no longer installs `uv` dynamically. A custom image that additionally wants the built-in Chrome MCP connector (`chrome-devtools-mcp`) to work once enabled must also provide `stat`, Linux `/proc`, Unix sockets, and a browser resolvable at `/opt/google/chrome/chrome` — otherwise sandboxed calls to that connector fail. A warmed writable npx cache for the exact pinned `chrome-devtools-mcp@` version is not a substitute for the browser; the execution-scoped controller passes its cache path explicitly to the sandbox child.
 
-Both backends execute custom images as uid 1100/gid 1010. Custom images must
-define that identity, provide a writable `/home/sandbox`, and support Python
-user-site installs there; the Docker backend enforces the identity even when
-the image declares another `USER`.
+The Docker backend enforces uid 1100/gid 1010 even when a custom image declares
+another `USER`; Boxlite runs the image's user, which must be that `sandbox`
+identity. Custom images must also provide a writable `/home/sandbox` and support
+Python user-site installs there.
 
 **Build args:**
 
 | Arg | Default | Effect |
 |-----|---------|--------|
-| `INSTALL_CHROME` | `true` | Installs Google Chrome (amd64) or Chromium (arm64), each with `fonts-liberation`/`fonts-noto-cjk` (headless Chrome with no fonts installed renders blank/tofu text, not an error), symlinked to the same `/opt/google/chrome/chrome` resolver path Dockerfile.backend's copy uses, plus a warmed `npx` cache for the built-in Chrome MCP connector — same effect and same reasoning as Dockerfile.backend's identical arg (see the Backend section's table row above); pass `--build-arg INSTALL_CHROME=false` to skip both for deployments that never enable the connector. Both Docker and Boxlite execute the image as its uid 1100/gid 1010 `sandbox` identity. The npx cache lives at a fixed `NPM_CONFIG_CACHE=/opt/npm-cache`; it is owned by that user so either backend can reuse it and safely update npm metadata on a cache miss. The execution-scoped Chrome controller passes this cache path explicitly together with `CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS=1`. Its launch config still passes `--chrome-arg=--no-sandbox --chrome-arg=--disable-setuid-sandbox --chrome-arg=--disable-dev-shm-usage`; the connector remains hidden pending security review. |
+| `INSTALL_CHROME` | `true` | Installs Google Chrome (amd64) or Chromium (arm64), each with `fonts-liberation`/`fonts-noto-cjk` (headless Chrome with no fonts installed renders blank/tofu text, not an error), symlinked to the same `/opt/google/chrome/chrome` resolver path Dockerfile.backend's copy uses, plus a warmed `npx` cache for the built-in Chrome MCP connector — same effect and same reasoning as Dockerfile.backend's identical arg (see the Backend section's table row above); pass `--build-arg INSTALL_CHROME=false` to skip both for deployments that never enable the connector. Docker enforces uid 1100/gid 1010; Boxlite runs the image's uid 1100/gid 1010 `sandbox` user. The npx cache lives at a fixed `NPM_CONFIG_CACHE=/opt/npm-cache`; it is owned by that user so either backend can reuse it and safely update npm metadata on a cache miss. The execution-scoped Chrome controller passes this cache path explicitly together with `CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS=1`. Its launch config still passes `--chrome-arg=--no-sandbox --chrome-arg=--disable-setuid-sandbox --chrome-arg=--disable-dev-shm-usage`; the connector remains hidden pending security review. |
 
 ```bash
 docker buildx build \

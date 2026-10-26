@@ -18,14 +18,14 @@ The Python set comes only from the dedicated `sandbox` dependency group in Xagen
 
 ## Isolation
 
-Sandboxing is opt-in: Xagent runs tool calls in the backend process unless `SANDBOX_ENABLED=true`, and falls back to the backend when no sandbox backend is available or a tool cannot be wrapped. What follows applies to work that does reach a sandbox.
+Sandboxing is opt-in: Xagent runs eligible tool calls in the backend process unless `SANDBOX_ENABLED=true`. What follows applies to work that does reach a sandbox.
 
-The isolation comes from how the sandbox is run, not from this image. Xagent's Docker backend applies `no-new-privileges`, CPU and memory limits, and optional network isolation; its Boxlite backend runs the sandbox inside a KVM microVM. See [docker/README.md](https://github.com/xorbitsai/xagent/blob/main/docker/README.md) for the two modes and their trade-offs.
+The isolation comes from how the sandbox is run, not from this image. Xagent's Docker backend applies `no-new-privileges`, drops all Linux capabilities, and enforces CPU, memory, and PID limits. Docker does not itself filter private/metadata destinations when networking is enabled, so deployments using Docker must enforce public-only egress with host or network firewall policy. The backend stamps this policy into sandbox desired-state matching, so an existing sandbox created under a different profile is rebuilt before reuse. See [docker/README.md](https://github.com/xorbitsai/xagent/blob/main/docker/README.md) for deployment details.
 
-The image defines an unprivileged `sandbox` user (uid 1100, gid 1010), and both
-the Docker and Boxlite backends execute sandboxed code as that identity. The
-Docker backend also drops every Linux capability, enables
-`no-new-privileges`, and applies CPU, memory, and process-count limits.
+The image defines an unprivileged `sandbox` user (uid 1100, gid 1010). The
+Docker backend enforces uid 1100/gid 1010, while Boxlite runs the image's
+`sandbox` user. Replacement images must provide that identity, a writable
+`/home/sandbox` working directory, and writable cache directories.
 
 ## Tags
 
