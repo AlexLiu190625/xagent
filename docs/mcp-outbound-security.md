@@ -82,13 +82,9 @@ the connector's storage until the connector removes it. If the connector does
 not list the issuing tool for a user, that user gets no upload tool and the
 host logs a warning that names the connector and the tool.
 
-Two limits follow from the bytes leaving when the file id is requested. An
-approval gate that pauses the tool which takes the file does not hold the upload
-back; a gate decides on the upload tool by its own name. And if the connector
-also accepts its issuing tool through a dispatcher tool (for example
-`call_tool(name="request_upload", ...)`), the model can still reach the issuing
-tool that way and see its reply, because the host does not know the dispatcher's
-shape and does not block it.
+An approval gate that pauses the tool which takes the file does not hold the
+upload back, because the bytes leave when the file id is requested; a gate
+decides on the upload tool by its own name.
 
 One issuing tool cannot be used by both forms, and two issuer entries cannot
 name the same issuing tool.
@@ -101,7 +97,14 @@ remote MCP sessions.
 
 Both forms have the host call the issuing tool itself. At log level DEBUG the
 MCP SDK can log server messages in full, which includes the issuing tool's
-reply and so its signed URL. The default level, INFO, does not.
+reply and so its signed URL. The default level, INFO, does not. And if the
+connector also accepts its issuing tool through a dispatcher tool (for example
+`call_tool(name="request_upload", ...)`), the model can still reach the issuing
+tool that way and see its reply, because the host does not know the
+dispatcher's argument shape and does not block it.
+
+Save an issuer entry only after every instance of the deployment runs this
+version.
 
 Before rolling a deployment back to a version that does not know issuer
 entries, rewrite each issuer entry as a replacement entry. Give it a
