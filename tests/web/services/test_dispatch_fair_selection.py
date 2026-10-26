@@ -561,10 +561,30 @@ def test_the_lookup_among_the_running_tasks_is_sent_only_when_a_task_runs(
             world,
             lambda: scan(cap_of(active=active, occupancy={"A": 1}), attempt=attempt()),
         )
-        return [s for s, _ in seen if "task_execution_commands.task_id IN (" in s]
+        return [s for s, _ in seen if "running_task" in s]
 
     assert of_tasks(()) == []
     assert len(of_tasks({a_task})) == 1
+
+
+@pytest.mark.parametrize(
+    "order", ["first_task_first", "second_task_first"], ids=lambda order: order
+)
+def test_of_follow_ups_of_two_running_tasks_the_older_is_taken(world, on, clock, order):
+    first = world.task_of(world.add("A", status="completed"))
+    second = world.task_of(world.add("A", status="completed"))
+    world.add("A")  # a new task of A: older than B's, but it needs a new slot
+    if order == "first_task_first":
+        older = world.follow_up(first, "A")
+        newer = world.follow_up(second, "A")
+    else:
+        older = world.follow_up(second, "A")
+        newer = world.follow_up(first, "A")
+    assert older < newer
+    world.add("B")
+    cap = cap_of(active={first, second}, occupancy={"A": 2})
+
+    assert scan(cap, attempt=attempt()) == older
 
 
 @pytest.mark.parametrize(
