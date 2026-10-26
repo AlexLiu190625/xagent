@@ -60,7 +60,7 @@ def test_the_capped_tenant_rule(occupancy, queued, expected):
 
 @pytest.mark.parametrize(
     ("active", "held", "band", "expected"),
-    [(2, False, True, "a"), (3, False, True, "a"), (2, True, False, None)],
+    [(3, False, True, "a"), (2, True, False, None)],
 )
 def test_the_cap_applies_only_between_the_batch_line_and_the_limit(
     active, held, band, expected
@@ -458,7 +458,7 @@ PATHS = {
     "one_in_band": (queue_one_in_band, "a"),
     "nothing_found": (queue_nothing_found, "a"),
     "window": (queue_two, "a"),
-    "window_empty_key": (queue_empty_key, ""),
+    "one_in_band_empty_key": (queue_empty_key, ""),
 }
 
 

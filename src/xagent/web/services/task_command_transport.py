@@ -2429,6 +2429,9 @@ def count_claimable_task_commands(db: Session, *, runner_id: str) -> int:
     rechecks capacity under lock. Each of those checks can only turn a
     counted command away, and the cap's swap is one for one per task, so the
     result stays an upper bound on how many commands could be claimed.
+    The tenant cap's prefilter, which leaves out the new work of the tenant the
+    cap holds back between the batch line and the limit, belongs to the dispatch
+    scan only and is not applied here either.
 
     This is not a backlog depth either. Only the first unfinished command of
     each task passes, except that a cancel or pause may pass an earlier
