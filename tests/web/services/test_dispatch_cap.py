@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from collections.abc import Mapping
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -831,6 +832,8 @@ def take_last_slot_after_snapshot(
         policy: DispatchPolicy,
         interactive: bool,
         fairness_key: str | None = None,
+        queued_tenants: Mapping[str, int] | None = None,
+        require_listing: bool = False,
     ) -> Any:
         if not calls:
             calls.append(task_id)
@@ -843,6 +846,8 @@ def take_last_slot_after_snapshot(
             policy=policy,
             interactive=interactive,
             fairness_key=fairness_key,
+            queued_tenants=queued_tenants,
+            require_listing=require_listing,
         )
 
     monkeypatch.setattr(host.manager, "reserve_dispatch_slot", reserve)

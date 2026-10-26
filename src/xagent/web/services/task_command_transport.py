@@ -23,6 +23,7 @@ import re
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, NamedTuple, cast
@@ -72,6 +73,7 @@ from .task_dispatch_cap import (
     EXECUTION_OPENING_KINDS,
     DispatchCapSnapshot,
     DispatchClass,
+    TenantListingRequired,
     build_dispatch_cap_snapshot,
 )
 from .task_execution_host import consumes_task_commands
@@ -2231,6 +2233,9 @@ class CommandCandidate(NamedTuple):
     kind: TaskCommandKind
     interactive: bool
     fairness_key: str
+    # The oldest queued command id of each queued tenant the selection counted,
+    # for the slot decision; None when the selection listed no tenants.
+    queued_tenants: Mapping[str, int] | None = None
 
 
 def _find_command_candidate(
@@ -2413,6 +2418,7 @@ async def dispatch_one_task_command(
     registry = get_task_coordinator_registry()
     skipped_task_ids = set(registry.busy_command_tasks())
     attempt = _new_fair_attempt()
+    listing_rescanned = False
     while True:
         cap = build_dispatch_cap_snapshot()
         candidate = await run_db_io_cancellation_safe(
@@ -2422,25 +2428,40 @@ async def dispatch_one_task_command(
         )
         if candidate is None:
             return False
-        selected_id, task_id, kind, interactive, fairness_key = candidate
+        selected_id, task_id, kind, interactive, fairness_key, queued = candidate
         reservation = None
         if kind.value in EXECUTION_OPENING_KINDS:
-            reservation = background_task_manager.reserve_dispatch_slot(
-                task_id,
-                policy=cap.policy,
-                interactive=interactive,
-                fairness_key=fairness_key,
-            )
+            try:
+                reservation = background_task_manager.reserve_dispatch_slot(
+                    task_id,
+                    policy=cap.policy,
+                    interactive=interactive,
+                    fairness_key=fairness_key,
+                    queued_tenants=queued,
+                    require_listing=attempt is not None and command_db_id is None,
+                )
+            except TenantListingRequired:
+                # The snapshot this candidate was picked under sat below the
+                # batch line, so the selection listed no tenants; the process
+                # is between the lines now and the tenant cap needs the listing.
+                # Nothing was reserved, so select once more under a fresh
+                # snapshot, which lists them. The task is not set aside and the
+                # attempt is not counted again; a second miss ends the attempt.
+                if listing_rescanned:
+                    return False
+                listing_rescanned = True
+                continue
             if reservation is None:
                 # A candidate picked under a snapshot is one this process could
                 # start, so the slot is refused only when the state changed
                 # since: more tasks became active (to the batch line for a batch
-                # command, to the limit for any), or the candidate's task left
-                # the active set. An execution end signals the dispatcher, which
-                # retries then. Releasing another attempt's reservation signals
-                # nothing, so when the slot was held by an attempt that ends
-                # without starting an execution, the retry waits for the idle
-                # interval or the next notify.
+                # command, to the limit for any), the candidate's task left the
+                # active set, or the tenant cap, read from the active set now,
+                # holds the candidate's tenant back. An execution end signals
+                # the dispatcher, which retries then. Releasing another
+                # attempt's reservation signals nothing, so when the slot was
+                # held by an attempt that ends without starting an execution,
+                # the retry waits for the idle interval or the next notify.
                 return False
         try:
             coordinator = await registry.ensure(task_id)

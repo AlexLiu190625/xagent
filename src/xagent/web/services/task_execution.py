@@ -43,7 +43,7 @@ import time
 import uuid
 import weakref
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -105,7 +105,11 @@ from .task_auto_recovery import (
     settlement_interruption_for_failure,
     settlement_interruption_for_result,
 )
-from .task_dispatch_cap import DispatchCapSnapshot, DispatchPolicy
+from .task_dispatch_cap import (
+    DispatchCapSnapshot,
+    DispatchPolicy,
+    TenantListingRequired,
+)
 from .task_events import DeliveryNotifier, publish_task_event
 from .task_execution_event_writer import (
     FactWitness,
@@ -4907,8 +4911,8 @@ class BackgroundTaskManager:
         # the one place that drops entries: a task that has left the active set
         # is removed at the next snapshot. A task that releases its slot and
         # re-enters the active set outside the dispatcher before that snapshot
-        # keeps its old key; that only affects the per-tenant counts of the
-        # diagnostics line.
+        # keeps its old key; that affects the per-tenant counts of the
+        # diagnostics line, the fair-share ranking and the tenant cap.
         self._slot_keys: dict[int, str] = {}
         # Time this process spent at its dispatch cap, for the diagnostics
         # line's ``gate_held_s``. Observed at every cap snapshot and at each
@@ -5007,20 +5011,38 @@ class BackgroundTaskManager:
         policy: DispatchPolicy,
         interactive: bool,
         fairness_key: str | None = None,
+        queued_tenants: Mapping[str, int] | None = None,
+        require_listing: bool = False,
     ) -> DispatchReservation | None:
         """Take a slot for ``task_id`` unless the policy keeps it from this command.
 
         ``interactive`` is the class of the command that wants the slot; a
         batch command is refused from the batch line on, an interactive one
-        only at the limit. Reads the active set and adds the token with no
-        await in between, so concurrent dispatch attempts cannot both take
-        the last slot. Records ``fairness_key`` for a task that was not yet
-        active; a task already in the active set keeps its recorded key.
+        only at the limit. Between the two lines, given ``queued_tenants`` (the
+        oldest queued command id of each queued tenant, as the selection that
+        picked the command listed them), the tenant that holds the most slots
+        here is refused a new slot (``DispatchCapSnapshot.capped_tenant``). When
+        ``require_listing`` is true and no listing came with the command,
+        ``TenantListingRequired`` is raised instead of taking a slot between
+        the two lines, so that the caller selects again with the listing.
+        Reads the active set and adds the token with no await in between, so
+        concurrent dispatch attempts cannot both take the last slot. Records
+        ``fairness_key`` for a task that was not yet active; a task already in
+        the active set keeps its recorded key. A refusal or a raise leaves no
+        trace.
         """
 
         snapshot = self.dispatch_cap_snapshot(policy)
         if not snapshot.admits(task_id, interactive=interactive):
             return None
+        if task_id not in snapshot.active_ids:
+            if queued_tenants is None:
+                if require_listing and snapshot.in_reserve_band:
+                    raise TenantListingRequired
+            else:
+                capped = snapshot.capped_tenant(queued_tenants)
+                if capped is not None and fairness_key == capped:
+                    return None
         if fairness_key is not None and task_id not in snapshot.active_ids:
             self._slot_keys[task_id] = fairness_key
         self._dispatch_reservations[task_id] += 1
