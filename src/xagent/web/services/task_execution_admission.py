@@ -206,7 +206,7 @@ def upstream_dispatch_class(view: TaskClassificationView, kind: str) -> Dispatch
     An answer to a waiting task (a ``resume_input`` command that is not
     background) is always interactive and never looks at the task's
     declaration. Any other command takes the caller's
-    declared class when the task has one and both the acceptance setting and
+    declared class when the task has a valid one and both the acceptance setting and
     fair-share dispatch are on. Without an accepted declaration, a background
     command follows its task source; a source the rule does not recognize keeps
     the interactive class of the task's previous command, and is batch

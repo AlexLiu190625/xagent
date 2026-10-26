@@ -125,7 +125,8 @@ class TaskStartResult:
     run_id: str
     state_version: int
     control_state: str
-    # The class the start command was given; None when no command was queued.
+    # Set only by task creation: the class its start command was given. None for
+    # an append, and for a creation that runs in this process.
     dispatch_class: DispatchClass | None = None
 
 
