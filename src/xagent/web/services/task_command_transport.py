@@ -2125,7 +2125,8 @@ class _FairAttempt:
 
     ``decided`` is set by the first scan, which counts the attempt when it has
     room and fixes whether the attempt is a fallback round; a rescan keeps that
-    decision. ``tenants`` is the listing of the queue, taken by the first scan
+    decision. A scan the presence precheck ends because no command is open
+    never reaches that decision, so it leaves ``decided`` unset. ``tenants`` is the listing of the queue, taken by the first scan
     that ranks and reused by the rescans of the same attempt.
     """
 
@@ -2147,7 +2148,8 @@ def _ranks_tenants(
     A scan for one command, or with no room, reads the queue as it always did
     and is not counted. Otherwise the first scan counts the attempt, and every
     FAIR_SHARE_FALLBACK_EVERY-th counted attempt is a fallback round for all its
-    scans.
+    scans. A scan the presence precheck already ended never calls this, so it is
+    not counted and does not set ``decided``.
     """
     has_room = command_db_id is None and (cap is None or not cap.closed)
     if not attempt.decided:
