@@ -117,6 +117,16 @@ class CreateTaskRequest(BaseModel):
             "validated and applied below the LLM/tool-argument layer."
         ),
     )
+    dispatch_class: Optional[Literal["interactive", "batch"]] = Field(
+        default=None,
+        description=(
+            "Dispatch class to request for this task: 'interactive' or "
+            "'batch'. Omit it or send null to let the server decide. Whether "
+            "the deployment honors the request is its own setting; the "
+            "response's 'dispatch_class' shows the class the start command "
+            "was given."
+        ),
+    )
     timezone: Optional[str] = Field(
         default=None,
         max_length=64,
@@ -287,6 +297,15 @@ class CreateTaskResponse(BaseModel):
     )
     control_state: str = Field(
         ..., description="Detailed control state, such as running or pause_requested."
+    )
+    dispatch_class: Optional[Literal["interactive", "batch"]] = Field(
+        default=None,
+        description=(
+            "Dispatch class the start command was given, which is the "
+            "requested class only when the deployment accepted it. Null when "
+            "the server runs the task in this process rather than through the "
+            "dispatch queue. Later commands on the task are not reported here."
+        ),
     )
 
 

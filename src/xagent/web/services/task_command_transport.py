@@ -562,6 +562,7 @@ def stage_task_command(
             Task.user_id,
             Task.source,
             Task.channel_name,
+            Task.requested_dispatch_class,
             User.id.label("task_owner_row_id"),
             User.actor_subject.label("task_owner_subject"),
         )
@@ -707,6 +708,7 @@ def stage_task_command(
                 owner_user_id=int(snapshot.user_id),
                 background=reserved,
                 previous_dispatch_class=previous_dispatch_class,
+                requested_dispatch_class=snapshot.requested_dispatch_class,
             ),
         )
         changed = False

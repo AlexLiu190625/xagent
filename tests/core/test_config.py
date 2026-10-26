@@ -4191,20 +4191,48 @@ def test_dispatcher_interactive_reserve_env_parsing(
 
 
 @pytest.mark.parametrize(
+    ("const", "env_var", "getter"),
+    [
+        (
+            "DISPATCHER_FAIR_SHARE",
+            "XAGENT_DISPATCHER_FAIR_SHARE",
+            "get_dispatcher_fair_share_enabled",
+        ),
+        (
+            "DISPATCH_ACCEPT_REQUESTED_CLASS",
+            "XAGENT_DISPATCH_ACCEPT_REQUESTED_CLASS",
+            "get_dispatch_accept_requested_class_enabled",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
     ("raw", "expected", "warns"),
     [
         (None, False, False),
         ("true", True, False),
+        ("TRUE", True, False),
+        ("True", True, False),
+        ("1", True, False),
+        ("yes", True, False),
+        ("YES", True, False),
+        ("on", True, False),
+        ("On", True, False),
         ("false", False, False),
+        ("FALSE", False, False),
+        ("0", False, False),
+        ("no", False, False),
+        ("off", False, False),
         # A blank value states nothing, as when a compose file interpolates an
         # unset variable: unlike the numeric settings above, it does not warn.
         ("", False, False),
+        ("   ", False, False),
         ("garbage", False, True),
     ],
 )
-def test_dispatcher_fair_share_env_parsing(monkeypatch, caplog, raw, expected, warns):
-    env_var = config.DISPATCHER_FAIR_SHARE
-    assert env_var == "XAGENT_DISPATCHER_FAIR_SHARE"
+def test_dispatch_switch_env_parsing(
+    monkeypatch, caplog, const, env_var, getter, raw, expected, warns
+):
+    assert getattr(config, const) == env_var
     if raw is None:
         monkeypatch.delenv(env_var, raising=False)
     else:
@@ -4212,7 +4240,7 @@ def test_dispatcher_fair_share_env_parsing(monkeypatch, caplog, raw, expected, w
 
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="xagent.config"):
-        assert config.get_dispatcher_fair_share_enabled() is expected
+        assert getattr(config, getter)() is expected
 
     warnings = [
         record

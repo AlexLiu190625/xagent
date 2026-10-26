@@ -117,12 +117,42 @@ held-back start waits with it. A command dispatched by its id is not held back.
 The switch accepts `1`,
 `true`, `yes` or `on` and `0`, `false`, `no` or `off`, in any case; unset or
 blank is off. Any other value counts as off and logs a warning in two places:
-where the dispatcher reads it, and where the `dispatch policy` line parses it,
-which happens again whenever the dispatch policy or classifier changes. The value
+where the dispatcher or the classification of a command whose task declared a
+dispatch class reads it (both use one parse per value), and where the
+`dispatch policy` line parses it, which happens again whenever the dispatch
+policy or classifier changes. The value
 in use is logged as `fair_share=` on the process's `dispatch policy` line, at its
 first dispatch snapshot and whenever the value, the policy or the classifier
 changes, so that line tells whether the switch is on; `fair_misses` is 0 both
 when it is off and when it is on with nothing missed.
+
+`POST /v1/chat/tasks` takes an optional `dispatch_class`, `interactive` or
+`batch`, which is stored with the task exactly as sent. `XAGENT_DISPATCH_ACCEPT_REQUESTED_CLASS`
+is off by default, and with it off the stored value never changes the class of
+any command. A command takes the task's declared class only when that setting and
+`XAGENT_DISPATCHER_FAIR_SHARE` are both on. This applies to the start, to appended
+messages, to manual resumes and to automatic resumes; an automatic resume takes
+the declared class before the task source. Answers to a waiting task do not look
+at the declaration and are always interactive, and pause and cancel are not
+classified. The decision is made when each command is enqueued and is then fixed
+on the command, so changing the setting affects only commands enqueued afterwards:
+a task whose declaration starts being accepted gets it on its later commands, and
+one whose declaration stops being accepted goes back to the source rule on its
+next command. The create response reports the class the start command was given
+in `dispatch_class`; it is null when the server runs the task in its own process
+instead of through the dispatch queue, and it does not describe later commands.
+
+Starts, messages and manual resumes are classified in the process that accepts
+the request, and automatic resumes in the process that executes the task, so set
+`XAGENT_DISPATCH_ACCEPT_REQUESTED_CLASS` and `XAGENT_DISPATCHER_FAIR_SHARE` to the
+same values in every process that accepts commands and every process that executes
+them. If they differ, the commands of one task can get different classes. The
+setting is read each time a command whose task has a valid declaration is
+classified. A stored value that is not a valid class is treated as no declaration
+and logged as a warning for each such command; a task with no declaration reads
+neither setting. A deployment classifier installed with `set_command_classifier`
+receives the stored declaration in the task view and decides for itself whether to
+adopt it.
 
 ## Configuration and upgrade
 
