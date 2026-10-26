@@ -46,7 +46,7 @@ _SQLITE_MAX_ATTEMPTS = 2
 _RERUN_LOCK_TIMEOUT = "5s"
 
 
-def _cause_links(error: BaseException) -> Iterator[BaseException]:
+def cause_links(error: BaseException) -> Iterator[BaseException]:
     """Yield ``error`` and its explicit ``__cause__`` chain, cycle-safe."""
     seen: set[int] = set()
     current: BaseException | None = error
@@ -61,6 +61,15 @@ def _sqlstate(link: BaseException) -> str | None:
     if orig is None:
         return None
     return getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+
+
+def database_sqlstate(error: BaseException) -> str | None:
+    """The first SQLSTATE found on ``error`` or any link of its cause chain."""
+    for link in cause_links(error):
+        state = _sqlstate(link)
+        if state:
+            return str(state)
+    return None
 
 
 def is_retryable_database_error(error: BaseException) -> bool:
@@ -84,7 +93,7 @@ def is_retryable_database_error(error: BaseException) -> bool:
     if is_database_pool_timeout(error):
         return False
     return not any(
-        _sqlstate(link) == _QUERY_CANCELED_SQLSTATE for link in _cause_links(error)
+        _sqlstate(link) == _QUERY_CANCELED_SQLSTATE for link in cause_links(error)
     )
 
 
@@ -93,7 +102,7 @@ def _is_sqlite_error(error: BaseException) -> bool:
     return any(
         isinstance(link, sqlite3.Error)
         or isinstance(getattr(link, "orig", None), sqlite3.Error)
-        for link in _cause_links(error)
+        for link in cause_links(error)
     )
 
 

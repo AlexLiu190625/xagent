@@ -117,6 +117,7 @@ from .task_execution_event_writer import (
     stage_result_fact_no_commit,
 )
 from .task_lease_service import (
+    current_task_lease,
     lock_task_lease_for_settlement_no_commit,
     lock_task_lease_no_commit,
     task_lease_attempt_predicate,
@@ -163,6 +164,7 @@ from .db_write_retry import (
     bound_rerun_lock_wait_no_commit,
     retry_db_write_async,
 )
+from .execution_event_signals import report_commit_failure
 from .execution_result_projection import (
     FailedResultPresentation,
     completion_outcome_for_status,
@@ -593,6 +595,9 @@ def _terminal_task_error_payload(
     SessionLocal = get_session_local()
     db = SessionLocal()
     canonical = False
+    # Set once the write has committed or was skipped; a failure after that
+    # (reading the payload to return) did not lose a fact.
+    write_settled = False
     try:
         from .task_execution_event_writer import uses_execution_events
 
@@ -632,6 +637,7 @@ def _terminal_task_error_payload(
         result = db.execute(statement.execution_options(synchronize_session=False))
         if int(getattr(result, "rowcount", 0) or 0) != 1:
             db.rollback()
+            write_settled = True
             current_payload = _task_error_payload(
                 db,
                 task_id,
@@ -679,6 +685,7 @@ def _terminal_task_error_payload(
                 db.refresh(task)
                 stage_result_fact_no_commit(db, task, {"error": message})
             db.commit()
+        write_settled = True
         return _task_error_payload(
             db,
             task_id,
@@ -690,6 +697,14 @@ def _terminal_task_error_payload(
         if canonical:
             from ...core.agent.checkpoint import ExecutionEventPersistenceError
 
+            if not write_settled:
+                report_commit_failure(
+                    "terminal_failure",
+                    exc,
+                    task_id=task_id,
+                    run_id=expected_run_id,
+                    retried=False,
+                )
             raise ExecutionEventPersistenceError(
                 "Terminal failure event commit failed"
             ) from exc
@@ -805,8 +820,6 @@ def _persist_agent_outbound_event(
     db_gen = get_db()
     db = next(db_gen)
     try:
-        from .task_lease_service import current_task_lease
-
         if rerun:
             bound_rerun_lock_wait_no_commit(db)
         lease = current_task_lease()
@@ -1058,7 +1071,18 @@ async def _persist_authoritative_outbound_event(
         )
         return candidate
 
-    persisted = await retry_db_write_async(attempt, site="outbound")
+    try:
+        persisted = await retry_db_write_async(attempt, site="outbound")
+    except Exception as exc:
+        lease = current_task_lease()
+        report_commit_failure(
+            "outbound",
+            exc,
+            task_id=task_id,
+            run_id=lease.run_id if lease is not None else None,
+            retried=attempts > 1,
+        )
+        raise
     event.clear()
     event.update(persisted)
 
