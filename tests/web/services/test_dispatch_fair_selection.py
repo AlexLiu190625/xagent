@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import sqlalchemy as sa
-from sqlalchemy.dialects import postgresql
+from sqlalchemy.dialects import postgresql, sqlite
 
 from tests.web.services.fair_selection_support import (
     QUEUED,
@@ -28,6 +28,7 @@ from xagent import config
 from xagent.web.models import database as database_module
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.services import task_command_transport as transport
 from xagent.web.services import task_coordinator_runtime as runtime
 from xagent.web.services import task_coordinator_service as ownership
@@ -280,6 +281,7 @@ def test_the_window_is_a_range_on_the_key_so_that_the_index_serves_it():
     assert "fairness_key >=" in sql and "fairness_key <=" in sql
     assert "fairness_key =" not in sql
     assert "ORDER BY task_execution_commands.fairness_key, " in sql
+    assert "dispatch_class, task_execution_commands.priority DESC, " in sql
     assert transport.FAIR_SHARE_WINDOW == 16
     assert f"LIMIT {transport.FAIR_SHARE_WINDOW}" in str(
         transport._queued_tenant_window("user:1", "batch").compile(
@@ -829,6 +831,141 @@ def test_a_tenant_whose_commands_all_wait_for_admission_misses_and_is_skipped(
     assert transport.drain_fair_misses() == 1
     _, within_two_seconds = recorded(world, lambda: scan(cap, attempt=attempt()))
     assert windows_asked(within_two_seconds) == ["batch"]
+
+
+# --- priority inside one tenant key and class -----------------------------------
+
+BATCH_CLOSED = cap_of(active=[900], policy=POLICY)
+
+
+def settle(world, command_id):
+    with world.sessions() as db:
+        db.execute(
+            sa.update(TaskExecutionCommand)
+            .where(TaskExecutionCommand.id == command_id)
+            .values(status="completed")
+        )
+        db.commit()
+
+
+# Queued oldest first as (name, class, priority), then the picks, each settled before
+# the next. A second tenant holding more slots puts the first one ahead.
+B0, B5, I0, TOP = ("b0", "b", 0), ("b5", "b", 5), ("i", "i", 0), ("top", "b", 5)
+PRIORITY_CASES = {
+    "higher first": ([B0, B5], ["b5", "b0"], None),
+    "older interactive first": ([I0, B5], ["i", "b5"], None),
+    "interactive between batch": ([B0, I0, B5], ["i", "b5", "b0"], None),
+    "interactive that outranks the oldest one": (
+        [("i0", "i", 0), B0, ("w10", "i", 10)],
+        ["w10", "i0", "b0"],
+        None,
+    ),
+    "newest of twenty": ([("n", "b", 0)] * 19 + [TOP], ["top"], None),
+    "newest of forty": ([("n", "b", 0)] * 39 + [TOP], ["top"], None),
+    "equal priority by id": ([("x", "b", 5), ("y", "b", 5)], ["x", "y"], None),
+    "negative last": ([("low", "b", -3), ("zero", "b", 0)], ["zero", "low"], None),
+    "between batch line and limit": ([B0, I0, B5], ["i"], BATCH_CLOSED),
+}
+
+
+@pytest.mark.parametrize("name", PRIORITY_CASES)
+def test_a_tenant_class_is_read_by_priority_and_the_classes_by_age(
+    world, on, clock, name
+):
+    spec, expected, cap = PRIORITY_CASES[name]
+    ids = {
+        label: world.add("a", "interactive" if kind == "i" else "batch", priority=p)
+        for label, kind, p in spec
+    }
+    world.add("b", "interactive")
+    cap = cap or cap_of()
+    cap = DispatchCapSnapshot(
+        policy=cap.policy, active_ids=cap.active_ids, occupancy={"b": 5}
+    )
+
+    picks = []
+    for _ in expected:
+        chosen = scan(cap, attempt=attempt())
+        picks.append(next(label for label, number in ids.items() if number == chosen))
+        settle(world, chosen)
+
+    assert picks == expected
+
+
+def test_an_interactive_command_that_waits_elsewhere_does_not_hold_back_batch_work(
+    world, on, clock
+):
+    blocked = world.add("a", "interactive", pinned=True)
+    batch = world.add("a", "batch")
+    interactive = world.add("a", "interactive")
+    world.add("b", "interactive")
+    cap = cap_of(occupancy={"b": 5})
+
+    assert blocked < batch < interactive
+    assert scan(cap, attempt=attempt()) == batch
+
+
+def test_one_tenant_alone_is_read_by_age_and_not_by_priority(world, on, clock):
+    oldest = world.add("a", priority=0)
+    world.add("a", priority=5)
+
+    assert scan(cap_of(), attempt=attempt()) == oldest
+
+
+def test_a_window_full_of_commands_that_wait_elsewhere_is_missed_until_the_fallback_round(
+    world, on, clock
+):
+    oldest = world.add("a", priority=0)
+    first = world.add("a", pinned=True, priority=5)
+    for _ in range(15):
+        world.follow_up(world.task_of(first), "a", priority=5)
+    other = world.add("b")
+
+    cap = cap_of()
+    picks = [scan(cap, attempt=attempt()) for _ in range(7)]
+
+    # The sixteen highest-priority commands of a wait for another process, so its
+    # window finds nothing and a is missed; the round that reads the queue as it
+    # always did takes the oldest command, not the highest priority.
+    assert picks == [other] * 7
+    assert transport.drain_fair_misses() == 1
+    assert scan(cap, attempt=attempt()) == oldest
+
+
+def test_a_follow_up_of_a_running_task_is_taken_before_a_higher_priority_command(
+    world, on, clock
+):
+    running = world.add("a", kind="message", priority=-10)
+    world.add("a", priority=5)
+    world.add("b")
+
+    cap = cap_of(active=[world.task_of(running)], occupancy={"a": 1, "b": 5})
+
+    assert scan(cap, attempt=attempt()) == running
+
+
+@pytest.mark.parametrize("dialect", [sqlite.dialect(), postgresql.dialect()])
+def test_the_dispatch_statements_do_not_select_the_priority_columns(world, dialect):
+    with world.sessions() as db:
+        statements = [
+            db.query(TaskExecutionCommand).statement,
+            db.query(Task).statement,
+            transport._dispatcher_candidate_query(
+                db,
+                runner_id="me",
+                command_db_id=None,
+                shared=True,
+                cap=cap_of(),
+                now=datetime.now(timezone.utc),
+            ).statement,
+        ]
+
+    for statement in statements:
+        select_list = str(statement.compile(dialect=dialect)).split(" FROM ")[0]
+        assert (
+            "dispatch_class" in select_list or "requested_dispatch_class" in select_list
+        )
+        assert "priority" not in select_list
 
 
 # --- random worlds against a brute-force reference --------------------------------

@@ -154,6 +154,34 @@ neither setting. A deployment classifier installed with `set_command_classifier`
 receives the stored declaration in the task view and decides for itself whether to
 adopt it.
 
+`POST /v1/chat/tasks` also takes an optional `priority`, an integer from -10 to 10
+(0 when omitted or null; higher goes first). It is stored with the task and copied
+onto the start, appended messages, manual and automatic resumes and answers; pause
+and cancel carry 0. A deployment classifier may return its own priority for a
+command. With `XAGENT_DISPATCHER_FAIR_SHARE` off the value is stored and changes
+nothing. With it on, it takes effect only while the process sees at least two tenant
+keys with queued commands, and it only orders commands of the same tenant key and
+dispatch class: of the sixteen highest-priority queued commands of that pair, the
+highest priority, then the oldest, that can be claimed is taken. When both classes
+of a tenant key have a candidate, the batch candidate is compared by its id and the
+interactive side by the smallest id among the claimable interactive commands of its
+window, so with equal priorities the order is the same as comparing ids. An older
+command that needs no new slot, such as a control command or one of a task already
+running in the process, still goes first, and a class the dispatcher has set aside
+for a while is not asked, so only the other class counts. Answers to waiting tasks
+are still taken first, oldest first. The fallback round, the step that takes an
+older command needing no new slot, a scan with no free slot (a process at its limit
+or on hold), and the path for a single queued tenant key ignore priority. Low-
+priority commands of a tenant key can be starved by a steady stream of higher-
+priority ones from the same key. If the sixteen highest-priority queued commands of
+a tenant key and class all wait for tasks leased by other processes, the tenant
+keeps being missed, even when a lower- priority command of it could run, until a
+fallback round happens to take it: that round takes the oldest claimable command of
+the whole table, which is not necessarily one of this tenant. With an admission hook
+installed, the same happens to a tenant whose command at the head of an admission
+queue has lower priority than the sixteen behind it, so do not enable admission
+together with priorities until admission waiters are ordered by priority.
+
 ## Configuration and upgrade
 
 1. Stop old application processes before upgrading the database. Back up the
