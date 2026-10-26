@@ -571,7 +571,7 @@ def test_with_the_switch_off_a_scan_lists_no_tenant_and_takes_the_oldest(
     assert chosen == ids[0]
     assert not any("RECURSIVE" in statement for statement in seen)
     assert not any("fairness_key >=" in statement for statement in seen)
-    assert transport._fair_state.attempts == 0
+    assert transport._fair_state.since_fallback == 0
     # The same world with the switch on is served differently.
     monkeypatch.setenv(SWITCH, "true")
     monkeypatch.setattr(transport, "_fair_share_memo", None)

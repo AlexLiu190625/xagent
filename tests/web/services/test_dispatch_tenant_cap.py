@@ -361,7 +361,7 @@ async def test_a_reservation_that_finds_the_band_without_a_listing_rescans_once_
     assert set(second[1]["queued_tenants"]) == {"a", "b"}
     assert second[2] is not None
     assert len(found) == 2
-    assert transport._fair_state.attempts == 1
+    assert transport._fair_state.since_fallback == 1
     assert sum("GROUP BY" in statement for statement in seen) == 1
     with world.sessions() as db:
         assert db.get(TaskExecutionCommand, reply).status == "pending"
@@ -468,14 +468,17 @@ def test_every_listed_path_leaves_out_the_capped_tenants_new_work(
 ):
     build, tenant = PATHS[path]
     own, other = build(world)
+    since_fallback = transport.FAIR_SHARE_FALLBACK_EVERY - 1
     if path == "fallback_round":
-        transport._fair_state.attempts = 7
+        transport._fair_state.since_fallback = since_fallback
     held = {tenant: 2, "b": 2 if path == "window" else 1}
     cap = cap_of(active=[900, 901], occupancy=held, policy=BAND)
     nobody = cap_of(active=[900, 901], policy=BAND)
 
     chosen, seen = recorded(world, lambda: scan(cap, attempt=attempt()))
-    transport._fair_state.attempts = 7 if path == "fallback_round" else 0
+    transport._fair_state.since_fallback = (
+        since_fallback if path == "fallback_round" else 0
+    )
     unheld = scan(nobody, attempt=attempt())
 
     assert unheld == own
@@ -495,9 +498,10 @@ def test_a_fallback_round_below_the_batch_line_lists_no_tenant(world, on, clock)
     world.add("a", "interactive")
     world.add("b", "interactive")
     below = cap_of(active=[900], occupancy={"a": 1}, policy=BAND)
-    transport._fair_state.attempts = 7
+    transport._fair_state.since_fallback = transport.FAIR_SHARE_FALLBACK_EVERY - 1
 
     _, fallback = recorded(world, lambda: scan(below, attempt=attempt()))
+    transport._fair_state.since_fallback = 0
     _, ranked = recorded(world, lambda: scan(below, attempt=attempt()))
 
     assert not any("GROUP BY" in s for s, _ in fallback)
