@@ -20,7 +20,7 @@ from xagent.db.config import create_alembic_config
 from xagent.web.models.task import Task
 
 REVISION = "20261026_task_requested_dispatch_class"
-DOWN_REVISION = "20261023_add_mcp_signed_uploads"
+DOWN_REVISION = "20261026_task_cmd_unfinished_idx"
 TABLE = "tasks"
 COLUMN = "requested_dispatch_class"
 ADD_SQL = f"ALTER TABLE {TABLE} ADD COLUMN {COLUMN} VARCHAR(16)"

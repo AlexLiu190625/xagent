@@ -14,7 +14,7 @@ behind it. Dropping the column on downgrade takes the same lock and follows the
 same rules. Stop the task execution processes before running the migration.
 
 Revision ID: 20261026_task_requested_dispatch_class
-Revises: 20261023_add_mcp_signed_uploads
+Revises: 20261026_task_cmd_unfinished_idx
 Create Date: 2026-10-26
 
 """
@@ -30,7 +30,7 @@ from xagent.migrations.ddl_lock_retry import (
 )
 
 revision: str = "20261026_task_requested_dispatch_class"
-down_revision: Union[str, None] = "20261023_add_mcp_signed_uploads"
+down_revision: Union[str, None] = "20261026_task_cmd_unfinished_idx"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
