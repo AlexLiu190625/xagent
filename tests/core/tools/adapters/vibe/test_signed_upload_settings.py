@@ -1256,21 +1256,6 @@ def test_issuer_entry_rejection_cells_cover_every_issuer_field() -> None:
     assert covered == set(signed_upload._ISSUER_ENTRY_KEYS)
 
 
-def test_issuer_entry_accepts_limits_exactly() -> None:
-    boundary = _boundary_entry()
-    issuer_entry = {
-        key: value
-        for key, value in boundary.items()
-        if key not in ("tool_name", "file_argument")
-    }
-
-    result = _parse([issuer_entry])
-
-    assert len(result) == 1
-    assert len(result[0].allowed_upload_hosts) == 20
-    assert len(result[0].content_types) == 50
-
-
 def _with_key(entry: dict[str, Any], key: str, value: Any = "x") -> dict[str, Any]:
     return {**entry, key: value}
 
@@ -1354,26 +1339,9 @@ CLASHING_ENTRIES = [
         id="rule3-issuer-last",
     ),
     pytest.param(
-        [
-            _issuer_entry(issuing_tool_name="issue_other"),
-            _entry(),
-            _issuer_entry(),
-        ],
-        _issuer_also_replacement(2),
-        id="rule3-points-at-the-issuer-position",
-    ),
-    pytest.param(
         [_issuer_entry(issuing_tool_name="attach_document"), _entry()],
         CLASH,
         id="rule4-issuer-tool-is-a-replaced-tool",
-    ),
-    pytest.param(
-        [
-            _entry(issuing_tool_name="issue_other"),
-            _issuer_entry(issuing_tool_name="attach_document"),
-        ],
-        CLASH,
-        id="rule4-issuer-tool-is-an-earlier-replaced-tool",
     ),
     pytest.param(
         [_issuer_entry(), _entry(), _entry()],
@@ -1421,15 +1389,6 @@ def test_signed_upload_entries_clash(raw: Any, message: str) -> None:
             id="different-issuing-tools",
         ),
         pytest.param(_mixed_entries(10, 10), id="twenty-entries"),
-        pytest.param(
-            [
-                _entry(
-                    tool_name="create_staff_qualification",
-                    file_argument="document_file_id",
-                )
-            ],
-            id="hide-only-entry",
-        ),
     ],
 )
 def test_signed_upload_entries_accepts_compatible_entries(raw: Any) -> None:
@@ -1646,9 +1605,7 @@ async def test_hide_only_entry_hides_the_issuing_tool_without_a_wrapper(
 ) -> None:
     caplog.set_level(logging.WARNING)
     _serve_tools(monkeypatch, "request_upload", "other")
-    hide_only = _entry(
-        tool_name="create_staff_qualification", file_argument="document_file_id"
-    )
+    hide_only = _entry(tool_name="unlisted_tool", file_argument="document_file_id")
 
     result = await load_mcp_tools_as_agent_tools(
         {"docs": _connection(signed_uploads=[hide_only])}

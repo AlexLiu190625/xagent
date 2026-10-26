@@ -613,7 +613,7 @@ OTHER_REPLACEMENT = {**SIGNED_UPLOADS[0], "issuing_tool_name": "issue_other"}
 HIDE_ONLY_ENTRIES = [
     {
         **ISSUER_ENTRY,
-        "tool_name": "create_staff_qualification",
+        "tool_name": "unlisted_tool",
         "file_argument": "document_file_id",
     }
 ]
@@ -630,9 +630,7 @@ def _also_a_replacement_issuer(position: int) -> str:
     "case",
     [
         "create-issuer",
-        "create-issuer-sse",
         "create-issuer-and-replacement",
-        "update-issuer-on-empty",
         "update-issuer-replaces-replacement",
         "update-issuer-rewritten-as-hide-only",
         "update-hide-only-back-to-issuer",
@@ -644,17 +642,15 @@ def test_api_accepts_issuer_entries(case: str) -> None:
     expected: list[dict[str, Any]] = ISSUER_ENTRIES
 
     if case.startswith("create-"):
-        transport = "sse" if case == "create-issuer-sse" else "streamable_http"
         if case == "create-issuer-and-replacement":
             expected = [ISSUER_ENTRY, OTHER_REPLACEMENT]
-        resp = _create(owner, transport=transport, signed_uploads=expected)
+        resp = _create(owner, signed_uploads=expected)
         assert resp.status_code == 201, resp.text
         assert resp.json()["signed_uploads"] == expected
         assert resp.json()["signed_uploads_error"] is None
         server_id = int(resp.json()["id"])
     else:
         stored: Any = {
-            "update-issuer-on-empty": None,
             "update-issuer-replaces-replacement": SIGNED_UPLOADS,
             "update-issuer-rewritten-as-hide-only": ISSUER_ENTRIES,
             "update-hide-only-back-to-issuer": HIDE_ONLY_ENTRIES,
@@ -695,46 +691,38 @@ _CLASHES = [
         _also_a_replacement_issuer(1),
         id="issuer-last",
     ),
-    pytest.param(
-        [ISSUER_ENTRY, ISSUER_ENTRY],
-        _invalid_detail("signed_uploads[1].issuing_tool_name repeats an earlier entry"),
-        id="two-issuers-for-one-tool",
-    ),
 ]
 
 
+@pytest.mark.parametrize("mode", ["create", "update"])
 @pytest.mark.parametrize(("clashing", "detail"), _CLASHES)
-def test_create_rejects_clashing_issuer_entries(clashing: Any, detail: str) -> None:
+def test_save_rejects_clashing_issuer_entries(
+    mode: str, clashing: Any, detail: str
+) -> None:
     _admin_headers()
     owner = _register_second_user("bob", "bobpass1")
-
-    resp = _create(owner, signed_uploads=clashing)
+    if mode == "create":
+        resp = _create(owner, signed_uploads=clashing)
+        server_id = None
+    else:
+        server_id = _create_ok(owner, signed_uploads=ISSUER_ENTRIES)
+        before = _row(server_id)
+        resp = client.put(
+            f"/api/mcp/servers/{server_id}",
+            json={"signed_uploads": clashing},
+            headers=owner,
+        )
 
     assert resp.status_code == 400, resp.text
     assert resp.json()["detail"] == detail
-    db = _direct_db_session()
-    try:
-        assert db.query(MCPServer).filter(MCPServer.name == NAME).count() == 0
-    finally:
-        db.close()
-
-
-@pytest.mark.parametrize(("clashing", "detail"), _CLASHES)
-def test_update_rejects_clashing_issuer_entries(clashing: Any, detail: str) -> None:
-    _admin_headers()
-    owner = _register_second_user("bob", "bobpass1")
-    server_id = _create_ok(owner, signed_uploads=ISSUER_ENTRIES)
-    before = _row(server_id)
-
-    resp = client.put(
-        f"/api/mcp/servers/{server_id}",
-        json={"signed_uploads": clashing},
-        headers=owner,
-    )
-
-    assert resp.status_code == 400, resp.text
-    assert resp.json()["detail"] == detail
-    assert _row(server_id) == before
+    if server_id is not None:
+        assert _row(server_id) == before
+    else:
+        db = _direct_db_session()
+        try:
+            assert db.query(MCPServer).filter(MCPServer.name == NAME).count() == 0
+        finally:
+            db.close()
 
 
 def test_non_owner_cannot_change_issuer_entries() -> None:

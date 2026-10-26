@@ -3967,8 +3967,8 @@ class MCPToolAdapter(AbstractBaseTool):
         # never do and are final as they are.
         if "structured_content" not in issued:
             raise _SignedUploadRefused(result=issued)
-        # A refresh after a 401 replaces the connection, and the tool call
-        # below uses the replacement, so it is checked like the first one.
+        # A refresh after a 401 replaces the connection, and the reply came
+        # over the replacement, so it is checked like the first one.
         _check_signed_upload_connection(issuing_connection, target, tool_name)
         if issued.get("is_error"):
             raise _SignedUploadRefused(

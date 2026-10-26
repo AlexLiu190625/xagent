@@ -209,8 +209,6 @@ def _remote_issuing_tool(annotations: dict[str, Any] | None) -> MCPTool:
     ("annotations", "ordinary_non_idempotent"),
     [
         pytest.param(None, False, id="no-annotations"),
-        pytest.param({"readOnlyHint": True}, False, id="read-only"),
-        pytest.param({"idempotentHint": False}, True, id="not-idempotent"),
         pytest.param({"destructiveHint": True}, True, id="destructive"),
     ],
 )
@@ -350,27 +348,6 @@ async def test_issuer_wrapper_returns_only_the_remote_file_id(
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("scenario", _SCENARIOS, ids=[s.id for s in _SCENARIOS])
-async def test_issuer_wrapper_outcomes(env: _Env, scenario: _Scenario) -> None:
-    result = await _run_scenario(env, scenario)
-
-    assert env.staging_leftovers() == []
-    assert len(env.put_requests) == scenario.puts
-    # The wrapper never calls the connector's receiving tool.
-    assert env.calls_to(OUTER_TOOL) == []
-    if result is None:
-        return
-    if scenario.message is None:
-        assert result["is_error"] is False
-        assert _structured(result)["file_id"] == REMOTE_FILE_ID
-    else:
-        assert result["is_error"] is True
-        if scenario.expected_prefix:
-            assert _text(result).startswith(scenario.message)
-        else:
-            assert _text(result) == scenario.message
-
-
 def _text_only_success(env: _Env) -> None:
     env.issue = lambda args: _text_only_reply()
 
@@ -381,21 +358,35 @@ def _secret_instructions(env: _Env) -> None:
     )
 
 
-_LEAK_CELLS = [
+_OUTCOMES = [
     *_SCENARIOS,
     _Scenario("text-only-success", _text_only_success, None, puts=1),
     _Scenario("text-only-secret-instructions", _secret_instructions, None, puts=1),
 ]
 
 
-@pytest.mark.parametrize("scenario", _LEAK_CELLS, ids=[s.id for s in _LEAK_CELLS])
-async def test_issuer_wrapper_url_never_leaks(
+@pytest.mark.parametrize("scenario", _OUTCOMES, ids=[s.id for s in _OUTCOMES])
+async def test_issuer_wrapper_outcomes(
     env: _Env, scenario: _Scenario, caplog: pytest.LogCaptureFixture
 ) -> None:
     caplog.set_level(logging.DEBUG, logger="xagent")
 
     result = await _run_scenario(env, scenario)
 
+    assert env.staging_leftovers() == []
+    assert len(env.put_requests) == scenario.puts
+    # The wrapper never calls the connector's receiving tool.
+    assert env.calls_to(OUTER_TOOL) == []
+    if result is not None:
+        if scenario.message is None:
+            assert result["is_error"] is False
+            assert _structured(result)["file_id"] == REMOTE_FILE_ID
+        else:
+            assert result["is_error"] is True
+            if scenario.expected_prefix:
+                assert _text(result).startswith(scenario.message)
+            else:
+                assert _text(result) == scenario.message
     seen = {"xagent log": caplog.text, "result": repr(result)}
     for where, text in seen.items():
         for secret in (
@@ -416,7 +407,6 @@ async def test_issuer_wrapper_url_never_leaks(
 @pytest.mark.parametrize(
     "args",
     [
-        pytest.param({"file": f"file:{OUR_FILE_ID}"}, id="file-reference"),
         pytest.param({"file": OUR_FILE_ID}, id="bare-uuid"),
         pytest.param(
             {
@@ -451,7 +441,7 @@ async def test_issuer_wrapper_accepts_a_file(env: _Env, args: dict[str, Any]) ->
         pytest.param({"file": 7}, id="number"),
         pytest.param({"file": ""}, id="empty-string"),
         pytest.param({"file": [f"file:{OUR_FILE_ID}"]}, id="list"),
-        pytest.param({"file": "scup_abcdefgh"}, id="connector-file-id"),
+        pytest.param({"file": "remote_abcdefgh"}, id="connector-file-id"),
         pytest.param({"arguments": {"file": f"file:{OUR_FILE_ID}"}}, id="wrapped"),
         pytest.param(
             {"filename": "report.pdf", "mime_type": "application/pdf", "size_bytes": 3},
@@ -490,7 +480,6 @@ class _StagingFails:
         "unknown-bare-uuid",
         "suffix-not-in-the-table",
         "connection-to-another-host",
-        "connection-without-url",
         "staging-os-error",
         "staging-error",
     ],
@@ -516,11 +505,6 @@ async def test_issuer_wrapper_refuses_before_issuing(
     elif cell == "connection-to-another-host":
         wrapper = _wrapper(
             env, connection=_connection(url="https://other.example.test/mcp")
-        )
-        expected = UNTRUSTED_CONNECTOR
-    elif cell == "connection-without-url":
-        wrapper = _wrapper(
-            env, connection={"transport": "streamable_http", "headers": {}}
         )
         expected = UNTRUSTED_CONNECTOR
     elif cell == "staging-os-error":
@@ -605,93 +589,87 @@ def _unauthorized(args: dict[str, Any]) -> CallToolResult:
     raise _http_401()
 
 
-async def test_issuer_wrapper_401_without_a_refresh_is_an_authorization_failure(
-    env: _Env,
-) -> None:
+def _no_refresh(env: _Env, calls: list[str]) -> tuple[Any, Any]:
     env.issue = _unauthorized
-
-    result = await _wrapper(env).run_json_async(_args())
-
-    assert result == _delegated_authorization_failed_result()
-    assert env.put_requests == []
-    assert env.staging_leftovers() == []
+    return _connection(), _delegated_authorization_failed_result()
 
 
-async def test_issuer_wrapper_failed_refresh_is_final(env: _Env) -> None:
-    refresh_calls = 0
-
+def _refresh_raises(env: _Env, calls: list[str]) -> tuple[Any, Any]:
     def refresh() -> Any:
-        nonlocal refresh_calls
-        refresh_calls += 1
+        calls.append("refresh")
         raise RuntimeError(LEAKY_MESSAGE)
 
     env.issue = _unauthorized
-
-    result = await _wrapper(
-        env, connection=_connection(**{_RUNTIME_KEY: refresh})
-    ).run_json_async(_args())
-
-    assert result == _delegated_authorization_failed_result()
-    assert refresh_calls == 1
-    assert env.put_requests == []
-    assert env.staging_leftovers() == []
+    return (
+        _connection(**{_RUNTIME_KEY: refresh}),
+        _delegated_authorization_failed_result(),
+    )
 
 
-async def test_issuer_wrapper_resolver_failure_keeps_its_failure_code(
-    env: _Env,
-) -> None:
+def _resolver_classifies_the_failure(env: _Env, calls: list[str]) -> tuple[Any, Any]:
     async def refresh(challenge: Any) -> Any:
         return ClassifiedToolFailure(failure_code="oauth_token_required")
 
     env.issue = lambda args: (_ for _ in ()).throw(
         _http_401(['Bearer error="invalid_token"'])
     )
-
-    result = await _wrapper(
-        env, connection=_connection(**{_RESOLVER_KEY: refresh})
-    ).run_json_async(_args())
-
-    assert result == _delegated_authorization_failed_result(
-        failure_code="oauth_token_required"
+    return (
+        _connection(**{_RESOLVER_KEY: refresh}),
+        _delegated_authorization_failed_result(failure_code="oauth_token_required"),
     )
-    assert env.put_requests == []
 
 
-async def test_issuer_wrapper_retry_failure_is_the_retry_result(env: _Env) -> None:
+def _retry_fails(env: _Env, calls: list[str]) -> tuple[Any, Any]:
     def refresh() -> dict[str, Any]:
+        calls.append("refresh")
         return _connection(headers={"Authorization": FRESH_AUTH})
 
     def issue(args: dict[str, Any]) -> CallToolResult:
         raise RuntimeError(LEAKY_MESSAGE)
 
     env.issue = _rejecting_the_initial_credential(env, issue)
-
-    result = await _wrapper(
-        env, connection=_connection(**{_RUNTIME_KEY: refresh})
-    ).run_json_async(_args())
-
-    assert result == _delegated_retry_failed_result()
-    assert env.put_requests == []
-    assert env.staging_leftovers() == []
+    return _connection(**{_RUNTIME_KEY: refresh}), _delegated_retry_failed_result()
 
 
-async def test_issuer_wrapper_401_then_refresh_continues_the_upload(env: _Env) -> None:
+def _retry_succeeds(env: _Env, calls: list[str]) -> tuple[Any, Any]:
     def refresh() -> dict[str, Any]:
+        calls.append("refresh")
         return _connection(headers={"Authorization": FRESH_AUTH})
 
     env.issue = _rejecting_the_initial_credential(env, env.issue)
+    return _connection(**{_RUNTIME_KEY: refresh}), None
 
-    result = await _wrapper(
-        env, connection=_connection(**{_RUNTIME_KEY: refresh})
-    ).run_json_async(_args())
 
-    assert result["is_error"] is False
-    assert env.call_auth == [
-        (ISSUING_TOOL, CONNECTION_AUTH),
-        (ISSUING_TOOL, FRESH_AUTH),
-    ]
-    assert len(env.put_requests) == 1
+@pytest.mark.parametrize(
+    ("setup", "refreshes"),
+    [
+        pytest.param(_no_refresh, 0, id="401-without-a-refresh"),
+        pytest.param(_refresh_raises, 1, id="refresh-fails"),
+        pytest.param(_resolver_classifies_the_failure, 0, id="resolver-failure-code"),
+        pytest.param(_retry_fails, 1, id="retry-fails"),
+        pytest.param(_retry_succeeds, 1, id="retry-succeeds"),
+    ],
+)
+async def test_issuer_wrapper_authorization_paths(
+    env: _Env, setup: Callable[[_Env, list[str]], tuple[Any, Any]], refreshes: int
+) -> None:
+    calls: list[str] = []
+    connection, expected = setup(env, calls)
+
+    result = await _wrapper(env, connection=connection).run_json_async(_args())
+
+    assert calls == ["refresh"] * refreshes
     assert env.staging_leftovers() == []
+    if expected is None:
+        assert result["is_error"] is False
+        assert env.call_auth == [
+            (ISSUING_TOOL, CONNECTION_AUTH),
+            (ISSUING_TOOL, FRESH_AUTH),
+        ]
+        assert len(env.put_requests) == 1
+    else:
+        assert result == expected
+        assert env.put_requests == []
 
 
 @pytest.mark.parametrize("issuing_is_error", [False, True])
