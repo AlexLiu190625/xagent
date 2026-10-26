@@ -43,7 +43,6 @@ from test_signed_upload_substitution import (  # isort: skip
     EXPIRES_AT,
     FILE_ARGUMENT,
     FILE_BYTES,
-    FILE_UNAVAILABLE,
     FRESH_AUTH,
     HEADER_SECRET,
     ISSUING_TOOL,
@@ -72,6 +71,7 @@ from test_signed_upload_substitution import (  # isort: skip
 
 ARGUMENT_ERROR = "Pass one workspace file as `file`, written as file:<id>."
 GENERIC_ERROR = "Error executing MCP tool."
+FILE_UNAVAILABLE = "The workspace file is no longer available."
 INSTRUCTIONS_SECRET = "instructions-secret-text"
 FILE_PROPERTY_DESCRIPTION = (
     "A workspace file (attached or generated), written as file:<id>."
@@ -775,8 +775,15 @@ async def _run_failing_call(env: _Env, path: str) -> dict[str, Any]:
 
 
 @pytest.mark.parametrize("path", ["replacement", "issuer"])
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(OSError("disk unavailable"), id="single-exception"),
+        pytest.param(ExceptionGroup("group", [OSError("leaf")]), id="exception-group"),
+    ],
+)
 async def test_both_paths_end_in_the_shared_failure_handler(
-    env: _Env, monkeypatch: pytest.MonkeyPatch, path: str
+    env: _Env, monkeypatch: pytest.MonkeyPatch, path: str, error: Exception
 ) -> None:
     sentinel = {"content": [{"text": "sentinel"}], "is_error": True}
     seen: list[BaseException] = []
@@ -788,20 +795,16 @@ async def test_both_paths_end_in_the_shared_failure_handler(
     monkeypatch.setattr(
         mcp_adapter_module.MCPToolAdapter, "_execution_failure_result", failure_result
     )
-    _fail_staging(env, monkeypatch, OSError("disk unavailable"))
+    _fail_staging(env, monkeypatch, error)
 
     result = await _run_failing_call(env, path)
 
     assert result is sentinel
-    assert [type(exc) for exc in seen] == [OSError]
+    assert seen == [error]
 
 
-@pytest.mark.parametrize("path", ["replacement", "issuer"])
-async def test_both_paths_log_an_exception_group_by_its_leaves(
-    env: _Env,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-    path: str,
+async def test_issuer_wrapper_logs_an_exception_group_by_its_leaves(
+    env: _Env, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     caplog.set_level(logging.ERROR, logger="xagent")
     _fail_staging(
@@ -810,7 +813,7 @@ async def test_both_paths_log_an_exception_group_by_its_leaves(
         ExceptionGroup("group", [OSError("first leaf"), ValueError("second leaf")]),
     )
 
-    result = await _run_failing_call(env, path)
+    result = await _run_failing_call(env, "issuer")
 
     assert result["is_error"] is True
     assert _text(result) == GENERIC_ERROR
@@ -964,8 +967,8 @@ _UPLOAD_CHECKS = (
 
 
 @contextmanager
-def _recorded_upload_checks() -> Iterator[list[tuple[str, str]]]:
-    """Record each run of an upload check and the function that ran it.
+def _recorded_upload_checks() -> Iterator[list[tuple[str, bool]]]:
+    """Record each run of an upload check and whether the shared method ran it.
 
     The checks are found by their code objects, so a call through another name
     for the same function is recorded too. The module's own names are read
@@ -975,17 +978,19 @@ def _recorded_upload_checks() -> Iterator[list[tuple[str, str]]]:
     codes = {
         getattr(mcp_adapter_module, name).__code__: name for name in _UPLOAD_CHECKS
     }
-    calls: list[tuple[str, str]] = []
+    shared = mcp_adapter_module.MCPToolAdapter._issue_and_upload_staged_file.__code__
+    calls: list[tuple[str, bool]] = []
 
     def profiler(frame: Any, event: str, _arg: Any) -> None:
         if event == "call" and frame.f_code in codes:
-            calls.append((codes[frame.f_code], frame.f_back.f_code.co_name))
+            calls.append((codes[frame.f_code], frame.f_back.f_code is shared))
 
+    previous = sys.getprofile()
     sys.setprofile(profiler)
     try:
         yield calls
     finally:
-        sys.setprofile(None)
+        sys.setprofile(previous)
 
 
 @pytest.mark.parametrize("path", ["replacement", "issuer"])
@@ -1003,6 +1008,4 @@ async def test_signed_upload_checks_run_once_and_only_in_the_shared_upload(
 
     assert result["is_error"] is False
     assert len(env.put_requests) == 1
-    assert sorted(calls) == sorted(
-        (name, "_issue_and_upload_staged_file") for name in _UPLOAD_CHECKS
-    )
+    assert sorted(calls) == sorted((name, True) for name in _UPLOAD_CHECKS)

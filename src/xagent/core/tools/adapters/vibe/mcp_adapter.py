@@ -633,6 +633,9 @@ _SIGNED_UPLOAD_FAILED_MESSAGE = "File upload failed."
 _SIGNED_UPLOAD_ISSUER_ARGUMENT_MESSAGE = (
     "Pass one workspace file as `file`, written as file:<id>."
 )
+_SIGNED_UPLOAD_ISSUER_FILE_UNAVAILABLE_MESSAGE = (
+    "The workspace file is no longer available."
+)
 # What the model is told about a tool the host runs in place of an issuing tool.
 # The connector's own description of that tool is not used: it tells the caller
 # to fetch an upload URL and send the bytes itself.
@@ -4293,7 +4296,9 @@ class SignedUploadIssuerAdapter(MCPToolAdapter):
                 }
             if self._workspace is None:
                 return {
-                    "content": [{"text": _SIGNED_UPLOAD_FILE_UNAVAILABLE_MESSAGE}],
+                    "content": [
+                        {"text": _SIGNED_UPLOAD_ISSUER_FILE_UNAVAILABLE_MESSAGE}
+                    ],
                     "is_error": True,
                 }
 
@@ -4317,7 +4322,7 @@ class SignedUploadIssuerAdapter(MCPToolAdapter):
                         staged = await self._stage_external_upload_file(file_id)
                     except FileNotFoundError:
                         raise _SignedUploadRefused(
-                            _SIGNED_UPLOAD_FILE_UNAVAILABLE_MESSAGE
+                            _SIGNED_UPLOAD_ISSUER_FILE_UNAVAILABLE_MESSAGE
                         ) from None
                     try:
                         (
