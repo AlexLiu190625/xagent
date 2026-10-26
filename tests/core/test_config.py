@@ -4224,6 +4224,51 @@ def test_dispatcher_fair_share_env_parsing(monkeypatch, caplog, raw, expected, w
 
 
 @pytest.mark.parametrize(
+    ("raw", "expected", "warns"),
+    [
+        (None, False, False),
+        ("", False, False),
+        ("   ", False, False),
+        ("true", True, False),
+        ("TRUE", True, False),
+        ("True", True, False),
+        ("1", True, False),
+        ("yes", True, False),
+        ("YES", True, False),
+        ("on", True, False),
+        ("On", True, False),
+        ("false", False, False),
+        ("FALSE", False, False),
+        ("0", False, False),
+        ("no", False, False),
+        ("off", False, False),
+        ("garbage", False, True),
+    ],
+)
+def test_dispatch_accept_requested_class_env_parsing(
+    monkeypatch, caplog, raw, expected, warns
+):
+    env_var = config.DISPATCH_ACCEPT_REQUESTED_CLASS
+    assert env_var == "XAGENT_DISPATCH_ACCEPT_REQUESTED_CLASS"
+    if raw is None:
+        monkeypatch.delenv(env_var, raising=False)
+    else:
+        monkeypatch.setenv(env_var, raw)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="xagent.config"):
+        assert config.get_dispatch_accept_requested_class_enabled() is expected
+
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name == "xagent.config" and record.levelno == logging.WARNING
+    ]
+    assert len(warnings) == int(warns)
+    assert all(env_var in record.getMessage() for record in warnings)
+
+
+@pytest.mark.parametrize(
     "name,value",
     [
         ("XAGENT_EXECUTION_BUDGET_DEFAULT_TOKENS", "-1"),

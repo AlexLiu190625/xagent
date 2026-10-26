@@ -561,6 +561,11 @@ class Task(Base):  # type: ignore
         index=True,
     )
 
+    # The dispatch class the caller declared at creation, stored as sent whether
+    # or not a deployment accepts it; acceptance is decided as each command is
+    # enqueued.
+    requested_dispatch_class = Column(String(16), nullable=True)
+
     # Visibility flag for discovery surfaces such as sidebar/history/search.
     # Hidden tasks still use normal owner/admin access by exact task_id.
     is_visible = Column(
