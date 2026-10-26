@@ -17,7 +17,6 @@ from tests.shared.postgres_disposable import (
     load_migration_module,
 )
 from xagent.db.config import create_alembic_config
-from xagent.web.models.database import Base
 from xagent.web.models.task import Task
 
 REVISION = "20261026_task_requested_dispatch_class"
@@ -85,6 +84,12 @@ def test_sqlite_upgrade_adds_a_nullable_column_and_downgrade_drops_it() -> None:
             is None
         )
 
+        # Running the revision body again, as after create_all, is a no-op.
+        migration = load_migration_module(MIGRATION_PATH, "requested_class_twice")
+        with Operations.context(MigrationContext.configure(connection)):
+            migration.upgrade()
+        assert COLUMN in _columns(connection)
+
         command.downgrade(config, DOWN_REVISION)
         assert COLUMN not in _columns(connection)
 
@@ -101,20 +106,6 @@ def test_sqlite_upgrade_and_downgrade_skip_without_the_table() -> None:
         command.downgrade(config, DOWN_REVISION)
 
         assert TABLE not in inspect(connection).get_table_names()
-
-
-def test_create_all_builds_the_column_and_the_migration_is_then_a_noop() -> None:
-    engine = create_engine("sqlite:///:memory:")
-    config = create_alembic_config(engine)
-
-    with engine.begin() as connection:
-        Base.metadata.create_all(connection)
-        _stamp(connection)
-        config.attributes["connection"] = connection
-        assert COLUMN in _columns(connection)
-
-        command.upgrade(config, REVISION)
-        assert COLUMN in _columns(connection)
 
 
 def test_model_column_matches_the_migration() -> None:
@@ -137,22 +128,26 @@ def _offline_sql(dialect: str, operation: str) -> str:
 
 
 @pytest.mark.parametrize(
-    "operation,statement", [("upgrade", ADD_SQL), ("downgrade", DROP_SQL)]
+    "dialect,operation,statement",
+    [
+        ("postgresql", "upgrade", ADD_SQL),
+        ("postgresql", "downgrade", DROP_SQL),
+        ("sqlite", "upgrade", f"ADD COLUMN {COLUMN} VARCHAR(16)"),
+        ("sqlite", "downgrade", f"DROP COLUMN {COLUMN}"),
+    ],
 )
-def test_offline_postgresql_sets_a_session_lock_timeout_around_the_alter(
-    operation, statement
-) -> None:
-    sql = _offline_sql("postgresql", operation)
-    assert "SET LOCAL" not in sql
-    set_at = sql.index("SET lock_timeout = '5s'")
-    alter_at = sql.index(statement)
-    reset_at = sql.index("RESET lock_timeout")
-    assert set_at < alter_at < reset_at
-
-
-def test_offline_sqlite_adds_the_column_and_drops_it_on_downgrade() -> None:
-    assert f"ADD COLUMN {COLUMN} VARCHAR(16)" in _offline_sql("sqlite", "upgrade")
-    assert f"DROP COLUMN {COLUMN}" in _offline_sql("sqlite", "downgrade")
+def test_offline_sql(dialect, operation, statement) -> None:
+    sql = _offline_sql(dialect, operation)
+    assert statement in sql
+    if dialect == "postgresql":
+        # A session lock timeout, set and reset around the ALTER.
+        assert "SET LOCAL" not in sql
+        set_at = sql.index("SET lock_timeout = '5s'")
+        alter_at = sql.index(statement)
+        reset_at = sql.index("RESET lock_timeout")
+        assert set_at < alter_at < reset_at
+    else:
+        assert "lock_timeout" not in sql
 
 
 @pytest.fixture

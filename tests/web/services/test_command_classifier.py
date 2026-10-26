@@ -2,6 +2,7 @@
 
 import asyncio
 import itertools
+import logging
 from unittest.mock import Mock
 
 import pytest
@@ -50,7 +51,7 @@ def host(tmp_path, monkeypatch):
             self.user = user_id
             self.counter = itertools.count(1)
 
-        def task(self, source="internal", channel_name=None):
+        def task(self, source="internal", channel_name=None, declared=None):
             with sessions() as db:
                 task = Task(
                     user_id=user_id,
@@ -58,6 +59,7 @@ def host(tmp_path, monkeypatch):
                     status=TaskStatus.PENDING,
                     source=source,
                     channel_name=channel_name,
+                    requested_dispatch_class=declared,
                 )
                 db.add(task)
                 db.commit()
@@ -502,7 +504,8 @@ def test_classifier_receives_the_task_view(host):
         return admission.CommandClassification()
 
     admission.set_command_classifier(classify, admission_enabled=False)
-    task_id = host.task(source="widget", channel_name="support")
+    # The view carries the stored value as it is, even one that is not a class.
+    task_id = host.task(source="widget", channel_name="support", declared="bogus")
     host.stage(KINDS.START, task_id=task_id)
     assert seen == [
         admission.TaskClassificationView(
@@ -512,7 +515,7 @@ def test_classifier_receives_the_task_view(host):
             owner_user_id=host.user,
             background=False,
             previous_dispatch_class=None,
-            requested_dispatch_class=None,
+            requested_dispatch_class="bogus",
         )
     ]
 
@@ -798,3 +801,84 @@ def test_the_class_survives_defer_failure_and_retry(host, monkeypatch):
         assert db.get(TaskExecutionCommand, command_id).status == "failed"
         assert transport.retry_failed_task_command(db, command_id)
     assert host.klass(command_id) == I
+
+
+# ---------------------------------------------------------------- declared class
+
+ACCEPT = "XAGENT_DISPATCH_ACCEPT_REQUESTED_CLASS"
+FAIR = "XAGENT_DISPATCHER_FAIR_SHARE"
+
+
+def _settings(monkeypatch, *, accept, fair):
+    monkeypatch.setenv(ACCEPT, str(accept))
+    monkeypatch.setenv(FAIR, str(fair))
+
+
+def test_each_command_judges_the_gates_when_it_is_enqueued(host, monkeypatch):
+    monkeypatch.delenv(ACCEPT, raising=False)
+    monkeypatch.delenv(FAIR, raising=False)
+    task_id = host.task(source="sdk", declared=I)
+    queued: list[tuple[int, str]] = []
+
+    def step(kind, expected, *, reserved=False):
+        queued.append(
+            (
+                host.stage(kind, task_id=task_id, reserved=reserved).staged_db_id,
+                expected,
+            )
+        )
+        for db_id, earlier in queued:
+            assert host.klass(db_id) == earlier
+
+    step(KINDS.START, B)
+    _settings(monkeypatch, accept=True, fair=True)
+    step(KINDS.MESSAGE, I)
+    _settings(monkeypatch, accept=False, fair=True)
+    step(KINDS.RESUME, B)
+    _settings(monkeypatch, accept=True, fair=True)
+    step(KINDS.RESUME, I, reserved=True)
+    _settings(monkeypatch, accept=True, fair=False)
+    step(KINDS.MESSAGE, B)
+
+
+def test_no_declaration_reads_neither_setting(host, monkeypatch):
+    def boom(*_args, **_kwargs):
+        raise AssertionError("a setting was read")
+
+    monkeypatch.setattr(admission, "get_dispatch_accept_requested_class_enabled", boom)
+    monkeypatch.setattr(transport, "_fair_share_enabled", boom)
+    task_id = host.task(source="sdk")
+    assert host.klass(host.stage(KINDS.START, task_id=task_id).staged_db_id) == B
+    assert host.klass(host.stage(KINDS.MESSAGE, task_id=task_id).staged_db_id) == B
+
+
+def test_an_unknown_stored_value_is_ignored_and_logged_once(host, monkeypatch, caplog):
+    _settings(monkeypatch, accept=True, fair=True)
+    task_id = host.task(source="internal", declared="bogus")
+    with caplog.at_level(logging.WARNING, logger=admission.logger.name):
+        staged = host.stage(KINDS.START, task_id=task_id)
+    assert host.klass(staged.staged_db_id) == I
+    messages = [
+        r.getMessage()
+        for r in caplog.records
+        if "requested dispatch class" in r.getMessage()
+    ]
+    assert len(messages) == 1
+    assert "bogus" in messages[0]
+
+
+def test_staging_reads_the_declaration_in_the_one_task_snapshot(host):
+    statements = []
+
+    def record(_conn, _cursor, statement, *_args):
+        if "FROM tasks" in statement and "tasks.channel_name" in statement:
+            statements.append(statement)
+
+    task_id = host.task(source="sdk", declared=I)
+    sa.event.listen(host.engine, "before_cursor_execute", record)
+    try:
+        host.stage(KINDS.START, task_id=task_id)
+    finally:
+        sa.event.remove(host.engine, "before_cursor_execute", record)
+    assert len(statements) == 1
+    assert "tasks.requested_dispatch_class" in statements[0]
