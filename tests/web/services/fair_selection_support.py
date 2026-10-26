@@ -135,12 +135,6 @@ class RecordingLock:
 
 # (tenant key, dispatch class, kind) of the pending commands of each world, oldest first.
 WORLDS = {
-    "empty": [],
-    "single": [
-        ("user:1", "batch", "start"),
-        ("user:1", "interactive", "start"),
-        ("user:1", "batch", "message"),
-    ],
     "three": [
         ("user:1", "batch", "start"),
         ("user:2", "interactive", "start"),
@@ -148,13 +142,9 @@ WORLDS = {
         ("user:2", "batch", "start"),
         ("user:1", "interactive", "message"),
     ],
-    "answer": [
-        ("user:1", "batch", "start"),
-        ("user:2", "interactive", "resume_input"),
-        ("user:3", "batch", "start"),
-        ("user:2", "batch", "pause"),
-    ],
 }
+
+
 # --- random worlds and a brute-force reading of the selection rules --------------------
 
 CLASSES = ("batch", "interactive")

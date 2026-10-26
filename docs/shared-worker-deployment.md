@@ -109,11 +109,13 @@ as for `slot_tenants`: a resume started another way, such as one for a task that
 waited for an A2A or a user reply, holds a slot of the cap but counts for no
 tenant, so its tenant ranks as if it held fewer slots. The switch accepts `1`,
 `true`, `yes` or `on` and `0`, `false`, `no` or `off`, in any case; unset or
-blank is off. Any other value counts as off and logs a warning when the value
-changes, not on every read. The value in use is logged as `fair_share=` on the
-process's `dispatch policy` line, at its first dispatch snapshot and whenever the
-value changes, so that line tells whether the switch is on; `fair_misses` is 0
-both when it is off and when it is on with nothing missed.
+blank is off. Any other value counts as off and logs a warning in two places:
+where the dispatcher reads it, and where the `dispatch policy` line parses it,
+which happens again whenever the dispatch policy or classifier changes. The value
+in use is logged as `fair_share=` on the process's `dispatch policy` line, at its
+first dispatch snapshot and whenever the value, the policy or the classifier
+changes, so that line tells whether the switch is on; `fair_misses` is 0 both
+when it is off and when it is on with nothing missed.
 
 ## Configuration and upgrade
 

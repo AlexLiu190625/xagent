@@ -550,6 +550,23 @@ def test_a_cancel_goes_before_a_newer_task_of_another_tenant(world, on, clock):
     assert scan(cap, attempt=attempt()) == cancel
 
 
+def test_the_lookup_among_the_running_tasks_is_sent_only_when_a_task_runs(
+    world, on, clock
+):
+    a_task = running_tenant_and_newer_task(world)
+    world.add("B")
+
+    def of_tasks(active):
+        _, seen = recorded(
+            world,
+            lambda: scan(cap_of(active=active, occupancy={"A": 1}), attempt=attempt()),
+        )
+        return [s for s, _ in seen if "task_execution_commands.task_id IN (" in s]
+
+    assert of_tasks(()) == []
+    assert len(of_tasks({a_task})) == 1
+
+
 @pytest.mark.parametrize(
     "order", ["control_first", "follow_up_first"], ids=lambda order: order
 )
