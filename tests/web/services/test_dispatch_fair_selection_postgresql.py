@@ -2,6 +2,7 @@
 
 import json
 import random
+import re
 from datetime import datetime, timezone
 
 import pytest
@@ -21,6 +22,7 @@ from tests.web.services.fair_selection_support import (
 )
 from xagent.web.models import database as database_module
 from xagent.web.models.database import Base
+from xagent.web.models.task_admission import TaskAdmissionBucket, TaskAdmissionTicket
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.services import task_command_transport as transport
 from xagent.web.services.task_dispatch_cap import DispatchCapSnapshot, DispatchPolicy
@@ -281,6 +283,239 @@ def test_the_plan_of_the_older_control_lookup_reads_the_kind_index(busy_table) -
     assert_fed_by(
         plan_root(explain(busy_table, statement)), "ix_task_commands_claimable_kind"
     )
+
+
+RUNNING = range(1, 11)
+UNFINISHED_INDEX = "ix_task_commands_unfinished_task"
+ID_INDEX = "ix_task_commands_claimable_id"
+TASK_ORDER_INDEX = "ix_task_commands_task_order"
+PRIMARY_KEY_INDEX = "task_execution_commands_pkey"
+
+
+@pytest.fixture
+def flood_table(pg):
+    """Ten running tasks behind a backlog of another tenant's older commands.
+
+    Task 1..10 each hold five thousand settled commands and one newer pending
+    follow-up. Tasks 11..2000 hold fifty thousand pending starts that are all
+    older than those follow-ups.
+    """
+    with pg.begin() as connection:
+        connection.execute(
+            sa.text(
+                "INSERT INTO users (id, username, password_hash, is_admin) "
+                "VALUES (1, 'u', 'h', false)"
+            )
+        )
+        connection.execute(
+            sa.text(
+                "INSERT INTO tasks (id, user_id, title, status) "
+                "SELECT g, 1, 't', 'PENDING' FROM generate_series(1, 2000) g"
+            )
+        )
+        connection.execute(
+            sa.text(
+                "INSERT INTO task_execution_commands (task_id, command_id, kind, "
+                "payload, status, attempt_count, dispatch_class, fairness_key, "
+                "created_at, updated_at) "
+                "SELECT 11 + (g % 1990), 'q' || g, 'start', '{}', 'pending', 0, "
+                "'batch', 'user:2', now(), now() "
+                "FROM generate_series(1, 50000) g"
+            )
+        )
+        connection.execute(
+            sa.text(
+                "INSERT INTO task_execution_commands (task_id, command_id, kind, "
+                "payload, status, attempt_count, dispatch_class, fairness_key, "
+                "created_at, updated_at) "
+                "SELECT (g % 10) + 1, 'h' || g, 'message', '{}', 'completed', 1, "
+                "'batch', 'user:1', now(), now() "
+                "FROM generate_series(1, 50000) g"
+            )
+        )
+        connection.execute(
+            sa.text(
+                "INSERT INTO task_execution_commands (task_id, command_id, kind, "
+                "payload, status, attempt_count, dispatch_class, fairness_key, "
+                "created_at, updated_at) "
+                "SELECT g, 'f' || g, 'message', '{}', 'pending', 0, "
+                "'batch', 'user:1', now(), now() "
+                "FROM generate_series(1, 10) g"
+            )
+        )
+    with pg.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+        connection.execute(sa.text("VACUUM (ANALYZE) task_execution_commands"))
+        connection.execute(sa.text("ANALYZE tasks"))
+    return pg
+
+
+def read_units(root: dict) -> list[dict]:
+    """The reads of the command table that ran, one entry per read unit.
+
+    A unit is an index scan or a sequential scan of the table; a Bitmap Heap Scan
+    together with the Bitmap Index Scans below it is one unit, whose index names
+    and index conditions are those of its bitmap scans. Nodes that never ran
+    (zero loops) are left out. ``rows`` counts every row the unit looked at,
+    kept or filtered out, over all its loops.
+    """
+    units = []
+    for node in nodes_under(root):
+        if node.get("Relation Name") != TABLE or node.get("Actual Loops", 0) <= 0:
+            continue
+        below = nodes_under(node)
+        indexes = [n for n in below if "Index Name" in n]
+        units.append(
+            {
+                "type": node["Node Type"],
+                "indexes": {n["Index Name"] for n in indexes},
+                "conds": " ".join(n.get("Index Cond", "") for n in indexes),
+                "rows": (node["Actual Rows"] + node.get("Rows Removed by Filter", 0))
+                * node["Actual Loops"],
+            }
+        )
+    return units
+
+
+def explain_analyze(engine, statement: str) -> dict:
+    """The executed plan of ``statement``, run without parallel workers."""
+    with engine.connect() as connection:
+        connection.exec_driver_sql("SET max_parallel_workers_per_gather = 0")
+        plan = connection.exec_driver_sql(
+            "EXPLAIN (ANALYZE, FORMAT JSON) " + statement.replace("%", "%%")
+        ).scalar_one()
+    return plan_root(plan)
+
+
+def newest_id(engine) -> int:
+    with engine.connect() as connection:
+        return connection.execute(
+            sa.text("SELECT max(id) FROM task_execution_commands")
+        ).scalar_one()
+
+
+@pytest.mark.postgresql
+def test_the_plan_of_the_older_lookup_among_running_tasks_is_bounded_by_their_commands(
+    flood_table, monkeypatch
+) -> None:
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    cap = DispatchCapSnapshot(
+        policy=DispatchPolicy(limit=30, interactive_reserve=3),
+        active_ids=frozenset(RUNNING),
+    )
+    before = newest_id(flood_table) + 1
+    with sa.orm.Session(flood_table) as db:
+        statement = literal_sql(
+            transport._older_of_tasks(
+                lambda: claimable_query(db, cap), before, frozenset(RUNNING)
+            ).limit(1)
+        )
+
+    units = read_units(explain_analyze(flood_table, statement))
+
+    assert any(
+        UNFINISHED_INDEX in unit["indexes"] and "running_task.id" in unit["conds"]
+        for unit in units
+    )
+    assert not any(TASK_ORDER_INDEX in unit["indexes"] for unit in units)
+    # An ordered scan that is not keyed by task walks the backlog until it meets a
+    # row of a running task; the primary key and the claimable-id index are fine
+    # only when they are entered at a given id.
+    for unit in units:
+        if unit["indexes"] & {ID_INDEX, PRIMARY_KEY_INDEX}:
+            assert re.search(r"\(id = ", unit["conds"]), unit
+    assert not [unit for unit in units if unit["type"] == "Seq Scan"]
+    # Bound, with R running tasks and U of their unfinished commands older than
+    # the cut-off (here every running task holds one unfinished command, its
+    # follow-up, so U = R = 10). Rows actually read: each task's lookup reads its
+    # first unfinished command (U rows over R loops); the check for an earlier
+    # unfinished command of the same task finds none before it (0 rows); the
+    # outer query reads the chosen row by id (1 row) and its check finds none
+    # (0 rows). That is U + 1. PostgreSQL reports Actual Rows and Rows Removed by
+    # Filter as per-loop averages rounded to an integer, so multiplied back by
+    # the loops each of the two counts of a node can overstate it by less than
+    # half its loops: under R for each of the two nodes that loop once per task,
+    # nothing for the outer nodes. The bound is U + 1 + 2R = 31. A scan of the
+    # backlog or of the settled history reads tens of thousands of rows.
+    running, unfinished = len(RUNNING), len(RUNNING)
+    assert sum(unit["rows"] for unit in units) <= unfinished + 1 + 2 * running
+
+
+@pytest.mark.postgresql
+@pytest.mark.parametrize("shared", ["true", "false"])
+def test_the_same_task_check_of_the_oldest_claimable_lookup_reads_the_unfinished_index(
+    flood_table, monkeypatch, shared
+) -> None:
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", shared)
+    cap = DispatchCapSnapshot(
+        policy=DispatchPolicy(limit=30, interactive_reserve=3),
+        active_ids=frozenset(RUNNING),
+    )
+    with sa.orm.Session(flood_table) as db:
+        statement = literal_sql(claimable_query(db, cap).limit(1))
+
+    units = read_units(explain_analyze(flood_table, statement))
+
+    # The check that a candidate has no earlier unfinished command of its task
+    # goes through the index of unfinished commands and not through the index of
+    # every command of the task in order.
+    assert any(UNFINISHED_INDEX in unit["indexes"] for unit in units)
+    assert not any(TASK_ORDER_INDEX in unit["indexes"] for unit in units)
+
+
+@pytest.fixture
+def waiting_start_then_cancel(pg, monkeypatch):
+    """One task whose pending start waits for an admission ticket, then a cancel.
+
+    The bucket has room and holds no ticket, no pacing row exists and the start's
+    ticket has no owner, so the start is claimable, and the cancel is claimable
+    too because a cancel may pass a start that waits for a ticket. Another
+    tenant's newer task follows.
+    """
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    world = World(pg)
+    start = world.add("a", kind="start")
+    task = world.task_of(start)
+    cancel = world.follow_up(task, "a", kind="cancel")
+    world.add("b")
+    with world.sessions() as db:
+        db.add(TaskAdmissionBucket(key="bucket", capacity=1, max_pending=10))
+        db.flush()
+        db.add(
+            TaskAdmissionTicket(
+                command_id=start,
+                bucket_key="bucket",
+                task_id=task,
+                owner_attempt_id=None,
+            )
+        )
+        db.commit()
+    return world, task, start, cancel
+
+
+@pytest.mark.postgresql
+def test_of_two_commands_of_a_running_task_that_can_pass_the_older_is_found(
+    waiting_start_then_cancel,
+) -> None:
+    world, task, start, cancel = waiting_start_then_cancel
+    cap = DispatchCapSnapshot(
+        policy=DispatchPolicy(limit=30, interactive_reserve=3),
+        active_ids=frozenset({task}),
+    )
+    with world.sessions() as db:
+        # Both commands pass every filter of the claimable query, so the lookup
+        # has two rows of the one task to choose from.
+        assert [
+            row.id
+            for row in claimable_query(db, cap).filter(
+                TaskExecutionCommand.task_id == task
+            )
+        ] == [start, cancel]
+
+        found = transport._older_of_tasks(
+            lambda: claimable_query(db, cap), cancel + 10, frozenset({task})
+        ).first()
+
+    assert found is not None and found.id == start
 
 
 SWITCH = "XAGENT_DISPATCHER_FAIR_SHARE"

@@ -2035,18 +2035,39 @@ def _older_controls(query: Query[Any], before_id: int) -> Query[Any]:
 
 
 def _older_of_tasks(
-    query: Query[Any], before_id: int, task_ids: frozenset[int]
+    claimable: Callable[[], Query[Any]], before_id: int, task_ids: frozenset[int]
 ) -> Query[Any]:
-    """``query`` narrowed to commands of ``task_ids`` older than ``before_id``.
+    """The claimable commands of ``task_ids`` older than ``before_id``, narrowed
+    to the oldest one.
 
-    No index bounds it: ix_task_commands_task_order also holds the settled history
-    of each task, so PostgreSQL reads either that history or the claimable ids
-    older than ``before_id``, whichever it estimates to be cheaper.
+    Every running task is asked for its own oldest claimable command and the
+    smallest of those ids is taken, so each task's lookup reads
+    ix_task_commands_unfinished_task in id order, and the check that a command
+    has no earlier unfinished command of its task reads that index too. The
+    command-index rows each lookup reads are its own task's unfinished
+    commands, whatever the length of the backlog or of the settled history.
     """
-    return query.filter(
-        TaskExecutionCommand.task_id.in_(sorted(task_ids)),
-        TaskExecutionCommand.id < before_id,
+    running = aliased(Task, name="running_task")
+    oldest_of_task = (
+        claimable()
+        .filter(
+            TaskExecutionCommand.task_id == running.id,
+            TaskExecutionCommand.id < before_id,
+        )
+        .order_by(None)
+        .order_by(TaskExecutionCommand.id)
+        .limit(1)
+        .with_entities(TaskExecutionCommand.id)
+        .correlate(running)
+        .scalar_subquery()
     )
+    oldest = (
+        select(func.min(oldest_of_task))
+        .select_from(running)
+        .where(running.id.in_(sorted(task_ids)))
+        .scalar_subquery()
+    )
+    return claimable().filter(TaskExecutionCommand.id == oldest)
 
 
 def _older_needing_no_new_slot(
@@ -2062,7 +2083,7 @@ def _older_needing_no_new_slot(
     """
     found = [_older_controls(claimable(), before_id).first()]
     if active:
-        found.append(_older_of_tasks(claimable(), before_id, active).first())
+        found.append(_older_of_tasks(claimable, before_id, active).first())
     rows = [row for row in found if row is not None]
     return min(rows, key=lambda row: row.id) if rows else None
 
