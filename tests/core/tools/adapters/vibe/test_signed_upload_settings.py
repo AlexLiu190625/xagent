@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -18,8 +19,13 @@ from xagent.core.tools.adapters.vibe.mcp_adapter import (
     load_mcp_tools_as_agent_tools,
     mcp_load_failure_message,
 )
+from xagent.core.tools.adapters.vibe.selection_spec import (
+    ToolSelectionSpec,
+    normalize_mcp_server_name,
+)
 from xagent.core.tools.adapters.vibe.signed_upload import (
     SignedUploadBinding,
+    SignedUploadIssuer,
     connection_signed_uploads,
     parse_signed_upload_response,
     parse_signed_upload_settings,
@@ -62,6 +68,29 @@ def _binding(**overrides: Any) -> SignedUploadBinding:
     }
     fields.update(overrides)
     return SignedUploadBinding(**fields)
+
+
+def _issuer_entry(**overrides: Any) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "issuing_tool_name": "request_upload",
+        "allowed_upload_hosts": ["uploads.example.test"],
+        "upload_path_prefix": "/staged/",
+        "content_types": {".pdf": "application/pdf", ".png": "image/png"},
+    }
+    entry.update(overrides)
+    return entry
+
+
+def _issuer(**overrides: Any) -> Any:
+    fields: dict[str, Any] = {
+        "connection_host": CONNECTION_HOST,
+        "issuing_tool_name": "request_upload",
+        "allowed_upload_hosts": frozenset({"uploads.example.test"}),
+        "upload_path_prefix": "/staged/",
+        "content_types": {".pdf": "application/pdf", ".png": "image/png"},
+    }
+    fields.update(overrides)
+    return SignedUploadIssuer(**fields)
 
 
 def _connection(transport: str = "streamable_http", **extra: Any) -> dict[str, Any]:
@@ -995,6 +1024,25 @@ _MARKER = "planted_marker_tool"
         ),
         pytest.param(
             _connection(
+                signed_uploads=[
+                    _issuer_entry(
+                        issuing_tool_name=_MARKER, allowed_upload_hosts=["10.0.0.1"]
+                    )
+                ]
+            ),
+            id="issuer-ip-upload-host",
+        ),
+        pytest.param(
+            _connection(
+                signed_uploads=[
+                    _issuer_entry(issuing_tool_name=_MARKER),
+                    _issuer_entry(issuing_tool_name=_MARKER),
+                ]
+            ),
+            id="issuers-repeat-an-issuing-tool",
+        ),
+        pytest.param(
+            _connection(
                 url="https://[bad/mcp", signed_uploads=[_entry(tool_name=_MARKER)]
             ),
             id="unparseable-url",
@@ -1128,29 +1176,6 @@ def test_no_process_registry(name: str) -> None:
 # ---------------------------------------------------------------------------
 # Issuer entries
 # ---------------------------------------------------------------------------
-
-
-def _issuer_entry(**overrides: Any) -> dict[str, Any]:
-    entry: dict[str, Any] = {
-        "issuing_tool_name": "request_upload",
-        "allowed_upload_hosts": ["uploads.example.test"],
-        "upload_path_prefix": "/staged/",
-        "content_types": {".pdf": "application/pdf", ".png": "image/png"},
-    }
-    entry.update(overrides)
-    return entry
-
-
-def _issuer(**overrides: Any) -> Any:
-    fields: dict[str, Any] = {
-        "connection_host": CONNECTION_HOST,
-        "issuing_tool_name": "request_upload",
-        "allowed_upload_hosts": frozenset({"uploads.example.test"}),
-        "upload_path_prefix": "/staged/",
-        "content_types": {".pdf": "application/pdf", ".png": "image/png"},
-    }
-    fields.update(overrides)
-    return signed_upload.SignedUploadIssuer(**fields)
 
 
 @pytest.mark.parametrize(
@@ -1468,3 +1493,168 @@ def test_parse_signed_upload_response_reads_file_id_expiry(
         assert ticket.file_id_expires_at.tzinfo is _UTC
     # The expiry of the upload URL is read as before.
     assert ticket.expires_at == datetime(2030, 1, 1, 0, 10, tzinfo=_UTC)
+
+
+# ---------------------------------------------------------------------------
+# Loading issuer entries through the MCP adapter
+# ---------------------------------------------------------------------------
+
+
+def _gated_targets(result: Any) -> dict[str, Any]:
+    # The loader wraps each adapter in the approval gate; ``_target`` is the adapter.
+    return {tool.name: tool._target for tool in result.tools}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("signed_uploads", "replaces_attach_document"),
+    [
+        pytest.param([_issuer_entry()], False, id="issuer-only"),
+        pytest.param(
+            [_issuer_entry(), _entry(issuing_tool_name="issue_other")],
+            True,
+            id="issuer-and-replacement-of-another-issuing-tool",
+        ),
+        pytest.param(None, False, id="no-settings"),
+    ],
+)
+async def test_issuer_entry_replaces_issuing_tool_with_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+    signed_uploads: Any,
+    replaces_attach_document: bool,
+) -> None:
+    _serve_tools(monkeypatch, *_ALL_TOOLS)
+    connection = _connection()
+    if signed_uploads is not None:
+        connection["signed_uploads"] = signed_uploads
+    visibility = mcp_adapter_module.ToolVisibility.PUBLIC
+    allow_users = ["user-42"]
+    workspace = SimpleNamespace(marker="workspace")
+
+    result = await load_mcp_tools_as_agent_tools(
+        {"docs": connection},
+        visibility=visibility,
+        allow_users=allow_users,
+        workspace=workspace,
+    )
+
+    assert result.failures == ()
+    assert [tool.name for tool in result.tools] == [
+        f"mcp_docs_{name}" for name in _ALL_TOOLS
+    ]
+    adapters = _gated_targets(result)
+    issuing_tool = adapters["mcp_docs_request_upload"]
+    if signed_uploads is None:
+        assert type(issuing_tool) is mcp_adapter_module.MCPToolAdapter
+    else:
+        assert type(issuing_tool) is mcp_adapter_module.SignedUploadIssuerAdapter
+    # The wrapper stands in the tool's place as that connector's own tool.
+    ordinary = _build_mcp_tool_adapter(
+        "docs",
+        connection,
+        _server_tool("request_upload"),
+        visibility=visibility,
+        allow_users=allow_users,
+        workspace=workspace,
+    )
+    assert issuing_tool.name == ordinary.name == "mcp_docs_request_upload"
+    assert issuing_tool.metadata.source_server == ordinary.metadata.source_server
+    assert issuing_tool.metadata.source_server == normalize_mcp_server_name("docs")
+    assert issuing_tool._visibility == ordinary._visibility == visibility
+    assert issuing_tool._allow_users == ordinary._allow_users == allow_users
+    assert issuing_tool._workspace is ordinary._workspace is workspace
+    assert issuing_tool.concurrency_safe == ordinary.concurrency_safe
+    # The other tools are unaffected.
+    assert (
+        adapters["mcp_docs_attach_document"]._signed_upload is not None
+    ) is replaces_attach_document
+    assert adapters["mcp_docs_other"]._signed_upload is None
+
+
+@pytest.mark.asyncio
+async def test_issuer_wrapper_is_admitted_by_a_server_scoped_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _serve_tools(monkeypatch, *_ALL_TOOLS)
+
+    result = await load_mcp_tools_as_agent_tools(
+        {"docs": _connection(signed_uploads=[_issuer_entry()])}
+    )
+
+    spec = ToolSelectionSpec.from_raw(tool_categories=["mcp:docs"])
+    allowed = spec.compute_allowed_names(list(_gated_targets(result).values()))
+    assert allowed is not None
+    assert "mcp_docs_request_upload" in allowed
+    other_spec = ToolSelectionSpec.from_raw(tool_categories=["mcp:elsewhere"])
+    other_allowed = other_spec.compute_allowed_names(
+        list(_gated_targets(result).values())
+    )
+    assert other_allowed is not None
+    assert "mcp_docs_request_upload" not in other_allowed
+
+
+@pytest.mark.asyncio
+async def test_issuer_wrapper_needs_the_listed_tool(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING)
+    _serve_tools(monkeypatch, "attach_document", "other")
+
+    result = await load_mcp_tools_as_agent_tools(
+        {"docs": _connection(signed_uploads=[_issuer_entry()])},
+        allow_users=["user-42"],
+    )
+
+    assert [tool.name for tool in result.tools] == [
+        "mcp_docs_attach_document",
+        "mcp_docs_other",
+    ]
+    assert result.failures == ()
+    assert result.loaded_servers == ("docs",)
+    warnings = [
+        record for record in caplog.records if record.levelno >= logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].args == ("docs", "request_upload")
+    assert "user-42" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_server_with_only_a_taken_over_issuing_tool_loads_the_wrapper(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING)
+    _serve_tools(monkeypatch, "request_upload")
+
+    result = await load_mcp_tools_as_agent_tools(
+        {"docs": _connection(signed_uploads=[_issuer_entry()])}
+    )
+
+    assert [tool.name for tool in result.tools] == ["mcp_docs_request_upload"]
+    assert (
+        type(_gated_targets(result)["mcp_docs_request_upload"])
+        is mcp_adapter_module.SignedUploadIssuerAdapter
+    )
+    assert result.loaded_servers == ("docs",)
+    assert result.failures == ()
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+@pytest.mark.asyncio
+async def test_hide_only_entry_hides_the_issuing_tool_without_a_wrapper(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING)
+    _serve_tools(monkeypatch, "request_upload", "other")
+    hide_only = _entry(
+        tool_name="create_staff_qualification", file_argument="document_file_id"
+    )
+
+    result = await load_mcp_tools_as_agent_tools(
+        {"docs": _connection(signed_uploads=[hide_only])}
+    )
+
+    assert [tool.name for tool in result.tools] == ["mcp_docs_other"]
+    assert _gated_targets(result)["mcp_docs_other"]._signed_upload is None
+    assert result.failures == ()
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
