@@ -428,7 +428,7 @@ _FOREGROUND = {
 _BACKGROUND_UNKNOWN_SOURCE = {None: B, I: I, B: B}
 
 
-def _view(source, *, background, previous):
+def _view(source, *, background, previous, declared=None):
     return admission.TaskClassificationView(
         task_id=1,
         source=source,
@@ -436,40 +436,59 @@ def _view(source, *, background, previous):
         owner_user_id=1,
         background=background,
         previous_dispatch_class=previous,
+        requested_dispatch_class=declared,
     )
+
+
+# A declaration that is not a dispatch class counts as no declaration.
+_DECLARATIONS = (None, I, B, "bogus")
+_SWITCH = (False, True)
 
 
 def _expected_table():
     table = {}
-    for source, kind, background, previous in itertools.product(
-        _SOURCES, KINDS, (False, True), (None, I, B)
+    for source, kind, background, previous, declared, accept, fair in itertools.product(
+        _SOURCES, KINDS, (False, True), (None, I, B), _DECLARATIONS, _SWITCH, _SWITCH
     ):
-        if background and _SOURCE_CLASS[source] is not None:
+        accepted = declared in (I, B) and accept and fair
+        if background and accepted:
+            expected = declared
+        elif background and _SOURCE_CLASS[source] is not None:
             expected = _SOURCE_CLASS[source]
         elif background:
             expected = _BACKGROUND_UNKNOWN_SOURCE[previous]
+        elif kind is KINDS.RESUME_INPUT:
+            expected = I
+        elif accepted:
+            expected = declared
         else:
-            expected = _FOREGROUND[source][
-                "resume_input" if kind is KINDS.RESUME_INPUT else "other"
-            ]
-        table[(source, kind, background, previous)] = expected
+            expected = _FOREGROUND[source]["other"]
+        table[(source, kind, background, previous, declared, accept, fair)] = expected
     return table
 
 
-def test_upstream_rule_table_covers_the_whole_input_space():
+def test_upstream_rule_table_covers_the_whole_input_space(monkeypatch):
     table = _expected_table()
     assert set(table) == set(
-        itertools.product(_SOURCES, KINDS, (False, True), (None, I, B))
-    )
-    assert len(table) == 11 * 6 * 2 * 3
-    for (source, kind, background, previous), expected in table.items():
-        view = _view(source, background=background, previous=previous)
-        assert admission.upstream_dispatch_class(view, kind.value) == expected, (
-            source,
-            kind,
-            background,
-            previous,
+        itertools.product(
+            _SOURCES,
+            KINDS,
+            (False, True),
+            (None, I, B),
+            _DECLARATIONS,
+            _SWITCH,
+            _SWITCH,
         )
+    )
+    assert len(table) == 11 * 6 * 2 * 3 * 4 * 2 * 2
+    for key, expected in table.items():
+        source, kind, background, previous, declared, accept, fair = key
+        monkeypatch.setenv("XAGENT_DISPATCH_ACCEPT_REQUESTED_CLASS", str(accept))
+        monkeypatch.setenv("XAGENT_DISPATCHER_FAIR_SHARE", str(fair))
+        view = _view(
+            source, background=background, previous=previous, declared=declared
+        )
+        assert admission.upstream_dispatch_class(view, kind.value) == expected, key
 
 
 # ---------------------------------------------------------------- I-24 and the view
@@ -493,6 +512,7 @@ def test_classifier_receives_the_task_view(host):
             owner_user_id=host.user,
             background=False,
             previous_dispatch_class=None,
+            requested_dispatch_class=None,
         )
     ]
 
