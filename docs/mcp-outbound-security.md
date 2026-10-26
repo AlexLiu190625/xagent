@@ -82,6 +82,14 @@ the connector's storage until the connector removes it. If the connector does
 not list the issuing tool for a user, that user gets no upload tool and the
 host logs a warning that names the connector and the tool.
 
+Two limits follow from the bytes leaving when the file id is requested. An
+approval gate that pauses the tool which takes the file does not hold the upload
+back; a gate decides on the upload tool by its own name. And if the connector
+also accepts its issuing tool through a dispatcher tool (for example
+`call_tool(name="request_upload", ...)`), the model can still reach the issuing
+tool that way and see its reply, because the host does not know the dispatcher's
+shape and does not block it.
+
 One issuing tool cannot be used by both forms, and two issuer entries cannot
 name the same issuing tool.
 
@@ -90,6 +98,20 @@ connector's owner or a platform administrator can change it. The URL must be
 HTTPS without a port or user info, on one of `allowed_upload_hosts`, under
 `upload_path_prefix`, and the request uses the public-address egress policy of
 remote MCP sessions.
+
+Both forms have the host call the issuing tool itself. At log level DEBUG the
+MCP SDK can log server messages in full, which includes the issuing tool's
+reply and so its signed URL. The default level, INFO, does not.
+
+Before rolling a deployment back to a version that does not know issuer
+entries, rewrite each issuer entry as a replacement entry. Give it a
+`tool_name` that the connector does not list at the top level and a
+`file_argument` of any name, and keep its `issuing_tool_name`, hosts, path
+prefix and content types. The older version accepts that entry and keeps hiding
+the issuing tool, while an issuer entry would make it mark the connector
+unavailable. Do not clear the settings instead: without them the older version
+offers the issuing tool to the model again. After rolling forward, restore the
+issuer entry.
 
 Settings that cannot be used fail closed: the web runtime marks the whole
 connector unavailable with reason `invalid_configuration`, and
