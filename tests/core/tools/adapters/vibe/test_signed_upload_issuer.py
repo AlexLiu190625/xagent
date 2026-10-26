@@ -731,10 +731,11 @@ async def test_issuer_wrapper_refuses_when_the_actor_refresh_fails(
     env: _Env, monkeypatch: pytest.MonkeyPatch, make_refresh: Callable[[], Any]
 ) -> None:
     staged: list[str] = []
+    original_stage = mcp_adapter_module.MCPToolAdapter._stage_external_upload_file
 
-    async def recording_stage(_self: Any, file_id: str) -> Any:
+    async def recording_stage(self: Any, file_id: str) -> Any:
         staged.append(file_id)
-        raise AssertionError("nothing may be staged")
+        return await original_stage(self, file_id)
 
     monkeypatch.setattr(
         mcp_adapter_module.MCPToolAdapter,
