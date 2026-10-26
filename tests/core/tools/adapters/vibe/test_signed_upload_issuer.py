@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import inspect
 import json
 import logging
+import sys
 import threading
 from collections.abc import Callable
 from contextlib import asynccontextmanager
@@ -36,10 +36,12 @@ from test_signed_upload_substitution import (  # isort: skip
     _RESOLVER_KEY,
     _RUNTIME_KEY,
     _SCENARIOS,
+    _SLACK_REFRESH_KEY,
     CONNECTION_AUTH,
     CONNECTION_SECRET,
     CONNECTION_URL,
     EXPIRES_AT,
+    FILE_ARGUMENT,
     FILE_BYTES,
     FILE_UNAVAILABLE,
     FRESH_AUTH,
@@ -68,11 +70,14 @@ from test_signed_upload_substitution import (  # isort: skip
     env,
 )
 
-ARGUMENT_ERROR = "Pass one attached file as `file`, written as file:<id>."
+ARGUMENT_ERROR = "Pass one workspace file as `file`, written as file:<id>."
 GENERIC_ERROR = "Error executing MCP tool."
 INSTRUCTIONS_SECRET = "instructions-secret-text"
+FILE_PROPERTY_DESCRIPTION = (
+    "A workspace file (attached or generated), written as file:<id>."
+)
 DESCRIPTION = (
-    "Upload a file that was attached in this conversation to this connector. "
+    "Upload a workspace file (attached or generated) to this connector. "
     "Pass the file as `file`, written as file:<id>. The host works out the "
     "file's name, type, size and SHA-256 digest, asks the connector for an "
     "upload and sends the bytes itself; it never returns an upload URL. The "
@@ -256,6 +261,7 @@ async def test_issuer_wrapper_schema_description_and_hints(
     schema = wrapper.args_type().model_json_schema()
     assert set(schema["properties"]) == {"file"}
     assert schema["required"] == ["file"]
+    assert schema["properties"]["file"]["description"] == FILE_PROPERTY_DESCRIPTION
     assert wrapper.description == DESCRIPTION
     assert wrapper.non_idempotent_write is False
     assert wrapper.write_hint == classify_write_hint(None)
@@ -698,6 +704,125 @@ async def test_issuer_wrapper_refuses_a_refreshed_connection_to_another_host(
     assert env.staging_leftovers() == []
 
 
+def _refresh_is_not_callable() -> Any:
+    return "not callable"
+
+
+def _refresh_raises_an_error() -> Any:
+    def refresh() -> Any:
+        raise RuntimeError(LEAKY_MESSAGE)
+
+    return refresh
+
+
+def _refresh_returns_no_connection() -> Any:
+    return lambda: ["not a connection"]
+
+
+@pytest.mark.parametrize(
+    "make_refresh",
+    [
+        pytest.param(_refresh_is_not_callable, id="not-callable"),
+        pytest.param(_refresh_raises_an_error, id="raises"),
+        pytest.param(_refresh_returns_no_connection, id="returns-no-connection"),
+    ],
+)
+async def test_issuer_wrapper_refuses_when_the_actor_refresh_fails(
+    env: _Env, monkeypatch: pytest.MonkeyPatch, make_refresh: Callable[[], Any]
+) -> None:
+    staged: list[str] = []
+
+    async def recording_stage(_self: Any, file_id: str) -> Any:
+        staged.append(file_id)
+        raise AssertionError("nothing may be staged")
+
+    monkeypatch.setattr(
+        mcp_adapter_module.MCPToolAdapter,
+        "_stage_external_upload_file",
+        recording_stage,
+    )
+    wrapper = _wrapper(
+        env, connection=_connection(**{_SLACK_REFRESH_KEY: make_refresh()})
+    )
+
+    result = await wrapper.run_json_async(_args())
+
+    assert result == _delegated_authorization_failed_result()
+    assert staged == []
+    assert env.calls_to(ISSUING_TOOL) == []
+    assert env.put_requests == []
+    assert env.staging_leftovers() == []
+
+
+# --------------------------------------------------------------------------
+# One handler for a failed call on both paths
+# --------------------------------------------------------------------------
+
+
+def _fail_staging(env: _Env, monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+    monkeypatch.setattr(
+        env.workspace, "stage_file_for_external_upload", _StagingFails(error)
+    )
+
+
+async def _run_failing_call(env: _Env, path: str) -> dict[str, Any]:
+    if path == "replacement":
+        return await env.adapter().run_json_async(
+            {FILE_ARGUMENT: f"file:{OUR_FILE_ID}"}
+        )
+    return await _wrapper(env).run_json_async(_args())
+
+
+@pytest.mark.parametrize("path", ["replacement", "issuer"])
+async def test_both_paths_end_in_the_shared_failure_handler(
+    env: _Env, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    sentinel = {"content": [{"text": "sentinel"}], "is_error": True}
+    seen: list[BaseException] = []
+
+    def failure_result(_self: Any, exc: BaseException) -> dict[str, Any]:
+        seen.append(exc)
+        return sentinel
+
+    monkeypatch.setattr(
+        mcp_adapter_module.MCPToolAdapter, "_execution_failure_result", failure_result
+    )
+    _fail_staging(env, monkeypatch, OSError("disk unavailable"))
+
+    result = await _run_failing_call(env, path)
+
+    assert result is sentinel
+    assert [type(exc) for exc in seen] == [OSError]
+
+
+@pytest.mark.parametrize("path", ["replacement", "issuer"])
+async def test_both_paths_log_an_exception_group_by_its_leaves(
+    env: _Env,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    path: str,
+) -> None:
+    caplog.set_level(logging.ERROR, logger="xagent")
+    _fail_staging(
+        env,
+        monkeypatch,
+        ExceptionGroup("group", [OSError("first leaf"), ValueError("second leaf")]),
+    )
+
+    result = await _run_failing_call(env, path)
+
+    assert result["is_error"] is True
+    assert _text(result) == GENERIC_ERROR
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "execution failed with exception group ExceptionGroup" in m for m in messages
+    )
+    assert any("related exception OSError" in m for m in messages)
+    assert any("related exception ValueError" in m for m in messages)
+    assert env.put_requests == []
+    assert env.staging_leftovers() == []
+
+
 # --------------------------------------------------------------------------
 # Cancellation and concurrency
 # --------------------------------------------------------------------------
@@ -837,19 +962,36 @@ _UPLOAD_CHECKS = (
 )
 
 
-def test_signed_upload_checks_have_one_owner() -> None:
-    shared = inspect.getsource(
-        mcp_adapter_module.MCPToolAdapter._issue_and_upload_staged_file
-    )
-    callers = [
-        inspect.getsource(mcp_adapter_module.MCPToolAdapter._substitute_signed_upload),
-        inspect.getsource(mcp_adapter_module.SignedUploadIssuerAdapter.run_json_async),
-    ]
+@pytest.mark.parametrize("path", ["replacement", "issuer"])
+async def test_signed_upload_checks_run_once_and_only_in_the_shared_upload(
+    env: _Env, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """Each check runs once per upload, called by the shared method alone."""
+    calls: list[tuple[str, str]] = []
 
+    def counting(name: str, original: Callable[..., Any]) -> Callable[..., Any]:
+        def counted(*args: Any, **kwargs: Any) -> Any:
+            calls.append((name, sys._getframe(1).f_code.co_name))
+            return original(*args, **kwargs)
+
+        return counted
+
+    # Wrapped after ``env`` has put its fake transport in place, so the
+    # counted function is the one the upload would have used.
     for name in _UPLOAD_CHECKS:
-        assert shared.count(f"{name}(") == 1, name
-        assert shared.count(name) == 1, name
-        for source in callers:
-            assert name not in source, name
-    for source in callers:
-        assert "_issue_and_upload_staged_file(" in source
+        monkeypatch.setattr(
+            mcp_adapter_module, name, counting(name, getattr(mcp_adapter_module, name))
+        )
+
+    if path == "replacement":
+        result = await env.adapter().run_json_async(
+            {FILE_ARGUMENT: f"file:{OUR_FILE_ID}"}
+        )
+    else:
+        result = await _wrapper(env).run_json_async(_args())
+
+    assert result["is_error"] is False
+    assert len(env.put_requests) == 1
+    assert sorted(calls) == sorted(
+        (name, "_issue_and_upload_staged_file") for name in _UPLOAD_CHECKS
+    )

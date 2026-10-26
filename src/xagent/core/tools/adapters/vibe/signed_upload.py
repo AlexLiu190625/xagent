@@ -504,10 +504,10 @@ def parse_signed_upload_response(
     if isinstance(file_id_expiry_raw, str):
         try:
             parsed = datetime.fromisoformat(file_id_expiry_raw)
-            if parsed.tzinfo is not None and parsed.utcoffset() is not None:
+            if parsed.tzinfo is not None:
                 file_id_expires_at = parsed.astimezone(timezone.utc)
         except (ValueError, OverflowError):
-            file_id_expires_at = None
+            pass
 
     return SignedUploadTicket(
         file_id=file_id,

@@ -650,7 +650,7 @@ def test_api_accepts_issuer_entries(case: str) -> None:
         assert resp.json()["signed_uploads_error"] is None
         server_id = int(resp.json()["id"])
     else:
-        stored: Any = {
+        stored: list[dict[str, Any]] = {
             "update-issuer-replaces-replacement": SIGNED_UPLOADS,
             "update-issuer-rewritten-as-hide-only": ISSUER_ENTRIES,
             "update-hide-only-back-to-issuer": HIDE_ONLY_ENTRIES,
@@ -659,11 +659,7 @@ def test_api_accepts_issuer_entries(case: str) -> None:
             expected = HIDE_ONLY_ENTRIES
         elif case == "update-hide-only-back-to-issuer":
             expected = ISSUER_ENTRIES
-        server_id = (
-            _create_ok(owner)
-            if stored is None
-            else _create_ok(owner, signed_uploads=stored)
-        )
+        server_id = _create_ok(owner, signed_uploads=stored)
         resp = client.put(
             f"/api/mcp/servers/{server_id}",
             json={"signed_uploads": expected},

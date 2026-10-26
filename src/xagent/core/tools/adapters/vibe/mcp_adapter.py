@@ -631,13 +631,13 @@ _SIGNED_UPLOAD_UNSUPPORTED_TYPE_MESSAGE = (
 _SIGNED_UPLOAD_UNTRUSTED_URL_MESSAGE = "Upload refused: untrusted upload URL."
 _SIGNED_UPLOAD_FAILED_MESSAGE = "File upload failed."
 _SIGNED_UPLOAD_ISSUER_ARGUMENT_MESSAGE = (
-    "Pass one attached file as `file`, written as file:<id>."
+    "Pass one workspace file as `file`, written as file:<id>."
 )
 # What the model is told about a tool the host runs in place of an issuing tool.
 # The connector's own description of that tool is not used: it tells the caller
 # to fetch an upload URL and send the bytes itself.
 _SIGNED_UPLOAD_ISSUER_DESCRIPTION = (
-    "Upload a file that was attached in this conversation to this connector. "
+    "Upload a workspace file (attached or generated) to this connector. "
     "Pass the file as `file`, written as file:<id>. The host works out the "
     "file's name, type, size and SHA-256 digest, asks the connector for an "
     "upload and sends the bytes itself; it never returns an upload URL. The "
@@ -652,7 +652,7 @@ _SIGNED_UPLOAD_ISSUER_INPUT_SCHEMA: dict[str, Any] = {
     "properties": {
         "file": {
             "type": "string",
-            "description": "A file attached in this conversation, written as file:<id>.",
+            "description": "A workspace file (attached or generated), written as file:<id>.",
         }
     },
     "required": ["file"],
@@ -3424,25 +3424,36 @@ class MCPToolAdapter(AbstractBaseTool):
             finally:
                 await self._discard_external_upload_args(staged_uploads)
 
-        # The tool-loading handlers (_load_direct_mcp_tools,
-        # load_mcp_tools_as_agent_tools) log only class names (and, in
-        # _load_direct_mcp_tools, an integer HTTP status) above DEBUG
-        # and keep the raw traceback (exc_info) for DEBUG, because a traceback
-        # is unredacted and unbounded. These two handlers log at ERROR, but
-        # only _truncated_error_message() output -- passed through
-        # redact_urls_in_text and redact_sensitive_text and capped per line --
-        # and never a traceback, so do not add exc_info here. Shapes neither
-        # helper recognises: #2272 and some of those listed in #2356.
         except BaseExceptionGroup as e:
+            return self._execution_failure_result(e)
+
+        except Exception as e:
+            return self._execution_failure_result(e)
+
+    def _execution_failure_result(self, exc: BaseException) -> dict[str, Any]:
+        """Log a failed tool call and return the fixed error result.
+
+        Both ``run_json_async`` implementations that execute a call end in this
+        handler.  The tool-loading handlers (_load_direct_mcp_tools,
+        load_mcp_tools_as_agent_tools) log only class names (and, in
+        _load_direct_mcp_tools, an integer HTTP status) above DEBUG
+        and keep the raw traceback (exc_info) for DEBUG, because a traceback
+        is unredacted and unbounded.  This handler logs at ERROR, but
+        only _truncated_error_message() output -- passed through
+        redact_urls_in_text and redact_sensitive_text and capped per line --
+        and never a traceback, so do not add exc_info here.  Shapes neither
+        helper recognises: #2272 and some of those listed in #2356.
+        """
+        if isinstance(exc, BaseExceptionGroup):
             logger.error(
                 "MCP tool %s execution failed with exception group %s: %s",
                 self.mcp_tool.name,
-                type(e).__name__,
-                _truncated_error_message(e),
+                type(exc).__name__,
+                _truncated_error_message(exc),
             )
             leaf_count = 0
-            for node in _level_order_exception_nodes(e):
-                if node is e or isinstance(node, BaseExceptionGroup):
+            for node in _level_order_exception_nodes(exc):
+                if node is exc or isinstance(node, BaseExceptionGroup):
                     continue
                 if leaf_count >= _MCP_TOOL_ERROR_LOG_MAX_SUB_EXCEPTIONS:
                     break
@@ -3453,22 +3464,17 @@ class MCPToolAdapter(AbstractBaseTool):
                     type(node).__name__,
                     _truncated_error_message(node),
                 )
-            return {
-                "content": [{"text": "Error executing MCP tool."}],
-                "is_error": True,
-            }
-
-        except Exception as e:
+        else:
             logger.error(
                 "MCP tool %s execution failed with %s: %s",
                 self.mcp_tool.name,
-                type(e).__name__,
-                _truncated_error_message(e),
+                type(exc).__name__,
+                _truncated_error_message(exc),
             )
-            return {
-                "content": [{"text": "Error executing MCP tool."}],
-                "is_error": True,
-            }
+        return {
+            "content": [{"text": "Error executing MCP tool."}],
+            "is_error": True,
+        }
 
     async def _invocation_connection(self) -> tuple[Connection | None, bool]:
         """Resolve a one-call trusted connection without stale fallback."""
@@ -4203,7 +4209,7 @@ class MCPToolAdapter(AbstractBaseTool):
 class SignedUploadIssuerAdapter(MCPToolAdapter):
     """The tool the host runs in place of a connector's issuing tool.
 
-    The model passes one attached file as ``file``.  The host stages it, asks the
+    The model passes one workspace file as ``file``.  The host stages it, asks the
     connector for a signed upload with ``_issue_and_upload_staged_file``, sends
     the bytes and returns only the connector's file id (and when it stops
     working, if the connector says).  The model then puts that file id into the
@@ -4216,9 +4222,9 @@ class SignedUploadIssuerAdapter(MCPToolAdapter):
     bindings or schema.
 
     ``run_json_async`` does not call ``MCPToolAdapter.run_json_async``.  It
-    mirrors that method's pre-call checks (the user allowlist and
-    ``_invocation_connection``) and its two fallback branches.  Whoever adds a
-    pre-call check there must add it here too.
+    ends in the same ``_execution_failure_result`` handler, but it repeats that
+    method's pre-call checks (the user allowlist and ``_invocation_connection``)
+    itself.  Whoever adds a pre-call check there must add it here too.
     """
 
     def __init__(
@@ -4271,7 +4277,7 @@ class SignedUploadIssuerAdapter(MCPToolAdapter):
         return set()
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
-        """Upload the attached file the model passed and return the file id."""
+        """Upload the workspace file the model passed and return the file id."""
         try:
             current_user_id = self._get_current_user_id()
             if not self._is_user_allowed(current_user_id):
@@ -4345,40 +4351,9 @@ class SignedUploadIssuerAdapter(MCPToolAdapter):
                 "is_error": False,
             }
         except BaseExceptionGroup as e:
-            logger.error(
-                "MCP tool %s execution failed with exception group %s: %s",
-                self.mcp_tool.name,
-                type(e).__name__,
-                _truncated_error_message(e),
-            )
-            leaf_count = 0
-            for node in _level_order_exception_nodes(e):
-                if node is e or isinstance(node, BaseExceptionGroup):
-                    continue
-                if leaf_count >= _MCP_TOOL_ERROR_LOG_MAX_SUB_EXCEPTIONS:
-                    break
-                leaf_count += 1
-                logger.error(
-                    "MCP tool %s execution failed with related exception %s: %s",
-                    self.mcp_tool.name,
-                    type(node).__name__,
-                    _truncated_error_message(node),
-                )
-            return {
-                "content": [{"text": "Error executing MCP tool."}],
-                "is_error": True,
-            }
+            return self._execution_failure_result(e)
         except Exception as e:
-            logger.error(
-                "MCP tool %s execution failed with %s: %s",
-                self.mcp_tool.name,
-                type(e).__name__,
-                _truncated_error_message(e),
-            )
-            return {
-                "content": [{"text": "Error executing MCP tool."}],
-                "is_error": True,
-            }
+            return self._execution_failure_result(e)
 
 
 class ChromeExecutionMCPToolAdapter(MCPToolAdapter):
@@ -5157,7 +5132,7 @@ async def _load_direct_mcp_tools(
         try:
             if issuer is not None:
                 # The host runs this issuing tool for the model: the model gets
-                # a tool of the same name that uploads an attached file and
+                # a tool of the same name that uploads a workspace file and
                 # returns only the connector's file id, never the URL.
                 adapter: MCPToolAdapter = _build_signed_upload_issuer_adapter(
                     server_name,
