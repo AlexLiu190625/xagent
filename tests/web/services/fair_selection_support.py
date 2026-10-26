@@ -1,5 +1,6 @@
 """Queued task commands for the fair-share selection tests, on any engine."""
 
+import copy
 import random
 import threading
 from collections import Counter
@@ -330,6 +331,8 @@ class Reference:
         self.tenants_per_scan = 4
         self.window = 16
         self.fallback_every = 8
+        self.tenant_cap = True
+        self.last_capped: str | None = None
 
     def claimable(self, cmd: Cmd, cap, busy) -> bool:
         if cmd.status not in QUEUED or cmd.pinned or cmd.unavailable:
@@ -343,13 +346,47 @@ class Reference:
             return needs_no_slot or cmd.dispatch_class == "interactive"
         return True
 
+    def capped_tenant(self, cap) -> str | None:
+        if not self.tenant_cap or not cap.batch_closed or cap.closed:
+            return None
+        now = self.clock()
+        skips = {k for k, until in self.skips.items() if until > now}
+        counted: dict[str, int] = {}
+        classes: dict[str, set[str]] = {}
+        for c in self.commands:
+            if c.status in QUEUED and c.kind not in CONTROL_KINDS:
+                counted[c.tenant] = min(counted.get(c.tenant, c.id), c.id)
+                classes.setdefault(c.tenant, set()).add(c.dispatch_class)
+        counted = {
+            t: first
+            for t, first in counted.items()
+            if any((t, k) not in skips for k in classes[t])
+        }
+        top = max(cap.occupancy.values(), default=0)
+        if len(counted) < 2 or top <= 0:
+            return None
+        holders = [t for t, n in cap.occupancy.items() if n == top and t in counted]
+        return min(holders, key=lambda t: counted[t]) if holders else None
+
     def pick(self, cap, busy=()) -> int | None:
         has_room = not cap.closed
         fallback = False
         if has_room:
             self.attempts += 1
             fallback = self.attempts % self.fallback_every == 0
-        usable = [c for c in self.commands if self.claimable(c, cap, busy)]
+        capped = self.capped_tenant(cap) if has_room else None
+        self.last_capped = capped
+        usable = [
+            c
+            for c in self.commands
+            if self.claimable(c, cap, busy)
+            and not (
+                capped is not None
+                and c.tenant == capped
+                and c.kind not in CONTROL_KINDS
+                and c.task not in cap.active_ids
+            )
+        ]
         today = min((c.id for c in usable), default=None)
         if not has_room:
             return today
@@ -387,6 +424,7 @@ class Reference:
                         remaining,
                     )
                 )
+        ranked = [entry for entry in ranked if entry[2] != capped]
         ranked.sort()
         best = None
         for _, _, tenant, remaining in ranked[: self.tenants_per_scan]:
@@ -438,7 +476,9 @@ def attempt():
     return transport._FairAttempt()
 
 
-def play(world, clock, seed, *, tenants, reserves, attempts=20, **world_options):
+def play(
+    world, clock, seed, *, tenants, reserves, attempts=20, stats=None, **world_options
+):
     """Run ``attempts`` scans of one random world and compare each with the reference.
 
     Fails with the seed and the whole world. After every scan the chosen command is
@@ -469,7 +509,15 @@ def play(world, clock, seed, *, tenants, reserves, attempts=20, **world_options)
             occupancy=dict(Counter(tenant for _, tenant in holds)),
         )
         busy = tuple(c.task for c in spec.commands if rng.random() < 0.03)
+        shadow = None
+        if stats is not None:
+            shadow = copy.deepcopy(reference)
+            shadow.clock, shadow.tenant_cap = clock, False
         expected = reference.pick(cap, busy)
+        if shadow is not None and reference.last_capped is not None:
+            stats["capped"] = stats.get("capped", 0) + 1
+            if shadow.pick(cap, busy) != expected:
+                stats["changed"] = stats.get("changed", 0) + 1
         chosen = scan(cap, attempt=attempt(), busy=busy)
         assert chosen == expected, (
             f"seed {seed} step {step}: dispatcher {chosen}, reference {expected}\n"

@@ -107,7 +107,14 @@ as many slots are ordered by their oldest queued command that opens an execution
 Only executions the process started through its dispatcher count for a tenant,
 as for `slot_tenants`: a resume started another way, such as one for a task that
 waited for an A2A or a user reply, holds a slot of the cap but counts for no
-tenant, so its tenant ranks as if it held fewer slots. The switch accepts `1`,
+tenant, so its tenant ranks as if it held fewer slots. Between the batch line
+and the limit (`XAGENT_DISPATCHER_INTERACTIVE_RESERVE_PER_PROCESS` above 0), when
+at least two tenants have queued commands, the tenant holding the most slots in
+the process may not take a new one, so a reserve slot can stay empty until the
+process is back under the batch line. Controls and commands of tasks the process
+already runs still pass, but within one task a cancel or pause queued behind a
+held-back start waits with it. A command dispatched by its id is not held back.
+The switch accepts `1`,
 `true`, `yes` or `on` and `0`, `false`, `no` or `off`, in any case; unset or
 blank is off. Any other value counts as off and logs a warning in two places:
 where the dispatcher reads it, and where the `dispatch policy` line parses it,
