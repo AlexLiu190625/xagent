@@ -863,3 +863,29 @@ def test_a_queue_of_one_tenant_is_scanned_as_before_plus_one_listing(world, on, 
 
         assert on_choice == off, f"seed {seed}: {spec.commands}"
         assert len(on_seen) == len(off_seen) + 1, f"seed {seed}: {spec.commands}"
+
+
+def test_a_scan_that_finds_no_open_command_is_not_counted(world, on, clock):
+    record = attempt()
+
+    chosen, seen = recorded(world, lambda: scan(cap_of(), attempt=record))
+
+    assert chosen is None
+    assert len(seen) == 1
+    assert transport._fair_state.attempts == 0
+    assert not record.decided
+
+
+def test_a_held_cap_ranks_no_tenant_and_is_not_counted(world, on, clock):
+    world.add("a")
+    world.add("b")
+    held = DispatchCapSnapshot(
+        policy=cap_of().policy, active_ids=frozenset(), held=True
+    )
+    off, off_seen = recorded(world, lambda: scan(held))
+
+    chosen, seen = recorded(world, lambda: scan(held, attempt=attempt()))
+
+    assert chosen == off
+    assert [statement for statement, _ in seen] == [s for s, _ in off_seen]
+    assert transport._fair_state.attempts == 0
