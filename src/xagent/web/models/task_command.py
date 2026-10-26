@@ -16,16 +16,32 @@ from sqlalchemy.sql import func
 
 from .database import Base
 
-# Statuses a dispatcher can still claim. The partial indexes below, the
-# dispatcher's presence precheck and the shared-mode claim condition take their
-# status set from here. The legacy claim arms name their statuses; a test keeps
-# them within this set, so a precheck cannot miss a command a claim would take.
+# A command is in exactly one of two status sets, and together they hold every
+# status a command is written with.
+#
+# Claimable: statuses a dispatcher can still claim. The three claimable partial
+# indexes below, the dispatcher's presence precheck and the shared-mode claim
+# condition take their status set from here. The legacy claim arms name their
+# statuses; a test keeps them within this set, so a precheck cannot miss a
+# command a claim would take.
+#
+# Terminal: statuses a command never leaves. The unfinished-task partial index
+# below takes its status set from here, as every unfinished-command check
+# (``status NOT IN`` the terminal set) does; a test keeps the transport's and
+# the admission code's terminal tuples equal to it.
 CLAIMABLE_COMMAND_STATUSES = ("pending", "processing")
+TERMINAL_COMMAND_STATUSES = ("completed", "failed")
 
 # Rows a dispatcher can still claim. Settled commands leave the partial index,
 # so it stays small however large the command history grows.
 _CLAIMABLE_STATUS_CLAUSE = text(
     "status IN ({})".format(", ".join(f"'{s}'" for s in CLAIMABLE_COMMAND_STATUSES))
+)
+
+# Rows that are not settled. The partial index keeps only these, so it stays
+# small however large the command history grows.
+_UNFINISHED_STATUS_CLAUSE = text(
+    "status NOT IN ({})".format(", ".join(f"'{s}'" for s in TERMINAL_COMMAND_STATUSES))
 )
 
 
@@ -62,6 +78,17 @@ class TaskExecutionCommand(Base):  # type: ignore
             "id",
             sqlite_where=_CLAIMABLE_STATUS_CLAUSE,
             postgresql_where=_CLAIMABLE_STATUS_CLAUSE,
+        ),
+        # Serves two reads: the oldest unfinished id of one task (the dispatcher's
+        # lookup of what a running task has queued) and the check, in every
+        # claimable query, that a task has no unfinished command before the
+        # candidate.
+        Index(
+            "ix_task_commands_unfinished_task",
+            "task_id",
+            "id",
+            sqlite_where=_UNFINISHED_STATUS_CLAUSE,
+            postgresql_where=_UNFINISHED_STATUS_CLAUSE,
         ),
     )
 

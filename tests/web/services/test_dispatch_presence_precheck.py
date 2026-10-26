@@ -36,11 +36,14 @@ from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import (
     _CLAIMABLE_STATUS_CLAUSE,
+    _UNFINISHED_STATUS_CLAUSE,
     CLAIMABLE_COMMAND_STATUSES,
+    TERMINAL_COMMAND_STATUSES,
     TaskExecutionCommand,
 )
 from xagent.web.models.user import User
 from xagent.web.services import task_command_transport as transport
+from xagent.web.services import task_execution_admission
 from xagent.web.services.task_command_transport import (
     COMMAND_COMPLETED,
     COMMAND_FAILED,
@@ -55,6 +58,9 @@ MIGRATIONS = REPO_ROOT / "src/xagent/migrations/versions"
 KIND_INDEX_MIGRATION = MIGRATIONS / "20261014_task_command_claimable_kind_index.py"
 ID_INDEX_MIGRATION = MIGRATIONS / "20261015_task_command_claimable_id_index.py"
 FAIR_INDEX_MIGRATION = MIGRATIONS / "20261022_task_command_claimable_fair_index.py"
+UNFINISHED_INDEX_MIGRATION = (
+    MIGRATIONS / "20261026_task_command_unfinished_task_index.py"
+)
 
 NOW = datetime(2026, 10, 24, 12, 0, tzinfo=timezone.utc)
 
@@ -118,6 +124,28 @@ def test_claimable_statuses_single_source() -> None:
         FAIR_INDEX_MIGRATION, "presence_fair_index_migration"
     )
     assert set(CLAIMABLE_COMMAND_STATUSES) == {COMMAND_PENDING, COMMAND_PROCESSING}
+
+
+def test_terminal_statuses_single_source() -> None:
+    assert str(_UNFINISHED_STATUS_CLAUSE) == "status NOT IN ('completed', 'failed')"
+    assert str(_UNFINISHED_STATUS_CLAUSE) == _migration_predicate(
+        UNFINISHED_INDEX_MIGRATION, "presence_unfinished_index_migration"
+    )
+    assert set(TERMINAL_COMMAND_STATUSES) == set(COMMAND_TERMINAL)
+    assert set(TERMINAL_COMMAND_STATUSES) == set(task_execution_admission._TERMINAL)
+
+
+def test_claimable_and_terminal_statuses_cover_every_written_status() -> None:
+    # The unfinished-task index holds every status that is not terminal, and the
+    # claimable indexes hold the claimable ones: a status in neither set would be
+    # indexed for one reader and not for the other.
+    assert not set(CLAIMABLE_COMMAND_STATUSES) & set(TERMINAL_COMMAND_STATUSES)
+    assert set(CLAIMABLE_COMMAND_STATUSES) | set(TERMINAL_COMMAND_STATUSES) == {
+        COMMAND_PENDING,
+        COMMAND_PROCESSING,
+        COMMAND_COMPLETED,
+        COMMAND_FAILED,
+    }
 
 
 _STATUS_COMPARISON = re.compile(
