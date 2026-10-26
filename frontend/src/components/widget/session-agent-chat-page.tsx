@@ -12,6 +12,7 @@ import {
   useApp,
 } from "@/contexts/app-context-chat"
 import { useI18n } from "@/contexts/i18n-context"
+import { useWidgetInitialMessage } from "@/hooks/use-widget-initial-message"
 import type { WebSocketConnection } from "@/hooks/use-websocket"
 import { readSendErrorCode } from "@/components/chat/clarification-delivery"
 import {
@@ -164,6 +165,13 @@ function SessionConversationContent({
       setResetError(true)
     }
   }, [startNewConversation])
+
+  useWidgetInitialMessage({
+    ready: status === "active" && agent !== null && isConnected,
+    // A first send queued during the initial connect has no task yet.
+    hasConversation: state.taskId !== null || isMessageDeliveryPending,
+    onMessage: (message) => handleStartMessage(message, []),
+  })
 
   if (status === "waiting" || (status === "refreshing" && !agent)) {
     return (

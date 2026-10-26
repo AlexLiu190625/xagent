@@ -898,4 +898,88 @@ describe("SessionAgentChatPage", () => {
       expect(app.panelProps?.onAttachmentFilesChange).toBeUndefined()
     })
   })
+
+  describe("initial message from the host page", () => {
+    function deliverInitialMessage(value: unknown) {
+      window.dispatchEvent(new MessageEvent("message", {
+        data: { xagent: true, v: 1, type: "initial_message", value },
+        source: window.parent as unknown as MessageEventSource,
+      }))
+    }
+
+    function stubParent() {
+      const post = vi.fn()
+      vi.stubGlobal("parent", { postMessage: post })
+      return post
+    }
+
+    const initialRequests = (post: ReturnType<typeof vi.fn>) => (
+      post.mock.calls.filter(([data]) => data.type === "initial_message_request")
+    )
+
+    it("sends the delivered message once the connection is open", async () => {
+      const post = stubParent()
+      setBridge("active", activeSession())
+      app.isConnected = true
+      app.sendMessage.mockResolvedValue(undefined)
+
+      render(<SessionAgentChatPage />)
+      await waitFor(() => expect(initialRequests(post)).toHaveLength(1))
+
+      deliverInitialMessage("hello agent")
+
+      await waitFor(() => {
+        expect(app.sendMessage).toHaveBeenCalledWith("hello agent", undefined, [])
+      })
+      deliverInitialMessage("again")
+      expect(app.sendMessage).toHaveBeenCalledTimes(1)
+    })
+
+    it("does not send after a first message queued before the connection opened", () => {
+      const post = stubParent()
+      setBridge("active", activeSession())
+      app.isConnected = false
+      app.isMessageDeliveryPending = true
+      const { rerender } = render(<SessionAgentChatPage />)
+
+      app.isConnected = true
+      rerender(<SessionAgentChatPage />)
+
+      expect(initialRequests(post)).toEqual([])
+    })
+
+    it("waits for an open connection before asking", () => {
+      const post = stubParent()
+      setBridge("active", activeSession())
+      app.isConnected = false
+
+      render(<SessionAgentChatPage />)
+
+      expect(initialRequests(post)).toEqual([])
+    })
+
+    it("does not ask while a conversation already exists", () => {
+      const post = stubParent()
+      setBridge("active", activeSession())
+      app.isConnected = true
+      app.state.taskId = 7
+
+      render(<SessionAgentChatPage />)
+
+      expect(initialRequests(post)).toEqual([])
+    })
+
+    it("surfaces a failed send on the start screen", async () => {
+      const post = stubParent()
+      setBridge("active", activeSession())
+      app.isConnected = true
+      app.sendMessage.mockRejectedValue(new Error("delivery failed"))
+
+      render(<SessionAgentChatPage />)
+      await waitFor(() => expect(initialRequests(post)).toHaveLength(1))
+      deliverInitialMessage("hello agent")
+
+      expect(await screen.findByText("widgetSession.startMessageFailed")).toBeInTheDocument()
+    })
+  })
 })
