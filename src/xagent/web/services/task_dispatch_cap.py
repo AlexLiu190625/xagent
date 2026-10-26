@@ -118,6 +118,52 @@ class DispatchCapSnapshot:
             return True
         return not (self.closed if interactive else self.batch_closed)
 
+    @property
+    def in_reserve_band(self) -> bool:
+        """Whether the process sits between its batch line and its limit.
+
+        Only there can the tenant cap hold a tenant back: below the batch line
+        every command may take a slot, at the limit none may, and with no
+        interactive reserve the band is empty.
+        """
+        return self.batch_closed and not self.closed
+
+    def capped_tenant(self, queued: Mapping[str, int] | None) -> str | None:
+        """The tenant that may not take a new slot now, or None when nobody is held back.
+
+        ``queued`` maps each queued tenant key to the id of its oldest queued
+        command. Between the batch line and the limit, when at least two
+        tenants are queued, the tenant holding the most slots in this process
+        is held back. Every tenant that holds slots is compared, queued or not;
+        when the top holders have nothing queued nobody is held back, and on a
+        tie only the tied tenant with the earliest queued command is.
+
+        None when ``queued`` is None or lists fewer than two tenants, when the
+        process is not between the lines (``in_reserve_band``) and when no
+        queued tenant is a top holder. The empty string is a valid tenant key
+        and a valid result, so callers compare the result with ``is None``.
+        """
+        if queued is None or len(queued) < 2 or not self.in_reserve_band:
+            return None
+        top = max(self.occupancy.values(), default=0)
+        if top <= 0:
+            return None
+        holders = [
+            key for key, held in self.occupancy.items() if held == top and key in queued
+        ]
+        if not holders:
+            return None
+        return min(holders, key=lambda key: queued[key])
+
+
+class TenantListingRequired(Exception):
+    """A slot was asked for without the queued tenants, inside the reserve band.
+
+    Raised by ``BackgroundTaskManager.reserve_dispatch_slot`` only when the
+    caller passed ``require_listing=True``; it leaves no state behind. The
+    dispatch attempt that gets it selects again, with the tenants listed.
+    """
+
 
 # The last raw environment values and the policy parsed from them; the clamp
 # warning is logged once per parse. Event-loop thread only.
