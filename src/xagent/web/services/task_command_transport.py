@@ -2126,8 +2126,9 @@ class _FairAttempt:
     ``decided`` is set by the first scan, which counts the attempt when it has
     room and fixes whether the attempt is a fallback round; a rescan keeps that
     decision. A scan the presence precheck ends because no command is open
-    never reaches that decision, so it leaves ``decided`` unset. ``tenants`` is the listing of the queue, taken by the first scan
-    that ranks and reused by the rescans of the same attempt.
+    never reaches that decision, so it leaves ``decided`` unset. ``tenants`` is
+    the listing of the queue, taken by the first scan that ranks and reused by
+    the rescans of the same attempt.
     """
 
     decided: bool = False
