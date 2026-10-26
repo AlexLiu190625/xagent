@@ -6,7 +6,7 @@ INFO line per window, whether or not anything happened::
     runtime diagnostics role=worker pid=4242 window_s=60.0 inflight=1
     resume_inflight=0 started_1m=2 finished_1m=1 ok=1 failed=0 cancelled=0
     gate_held_s=0.0 slot_tenants=1 slot_top=1 loop_lag_max_ms=12.3
-    loop_lag_samples=0 degradations=-
+    loop_lag_samples=0 degradations=- fair_misses=0
 
 The line is unconditional and has no switch: a process whose pid stops
 appearing for two windows is gone or has a blocked event loop, and an idle
@@ -63,6 +63,12 @@ Field meanings:
   degradations, sorted and comma-separated, or ``-`` when none is active.
   ``/health`` reports them only for web processes; a worker has no HTTP
   surface, so this line is where its degradations show up.
+- ``fair_misses``: how many times in the window a query for the commands of one
+  tenant key and dispatch class found nothing this process could claim, so that
+  the pair was skipped for a while. Counted per window like ``started_1m``. It
+  is ``0`` when ``XAGENT_DISPATCHER_FAIR_SHARE`` is off and in a process that
+  does not dispatch task commands. Read ``fair_share=`` on the dispatch policy
+  line to tell whether the switch is on.
 """
 
 from __future__ import annotations
@@ -97,6 +103,7 @@ class ExecutionCounters:
     slot_top: int
     loop_lag_max_ms: float
     loop_lag_samples: int
+    fair_misses: int
     degradations: tuple[str, ...] = ()
 
     @property
@@ -115,7 +122,8 @@ class ExecutionCounters:
             f"slot_tenants={self.slot_tenants} slot_top={self.slot_top} "
             f"loop_lag_max_ms={self.loop_lag_max_ms:.1f} "
             f"loop_lag_samples={self.loop_lag_samples} "
-            f"degradations={','.join(self.degradations) or '-'}"
+            f"degradations={','.join(self.degradations) or '-'} "
+            f"fair_misses={self.fair_misses}"
         )
 
 
@@ -158,6 +166,7 @@ def drain_execution_counters(now: float | None = None) -> ExecutionCounters:
     """
 
     from .ops_signals import active_degradations
+    from .task_command_transport import drain_fair_misses
     from .task_execution import background_task_manager
 
     if now is None:
@@ -168,6 +177,7 @@ def drain_execution_counters(now: float | None = None) -> ExecutionCounters:
     started, ok, failed, cancelled = background_task_manager.drain_window_counts()
     gate_held_s = min(background_task_manager.drain_gate_held_seconds(now), window_s)
     slot_tenants, slot_top = background_task_manager.slot_tenant_counts()
+    fair_misses = drain_fair_misses()
     counters = ExecutionCounters(
         role=_resolve_role(),
         pid=os.getpid(),
@@ -184,6 +194,7 @@ def drain_execution_counters(now: float | None = None) -> ExecutionCounters:
         loop_lag_max_ms=_window.lag_max_ms,
         loop_lag_samples=_window.lag_samples,
         degradations=tuple(sorted(active_degradations())),
+        fair_misses=fair_misses,
     )
     _window.started_at = now
     _window.lag_max_ms = 0.0
