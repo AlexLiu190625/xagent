@@ -216,6 +216,41 @@ async def test_retryable_failure_then_success(counters) -> None:
 
 
 @pytest.mark.asyncio
+async def test_retry_counter_exports_its_site(monkeypatch) -> None:
+    """The site must survive the exporter's attribute filter, not just the call."""
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+
+    from xagent.core import runtime_performance as metrics
+
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader], shutdown_on_exit=False)
+    monkeypatch.setattr(
+        metrics,
+        "runtime_performance",
+        metrics.RuntimePerformanceTelemetry(provider.get_meter("test")),
+    )
+    try:
+        operation = _FlakyOperation([_operational("40P01")])
+        await retry_db_write_async(operation, site="trace_fact", policy=_FAST)
+        data = reader.get_metrics_data()
+    finally:
+        provider.shutdown()
+    assert data is not None
+    (metric,) = [
+        m
+        for r in data.resource_metrics
+        for scope in r.scope_metrics
+        for m in scope.metrics
+        if m.name == _COUNTER
+    ]
+    assert {
+        (point.attributes["site"], point.attributes["outcome"]): point.value
+        for point in metric.data.data_points
+    } == {("trace_fact", "retried"): 1, ("trace_fact", "recovered"): 1}
+
+
+@pytest.mark.asyncio
 async def test_first_attempt_success_is_not_counted(counters) -> None:
     operation = _FlakyOperation([])
 

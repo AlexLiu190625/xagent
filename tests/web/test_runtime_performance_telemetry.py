@@ -6,6 +6,7 @@ import pytest
 from fastapi import FastAPI
 
 from xagent.web import app as app_module
+from xagent.web import runtime_telemetry
 
 
 @pytest.fixture
@@ -216,7 +217,7 @@ def test_runtime_performance_monitor_stays_off_without_exporter(
 ) -> None:
     test_app = FastAPI()
     monkeypatch.setattr(
-        app_module,
+        runtime_telemetry,
         "initialize_runtime_performance_telemetry",
         lambda: False,
     )
@@ -234,17 +235,17 @@ async def test_runtime_performance_monitor_registers_gauges_once_and_stops(
     registered: list[str] = []
     shutdown_calls: list[bool] = []
     monkeypatch.setattr(
-        app_module,
+        runtime_telemetry,
         "initialize_runtime_performance_telemetry",
         lambda: True,
     )
     monkeypatch.setattr(
-        app_module,
+        runtime_telemetry,
         "register_observable_gauge",
         lambda metric, *_args, **_kwargs: registered.append(metric),
     )
     monkeypatch.setattr(
-        app_module,
+        runtime_telemetry,
         "shutdown_runtime_performance_telemetry",
         lambda: shutdown_calls.append(True),
     )
@@ -264,3 +265,54 @@ async def test_runtime_performance_monitor_registers_gauges_once_and_stops(
     assert test_app.state.runtime_performance_task is None
     assert first_task.cancelled()
     assert shutdown_calls == [True]
+
+
+def test_process_telemetry_that_fails_to_start_shuts_down_and_returns_none(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A worker relies on this never raising: telemetry must not block startup."""
+    shutdown_calls: list[bool] = []
+    monkeypatch.setattr(
+        runtime_telemetry, "initialize_runtime_performance_telemetry", lambda: True
+    )
+
+    def broken_gauge(*_args, **_kwargs):
+        raise RuntimeError("meter rejected the gauge")
+
+    monkeypatch.setattr(runtime_telemetry, "register_observable_gauge", broken_gauge)
+    monkeypatch.setattr(
+        runtime_telemetry,
+        "shutdown_runtime_performance_telemetry",
+        lambda: shutdown_calls.append(True),
+    )
+
+    assert runtime_telemetry.start_process_runtime_telemetry() is None
+    assert shutdown_calls == [True]
+    assert "Could not start runtime performance monitor" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_worker_telemetry_registers_no_websocket_gauge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registered: list[str] = []
+    monkeypatch.setattr(
+        runtime_telemetry, "initialize_runtime_performance_telemetry", lambda: True
+    )
+    monkeypatch.setattr(
+        runtime_telemetry,
+        "register_observable_gauge",
+        lambda metric, *_args, **_kwargs: registered.append(metric),
+    )
+    monkeypatch.setattr(
+        runtime_telemetry, "shutdown_runtime_performance_telemetry", lambda: None
+    )
+
+    task = runtime_telemetry.start_process_runtime_telemetry()
+    try:
+        assert registered == [
+            "xagent.agent_tasks.running",
+            "xagent.agent_tasks.resuming",
+        ]
+    finally:
+        await runtime_telemetry.stop_process_runtime_telemetry(task)

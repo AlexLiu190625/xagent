@@ -6,7 +6,7 @@ INFO line per window, whether or not anything happened::
     runtime diagnostics role=worker pid=4242 window_s=60.0 inflight=1
     resume_inflight=0 started_1m=2 finished_1m=1 ok=1 failed=0 cancelled=0
     gate_held_s=0.0 slot_tenants=1 slot_top=1 loop_lag_max_ms=12.3
-    loop_lag_samples=0
+    loop_lag_samples=0 degradations=-
 
 The line is unconditional and has no switch: a process whose pid stops
 appearing for two windows is gone or has a blocked event loop, and an idle
@@ -59,6 +59,10 @@ Field meanings:
 - ``loop_lag_max_ms`` / ``loop_lag_samples``: largest event-loop scheduling
   delay seen by a 1-second sampler, and the number of samples delayed by at
   least 500 ms.
+- ``degradations``: names of this process's active ``ops_signals``
+  degradations, sorted and comma-separated, or ``-`` when none is active.
+  ``/health`` reports them only for web processes; a worker has no HTTP
+  surface, so this line is where its degradations show up.
 """
 
 from __future__ import annotations
@@ -93,6 +97,7 @@ class ExecutionCounters:
     slot_top: int
     loop_lag_max_ms: float
     loop_lag_samples: int
+    degradations: tuple[str, ...] = ()
 
     @property
     def finished(self) -> int:
@@ -109,7 +114,8 @@ class ExecutionCounters:
             f"gate_held_s={self.gate_held_s:.1f} "
             f"slot_tenants={self.slot_tenants} slot_top={self.slot_top} "
             f"loop_lag_max_ms={self.loop_lag_max_ms:.1f} "
-            f"loop_lag_samples={self.loop_lag_samples}"
+            f"loop_lag_samples={self.loop_lag_samples} "
+            f"degradations={','.join(self.degradations) or '-'}"
         )
 
 
@@ -151,6 +157,7 @@ def drain_execution_counters(now: float | None = None) -> ExecutionCounters:
     ``now`` is the event-loop clock reading used for ``window_s``.
     """
 
+    from .ops_signals import active_degradations
     from .task_execution import background_task_manager
 
     if now is None:
@@ -176,6 +183,7 @@ def drain_execution_counters(now: float | None = None) -> ExecutionCounters:
         slot_top=slot_top,
         loop_lag_max_ms=_window.lag_max_ms,
         loop_lag_samples=_window.lag_samples,
+        degradations=tuple(sorted(active_degradations())),
     )
     _window.started_at = now
     _window.lag_max_ms = 0.0

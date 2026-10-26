@@ -53,13 +53,6 @@ from ..core.execution_scope import (
     ExecutionScopeResolverContractError,
 )
 from ..core.file_storage import StorageKeyScopeError
-from ..core.runtime_performance import (
-    initialize_runtime_performance_telemetry,
-    register_observable_gauge,
-    shutdown_runtime_performance_telemetry,
-    start_event_loop_lag_monitor,
-    stop_event_loop_lag_monitor,
-)
 from ..core.tracing.langfuse import flush_langfuse, initialize_langfuse
 from .api.a2a import router as a2a_router
 from .api.admin_interaction_rollout import router as admin_interaction_rollout_router
@@ -110,6 +103,10 @@ from .content_security import is_active_content_type
 from .dynamic_memory_store import get_memory_store
 from .logging_config import setup_logging
 from .models.database import init_db
+from .runtime_telemetry import (
+    start_process_runtime_telemetry,
+    stop_process_runtime_telemetry,
+)
 from .services.a2a_protocol import A2AApiError, a2a_api_error_handler, a2a_error
 from .services.connector_team_scope import (
     ConnectorHookSessionBoundaryError,
@@ -1734,45 +1731,17 @@ def start_runtime_performance_monitor(app_instance: FastAPI) -> None:
     existing = getattr(app_instance.state, "runtime_performance_task", None)
     if existing is not None and not existing.done():
         return
-    try:
-        if not initialize_runtime_performance_telemetry():
-            app_instance.state.runtime_performance_task = None
-            return
+    from .api.websocket import manager
 
-        from .api.websocket import manager
-        from .services.task_execution import background_task_manager
-
-        register_observable_gauge(
-            "xagent.agent_tasks.running",
-            lambda: len(background_task_manager.running_tasks),
-            unit="{task}",
-            description="Current locally running agent tasks",
-        )
-        register_observable_gauge(
-            "xagent.agent_tasks.resuming",
-            lambda: len(background_task_manager.resume_tasks),
-            unit="{task}",
-            description="Current local resume coordinators",
-        )
-        register_observable_gauge(
-            "xagent.websocket.connections",
-            manager.connection_count,
-            unit="{connection}",
-            description="Current task WebSocket connections",
-        )
-        app_instance.state.runtime_performance_task = start_event_loop_lag_monitor()
-    except Exception:
-        # Telemetry is observational and must not block application startup.
-        app_instance.state.runtime_performance_task = None
-        shutdown_runtime_performance_telemetry()
-        logger.warning("Could not start runtime performance monitor", exc_info=True)
+    app_instance.state.runtime_performance_task = start_process_runtime_telemetry(
+        websocket_connections=manager.connection_count
+    )
 
 
 async def stop_runtime_performance_monitor(app_instance: FastAPI) -> None:
     task = getattr(app_instance.state, "runtime_performance_task", None)
     app_instance.state.runtime_performance_task = None
-    await stop_event_loop_lag_monitor(task)
-    await asyncio.to_thread(shutdown_runtime_performance_telemetry)
+    await stop_process_runtime_telemetry(task)
 
 
 def start_app_process_diagnostics(app_instance: FastAPI) -> None:

@@ -615,3 +615,24 @@ async def test_a_process_that_dispatches_nothing_reports_no_slot_tenants(
 
     assert (counters.slot_tenants, counters.slot_top) == (0, 0)
     assert " slot_tenants=0 slot_top=0 " in counters.format_line()
+
+
+def test_the_line_ends_with_the_active_degradations():
+    assert _counters().format_line().endswith(" loop_lag_samples=0 degradations=-")
+    line = _counters(degradations=("a_signal", "b_signal")).format_line()
+    assert line.endswith(" degradations=a_signal,b_signal")
+
+
+@pytest.mark.asyncio
+async def test_drain_reports_this_processes_degradations_sorted(manager, monkeypatch):
+    from xagent.web.services import ops_signals
+
+    monkeypatch.setattr(ops_signals, "_signals", {})
+    ops_signals.register_degradation("z_signal", "detail stays out of the line")
+    ops_signals.register_degradation("a_signal", "detail")
+    monkeypatch.setattr(process_diagnostics._window, "started_at", 0.0)
+
+    line = process_diagnostics.drain_execution_counters(now=10.0).format_line()
+
+    assert line.endswith(" degradations=a_signal,z_signal")
+    assert "detail" not in line
