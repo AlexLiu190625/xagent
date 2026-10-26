@@ -593,3 +593,165 @@ def test_list_and_detail_echo_usable_and_inert_signed_uploads() -> None:
         assert detail.status_code == 200, detail.text
         assert detail.json()["signed_uploads"] == SIGNED_UPLOADS
         assert detail.json()["signed_uploads_error"] is None
+
+
+# ---------------------------------------------------------------------------
+# Issuer entries
+# ---------------------------------------------------------------------------
+
+ISSUER_ENTRY = {
+    "issuing_tool_name": "request_upload",
+    "allowed_upload_hosts": ["uploads.example.test"],
+    "upload_path_prefix": "/staged/",
+    "content_types": {".pdf": "application/pdf"},
+}
+ISSUER_ENTRIES = [ISSUER_ENTRY]
+# A replacement entry for another issuing tool, which may sit next to an issuer.
+OTHER_REPLACEMENT = {**SIGNED_UPLOADS[0], "issuing_tool_name": "issue_other"}
+# A replacement entry that only hides the issuing tool: its tool is one the
+# connector does not list.
+HIDE_ONLY_ENTRIES = [
+    {
+        **ISSUER_ENTRY,
+        "tool_name": "create_staff_qualification",
+        "file_argument": "document_file_id",
+    }
+]
+
+
+def _also_a_replacement_issuer(position: int) -> str:
+    return _invalid_detail(
+        f"signed_uploads[{position}].issuing_tool_name "
+        "is also the issuing tool of a replacement entry"
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "create-issuer",
+        "create-issuer-sse",
+        "create-issuer-and-replacement",
+        "update-issuer-on-empty",
+        "update-issuer-replaces-replacement",
+        "update-issuer-rewritten-as-hide-only",
+        "update-hide-only-back-to-issuer",
+    ],
+)
+def test_api_accepts_issuer_entries(case: str) -> None:
+    _admin_headers()
+    owner = _register_second_user("bob", "bobpass1")
+    expected: list[dict[str, Any]] = ISSUER_ENTRIES
+
+    if case.startswith("create-"):
+        transport = "sse" if case == "create-issuer-sse" else "streamable_http"
+        if case == "create-issuer-and-replacement":
+            expected = [ISSUER_ENTRY, OTHER_REPLACEMENT]
+        resp = _create(owner, transport=transport, signed_uploads=expected)
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["signed_uploads"] == expected
+        assert resp.json()["signed_uploads_error"] is None
+        server_id = int(resp.json()["id"])
+    else:
+        stored: Any = {
+            "update-issuer-on-empty": None,
+            "update-issuer-replaces-replacement": SIGNED_UPLOADS,
+            "update-issuer-rewritten-as-hide-only": ISSUER_ENTRIES,
+            "update-hide-only-back-to-issuer": HIDE_ONLY_ENTRIES,
+        }[case]
+        if case == "update-issuer-rewritten-as-hide-only":
+            expected = HIDE_ONLY_ENTRIES
+        elif case == "update-hide-only-back-to-issuer":
+            expected = ISSUER_ENTRIES
+        server_id = (
+            _create_ok(owner)
+            if stored is None
+            else _create_ok(owner, signed_uploads=stored)
+        )
+        resp = client.put(
+            f"/api/mcp/servers/{server_id}",
+            json={"signed_uploads": expected},
+            headers=owner,
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["signed_uploads"] == expected
+        assert resp.json()["signed_uploads_error"] is None
+
+    assert _row(server_id)["signed_uploads"] == expected
+    detail = client.get(f"/api/mcp/servers/{server_id}", headers=owner)
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["signed_uploads"] == expected
+    assert detail.json()["signed_uploads_error"] is None
+
+
+_CLASHES = [
+    pytest.param(
+        [ISSUER_ENTRY, SIGNED_UPLOADS[0]],
+        _also_a_replacement_issuer(0),
+        id="issuer-first",
+    ),
+    pytest.param(
+        [SIGNED_UPLOADS[0], ISSUER_ENTRY],
+        _also_a_replacement_issuer(1),
+        id="issuer-last",
+    ),
+    pytest.param(
+        [ISSUER_ENTRY, ISSUER_ENTRY],
+        _invalid_detail("signed_uploads[1].issuing_tool_name repeats an earlier entry"),
+        id="two-issuers-for-one-tool",
+    ),
+]
+
+
+@pytest.mark.parametrize(("clashing", "detail"), _CLASHES)
+def test_create_rejects_clashing_issuer_entries(clashing: Any, detail: str) -> None:
+    _admin_headers()
+    owner = _register_second_user("bob", "bobpass1")
+
+    resp = _create(owner, signed_uploads=clashing)
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["detail"] == detail
+    db = _direct_db_session()
+    try:
+        assert db.query(MCPServer).filter(MCPServer.name == NAME).count() == 0
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(("clashing", "detail"), _CLASHES)
+def test_update_rejects_clashing_issuer_entries(clashing: Any, detail: str) -> None:
+    _admin_headers()
+    owner = _register_second_user("bob", "bobpass1")
+    server_id = _create_ok(owner, signed_uploads=ISSUER_ENTRIES)
+    before = _row(server_id)
+
+    resp = client.put(
+        f"/api/mcp/servers/{server_id}",
+        json={"signed_uploads": clashing},
+        headers=owner,
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["detail"] == detail
+    assert _row(server_id) == before
+
+
+def test_non_owner_cannot_change_issuer_entries() -> None:
+    _admin_headers()
+    owner = _register_second_user("bob", "bobpass1")
+    server_id = _create_ok(owner, signed_uploads=ISSUER_ENTRIES)
+    other = _register_second_user("carol", "carolpass1")
+    _link_non_owner("carol", server_id)
+    before = _row(server_id)
+    changed = [{**ISSUER_ENTRY, "upload_path_prefix": "/other/"}]
+
+    resp = client.put(
+        f"/api/mcp/servers/{server_id}",
+        json={"signed_uploads": changed},
+        headers=other,
+    )
+
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["detail"] == OWNER_ONLY_DETAIL
+    assert _row(server_id) == before

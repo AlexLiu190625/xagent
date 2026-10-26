@@ -43,8 +43,11 @@ by these application-client changes alone.
 
 An `sse` or `streamable_http` connector can carry `signed_uploads`, set with
 `POST /api/mcp/servers` or `PUT /api/mcp/servers/{server_id}`. The value is a
-list with one object per tool that takes a workspace file, each with exactly
-these keys; `null` and `[]` mean none:
+list of at most 20 objects; `null` and `[]` mean none. An object takes one of
+two forms, told apart by its keys, and the two can share a list.
+
+A replacement entry is for a tool that takes a workspace file. It has exactly
+these keys:
 
 ```json
 [{"tool_name": "attach_document", "file_argument": "document_file_id",
@@ -54,10 +57,36 @@ these keys; `null` and `[]` mean none:
 ```
 
 When the model passes `file:<id>` in `file_argument`, the host calls
-`issuing_tool_name` itself (the model never sees that tool) and PUTs the bytes
-of that workspace file to the signed URL it returns. The setting therefore
-decides which outside hosts receive task files, so only the connector's owner
-or a platform administrator can change it. The URL must be
+`issuing_tool_name` itself (the model never sees that tool's reply) and PUTs the
+bytes of that workspace file to the signed URL it returns.
+
+An issuer entry is for a connector whose issuing tool returns a file id that the
+connector's receiving tools accept. It has exactly these keys:
+
+```json
+[{"issuing_tool_name": "request_upload",
+  "allowed_upload_hosts": ["uploads.example.test"],
+  "upload_path_prefix": "/staged/", "content_types": {".pdf": "application/pdf"}}]
+```
+
+The host takes the issuing tool over. The model sees a host tool of the same
+name with one argument, `file`, written as `file:<id>`. When the model calls it,
+the host calls `issuing_tool_name`, PUTs the bytes of that workspace file to the
+signed URL it returns, and gives the model only the connector's `file_id`, plus
+its `expires_at` in UTC when the connector reports one. The model never sees
+the upload URL or the headers. It then puts that `file_id` into whichever
+connector tool takes the file, also when that tool is called through another
+tool's arguments. With an issuer entry the bytes leave when the model asks for
+a file id, before any later tool call, and a file id that is never used stays in
+the connector's storage until the connector removes it. If the connector does
+not list the issuing tool for a user, that user gets no upload tool and the
+host logs a warning that names the connector and the tool.
+
+One issuing tool cannot be used by both forms, and two issuer entries cannot
+name the same issuing tool.
+
+The setting decides which outside hosts receive task files, so only the
+connector's owner or a platform administrator can change it. The URL must be
 HTTPS without a port or user info, on one of `allowed_upload_hosts`, under
 `upload_path_prefix`, and the request uses the public-address egress policy of
 remote MCP sessions.
