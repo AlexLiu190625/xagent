@@ -512,10 +512,10 @@ def test_a_queue_with_no_interactive_command_between_the_lines_reads_as_today(
     chosen = scan(band, attempt=attempt())
 
     # The batch commands may not open an execution on the batch line; this scan
-    # finds what today's scan finds, and ranks nobody: the lock is taken once, to
-    # count the attempt.
+    # finds what today's scan finds, and ranks nobody: the lock is taken once to
+    # count the attempt and once to read the skip table for the tenant count.
     assert chosen == off
-    assert lock.taken == 1
+    assert lock.taken == 2
     assert batch_a is not None
 
 
@@ -598,11 +598,17 @@ def test_a_cancel_of_a_running_task_matches_both_lookups_and_is_taken(world, on,
 @pytest.mark.parametrize(
     "raw", [None, "false", "garbage"], ids=["unset", "false", "garbage"]
 )
+@pytest.mark.parametrize("between_the_lines", [False, True], ids=["room", "band"])
 def test_with_the_switch_off_a_scan_lists_no_tenant_and_takes_the_oldest(
-    world, monkeypatch, clock, raw
+    world, monkeypatch, clock, raw, between_the_lines
 ):
     ids = [world.add(*row[:2], kind=row[2]) for row in WORLDS["three"]]
-    cap = cap_of(occupancy={"user:1": 1})
+    if between_the_lines:
+        reply = world.add("user:2", "interactive", kind="resume_input")
+        cap = cap_of(active=[900], occupancy={"user:1": 1}, policy=POLICY)
+        assert cap.in_reserve_band
+    else:
+        cap = cap_of(occupancy={"user:1": 1})
     if raw is None:
         monkeypatch.delenv(SWITCH, raising=False)
     else:
@@ -612,12 +618,14 @@ def test_with_the_switch_off_a_scan_lists_no_tenant_and_takes_the_oldest(
 
     chosen, seen = recorded(world, lambda: scan(cap, attempt=None))
 
-    assert chosen == ids[0]
+    assert chosen == (reply if between_the_lines else ids[0])
     assert not any("RECURSIVE" in s or "GROUP BY" in s for s, _ in seen)
     assert windows_asked(seen) == []
     assert transport._fair_state.attempts == 0
     # The same world with the switch on is served differently, so the checks above
     # are not a scan that would have found the oldest command anyway.
+    if between_the_lines:
+        return
     monkeypatch.setenv(SWITCH, "true")
     monkeypatch.setattr(transport, "_fair_share_memo", None)
     assert scan(cap, attempt=attempt()) == ids[1]
@@ -807,6 +815,7 @@ def test_a_tenant_whose_commands_all_wait_for_admission_misses_and_is_skipped(
 
 
 def test_the_dispatcher_follows_the_reference_over_random_worlds(world, on, clock):
+    stats: dict[str, int] = {}
     for seed in range(300):
         play(
             world,
@@ -814,7 +823,11 @@ def test_the_dispatcher_follows_the_reference_over_random_worlds(world, on, cloc
             seed,
             tenants=random.Random(seed).randint(2, 7),
             reserves=lambda limit: range(limit),
+            stats=stats,
         )
+    # The worlds hold a tenant back, and holding it back changes some choice.
+    assert stats.get("capped", 0) > 0
+    assert stats.get("changed", 0) > 0
 
 
 def test_without_an_interactive_reserve_no_command_is_held_for_its_class(
