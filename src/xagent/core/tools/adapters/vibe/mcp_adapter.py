@@ -95,6 +95,7 @@ from .sandboxed_tool.sandboxed_mcp_tool_helper import (
 )
 from .signed_upload import (
     SignedUploadBinding,
+    SignedUploadIssuer,
     SignedUploadResponseError,
     SignedUploadURLRejected,
     check_signed_upload_url,
@@ -665,7 +666,9 @@ class _SignedUploadRefused(Exception):
 
 
 def _check_signed_upload_connection(
-    connection: Any, binding: SignedUploadBinding, tool_name: str
+    connection: Any,
+    binding: SignedUploadBinding | SignedUploadIssuer,
+    tool_name: str,
 ) -> None:
     """Refuse a signed upload over a connection to another host than the settings'."""
     url = connection.get("url") if isinstance(connection, Mapping) else None
@@ -4738,8 +4741,11 @@ async def _load_direct_mcp_tools(
                 ),
             ),
         )
-    issuing_tool_names = {binding.issuing_tool_name for binding in signed_uploads}
-    bindings_by_tool = {binding.tool_name: binding for binding in signed_uploads}
+    bindings = [
+        entry for entry in signed_uploads if isinstance(entry, SignedUploadBinding)
+    ]
+    issuing_tool_names = {binding.issuing_tool_name for binding in bindings}
+    bindings_by_tool = {binding.tool_name: binding for binding in bindings}
 
     agent_tools: list[AbstractBaseTool] = []
     mcp_tools: list[MCPTool] = []
