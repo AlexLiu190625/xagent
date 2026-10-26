@@ -43,7 +43,7 @@ def band_cap(occupancy, *, active=2, held=False, policy=BAND):
     ("occupancy", "queued", "expected"),
     [
         ({"x": 2, "y": 2}, {}, None),
-        ({"x": 2, "y": 2}, {"a": 1}, None),
+        ({"a": 2, "b": 1}, {"a": 1}, None),
         ({}, {"a": 1, "b": 2}, None),
         ({"x": 3, "y": 1}, {"y": 5, "z": 6}, None),
         ({"x": 2, "y": 2}, {"x": 7, "y": 3}, "y"),
@@ -194,19 +194,19 @@ async def test_a_second_missing_listing_ends_the_attempt(
     )
     monkeypatch.setattr(transport, "build_dispatch_cap_snapshot", lambda: below)
     real_find = transport._find_command_candidate
-    scans: list[int] = []
+    scans: list = []
 
     def spy(*args, **kwargs):
-        scans.append(len(scans))
-        assert len(scans) <= 2, "a third selection was started"
-        return real_find(*args, **kwargs)
+        assert len(scans) < 2, "a third selection was started"
+        scans.append(real_find(*args, **kwargs))
+        return scans[-1]
 
     monkeypatch.setattr(transport, "_find_command_candidate", spy)
     held = slot_state(dispatcher.manager)
 
     assert await transport.dispatch_one_task_command(dispatcher.executor) is False
 
-    assert len(scans) == 2
+    assert len(scans) == 2 and scans[0] == scans[1] and scans[0] is not None
     assert slot_state(dispatcher.manager) == held
     assert dispatcher.ensured == []
 
@@ -470,7 +470,8 @@ def test_every_listed_path_leaves_out_the_capped_tenants_new_work(
     own, other = build(world)
     if path == "fallback_round":
         transport._fair_state.attempts = 7
-    cap = cap_of(active=[900, 901], occupancy={tenant: 2, "b": 1}, policy=BAND)
+    held = {tenant: 2, "b": 2 if path == "window" else 1}
+    cap = cap_of(active=[900, 901], occupancy=held, policy=BAND)
     nobody = cap_of(active=[900, 901], policy=BAND)
 
     chosen, seen = recorded(world, lambda: scan(cap, attempt=attempt()))

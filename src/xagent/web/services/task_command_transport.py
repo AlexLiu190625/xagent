@@ -2211,11 +2211,12 @@ def _fair_pick(
     plain lookup of the oldest row. Tenants are ranked by the slots they hold in
     this process, then by their oldest queued command that opens an execution, and
     the first FAIR_SHARE_TENANTS_PER_SCAN that are not skipped and not ``capped``
-    are asked in that order, the live skip table coming from ``skips()``: the first with a claimable command among its window supplies the best
-    candidate, and the oldest claimable command older than that which needs no new
-    slot (``_older_needing_no_new_slot``) is taken in its place. A (tenant key,
-    class) with no claimable command in its window is missed and skipped for a
-    while. With no tenant ranked, the plain lookup decides.
+    are asked in that order, the live skip table coming from ``skips()``: the
+    first with a claimable command among its window supplies the best candidate,
+    and the oldest claimable command older than that which needs no new slot
+    (``_older_needing_no_new_slot``) is taken in its place. A (tenant key, class)
+    with no claimable command in its window is missed and skipped for a while.
+    With no tenant ranked, the plain lookup decides.
 
     The listing is taken once per attempt, so a rescan may rank a queue that has
     moved on; at worst that costs one more window query or one more recorded miss.
