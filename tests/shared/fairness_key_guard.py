@@ -3,7 +3,8 @@
 The key is written when a command is accepted and never updated afterwards, so
 the only statement allowed to write it is the flush ``stage_task_command``
 issues for the command it is accepting. The guard listens on every engine
-through the ``Engine`` class and looks at each statement that mentions the key, in any case:
+through the ``Engine`` class and looks at each statement that mentions the key,
+in any case:
 
 * A compiled UPDATE of the command table, or of an alias of it, counts when the
   columns it writes include the key, so a statement that only reads the key
@@ -80,7 +81,7 @@ def _without_leading_comments(statement: str) -> str:
 
 
 def raw_update_mentions_key(statement: str) -> bool:
-    """Whether raw SQL is an UPDATE of the command table that mentions the key anywhere."""
+    """Whether raw SQL is an UPDATE of the command table naming the key anywhere."""
     return (
         mentions_key(statement)
         and _RAW_UPDATE.match(_without_leading_comments(statement)) is not None
