@@ -513,7 +513,9 @@ def stage_task_command(
        transaction, before the admission ticket is staged. The fairness key
        is set on the inserted row (the owner key, or for a control command the
        key of the task's latest command); a classifier's key replaces it in
-       the flush that writes the dispatch class. A control command of a task
+       the flush that writes the dispatch class. The priority is the one the
+       classifier returned, else the task's declared value (NULL reads 0), and
+       is written in that same flush. A control command of a task
        with no earlier command takes the owner key, which can differ from a
        deployment classifier's key for that task.
 
@@ -563,6 +565,7 @@ def stage_task_command(
             Task.source,
             Task.channel_name,
             Task.requested_dispatch_class,
+            Task.dispatch_priority,
             User.id.label("task_owner_row_id"),
             User.actor_subject.label("task_owner_subject"),
         )
@@ -709,6 +712,7 @@ def stage_task_command(
                 background=reserved,
                 previous_dispatch_class=previous_dispatch_class,
                 requested_dispatch_class=snapshot.requested_dispatch_class,
+                dispatch_priority=snapshot.dispatch_priority,
             ),
         )
         changed = False
@@ -719,10 +723,18 @@ def stage_task_command(
         if classified_key is not None and classified_key != command.fairness_key:
             command.fairness_key = classified_key  # type: ignore[assignment]
             changed = True
+        priority = (
+            classification.priority
+            if classification.priority is not None
+            else int(snapshot.dispatch_priority or 0)
+        )
+        if priority != command.priority:
+            command.priority = priority
+            changed = True
         if changed:
-            # The session does not autoflush; write the class and the key before
-            # anything else in the acceptance transaction can read the row,
-            # whatever the caller does next.
+            # The session does not autoflush; write the class, the key and the
+            # priority before anything else in the acceptance transaction can
+            # read the row, whatever the caller does next.
             db.flush()
     stage_task_admission(
         db, command, classification.admission if classification else None

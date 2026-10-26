@@ -66,6 +66,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# The inclusive range of a command priority; higher goes first.
+PRIORITY_MIN = -10
+PRIORITY_MAX = 10
+
 _EXECUTION_KINDS = frozenset({"start", "resume", "resume_input", "message"})
 _TERMINAL = ("completed", "failed")
 _STOPPED_BEFORE_START = "Task stopped before execution started."
@@ -107,12 +111,16 @@ class CommandClassification:
     """What a deployment decided for one new execution command at acceptance.
 
     ``fairness_key`` is the tenant the command is accounted to; None means the
-    acceptance step gives it the task owner's default key.
+    acceptance step gives it the task owner's default key. ``priority`` is an
+    integer from -10 to 10, higher first, that orders the command among the
+    commands of its tenant key and class; None means the command inherits the
+    priority its task was created with, or 0 when the task has none.
     """
 
     admission: AdmissionPolicy | None = None
     dispatch_class: DispatchClass = DISPATCH_CLASS_BATCH
     fairness_key: str | None = None
+    priority: int | None = None
 
     def __post_init__(self) -> None:
         if self.dispatch_class not in DISPATCH_CLASSES:
@@ -120,6 +128,11 @@ class CommandClassification:
         key = self.fairness_key
         if key is not None and not (isinstance(key, str) and 1 <= len(key) <= 64):
             raise ValueError(f"Invalid fairness key: {self.fairness_key!r}")
+        priority = self.priority
+        if priority is not None and not (
+            type(priority) is int and PRIORITY_MIN <= priority <= PRIORITY_MAX
+        ):
+            raise ValueError(f"Invalid priority: {self.priority!r}")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -135,6 +148,8 @@ class TaskClassificationView:
     the task, exactly as stored: it may not be a valid class, and it is present
     whether or not the deployment accepts declarations. ``upstream_dispatch_class``
     decides whether to adopt it and only adopts a valid class.
+    ``dispatch_priority`` is the priority the caller declared at creation, as
+    stored: None means none.
     """
 
     task_id: int
@@ -144,6 +159,7 @@ class TaskClassificationView:
     background: bool
     previous_dispatch_class: DispatchClass | None
     requested_dispatch_class: str | None
+    dispatch_priority: int | None
 
 
 CommandClassifier = Callable[
@@ -302,6 +318,8 @@ def set_command_classifier(
     ``dispatch_class`` field defaults to batch, so a classifier that only sets
     ``admission`` makes every command batch. To keep the upstream class it can
     return ``dispatch_class=upstream_dispatch_class(view, command.kind)``.
+    It may also return a ``priority`` from -10 to 10 for the command; None keeps
+    the priority the task was created with.
     The view carries the caller's declaration as stored; a classifier that
     decides for itself whether to adopt it can clear it before calling the
     upstream rule with ``dataclasses.replace(view, requested_dispatch_class=None)``.

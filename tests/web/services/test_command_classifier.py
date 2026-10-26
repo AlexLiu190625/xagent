@@ -51,7 +51,9 @@ def host(tmp_path, monkeypatch):
             self.user = user_id
             self.counter = itertools.count(1)
 
-        def task(self, source="internal", channel_name=None, declared=None):
+        def task(
+            self, source="internal", channel_name=None, declared=None, priority=None
+        ):
             with sessions() as db:
                 task = Task(
                     user_id=user_id,
@@ -60,6 +62,7 @@ def host(tmp_path, monkeypatch):
                     source=source,
                     channel_name=channel_name,
                     requested_dispatch_class=declared,
+                    dispatch_priority=priority,
                 )
                 db.add(task)
                 db.commit()
@@ -121,6 +124,23 @@ def host(tmp_path, monkeypatch):
                         TaskExecutionCommand.id == db_id
                     )
                 ).scalar_one()
+
+        def priority(self, db_id):
+            with sessions() as db:
+                return db.execute(
+                    sa.select(TaskExecutionCommand.priority).where(
+                        TaskExecutionCommand.id == db_id
+                    )
+                ).scalar_one()
+
+        def set_task_priority(self, task_id, priority):
+            with sessions() as db:
+                db.execute(
+                    sa.update(Task)
+                    .where(Task.id == task_id)
+                    .values(dispatch_priority=priority)
+                )
+                db.commit()
 
         def tickets(self):
             with sessions() as db:
@@ -439,6 +459,7 @@ def _view(source, *, background, previous, declared=None):
         background=background,
         previous_dispatch_class=previous,
         requested_dispatch_class=declared,
+        dispatch_priority=None,
     )
 
 
@@ -505,7 +526,9 @@ def test_classifier_receives_the_task_view(host):
 
     admission.set_command_classifier(classify, admission_enabled=False)
     # The view carries the stored value as it is, even one that is not a class.
-    task_id = host.task(source="widget", channel_name="support", declared="bogus")
+    task_id = host.task(
+        source="widget", channel_name="support", declared="bogus", priority=3
+    )
     host.stage(KINDS.START, task_id=task_id)
     assert seen == [
         admission.TaskClassificationView(
@@ -516,6 +539,7 @@ def test_classifier_receives_the_task_view(host):
             background=False,
             previous_dispatch_class=None,
             requested_dispatch_class="bogus",
+            dispatch_priority=3,
         )
     ]
 
@@ -882,3 +906,91 @@ def test_staging_reads_the_declaration_in_the_one_task_snapshot(host):
         sa.event.remove(host.engine, "before_cursor_execute", record)
     assert len(statements) == 1
     assert "tasks.requested_dispatch_class" in statements[0]
+
+
+# --- priority -------------------------------------------------------------------
+
+# (kind, staged by the system itself) of every command the acceptance step sees.
+PRIORITY_SCENARIOS = {
+    "start": (KINDS.START, False),
+    "message": (KINDS.MESSAGE, False),
+    "manual resume": (KINDS.RESUME, False),
+    "automatic resume": (KINDS.RESUME, True),
+    "answer": (KINDS.RESUME_INPUT, False),
+    "pause": (KINDS.PAUSE, False),
+    "cancel": (KINDS.CANCEL, False),
+}
+
+
+@pytest.mark.parametrize("scenario", PRIORITY_SCENARIOS)
+@pytest.mark.parametrize("declared", [None, -10, 0, 7])
+def test_a_command_inherits_the_tasks_priority_and_a_control_command_gets_zero(
+    host, declared, scenario
+):
+    kind, reserved = PRIORITY_SCENARIOS[scenario]
+    task_id = host.task(priority=declared)
+
+    staged = host.stage(kind, task_id=task_id, reserved=reserved)
+
+    expected = 0 if kind in CONTROL else (declared or 0)
+    assert host.priority(staged.staged_db_id) == expected
+
+
+@pytest.mark.parametrize("returned,expected", [(10, 10), (0, 0), (-10, -10), (None, 7)])
+def test_a_priority_the_classifier_returns_wins_and_none_keeps_the_inherited_one(
+    host, returned, expected
+):
+    admission.set_command_classifier(
+        lambda db, command, view: admission.CommandClassification(priority=returned),
+        admission_enabled=False,
+    )
+    task_id = host.task(priority=7)
+
+    staged = host.stage(KINDS.MESSAGE, task_id=task_id)
+
+    assert host.priority(staged.staged_db_id) == expected
+
+
+@pytest.mark.parametrize("value", [-11, 11, True, False, 1.5, "1"])
+def test_any_other_priority_is_refused(value):
+    for fine in (-10, 0, 10, None):
+        assert admission.CommandClassification(priority=fine).priority == fine
+    with pytest.raises(ValueError, match="Invalid priority"):
+        admission.CommandClassification(priority=value)  # type: ignore[arg-type]
+
+
+def test_the_priority_is_written_in_the_flush_of_the_dispatch_class(host, no_autoflush):
+    admission.set_command_classifier(
+        lambda db, command, view: admission.CommandClassification(priority=4),
+        admission_enabled=False,
+    )
+    task_id = host.task()
+    with no_autoflush() as db:
+        staged = transport.stage_task_command(
+            db,
+            task_id=task_id,
+            actor_user_id=host.user,
+            command_id="message-1",
+            kind=KINDS.MESSAGE,
+            payload={},
+        )
+        stored = db.execute(
+            sa.select(TaskExecutionCommand.priority).where(
+                TaskExecutionCommand.id == staged.staged_db_id
+            )
+        ).scalar_one()
+        db.rollback()
+    assert stored == 4
+
+
+def test_a_command_keeps_the_priority_it_was_accepted_with(host):
+    task_id = host.task(priority=3)
+    first = host.stage(KINDS.MESSAGE, task_id=task_id)
+
+    host.set_task_priority(task_id, 5)
+    second = host.stage(KINDS.MESSAGE, task_id=task_id)
+
+    assert (host.priority(first.staged_db_id), host.priority(second.staged_db_id)) == (
+        3,
+        5,
+    )

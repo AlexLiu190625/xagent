@@ -27,7 +27,7 @@ Design notes:
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from .agent import PromptContextFieldDeclaration, PromptContextFieldList
 
@@ -125,6 +125,19 @@ class CreateTaskRequest(BaseModel):
             "the deployment honors the request is its own setting; the "
             "response's 'dispatch_class' shows the class the start command "
             "was given."
+        ),
+    )
+    priority: Optional[StrictInt] = Field(
+        default=None,
+        ge=-10,
+        le=10,
+        description=(
+            "Priority of this task's commands, an integer from -10 to 10; "
+            "higher goes first. Omit it or send null for 0. It takes effect "
+            "only where the deployment dispatches fairly across accounts, and "
+            "only orders commands of the same account and the same dispatch "
+            "class. Messages appended to the task and manual resumes inherit "
+            "it."
         ),
     )
     timezone: Optional[str] = Field(
