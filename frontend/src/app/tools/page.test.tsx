@@ -83,6 +83,11 @@ import * as fs from "node:fs"
 import * as path from "node:path"
 
 import { SIGNED_UPLOAD_TRANSPORTS } from "@/lib/mcp-utils"
+import {
+  signedUploadRowsFromValue,
+  signedUploadsFromRows,
+  type SignedUploadMode,
+} from "@/components/mcp/signed-uploads-form"
 
 import ToolsPage from "./page"
 import type { MCPServer } from "./page"
@@ -487,6 +492,16 @@ describe("ToolsPage signed upload settings", () => {
   const NOT_A_LIST = { tool_name: "attach_document" }
   const NOT_A_LIST_ERROR = "signed_uploads must be a list"
   const KEY = "tools.mcp.signedUploads"
+  // An issuer entry: exactly the four issuer keys.
+  const ISSUER_ENTRY = {
+    issuing_tool_name: "request_upload",
+    allowed_upload_hosts: ["uploads.example.test"],
+    upload_path_prefix: "/staged/",
+    content_types: { ".pdf": "application/pdf" },
+  }
+  // A replacement entry whose issuing tool differs from ISSUER_ENTRY's.
+  const REPLACEMENT_ENTRY = { ...SIGNED_UPLOADS[0], issuing_tool_name: "request_image_upload" }
+  const BOTH_KINDS = [REPLACEMENT_ENTRY, ISSUER_ENTRY]
 
   function uploadsServer(overrides: Partial<MCPServer> = {}): MCPServer {
     return officialMcpServer({
@@ -656,10 +671,13 @@ describe("ToolsPage signed upload settings", () => {
     expect(requests.put[0]).toEqual({ transport: "stdio", signed_uploads: [] })
   })
 
-  it("sends no upload settings for a viewer who cannot edit the shared config", async () => {
+  it.each([
+    ["replacement entries", SIGNED_UPLOADS, `${KEY}.modeIssuer`],
+    ["entries of both kinds", BOTH_KINDS, `${KEY}.modeReplacement`],
+  ])("sends no upload settings for a viewer who cannot edit the shared config: %s", async (_name, stored, otherMode) => {
     const requests = installUploadsApiMock(
       [uploadsServer({ can_edit_global: false })],
-      { signed_uploads: SIGNED_UPLOADS },
+      { signed_uploads: stored },
     )
     const dialog = await openUploadsEditor()
 
@@ -668,6 +686,13 @@ describe("ToolsPage signed upload settings", () => {
     const fields = block.querySelectorAll("input, textarea")
     expect(fields.length).toBeGreaterThan(0)
     fields.forEach((field) => expect(field).toBeDisabled())
+    expect(dialog.getByText("attach_document", { selector: "span" })).toBeInTheDocument()
+    const radios = within(block).getAllByRole("radio")
+    expect(radios).toHaveLength(stored.length * 2)
+    radios.forEach((radio) => expect(radio).toBeDisabled())
+    const lastRowOther = dialog.getAllByRole("radio", { name: otherMode })[stored.length - 1]
+    fireEvent.click(lastRowOther)
+    expect(lastRowOther).not.toBeChecked()
     fireEvent.click(saveButton(dialog))
 
     await waitFor(() => expect(requests.put).toHaveLength(1))
@@ -733,5 +758,151 @@ describe("ToolsPage signed upload settings", () => {
     await waitFor(() => expect(toast.error).toHaveBeenCalledWith(detailText))
     expect(requests.put).toHaveLength(1)
     expect(screen.getByRole("dialog")).toBeInTheDocument()
+  })
+
+  function rowIds() {
+    let next = 0
+    return () => `row-${next++}`
+  }
+
+  it.each([
+    ["replacement entries only", SIGNED_UPLOADS, ["replacement"]],
+    ["issuer entries only", [ISSUER_ENTRY], ["issuer"]],
+    ["a replacement entry before an issuer entry", BOTH_KINDS, ["replacement", "issuer"]],
+    ["an issuer entry before a replacement entry", [ISSUER_ENTRY, REPLACEMENT_ENTRY], ["issuer", "replacement"]],
+  ])("round-trips stored entries of both kinds: %s", (_name, stored, modes) => {
+    const rows = signedUploadRowsFromValue(stored, rowIds())
+    expect(rows.map((row) => row.mode)).toEqual(modes)
+    expect(signedUploadsFromRows(rows)).toStrictEqual(stored)
+  })
+
+  const ISSUER_KEY_NAMES = [
+    "issuing_tool_name",
+    "allowed_upload_hosts",
+    "upload_path_prefix",
+    "content_types",
+  ] as const
+  const KEY_SET_CASES: [string, unknown, SignedUploadMode][] = [
+    ["exactly the issuer keys", ISSUER_ENTRY, "issuer"],
+    ["the issuer keys with values of the wrong type", { ...ISSUER_ENTRY, allowed_upload_hosts: "uploads.example.test" }, "issuer"],
+    ["the six replacement keys", SIGNED_UPLOADS[0], "replacement"],
+    ["the issuer keys and tool_name", { ...ISSUER_ENTRY, tool_name: "attach_document" }, "replacement"],
+    ["the issuer keys and file_argument", { ...ISSUER_ENTRY, file_argument: "document_file_id" }, "replacement"],
+    ["the issuer keys and an unknown key", { ...ISSUER_ENTRY, note: "x" }, "replacement"],
+    ...ISSUER_KEY_NAMES.map((key): [string, unknown, SignedUploadMode] => {
+      const entry: Record<string, unknown> = { ...ISSUER_ENTRY }
+      delete entry[key]
+      return [`the issuer keys without ${key}`, entry, "replacement"]
+    }),
+    ["four keys that are not the issuer keys", { tool_name: "attach_document", allowed_upload_hosts: ["uploads.example.test"], upload_path_prefix: "/staged/", content_types: { ".pdf": "application/pdf" } }, "replacement"],
+    ["an empty object", {}, "replacement"],
+    ["a value that is not an object", "request_upload", "replacement"],
+  ]
+
+  it.each(KEY_SET_CASES)("reads an entry as an issuer row only when it has exactly the issuer keys: %s", (_name, entry, mode) => {
+    expect(signedUploadRowsFromValue([entry], rowIds())[0].mode).toBe(mode)
+  })
+
+  it("shows only the issuer fields for an issuer entry", async () => {
+    installUploadsApiMock([uploadsServer()], { signed_uploads: [ISSUER_ENTRY] })
+    const dialog = await openUploadsEditor()
+
+    expect(dialog.getByRole("radio", { name: `${KEY}.modeIssuer` })).toBeChecked()
+    expect(dialog.getByRole("radio", { name: `${KEY}.modeReplacement` })).not.toBeChecked()
+    expect(dialog.getByRole("radiogroup", { name: `${KEY}.mode` })).toBeInTheDocument()
+    expect(dialog.queryByLabelText(`${KEY}.toolName`)).not.toBeInTheDocument()
+    expect(dialog.queryByLabelText(`${KEY}.fileArgument`)).not.toBeInTheDocument()
+    expect(dialog.getByLabelText(`${KEY}.issuingToolName`)).toHaveValue("request_upload")
+    expect(dialog.getByText(`${KEY}.modeIssuerHint`)).toBeInTheDocument()
+    expect(dialog.getByText("request_upload", { selector: "span" })).toBeInTheDocument()
+  })
+
+  it("keeps a stored issuer entry when the owner saves without touching uploads", async () => {
+    const requests = installUploadsApiMock([uploadsServer()], { signed_uploads: BOTH_KINDS })
+    const dialog = await openUploadsEditor()
+    fireEvent.change(dialog.getByLabelText("tools.mcp.form.descriptionLabel"), {
+      target: { value: "Updated" },
+    })
+    fireEvent.click(saveButton(dialog))
+    await waitFor(() => expect(requests.put).toHaveLength(1))
+    expect(requests.put[0]).toStrictEqual({ description: "Updated" })
+  })
+
+  it.each([
+    ["the replacement row", 0, [{ ...REPLACEMENT_ENTRY, upload_path_prefix: "/incoming/" }, ISSUER_ENTRY]],
+    ["the issuer row", 1, [REPLACEMENT_ENTRY, { ...ISSUER_ENTRY, upload_path_prefix: "/incoming/" }]],
+  ])("keeps a stored issuer entry when the owner edits %s", async (_name, index, expected) => {
+    const requests = installUploadsApiMock([uploadsServer()], { signed_uploads: BOTH_KINDS })
+    const dialog = await openUploadsEditor()
+    fireEvent.change(dialog.getAllByLabelText(`${KEY}.uploadPathPrefix`)[index], {
+      target: { value: "/incoming/" },
+    })
+    fireEvent.click(saveButton(dialog))
+    await waitFor(() => expect(requests.put).toHaveLength(1))
+    expect(requests.put[0]).toStrictEqual({ signed_uploads: expected })
+  })
+
+  it("sends no upload settings after an upload edit is undone", async () => {
+    const requests = installUploadsApiMock([uploadsServer()], { signed_uploads: BOTH_KINDS })
+    const dialog = await openUploadsEditor()
+    const prefix = dialog.getAllByLabelText(`${KEY}.uploadPathPrefix`)[0]
+    fireEvent.change(prefix, { target: { value: "/incoming/" } })
+    fireEvent.change(prefix, { target: { value: "/staged/" } })
+    fireEvent.change(dialog.getByLabelText("tools.mcp.form.descriptionLabel"), {
+      target: { value: "Updated" },
+    })
+    fireEvent.click(saveButton(dialog))
+    await waitFor(() => expect(requests.put).toHaveLength(1))
+    expect(requests.put[0]).toStrictEqual({ description: "Updated" })
+  })
+
+  it.each([
+    ["the replacement row", 0, [ISSUER_ENTRY]],
+    ["the issuer row", 1, [REPLACEMENT_ENTRY]],
+  ])("removes only %s", async (_name, index, expected) => {
+    const requests = installUploadsApiMock([uploadsServer()], { signed_uploads: BOTH_KINDS })
+    const dialog = await openUploadsEditor()
+    fireEvent.click(dialog.getAllByRole("button", { name: `${KEY}.removeTool` })[index])
+    fireEvent.click(saveButton(dialog))
+    await waitFor(() => expect(requests.put).toHaveLength(1))
+    expect(requests.put[0]).toStrictEqual({ signed_uploads: expected })
+  })
+
+  it("writes a new issuer entry with exactly the issuer keys", async () => {
+    const requests = installUploadsApiMock([uploadsServer()], { signed_uploads: [REPLACEMENT_ENTRY] })
+    const dialog = await openUploadsEditor()
+    fireEvent.click(dialog.getByRole("button", { name: `${KEY}.addTool` }))
+    expect(dialog.getAllByRole("radio", { name: `${KEY}.modeReplacement` })[1]).toBeChecked()
+    fireEvent.click(dialog.getAllByRole("radio", { name: `${KEY}.modeIssuer` })[1])
+    expect(dialog.getAllByLabelText(`${KEY}.toolName`)).toHaveLength(1)
+    fireEvent.change(dialog.getAllByLabelText(`${KEY}.issuingToolName`)[1], { target: { value: " request_upload " } })
+    fireEvent.change(dialog.getAllByLabelText(`${KEY}.allowedUploadHosts`)[1], { target: { value: "uploads.example.test\n" } })
+    fireEvent.change(dialog.getAllByLabelText(`${KEY}.uploadPathPrefix`)[1], { target: { value: "/staged/" } })
+    fireEvent.change(dialog.getAllByLabelText(`${KEY}.extension`)[1], { target: { value: ".pdf" } })
+    fireEvent.change(dialog.getAllByLabelText(`${KEY}.contentType`)[1], { target: { value: "application/pdf" } })
+    fireEvent.click(saveButton(dialog))
+    await waitFor(() => expect(requests.put).toHaveLength(1))
+    expect(requests.put[0]).toStrictEqual({ signed_uploads: [REPLACEMENT_ENTRY, ISSUER_ENTRY] })
+  })
+
+  it.each([
+    ["a replacement entry to an issuer entry", [SIGNED_UPLOADS[0]], ["issuer"], [ISSUER_ENTRY]],
+    ["an issuer entry to a replacement entry", [ISSUER_ENTRY], ["replacement"], [{ ...ISSUER_ENTRY, tool_name: "", file_argument: "" }]],
+    ["a replacement entry to an issuer entry and back", [SIGNED_UPLOADS[0]], ["issuer", "replacement"], [{ ...ISSUER_ENTRY, tool_name: "", file_argument: "" }]],
+  ])("switching %s keeps only that mode's keys", async (_name, stored, clicks, expected) => {
+    const requests = installUploadsApiMock([uploadsServer()], { signed_uploads: stored })
+    const dialog = await openUploadsEditor()
+    for (const mode of clicks) {
+      fireEvent.click(dialog.getByRole("radio", { name: mode === "issuer" ? `${KEY}.modeIssuer` : `${KEY}.modeReplacement` }))
+    }
+    if (clicks[clicks.length - 1] === "issuer") {
+      expect(dialog.queryByLabelText(`${KEY}.toolName`)).not.toBeInTheDocument()
+    } else {
+      expect(dialog.getByLabelText(`${KEY}.toolName`)).toHaveValue("")
+      expect(dialog.getByLabelText(`${KEY}.fileArgument`)).toHaveValue("")
+    }
+    fireEvent.click(saveButton(dialog))
+    await waitFor(() => expect(requests.put).toHaveLength(1))
+    expect(requests.put[0]).toStrictEqual({ signed_uploads: expected })
   })
 })

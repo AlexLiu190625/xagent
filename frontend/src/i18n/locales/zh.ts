@@ -1290,7 +1290,12 @@ const zh = {
       },
       signedUploads: {
         title: "文件上传",
-        description: "为接收文件的工具配置此项。调用这类工具之前，会先调用签发工具获取上传地址，再把文件上传到该地址。",
+        description: "连接器的工具通过签发工具给出的上传地址接收文件时，配置此项。每一条都要选择一种模式。",
+        mode: "模式",
+        modeReplacement: "调用工具前上传",
+        modeReplacementHint: "调用接收文件的工具之前，会先调用签发工具获取上传地址，再把文件上传到该地址。",
+        modeIssuer: "代模型调用签发工具",
+        modeIssuerHint: "模型用一个工作区文件（附件或生成的文件）调用签发工具时，文件会立即上传，模型只拿到连接器返回的文件 ID，再把它填进接收文件的工具。模型看不到上传地址。",
         toolName: "接收文件的工具",
         fileArgument: "文件参数",
         issuingToolName: "签发工具",
