@@ -73,7 +73,11 @@ from ..services.db_runtime import (
     run_db_io_cancellation_safe,
 )
 from ..services.external_media import (
+    ExternalMediaPurpose,
     ExternalMediaTicketRejected,
+    ExternalMediaUnavailable,
+    instagram_image_requires_normalization,
+    instagram_jpeg_bytes,
     redeem_external_media_ticket,
 )
 from ..services.kb_file_service import (
@@ -1746,16 +1750,46 @@ def external_media_file(
             file_id=record.file_id,
         )
 
+    response_headers = {
+        "Cache-Control": "no-store, max-age=0",
+        "Referrer-Policy": "no-referrer",
+        "X-Content-Type-Options": "nosniff",
+    }
+    try:
+        normalize_for_instagram = (
+            redeemed.purpose is ExternalMediaPurpose.INSTAGRAM_PUBLISH
+            and instagram_image_requires_normalization(path)
+        )
+    except ExternalMediaUnavailable as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    if normalize_for_instagram:
+        try:
+            content = instagram_jpeg_bytes(path)
+        except ExternalMediaUnavailable as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        return Response(
+            content=content,
+            media_type="image/jpeg",
+            headers={
+                **response_headers,
+                "Content-Disposition": _content_disposition_header(
+                    "inline", f"{Path(str(record.filename)).stem}.jpg"
+                ),
+            },
+        )
+
     return FileResponse(
         path,
-        media_type=redeemed.media_type,
+        media_type=(
+            "image/jpeg"
+            if redeemed.purpose is ExternalMediaPurpose.INSTAGRAM_PUBLISH
+            else redeemed.media_type
+        ),
         headers={
-            "Cache-Control": "no-store, max-age=0",
+            **response_headers,
             "Content-Disposition": _content_disposition_header(
                 "inline", str(record.filename)
             ),
-            "Referrer-Policy": "no-referrer",
-            "X-Content-Type-Options": "nosniff",
         },
     )
 
