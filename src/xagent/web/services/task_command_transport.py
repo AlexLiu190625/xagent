@@ -1928,7 +1928,12 @@ def _fair_share_enabled() -> bool:
 # A dispatch that joins a task this process already executes opens no slot and leaves
 # the balance alone, so an attempt is also a fallback round once
 # FAIR_SHARE_FALLBACK_AFTER_DISPATCHES counted dispatches, joining ones included, have
-# gone by since the last counted dispatch of a fallback round.
+# gone by since the last counted dispatch of a fallback round. A fallback round the
+# dispatch count brings also takes FAIR_SHARE_FALLBACK_EVERY - 1 off when it opens a
+# slot, and the balance has no floor, so after a stretch of joining dispatches the
+# fair rounds pay that back before the balance brings a fallback round again. A
+# control command takes no slot token and is not counted, so the bound holds for
+# dispatches that take one.
 FAIR_SHARE_WINDOW = 16
 FAIR_SHARE_TENANTS_PER_SCAN = 4
 FAIR_SHARE_SKIP_SECONDS = 2.0
@@ -2195,7 +2200,8 @@ def _fair_count_dispatch(attempt: _FairAttempt, opened: bool) -> None:
     Called on the event loop once the attempt holds its slot token and the task's
     ownership check has passed, with no await in between. ``opened`` is whether
     no execution of this process held the task's slot at that moment, so that
-    applying the command takes a new one. An attempt whose slot is refused or
+    applying it is expected to take a new one; an execution that ends before the
+    command is applied leaves it counted as joining. An attempt whose slot is refused or
     released, or whose ownership check raises, never gets here; one that does is
     recorded even if applying the command then fails. A dispatch that opens a slot
     moves the balance: a fallback round takes FAIR_SHARE_FALLBACK_EVERY - 1 off,
@@ -2223,9 +2229,8 @@ class _FairAttempt:
     ``decided`` is set by the first scan, which fixes whether the attempt is a
     fallback round; a rescan keeps that decision. ``counted`` is set when that
     scan had room, and only a counted attempt is recorded once it dispatches
-    (``_fair_count_dispatch``). A scan the presence precheck
-    ends because no command is open never reaches that decision, so it leaves
-    ``decided`` unset. ``tenants`` is the listing of the queue, taken by the first
+    (``_fair_count_dispatch``). A scan the presence precheck ends because no
+    command is open never reaches that decision, so it leaves ``decided`` unset. ``tenants`` is the listing of the queue, taken by the first
     scan that ranks or that is between the batch line and the limit, and reused by
     the rescans of the same attempt.
     """
