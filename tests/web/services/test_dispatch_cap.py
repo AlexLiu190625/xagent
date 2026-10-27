@@ -400,6 +400,90 @@ async def test_one_notify_one_free_slot_admits_exactly_one(
         assert not host.manager._dispatch_reservations
 
 
+async def test_a_task_holds_an_execution_only_while_one_is_registered(
+    cap_host: CapHost,
+) -> None:
+    manager = cap_host.manager
+    token = manager.reserve_dispatch_slot(7, policy=policy_of(5), interactive=False)
+    assert 7 in manager._active_task_ids() and not manager.holds_execution(7)
+    handle, finish = cap_host.live(7)
+    manager.release_dispatch_slot(token)
+    assert manager.holds_execution(7)
+    finish.set()
+    await handle
+    assert not manager.holds_execution(7)
+    manager.resume_tasks[8] = asyncio.get_running_loop().create_future()
+    assert manager.holds_execution(8)
+
+
+@pytest.mark.parametrize("applies", ["first", "second", "neither"])
+async def test_the_attempt_that_applies_a_start_counts_its_new_slot_once(
+    applies: str, cap_host: CapHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two attempts take tokens for one START, the first before the second; the
+    order in which they continue past the task's owner startup decides which one
+    applies it, and ``neither`` puts another command on the owner first."""
+    host = cap_host
+    monkeypatch.setenv("XAGENT_DISPATCHER_FAIR_SHARE", "true")
+    monkeypatch.setattr(transport, "_fair_share_memo", None)
+    monkeypatch.setattr(transport, "_fair_state", transport._FairState())
+    task_id = host.new_task()
+    host.enqueue(task_id, "start")
+    arrived: list[str] = []
+    gates = {"first": asyncio.Event(), "second": asyncio.Event()}
+    real_ensure = host.registry.ensure
+
+    async def ensure(task_id: int) -> Any:
+        coordinator = await real_ensure(task_id)
+        # Where an attempt resumes after the owner's startup completed.
+        name = asyncio.current_task().get_name()
+        arrived.append(name)
+        await gates[name].wait()
+        return coordinator
+
+    monkeypatch.setattr(host.registry, "ensure", ensure)
+    applying = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def handler(command: Any) -> Any:
+        result = await host.handler(command)
+        applying.set()
+        await finish.wait()
+        return result
+
+    async def attempt(name: str) -> bool:
+        asyncio.current_task().set_name(name)
+        return await transport.dispatch_one_task_command(handler)
+
+    first = asyncio.create_task(attempt("first"))
+    await eventually(lambda: arrived == ["first"])
+    second = asyncio.create_task(attempt("second"))
+    await eventually(lambda: arrived == ["first", "second"])
+    assert host.manager._dispatch_reservations[task_id] == 2
+    if applies == "neither":
+        other = asyncio.get_running_loop().create_future()
+        busy = host.registry._coordinators[task_id]._command_tasks
+        busy.add(other)
+        gates["first"].set()
+        gates["second"].set()
+        await asyncio.wait_for(asyncio.gather(first, second), DB_PROGRESS_TIMEOUT)
+        busy.discard(other)
+    else:
+        loser = "second" if applies == "first" else "first"
+        gates[applies].set()
+        await asyncio.wait_for(applying.wait(), DB_PROGRESS_TIMEOUT)
+        gates[loser].set()
+        await eventually(lambda: (second if loser == "second" else first).done())
+    finish.set()
+    results = await asyncio.wait_for(asyncio.gather(first, second), DB_PROGRESS_TIMEOUT)
+
+    # Both attempts scanned with room, so both are counted attempts.
+    state = transport._fair_state
+    opened = 0 if applies == "neither" else 1
+    assert (state.since_fallback, state.attempts_since_fallback) == (opened, 2)
+    assert results == [applies == "first", applies == "second"]
+
+
 async def test_dispatch_reservation_tokens_count_per_attempt(
     cap_host: CapHost,
 ) -> None:

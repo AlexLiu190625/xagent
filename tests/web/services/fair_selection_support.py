@@ -324,7 +324,7 @@ class Reference:
     """The selection rules read straight off the specification, over plain objects.
 
     It shares no code with the dispatcher. ``clock`` is the time source the test
-    moves; the reference keeps its own counter and skip table.
+    moves; the reference keeps its own fallback balance and skip table.
     """
 
     def __init__(
@@ -336,7 +336,8 @@ class Reference:
         self.commands = commands
         self.clock = clock
         self.full = full
-        self.attempts = 0
+        self.since_fallback = 0
+        self.fallback = False
         self.skips: dict[tuple[str, str], float] = {}
         # Overridable so that a test can pin a rule to a different value.
         self.tenants_per_scan = 4
@@ -379,12 +380,22 @@ class Reference:
         holders = [t for t, n in cap.occupancy.items() if n == top and t in counted]
         return min(holders, key=lambda t: counted[t]) if holders else None
 
+    def count(self, cap, cmd: Cmd) -> None:
+        """Move the balance for the pick just made: a scan that had room, whose
+        command opens an execution of a task not yet active, took a new slot."""
+        if cap.closed or cmd.kind in CONTROL_KINDS or cmd.task in cap.active_ids:
+            return
+        if self.fallback:
+            self.since_fallback -= self.fallback_every - 1
+        else:
+            self.since_fallback += 1
+
     def pick(self, cap, busy=()) -> int | None:
         has_room = not cap.closed
         fallback = False
         if has_room:
-            self.attempts += 1
-            fallback = self.attempts % self.fallback_every == 0
+            fallback = self.since_fallback >= self.fallback_every - 1
+        self.fallback = fallback
         capped = self.capped_tenant(cap) if has_room else None
         self.last_capped = capped
         usable = [
@@ -502,6 +513,9 @@ def play(
     Fails with the seed and the whole world. After every scan the chosen command is
     settled and its task counted as holding a slot for its tenant.
     """
+    # The reference keeps no attempt count: a world runs too few attempts to pass
+    # FAIR_SHARE_FALLBACK_AFTER_ATTEMPTS.
+    assert attempts <= transport.FAIR_SHARE_FALLBACK_AFTER_ATTEMPTS
     rng = random.Random(seed)
     spec = random_world(rng, tenants=tenants, size=rng.randint(6, 45), **world_options)
     world.reset()
@@ -536,7 +550,8 @@ def play(
             stats["capped"] = stats.get("capped", 0) + 1
             if shadow.pick(cap, busy) != expected:
                 stats["changed"] = stats.get("changed", 0) + 1
-        chosen = scan(cap, attempt=attempt(), busy=busy)
+        one = attempt()
+        chosen = scan(cap, attempt=one, busy=busy)
         assert chosen == expected, (
             f"seed {seed} step {step}: dispatcher {chosen}, reference {expected}\n"
             f"limit {limit} reserve {policy.interactive_reserve} holds {holds} "
@@ -544,6 +559,11 @@ def play(
         )
         if chosen is not None:
             done = by_id[chosen]
+            if not cap.closed and done.kind not in CONTROL_KINDS:
+                # What the dispatch loop does once the pick holds a slot token: the
+                # tasks of ``holds`` are the ones an execution holds.
+                transport._fair_count_dispatch(one, done.task not in cap.active_ids)
+                reference.count(cap, done)
             done.status = "completed"
             with world.sessions() as db:
                 db.get(TaskExecutionCommand, chosen).status = "completed"

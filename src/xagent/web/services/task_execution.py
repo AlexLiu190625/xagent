@@ -4971,6 +4971,17 @@ class BackgroundTaskManager:
             | frozenset(self._dispatch_reservations)
         )
 
+    def holds_execution(self, task_id: int) -> bool:
+        """Whether an execution of this process holds ``task_id``'s slot now.
+
+        An execution holds it from its registration (``register_task`` or
+        ``register_reserved_resume``) until its handle has finished, and a resume
+        coordinator until the manager drops it. A dispatch token alone does not:
+        these are the tables of the active set other than the tokens. Read-only
+        and with no await, so the answer is the state at the moment of the call.
+        """
+        return task_id in self._live_executions or task_id in self.resume_tasks
+
     def _record_cap_state(self, closed: bool, now: float) -> None:
         since = self._cap_closed_since
         if closed:
