@@ -915,7 +915,9 @@ async def test_a_failing_ownership_check_leaves_the_balance_alone(loop):
     assert not loop.manager._dispatch_reservations
 
 
-@pytest.mark.parametrize("b_offers", ["pauses", "starts whose slot is refused"])
+@pytest.mark.parametrize(
+    "b_offers", ["pauses", "starts whose slot is refused", "pauses, a refused once"]
+)
 async def test_a_start_behind_a_missed_window_gets_the_fallback_round_after_the_attempt_line(
     b_offers, loop, clock, monkeypatch
 ):
@@ -927,21 +929,31 @@ async def test_a_start_behind_a_missed_window_gets_the_fallback_round_after_the_
         world.add("a", pinned=True)
     a_task = world.task_of(world.add("a"))
     world.add("b", pinned=True)
-    if b_offers == "pauses":
-        kind, b_dispatched = "pause", "b"
-    else:
+    kind, b_dispatched = "pause", "b"
+    refused = {"b": 0, "a": 0}
+    if b_offers == "starts whose slot is refused":
         kind, b_dispatched = "start", None
-        real = loop.manager.reserve_dispatch_slot
+        refused["b"] = AFTER + 2
+    elif b_offers == "pauses, a refused once":
+        refused["a"] = 1
+    real = loop.manager.reserve_dispatch_slot
 
-        def reserve(task_id, **kwargs):
-            if kwargs["fairness_key"] == "b":
-                return None
-            return real(task_id, **kwargs)
+    def reserve(task_id, **kwargs):
+        key = kwargs["fairness_key"]
+        if refused.get(key, 0) > 0:
+            refused[key] -= 1
+            return None
+        return real(task_id, **kwargs)
 
-        monkeypatch.setattr(loop.manager, "reserve_dispatch_slot", reserve)
+    monkeypatch.setattr(loop.manager, "reserve_dispatch_slot", reserve)
+    # A fallback round whose slot is refused does not reset the count, so the next
+    # attempt is a fallback round too.
+    expected = [b_dispatched] * AFTER + (
+        [None, "a"] if b_offers == "pauses, a refused once" else ["a"]
+    )
 
     dispatched = []
-    for _ in range(AFTER + 1):
+    for _ in range(len(expected)):
         clock.now += transport.FAIR_SHARE_SKIP_SECONDS
         world.add("b", kind=kind)
         before = len(loop.plan.ensured)
@@ -958,7 +970,7 @@ async def test_a_start_behind_a_missed_window_gets_the_fallback_round_after_the_
 
     # Every attempt misses A's window and is counted; the attempt after AFTER of
     # them is a fallback round, which reads past the window to A's START.
-    assert dispatched == [b_dispatched] * AFTER + ["a"]
+    assert dispatched == expected
     state = transport._fair_state
     assert (state.since_fallback, state.attempts_since_fallback) == (-(EVERY - 1), 0)
 
@@ -1338,14 +1350,19 @@ def test_a_window_full_of_commands_that_wait_elsewhere_is_missed_until_the_fallb
     other = world.add("b")
 
     cap = cap_of()
-    picks = [scan(cap, attempt=attempt()) for _ in range(7)]
+    fair_rounds = transport.FAIR_SHARE_FALLBACK_EVERY - 1
+    picks = []
+    for _ in range(fair_rounds):
+        one = attempt()
+        picks.append(scan(cap, attempt=one))
+        transport._fair_count_dispatch(one, True)
 
     # The sixteen highest-priority commands of a wait for another process, so its
-    # window finds nothing and a is missed; the round that reads the queue as it
-    # always did takes the oldest command, not the highest priority.
-    assert picks == [other] * 7
+    # window finds nothing and a is missed; once the fair rounds have opened their
+    # slots, the round that reads the queue as it always did takes the oldest
+    # command, not the highest priority.
+    assert picks == [other] * fair_rounds
     assert transport.drain_fair_misses() == 1
-    transport._fair_state.since_fallback = transport.FAIR_SHARE_FALLBACK_EVERY - 1
     assert scan(cap, attempt=attempt()) == oldest
 
 

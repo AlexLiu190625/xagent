@@ -1932,6 +1932,7 @@ def _fair_share_enabled() -> bool:
 # the FAIR_SHARE_WINDOW highest-priority, then oldest, queued commands of one
 # (tenant key, dispatch class). A (tenant key, class) that has none is not asked
 # again for FAIR_SHARE_SKIP_SECONDS.
+#
 # A fallback round reads the queue as it always did, so that a command only the full
 # scan can reach is not left behind. Fallback rounds aim at one in every
 # FAIR_SHARE_FALLBACK_EVERY new slots that counted attempts open: a fair round that
