@@ -41,6 +41,7 @@ class World:
         *,
         pinned=False,
         unavailable=False,
+        priority=0,
     ) -> int:
         """Queue one command of a new task; ``pinned`` puts the task's lease elsewhere."""
         self.count += 1
@@ -63,13 +64,16 @@ class World:
                 status=status,
                 dispatch_class=dispatch_class,
                 fairness_key=tenant,
+                priority=priority,
                 retry_available_at=later if unavailable else None,
             )
             db.add(command)
             db.commit()
             return command.id
 
-    def follow_up(self, task_id, tenant, kind="message", status="pending") -> int:
+    def follow_up(
+        self, task_id, tenant, kind="message", status="pending", priority=0
+    ) -> int:
         """Queue one more command of an existing task."""
         self.count += 1
         with self.sessions() as db:
@@ -81,6 +85,7 @@ class World:
                 status=status,
                 dispatch_class="batch",
                 fairness_key=tenant,
+                priority=priority,
             )
             db.add(command)
             db.commit()
@@ -164,6 +169,7 @@ class Cmd:
     pinned: bool = False
     unavailable: bool = False
     ticketed: bool = False
+    priority: int = 0
     id: int = 0
     task: int = 0
 
@@ -201,8 +207,11 @@ def random_world(
     leading: list[Cmd] = []
     if heavy and tenants > 1 and rng.random() < 0.4:
         name, klass = rng.choice(names), rng.choice(CLASSES)
-        leading = [Cmd(name, klass, "start", "pending", pinned=True) for _ in range(16)]
-        leading.append(Cmd(name, klass, "start", "pending"))
+        leading = [
+            Cmd(name, klass, "start", "pending", pinned=True, priority=10)
+            for _ in range(16)
+        ]
+        leading.append(Cmd(name, klass, "start", "pending", priority=-3))
     for _ in range(size):
         name = rng.choice(names)
         kind = rng.choice(kinds)
@@ -215,6 +224,7 @@ def random_world(
                 pinned=rng.random() < 0.1,
                 unavailable=rng.random() < 0.07,
                 ticketed=name in full and kind not in CONTROL_KINDS,
+                priority=rng.choice((-3, 0, 0, 0, 5, 10)),
             )
         )
     # Pauses and cancels whose key is not the key of any tenant with work, as when
@@ -293,6 +303,7 @@ def store_world(world: "World", spec: RandomWorld) -> None:
                 status=cmd.status,
                 dispatch_class=cmd.dispatch_class,
                 fairness_key=cmd.tenant,
+                priority=cmd.priority,
                 retry_available_at=later if cmd.unavailable else None,
             )
             db.add(row)
@@ -407,7 +418,6 @@ class Reference:
         if fallback:
             return today
         queued = [c for c in self.commands if c.status in QUEUED]
-        by_id = {c.id: c for c in self.commands}
         oldest: dict[tuple[str, str], int] = {}
         for c in queued:
             if c.kind in CONTROL_KINDS:
@@ -442,17 +452,25 @@ class Reference:
             hits = []
             for klass in remaining:
                 window = sorted(
-                    c.id
-                    for c in queued
-                    if c.tenant == tenant and c.dispatch_class == klass
+                    (
+                        c
+                        for c in queued
+                        if c.tenant == tenant and c.dispatch_class == klass
+                    ),
+                    key=lambda c: (-c.priority, c.id),
                 )[: self.window]
-                found = [i for i in window if self.claimable(by_id[i], cap, busy)]
+                found = [c.id for c in window if self.claimable(c, cap, busy)]
                 if found:
-                    hits.append(min(found))
+                    # The interactive side counts from the oldest claimable
+                    # interactive command of its window.
+                    age = found[0]
+                    if klass == "interactive":
+                        age = min(found)
+                    hits.append((age, found[0]))
                 else:
                     self.skips[(tenant, klass)] = now + 2.0
             if hits:
-                best = min(hits)
+                best = min(hits)[1]
                 break
         if best is None:
             return today

@@ -7,6 +7,7 @@ from uuid import uuid4
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from PIL import Image
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -59,6 +60,8 @@ def _record(
     db: Session,
     file_id: str,
     *,
+    filename: str = "launch.png",
+    mime_type: str = "image/png",
     storage_path: str | None = None,
     storage_status: str = "available",
     storage_key: str | None = "__default__",
@@ -71,8 +74,8 @@ def _record(
         file_id=file_id,
         user_id=7,
         task_id=11,
-        filename="launch.png",
-        mime_type="image/png",
+        filename=filename,
+        mime_type=mime_type,
         storage_status=storage_status,
         storage_path=storage_path,
         storage_key=storage_key,
@@ -178,6 +181,7 @@ def test_redirect_disabled_does_not_expose_signed_object_url(
     _record(db, file_id)
     monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
     monkeypatch.delenv("XAGENT_FILE_DELIVERY_REDIRECT_ENABLED", raising=False)
+    monkeypatch.setattr(external_media, "_validate_instagram_record", Mock())
     signed_access_url = Mock(
         return_value="https://internal-minio.example.test/private-object"
     )
@@ -209,8 +213,9 @@ def test_route_issues_and_redeems_get_and_head(
     uploads_dir = tmp_path / "uploads"
     image_path = uploads_dir / "user_7" / "web_task_11" / "launch.png"
     image_path.parent.mkdir(parents=True)
-    image_path.write_bytes(b"image-bytes")
+    Image.new("RGB", (640, 640), "blue").save(image_path)
     monkeypatch.setattr(files, "get_uploads_dir", lambda: uploads_dir)
+    monkeypatch.setattr(external_media, "get_uploads_dir", lambda: uploads_dir)
     file_id = str(uuid4())
     _record(
         db,
@@ -227,13 +232,79 @@ def test_route_issues_and_redeems_get_and_head(
     head = client.head(path)
 
     assert response.status_code == 200
-    assert response.content == b"image-bytes"
-    assert response.headers["content-type"] == "image/png"
+    assert response.content.startswith(b"\xff\xd8")
+    assert response.headers["content-type"] == "image/jpeg"
     assert response.headers["cache-control"] == "no-store, max-age=0"
     assert response.headers["content-disposition"].startswith("inline;")
+    assert "launch.jpg" in response.headers["content-disposition"]
     assert response.headers["referrer-policy"] == "no-referrer"
     assert head.status_code == 200
     assert head.content == b""
+
+
+def test_route_passes_through_conforming_jpeg(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    db: Session,
+    client: TestClient,
+):
+    uploads_dir = tmp_path / "uploads"
+    image_path = uploads_dir / "user_7" / "web_task_11" / "ready.png"
+    image_path.parent.mkdir(parents=True)
+    Image.new("RGB", (1080, 1080), "blue").save(image_path, format="JPEG")
+    expected = image_path.read_bytes()
+    monkeypatch.setattr(files, "get_uploads_dir", lambda: uploads_dir)
+    monkeypatch.setattr(external_media, "get_uploads_dir", lambda: uploads_dir)
+    file_id = str(uuid4())
+    _record(
+        db,
+        file_id,
+        filename="ready.png",
+        mime_type="image/png",
+        storage_path=str(image_path),
+        storage_status="legacy",
+        storage_key=None,
+    )
+    target = urlsplit(_issue_ticket_url(monkeypatch, db, file_id))
+
+    response = client.get(f"{target.path}?{target.query}")
+
+    assert response.status_code == 200
+    assert response.content == expected
+    assert response.headers["content-type"] == "image/jpeg"
+    assert "ready.png" in response.headers["content-disposition"]
+
+
+def test_route_maps_decode_failure_to_422(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    db: Session,
+    client: TestClient,
+):
+    uploads_dir = tmp_path / "uploads"
+    image_path = uploads_dir / "user_7" / "web_task_11" / "broken.png"
+    image_path.parent.mkdir(parents=True)
+    Image.new("RGB", (640, 640), "blue").save(image_path)
+    monkeypatch.setattr(files, "get_uploads_dir", lambda: uploads_dir)
+    monkeypatch.setattr(external_media, "get_uploads_dir", lambda: uploads_dir)
+    file_id = str(uuid4())
+    _record(
+        db,
+        file_id,
+        filename="broken.png",
+        storage_path=str(image_path),
+        storage_status="legacy",
+        storage_key=None,
+    )
+    target = urlsplit(_issue_ticket_url(monkeypatch, db, file_id))
+    image_path.write_bytes(b"not-an-image")
+
+    response = client.get(f"{target.path}?{target.query}")
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == (
+        "Registered image could not be decoded for Instagram"
+    )
 
 
 def test_route_requires_and_validates_ticket(client: TestClient):
@@ -277,8 +348,9 @@ def test_route_maps_storage_failures(
     uploads_dir = tmp_path / "uploads"
     image_path = uploads_dir / "user_7" / "launch.png"
     image_path.parent.mkdir(parents=True)
-    image_path.write_bytes(b"image")
+    Image.new("RGB", (640, 640), "blue").save(image_path)
     monkeypatch.setattr(files, "get_uploads_dir", lambda: uploads_dir)
+    monkeypatch.setattr(external_media, "get_uploads_dir", lambda: uploads_dir)
     file_id = str(uuid4())
     _record(db, file_id, storage_path=str(image_path))
     issued_url = _issue_ticket_url(monkeypatch, db, file_id)
@@ -312,9 +384,8 @@ def test_route_does_not_trust_local_path_outside_uploads(
         storage_status="legacy",
         storage_key=None,
     )
-    issued_url = _issue_ticket_url(monkeypatch, db, file_id)
-    target = urlsplit(issued_url)
-
-    response = client.get(f"{target.path}?{target.query}")
+    response = client.get(
+        f"/api/files/external-media/{file_id}?ticket={_ticket(file_id)}"
+    )
 
     assert response.status_code == 404

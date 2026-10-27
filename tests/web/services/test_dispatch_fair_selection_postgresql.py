@@ -28,6 +28,7 @@ from xagent.web.services import task_command_transport as transport
 from xagent.web.services.task_dispatch_cap import DispatchCapSnapshot, DispatchPolicy
 
 INDEX = "ix_task_commands_claimable_fair"
+PRIORITY_INDEX = "ix_task_commands_claimable_fair_priority"
 
 
 @pytest.fixture
@@ -234,7 +235,9 @@ def test_the_plan_of_the_tenant_listing_reads_the_tenant_index(busy_table) -> No
 
 
 @pytest.mark.postgresql
-def test_the_plan_of_a_tenants_window_query_reads_the_tenant_index(busy_table) -> None:
+def test_the_plan_of_a_tenants_window_query_reads_the_priority_index(
+    busy_table,
+) -> None:
     cap = DispatchCapSnapshot(
         policy=DispatchPolicy(limit=30, interactive_reserve=3),
         active_ids=frozenset(),
@@ -250,7 +253,7 @@ def test_the_plan_of_a_tenants_window_query_reads_the_tenant_index(busy_table) -
     # is planned as a hash anti-join that reads the command table; the oldest-first
     # lookup without the switch has the same node, so it is not a property of the
     # window.
-    feed = assert_fed_by(root, INDEX)
+    feed = assert_fed_by(root, PRIORITY_INDEX)
     limits = [
         n
         for n in nodes_under(root)

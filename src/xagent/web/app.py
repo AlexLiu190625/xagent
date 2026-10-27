@@ -55,6 +55,7 @@ from ..core.execution_scope import (
 from ..core.file_storage import StorageKeyScopeError
 from ..core.tracing.langfuse import flush_langfuse, initialize_langfuse
 from .api.a2a import router as a2a_router
+from .api.admin_execution_events import router as admin_execution_events_router
 from .api.admin_interaction_rollout import router as admin_interaction_rollout_router
 from .api.admin_mcp import admin_mcp_router
 from .api.admin_memory_embedding_authority import (
@@ -1673,6 +1674,7 @@ app.include_router(deployment_config_router)
 app.include_router(tools_router)
 app.include_router(admin_users_router)
 app.include_router(admin_interaction_rollout_router)
+app.include_router(admin_execution_events_router)
 app.include_router(execution_budget_router)
 app.include_router(admin_memory_embedding_authority_router)
 app.include_router(admin_mcp_router)

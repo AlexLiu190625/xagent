@@ -4375,3 +4375,96 @@ def test_an_append_ignores_the_field_and_follows_the_tasks_declaration(
         ("start", "interactive"),
     ]
     assert _stored_declaration(task_id) == "interactive"
+
+
+# ===== POST /v1/chat/tasks: priority =====
+
+
+def _stored_priorities(task_id):
+    """(task column, [command column of each command]) read by explicit query."""
+    db = _direct_db_session()
+    try:
+        task = db.query(Task.dispatch_priority).filter(Task.id == task_id).scalar()
+        commands = (
+            db.query(TaskExecutionCommand.priority)
+            .filter(TaskExecutionCommand.task_id == task_id)
+            .order_by(TaskExecutionCommand.id)
+            .all()
+        )
+        return task, [priority for (priority,) in commands]
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("value", [True, False, 1.0, "1", 11, -11, "high", [1]])
+def test_an_invalid_priority_is_rejected_with_the_error_envelope(value):
+    agent_id, full_key = _create_agent_with_key()
+    response = _create_with_dispatch_class(agent_id, full_key, priority=value)
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"]
+    db = _direct_db_session()
+    try:
+        assert db.query(Task).count() == 0
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "extra,stored_on_task,on_command",
+    [
+        ({}, None, 0),
+        ({"priority": None}, None, 0),
+        ({"priority": 0}, 0, 0),
+        ({"priority": -10}, -10, -10),
+        ({"priority": 10}, 10, 10),
+        ({"priority": 3}, 3, 3),
+    ],
+    ids=["omitted", "null", "zero", "minimum", "maximum", "three"],
+)
+def test_a_priority_is_stored_on_the_task_and_its_start_command(
+    shared_mode, extra, stored_on_task, on_command
+):
+    agent_id, full_key = _create_agent_with_key()
+
+    response = _create_with_dispatch_class(agent_id, full_key, **extra)
+
+    assert response.status_code == 202, response.text
+    assert _stored_priorities(response.json()["task_id"]) == (
+        stored_on_task,
+        [on_command],
+    )
+    assert "priority" not in response.json()
+
+
+def test_an_append_ignores_the_field_and_inherits_the_tasks_priority(shared_mode):
+    agent_id, full_key = _create_agent_with_key()
+    created = _create_with_dispatch_class(agent_id, full_key, priority=4).json()
+    task_id = created["task_id"]
+    db = _direct_db_session()
+    try:
+        db.query(TaskExecutionCommand).filter(
+            TaskExecutionCommand.task_id == task_id
+        ).update({"status": "completed"})
+        db.query(Task).filter(Task.id == task_id).update(
+            {
+                "status": TaskStatus.COMPLETED,
+                "control_state": "completed",
+                "run_id": created["run_id"],
+            }
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    appended = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "more"},
+            "priority": -7,
+        },
+    )
+
+    assert appended.status_code == 202, appended.text
+    assert _stored_priorities(task_id) == (4, [4, 4])

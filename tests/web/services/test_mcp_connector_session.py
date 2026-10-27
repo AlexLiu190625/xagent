@@ -826,6 +826,40 @@ async def test_signed_uploads_reach_connection(db_users, monkeypatch, transport,
     assert connection["signed_uploads"] == SIGNED_UPLOADS
 
 
+ISSUER_ENTRY = {
+    "issuing_tool_name": "request_upload",
+    "allowed_upload_hosts": ["uploads.example.test"],
+    "upload_path_prefix": "/staged/",
+    "content_types": {".pdf": "application/pdf"},
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stored",
+    [
+        pytest.param([ISSUER_ENTRY], id="issuer-only"),
+        pytest.param(
+            [ISSUER_ENTRY, {**SIGNED_UPLOADS[0], "issuing_tool_name": "issue_other"}],
+            id="issuer-and-replacement",
+        ),
+    ],
+)
+async def test_issuer_entries_reach_connection(db_users, monkeypatch, stored):
+    db, user, _ = db_users
+    server = _connect_plain_remote(
+        db, user, transport="streamable_http", url="https://mcp.example.test/mcp"
+    )
+    server.signed_uploads = stored
+    db.commit()
+
+    connection = await _assert_task_parity(db, user, server, monkeypatch)
+
+    assert connection["transport"] == "streamable_http"
+    assert connection["signed_uploads"] == stored
+    assert "unavailable" not in connection
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", ["websocket", "stdio"])
 async def test_signed_uploads_stay_off_other_transports(

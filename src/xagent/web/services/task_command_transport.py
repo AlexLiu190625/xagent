@@ -513,7 +513,9 @@ def stage_task_command(
        transaction, before the admission ticket is staged. The fairness key
        is set on the inserted row (the owner key, or for a control command the
        key of the task's latest command); a classifier's key replaces it in
-       the flush that writes the dispatch class. A control command of a task
+       the flush that writes the dispatch class. The priority is the one the
+       classifier returned, else the task's declared value (NULL reads 0), and
+       is written in that same flush. A control command of a task
        with no earlier command takes the owner key, which can differ from a
        deployment classifier's key for that task.
 
@@ -563,6 +565,7 @@ def stage_task_command(
             Task.source,
             Task.channel_name,
             Task.requested_dispatch_class,
+            Task.dispatch_priority,
             User.id.label("task_owner_row_id"),
             User.actor_subject.label("task_owner_subject"),
         )
@@ -709,6 +712,7 @@ def stage_task_command(
                 background=reserved,
                 previous_dispatch_class=previous_dispatch_class,
                 requested_dispatch_class=snapshot.requested_dispatch_class,
+                dispatch_priority=snapshot.dispatch_priority,
             ),
         )
         changed = False
@@ -719,10 +723,18 @@ def stage_task_command(
         if classified_key is not None and classified_key != command.fairness_key:
             command.fairness_key = classified_key  # type: ignore[assignment]
             changed = True
+        priority = (
+            classification.priority
+            if classification.priority is not None
+            else int(snapshot.dispatch_priority or 0)
+        )
+        if priority != command.priority:
+            command.priority = priority
+            changed = True
         if changed:
-            # The session does not autoflush; write the class and the key before
-            # anything else in the acceptance transaction can read the row,
-            # whatever the caller does next.
+            # The session does not autoflush; write the class, the key and the
+            # priority before anything else in the acceptance transaction can
+            # read the row, whatever the caller does next.
             db.flush()
     stage_task_admission(
         db, command, classification.admission if classification else None
@@ -1916,9 +1928,10 @@ def _fair_share_enabled() -> bool:
 
 
 # With the fair-share switch on, a scan with room asks each of the first
-# FAIR_SHARE_TENANTS_PER_SCAN ranked tenants for the oldest command it can claim among
-# the FAIR_SHARE_WINDOW oldest queued commands of one (tenant key, dispatch class). A
-# (tenant key, class) that has none is not asked again for FAIR_SHARE_SKIP_SECONDS.
+# FAIR_SHARE_TENANTS_PER_SCAN ranked tenants for the best command it can claim among
+# the FAIR_SHARE_WINDOW highest-priority, then oldest, queued commands of one
+# (tenant key, dispatch class). A (tenant key, class) that has none is not asked
+# again for FAIR_SHARE_SKIP_SECONDS.
 # A fallback round reads the queue as it always did, so that a command only the full
 # scan can reach is not left behind. Fallback rounds aim at one in every
 # FAIR_SHARE_FALLBACK_EVERY new slots that counted attempts open: a fair round that
@@ -2013,10 +2026,12 @@ def _tenants_in_band(
 
 
 def _queued_tenant_window(key: str, dispatch_class: str) -> Any:
-    """The ids of the oldest queued commands of one tenant key and class.
+    """The ids of the highest-priority queued commands of one tenant key and class.
 
-    The key is bounded with ``>=`` and ``<=`` rather than ``=``: with an equality
-    PostgreSQL prefers the primary-key order to the index on (key, class, id).
+    These are the FAIR_SHARE_WINDOW commands with the highest priority, oldest
+    first among equals. The key is bounded with ``>=`` and ``<=`` rather than
+    ``=``: with an equality PostgreSQL has preferred the primary-key order to an
+    index on (key, class, id).
     """
     return (
         select(TaskExecutionCommand.id)
@@ -2029,6 +2044,7 @@ def _queued_tenant_window(key: str, dispatch_class: str) -> Any:
         .order_by(
             TaskExecutionCommand.fairness_key,
             TaskExecutionCommand.dispatch_class,
+            TaskExecutionCommand.priority.desc(),
             TaskExecutionCommand.id,
         )
         .limit(FAIR_SHARE_WINDOW)
@@ -2036,9 +2052,17 @@ def _queued_tenant_window(key: str, dispatch_class: str) -> Any:
 
 
 def _in_tenant_window(query: Query[Any], key: str, dispatch_class: str) -> Query[Any]:
-    """``query`` narrowed to the oldest queued commands of one tenant key and class."""
-    return query.filter(
-        TaskExecutionCommand.id.in_(_queued_tenant_window(key, dispatch_class))
+    """``query`` narrowed to the window of one tenant key and class, best row first.
+
+    The claimable order by id is replaced by priority then id, so the first row is
+    the highest-priority, then oldest, claimable command of the window.
+    """
+    return (
+        query.filter(
+            TaskExecutionCommand.id.in_(_queued_tenant_window(key, dispatch_class))
+        )
+        .order_by(None)
+        .order_by(TaskExecutionCommand.priority.desc(), TaskExecutionCommand.id)
     )
 
 
@@ -2302,6 +2326,15 @@ def _fair_pick(
     with no claimable command in its window is missed and skipped for a while.
     With no tenant ranked, the plain lookup decides.
 
+    Within a tenant key and class the window is read by priority. When both
+    classes have a candidate, the one with the older side wins: the batch side by
+    its candidate's id, the interactive side by the smallest id among the
+    claimable interactive commands of its window. With all priorities equal this
+    is the same order as comparing the two candidates' ids. Commands that need no
+    new slot and are older than the winner (``_older_needing_no_new_slot``) still
+    run first, and a class in the skip table is not asked, so the other class
+    alone decides.
+
     The listing is taken once per attempt, so a rescan may rank a queue that has
     moved on; at worst that costs one more window query or one more recorded miss.
     A task the attempt already set aside (``busy``) that fills the window of a tenant
@@ -2328,14 +2361,21 @@ def _fair_pick(
         entry for entry in ranked if entry[3] and entry[2] != capped
     ][:FAIR_SHARE_TENANTS_PER_SCAN]:
         hits = []
+        ages: dict[str, int] = {}
         for dispatch_class in classes:
-            row = _in_tenant_window(claimable(), key, dispatch_class).first()
-            if row is None:
-                _fair_record_miss(key, dispatch_class)
+            window = _in_tenant_window(claimable(), key, dispatch_class)
+            # Only the interactive side needs every claimable row of its window.
+            if dispatch_class == DISPATCH_CLASS_INTERACTIVE:
+                rows = window.all()
             else:
-                hits.append(row)
+                rows = [row] if (row := window.first()) is not None else []
+            if not rows:
+                _fair_record_miss(key, dispatch_class)
+                continue
+            hits.append(rows[0])
+            ages[dispatch_class] = min(row.id for row in rows)
         if hits:
-            best = min(hits, key=lambda row: row.id)
+            best = min(hits, key=lambda row: ages[row.dispatch_class])
             break
     if best is None:
         return oldest_claimable()
@@ -2380,9 +2420,10 @@ def _find_command_candidate(
     claimable, the full scan still runs, adding one indexed round trip. A
     command committed after the precheck is found by the next poll or the
     in-process notify, within the bound ``stage_task_command`` documents.
-    With the fair-share switch on, the oldest command of the first-ranked tenant
-    that has one is taken instead, and between the batch line and the limit the
-    new work of the tenant the cap holds back is left out of every query.
+    With the fair-share switch on, the command ``_fair_pick`` chooses from the
+    first-ranked tenant that has one is taken instead, and between the batch line
+    and the limit the new work of the tenant the cap holds back is left out of
+    every query.
     """
     from ..models.database import get_session_local
 

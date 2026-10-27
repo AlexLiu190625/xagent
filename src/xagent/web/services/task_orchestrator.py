@@ -94,6 +94,7 @@ from .db_write_retry import (
     bound_rerun_lock_wait_no_commit,
     retry_db_write_async,
 )
+from .execution_event_signals import report_commit_failure
 from .external_task_cancel import (
     EXTERNAL_TASK_SOURCE,
     EXTERNAL_TURN_INTERRUPTED_MESSAGE,
@@ -1233,7 +1234,17 @@ async def _accept_existing_event_input(
             )
         )
 
-    await retry_db_write_async(attempt, site="input_accept")
+    try:
+        await retry_db_write_async(attempt, site="input_accept")
+    except Exception as exc:
+        report_commit_failure(
+            "input_accept",
+            exc,
+            task_id=lease.task_id,
+            run_id=lease.run_id,
+            retried=attempts > 1,
+        )
+        raise
 
 
 def reserve_task_start_no_commit(

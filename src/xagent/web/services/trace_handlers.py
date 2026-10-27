@@ -111,6 +111,14 @@ CHECKPOINT_ROW_SCAN_LIMIT = 100
 CHECKPOINT_SCAN_MAX_PAGES = 50
 
 
+class ToolAttemptAlreadyStartedError(RuntimeError):
+    """A tool attempt already has a start fact from an earlier, unreconciled run."""
+
+    def __init__(self, tool_attempt_id: str) -> None:
+        super().__init__("Tool attempt already started; result reconciliation required")
+        self.tool_attempt_id = tool_attempt_id
+
+
 @dataclass
 class CommitState:
     """What one ``commit_event`` call has staged across its retry attempts.
@@ -268,6 +276,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
         self, event: CoreTraceEvent, *, commit_state: CommitState | None = None
     ) -> None:
         """Save trace event to database."""
+        storage = "v2" if self.authoritative else "v1"
         try:
             # A cancelled caller must wait for the instrumented worker to
             # release its transaction before task settlement can begin.
@@ -287,7 +296,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
             await drain_async_task_cancellation_safe(worker)
             increment_performance_counter(
                 "xagent.trace.database.writes",
-                attributes={"outcome": "succeeded"},
+                attributes={"outcome": "succeeded", "storage": storage},
             )
         except Exception as e:
             if _retryable_commit_failure(e, commit_state):
@@ -295,7 +304,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 # and final error report the outcome of the whole write.
                 increment_performance_counter(
                     "xagent.trace.database.writes",
-                    attributes={"outcome": "retryable_failed"},
+                    attributes={"outcome": "retryable_failed", "storage": storage},
                 )
                 logger.warning(
                     "Trace event commit attempt failed for task %s: %s",
@@ -305,18 +314,21 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 raise
             increment_performance_counter(
                 "xagent.trace.database.writes",
-                attributes={"outcome": "failed"},
+                attributes={"outcome": "failed", "storage": storage},
             )
             # Don't catch required field validation errors - let them propagate
             if isinstance(e, ValueError) and ("missing required" in str(e)):
                 logger.error(f"Re-raising required field validation error: {e}")
                 raise
             if getattr(event, "require_persisted", False):
-                logger.error(
-                    "Required trace event persistence failed for task %s: %s",
-                    self.task_id,
-                    e,
-                )
+                if not self.authoritative:
+                    # An authoritative write is reported once, with its
+                    # retry outcome, by ExecutionEventTraceAdapter.commit_event.
+                    logger.error(
+                        "Required trace event persistence failed for task %s: %s",
+                        self.task_id,
+                        e,
+                    )
                 raise
 
             logger.warning(
@@ -1205,9 +1217,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
                             # Until event-based recovery reconciles the attempt,
                             # do not re-execute a possibly completed external
                             # effect.
-                            raise RuntimeError(
-                                "Tool attempt already started; result reconciliation required"
-                            )
+                            raise ToolAttemptAlreadyStartedError(str(attempt))
                         fresh_start = not rows
                 key = (
                     f"tool:{attempt}:{fact_type}" if attempt else f"runtime:{event.id}"
@@ -1419,11 +1429,13 @@ class DatabaseTraceHandler(BaseTraceHandler):
                     f"Skip trace event for missing task {self.task_id}: {event.id}"
                 )
                 return
-            logger.error(f"Failed to save trace event to database: {e}")
+            if not self.authoritative:
+                logger.error(f"Failed to save trace event to database: {e}")
             raise
         except Exception as e:
-            # A retryable V2 attempt is reported once, by _save_to_database.
-            if not _retryable_commit_failure(e, commit_state):
+            # A V2 write is reported once, with its retry outcome, by
+            # ExecutionEventTraceAdapter.commit_event.
+            if not self.authoritative:
                 logger.error(f"Failed to save trace event to database: {e}")
             db.rollback()
             raise

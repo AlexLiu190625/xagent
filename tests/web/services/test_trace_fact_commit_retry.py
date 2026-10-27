@@ -682,4 +682,5 @@ async def test_retried_attempts_warn_and_only_a_failed_write_errors(
         assert errors == []
     else:
         assert len(errors) == 1
-        assert "after retries" in errors[0]
+        assert errors[0].startswith("execution_event_commit_failed ")
+        assert "site=trace_fact" in errors[0]

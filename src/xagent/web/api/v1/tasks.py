@@ -356,6 +356,7 @@ async def create_chat_task(
             ),
             timezone=request.timezone,
             requested_dispatch_class=request.dispatch_class,
+            requested_priority=request.priority,
         )
     except task_start_service.TaskStartRejected as exc:
         _raise_start_rejection(exc)
