@@ -20,8 +20,11 @@ the address a name resolves to.  The upload request must therefore be sent
 through ``PublicHttpTransport`` (``xagent.core.utils.public_http_transport``),
 which resolves the host and refuses any address that is not public.
 
-A binding replaces one scalar string argument of one tool.  A list value in
-that argument is passed through unchanged.
+A settings entry takes one of two forms.  A binding replaces one scalar string
+argument of one tool, and a list value in that argument is passed through
+unchanged.  An issuer takes over one issuing tool: the host offers the model a
+tool of the same name that stages a file, runs the issuing call itself and
+returns only the connector's file id.
 """
 
 from __future__ import annotations
@@ -31,7 +34,7 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -51,6 +54,14 @@ _SETTINGS_ENTRY_KEYS = frozenset(
     {
         "tool_name",
         "file_argument",
+        "issuing_tool_name",
+        "allowed_upload_hosts",
+        "upload_path_prefix",
+        "content_types",
+    }
+)
+_ISSUER_ENTRY_KEYS = frozenset(
+    {
         "issuing_tool_name",
         "allowed_upload_hosts",
         "upload_path_prefix",
@@ -88,6 +99,19 @@ class SignedUploadBinding:
     content_types: Mapping[str, str]  # lower-case one-dot suffix -> MIME
 
 
+@dataclass(frozen=True)
+class SignedUploadIssuer:
+    """An issuing tool of one remote connector that the host runs for the model."""
+
+    # Same meaning and same rule as SignedUploadBinding.connection_host.
+    connection_host: str
+    issuing_tool_name: str  # tool that returns the signed upload URL
+    # exact hostnames, no wildcards, no IP literals
+    allowed_upload_hosts: frozenset[str]
+    upload_path_prefix: str  # starts and ends with "/"
+    content_types: Mapping[str, str]  # lower-case one-dot suffix -> MIME
+
+
 def _validate_hostname(host: Any, label: str) -> None:
     if not isinstance(host, str) or not host:
         raise ValueError(f"{label} must be a non-empty string")
@@ -117,12 +141,29 @@ def _validate_string(value: Any, label: str) -> str:
 
 def _validate_entry(
     entry: Any, position: int, connection_host: str
-) -> SignedUploadBinding:
-    """Validate one stored settings entry; ``position`` only labels errors."""
+) -> SignedUploadBinding | SignedUploadIssuer:
+    """Validate one stored settings entry; ``position`` only labels errors.
+
+    An entry with exactly the keys of a binding is a binding, and an entry with
+    exactly the keys of an issuer is an issuer.
+    """
     label = f"signed_uploads[{position}]"
     if not isinstance(entry, dict):
         raise ValueError(f"{label} must be an object")
-    if set(entry) != _SETTINGS_ENTRY_KEYS:
+    keys = set(entry)
+    if keys == _ISSUER_ENTRY_KEYS:
+        issuing_tool_name = _validate_string(
+            entry["issuing_tool_name"], f"{label}.issuing_tool_name"
+        )
+        hosts, prefix, content_types = _validate_upload_rules(entry, label)
+        return SignedUploadIssuer(
+            connection_host=connection_host,
+            issuing_tool_name=issuing_tool_name,
+            allowed_upload_hosts=hosts,
+            upload_path_prefix=prefix,
+            content_types=content_types,
+        )
+    if keys != _SETTINGS_ENTRY_KEYS:
         raise ValueError(f"{label} must have exactly the documented keys")
 
     tool_name = _validate_string(entry["tool_name"], f"{label}.tool_name")
@@ -130,7 +171,26 @@ def _validate_entry(
     issuing_tool_name = _validate_string(
         entry["issuing_tool_name"], f"{label}.issuing_tool_name"
     )
+    hosts, prefix, content_types = _validate_upload_rules(entry, label)
+    return SignedUploadBinding(
+        connection_host=connection_host,
+        tool_name=tool_name,
+        file_argument=file_argument,
+        issuing_tool_name=issuing_tool_name,
+        allowed_upload_hosts=hosts,
+        upload_path_prefix=prefix,
+        content_types=content_types,
+    )
 
+
+def _validate_upload_rules(
+    entry: dict[str, Any], label: str
+) -> tuple[frozenset[str], str, Mapping[str, str]]:
+    """Validate the upload host, path prefix and type table shared by both entry forms.
+
+    ``entry`` holds the three keys; returns the kept values, which no longer
+    share anything with the stored value.
+    """
     hosts_label = f"{label}.allowed_upload_hosts"
     hosts = entry["allowed_upload_hosts"]
     if not isinstance(hosts, list):
@@ -192,42 +252,71 @@ def _validate_entry(
                 f"{types_label} values must not be longer than {_MAX_STRING_LENGTH}"
             )
 
-    return SignedUploadBinding(
-        connection_host=connection_host,
-        tool_name=tool_name,
-        file_argument=file_argument,
-        issuing_tool_name=issuing_tool_name,
-        allowed_upload_hosts=frozenset(hosts),
-        upload_path_prefix=prefix,
-        content_types=MappingProxyType(dict(content_types)),
-    )
+    return frozenset(hosts), prefix, MappingProxyType(dict(content_types))
 
 
-def _check_entries_together(bindings: list[SignedUploadBinding]) -> None:
-    """Reject settings whose entries clash with each other."""
-    seen_tools: set[str] = set()
-    for position, binding in enumerate(bindings):
-        if binding.tool_name in seen_tools:
+def _check_entries_together(
+    entries: list[SignedUploadBinding | SignedUploadIssuer],
+) -> None:
+    """Reject settings whose entries clash with each other.
+
+    ``entries`` is in stored order and every position in an error is the
+    entry's position in that order.  The checks run in a fixed order: a
+    repeated replaced tool, a repeated issuing tool of two issuers, an issuing
+    tool that an issuer shares with a binding, and a tool that is both an
+    issuing tool and a replaced tool.
+    """
+    replaced_tools: set[str] = set()
+    binding_issuing_tools: set[str] = set()
+    issuer_tools: set[str] = set()
+    repeated_replaced_tool: int | None = None
+    repeated_issuer_tool: int | None = None
+    issuer_positions: list[tuple[int, str]] = []
+    for position, entry in enumerate(entries):
+        if isinstance(entry, SignedUploadBinding):
+            if entry.tool_name in replaced_tools and repeated_replaced_tool is None:
+                repeated_replaced_tool = position
+            replaced_tools.add(entry.tool_name)
+            binding_issuing_tools.add(entry.issuing_tool_name)
+        else:
+            if entry.issuing_tool_name in issuer_tools and repeated_issuer_tool is None:
+                repeated_issuer_tool = position
+            issuer_tools.add(entry.issuing_tool_name)
+            issuer_positions.append((position, entry.issuing_tool_name))
+    if repeated_replaced_tool is not None:
+        raise ValueError(
+            f"signed_uploads[{repeated_replaced_tool}].tool_name "
+            "repeats an earlier entry"
+        )
+    if repeated_issuer_tool is not None:
+        raise ValueError(
+            f"signed_uploads[{repeated_issuer_tool}].issuing_tool_name "
+            "repeats an earlier entry"
+        )
+    # The index names the issuer: a binding's issuing tool is by definition the
+    # issuing tool of a binding, so the issuer is the entry to change.
+    for position, issuing_tool_name in issuer_positions:
+        if issuing_tool_name in binding_issuing_tools:
             raise ValueError(
-                f"signed_uploads[{position}].tool_name repeats an earlier entry"
+                f"signed_uploads[{position}].issuing_tool_name "
+                "is also the issuing tool of a replacement entry"
             )
-        seen_tools.add(binding.tool_name)
-    issuing_tools = {binding.issuing_tool_name for binding in bindings}
-    if seen_tools & issuing_tools:
+    if replaced_tools & (binding_issuing_tools | issuer_tools):
         raise ValueError("a tool cannot be both an issuing tool and a replaced tool")
 
 
 def parse_signed_upload_settings(
     raw: Any, *, connection_host: str | None
-) -> tuple[SignedUploadBinding, ...]:
+) -> tuple[SignedUploadBinding | SignedUploadIssuer, ...]:
     """Validate a connector's stored signed_uploads value; raise ValueError.
 
     ``None`` and an empty list mean no settings and give an empty tuple.  Any
-    other value must be a list of entries with exactly the documented keys, and
-    the connection needs a hostname (``connection_host``, the lower-case
-    hostname of the connection URL, taken as given; ``None`` and an empty
-    string both mean it has none).  The error text is fixed and never carries
-    a stored value.
+    other value must be a list of entries, each with exactly the keys of a
+    binding or exactly the keys of an issuer, and the connection needs a
+    hostname (``connection_host``, the lower-case hostname of the connection
+    URL, taken as given; ``None`` and an empty string both mean it has none).
+    The result has one object per entry, in stored order.  The error text is
+    fixed and never carries a stored value.
     """
     if raw is None or (isinstance(raw, list) and not raw):
         return ()
@@ -239,12 +328,12 @@ def parse_signed_upload_settings(
         raise ValueError(
             f"signed_uploads must not have more than {_MAX_SETTINGS_ENTRIES} entries"
         )
-    bindings = [
+    entries = [
         _validate_entry(entry, position, connection_host)
         for position, entry in enumerate(raw)
     ]
-    _check_entries_together(bindings)
-    return tuple(bindings)
+    _check_entries_together(entries)
+    return tuple(entries)
 
 
 def _url_hostname(url: Any) -> str | None:
@@ -270,7 +359,9 @@ def signed_upload_settings_error(raw: Any, *, transport: Any, url: Any) -> str |
     return None
 
 
-def connection_signed_uploads(connection: Any) -> tuple[SignedUploadBinding, ...]:
+def connection_signed_uploads(
+    connection: Any,
+) -> tuple[SignedUploadBinding | SignedUploadIssuer, ...]:
     """Read and validate the settings carried by ``connection``.
 
     A connection that is not a mapping, or whose transport does not take part,
@@ -295,6 +386,10 @@ class SignedUploadTicket:
     upload_url: str  # not yet checked against a binding
     headers: Mapping[str, str]  # headers the connector asks to send with the PUT
     expires_at: datetime  # timezone-aware
+    # When the connector reports when the file id stops working: that moment in
+    # UTC.  ``None`` when the reply has no such time or it cannot be read; the
+    # upload does not depend on it.
+    file_id_expires_at: datetime | None = None
 
 
 class SignedUploadResponseError(ValueError):
@@ -402,15 +497,30 @@ def parse_signed_upload_response(
         if name == "content-length" and value != str(size_bytes):
             raise SignedUploadResponseError("forbidden_header")
 
+    # The file id's own expiry is optional and only informs the model, so a
+    # value that cannot be read, or cannot be expressed in UTC, counts as absent.
+    file_id_expires_at: datetime | None = None
+    file_id_expiry_raw = payload.get("expires_at")
+    if isinstance(file_id_expiry_raw, str):
+        try:
+            parsed = datetime.fromisoformat(file_id_expiry_raw)
+            if parsed.tzinfo is not None:
+                file_id_expires_at = parsed.astimezone(timezone.utc)
+        except (ValueError, OverflowError):
+            pass
+
     return SignedUploadTicket(
         file_id=file_id,
         upload_url=upload_url,
         headers=MappingProxyType(dict(headers)),
         expires_at=expires_at,
+        file_id_expires_at=file_id_expires_at,
     )
 
 
-def check_signed_upload_url(raw: str, binding: SignedUploadBinding) -> httpx.URL:
+def check_signed_upload_url(
+    raw: str, binding: SignedUploadBinding | SignedUploadIssuer
+) -> httpx.URL:
     """Parse ``raw`` and check it against ``binding``; return the checked URL.
 
     The returned object is the one that must be used to send the request, so

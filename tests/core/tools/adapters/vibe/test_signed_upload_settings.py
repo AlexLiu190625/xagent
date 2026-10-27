@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import copy
+import logging
 import re
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
@@ -17,9 +19,15 @@ from xagent.core.tools.adapters.vibe.mcp_adapter import (
     load_mcp_tools_as_agent_tools,
     mcp_load_failure_message,
 )
+from xagent.core.tools.adapters.vibe.selection_spec import (
+    ToolSelectionSpec,
+    normalize_mcp_server_name,
+)
 from xagent.core.tools.adapters.vibe.signed_upload import (
     SignedUploadBinding,
+    SignedUploadIssuer,
     connection_signed_uploads,
+    parse_signed_upload_response,
     parse_signed_upload_settings,
     signed_upload_settings_error,
 )
@@ -60,6 +68,29 @@ def _binding(**overrides: Any) -> SignedUploadBinding:
     }
     fields.update(overrides)
     return SignedUploadBinding(**fields)
+
+
+def _issuer_entry(**overrides: Any) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "issuing_tool_name": "request_upload",
+        "allowed_upload_hosts": ["uploads.example.test"],
+        "upload_path_prefix": "/staged/",
+        "content_types": {".pdf": "application/pdf", ".png": "image/png"},
+    }
+    entry.update(overrides)
+    return entry
+
+
+def _issuer(**overrides: Any) -> Any:
+    fields: dict[str, Any] = {
+        "connection_host": CONNECTION_HOST,
+        "issuing_tool_name": "request_upload",
+        "allowed_upload_hosts": frozenset({"uploads.example.test"}),
+        "upload_path_prefix": "/staged/",
+        "content_types": {".pdf": "application/pdf", ".png": "image/png"},
+    }
+    fields.update(overrides)
+    return SignedUploadIssuer(**fields)
 
 
 def _connection(transport: str = "streamable_http", **extra: Any) -> dict[str, Any]:
@@ -993,6 +1024,25 @@ _MARKER = "planted_marker_tool"
         ),
         pytest.param(
             _connection(
+                signed_uploads=[
+                    _issuer_entry(
+                        issuing_tool_name=_MARKER, allowed_upload_hosts=["10.0.0.1"]
+                    )
+                ]
+            ),
+            id="issuer-ip-upload-host",
+        ),
+        pytest.param(
+            _connection(
+                signed_uploads=[
+                    _issuer_entry(issuing_tool_name=_MARKER),
+                    _issuer_entry(issuing_tool_name=_MARKER),
+                ]
+            ),
+            id="issuers-repeat-an-issuing-tool",
+        ),
+        pytest.param(
+            _connection(
                 url="https://[bad/mcp", signed_uploads=[_entry(tool_name=_MARKER)]
             ),
             id="unparseable-url",
@@ -1121,3 +1171,447 @@ async def test_loader_passes_each_tool_its_binding(
 )
 def test_no_process_registry(name: str) -> None:
     assert not hasattr(signed_upload, name)
+
+
+# ---------------------------------------------------------------------------
+# Issuer entries
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        pytest.param([_issuer_entry()], lambda: (_issuer(),), id="issuer-only"),
+        pytest.param(
+            [_entry(issuing_tool_name="issue_other"), _issuer_entry()],
+            lambda: (_binding(issuing_tool_name="issue_other"), _issuer()),
+            id="replacement-then-issuer",
+        ),
+        pytest.param(
+            [_issuer_entry(), _entry(issuing_tool_name="issue_other")],
+            lambda: (_issuer(), _binding(issuing_tool_name="issue_other")),
+            id="issuer-then-replacement",
+        ),
+    ],
+)
+def test_parse_signed_upload_settings_accepts_issuer_entries(
+    raw: Any, expected: Any
+) -> None:
+    given = copy.deepcopy(raw)
+
+    result = _parse(raw)
+
+    assert result == expected()
+    assert [type(item) for item in result] == [type(item) for item in expected()]
+    for item in result:
+        assert isinstance(item.allowed_upload_hosts, frozenset)
+        assert isinstance(item.content_types, MappingProxyType)
+        assert item.connection_host == CONNECTION_HOST
+    # What was kept is a copy: changing the stored value later changes nothing.
+    for entry in raw:
+        entry["content_types"][".txt"] = "text/plain"
+        entry["allowed_upload_hosts"].append("later.example.test")
+    assert result == _parse(given)
+    assert result == expected()
+
+
+_ISSUER_FIELD_PREFIXES = (
+    "signed_uploads[0].issuing_tool_name",
+    "signed_uploads[0].allowed_upload_hosts",
+    "signed_uploads[0].upload_path_prefix",
+    "signed_uploads[0].content_types",
+)
+
+
+def _issuer_rejected_cells() -> list[Any]:
+    cells: list[Any] = []
+    for cell in REJECTED_SETTINGS:
+        raw, message = cell.values
+        if not message.startswith(_ISSUER_FIELD_PREFIXES):
+            continue
+        assert isinstance(raw, list) and len(raw) == 1
+        entry = {
+            key: value
+            for key, value in raw[0].items()
+            if key not in ("tool_name", "file_argument")
+        }
+        cells.append(pytest.param([entry], message, id=cell.id))
+    return cells
+
+
+@pytest.mark.parametrize(("raw", "message"), _issuer_rejected_cells())
+def test_parse_signed_upload_settings_rejects_issuer_entries(
+    raw: Any, message: str
+) -> None:
+    with pytest.raises(ValueError, match=_exactly(message)):
+        _parse(raw)
+
+
+def test_issuer_entry_rejection_cells_cover_every_issuer_field() -> None:
+    covered: set[str] = set()
+    for cell in _issuer_rejected_cells():
+        _raw, message = cell.values
+        covered.add(message.split(" ")[0].split(".")[1])
+
+    assert covered == set(signed_upload._ISSUER_ENTRY_KEYS)
+
+
+def _with_key(entry: dict[str, Any], key: str, value: Any = "x") -> dict[str, Any]:
+    return {**entry, key: value}
+
+
+def _without_issuer_key(key: str) -> dict[str, Any]:
+    entry = _issuer_entry()
+    del entry[key]
+    return entry
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        pytest.param(_with_key(_issuer_entry(), "tool_name"), id="plus-tool-name"),
+        pytest.param(
+            _with_key(_issuer_entry(), "file_argument"), id="plus-file-argument"
+        ),
+        pytest.param(_with_key(_issuer_entry(), "extra"), id="plus-extra-key"),
+        *[
+            pytest.param(_without_issuer_key(key), id=f"missing-{key}")
+            for key in _issuer_entry()
+        ],
+        pytest.param(
+            {
+                key: value
+                for key, value in _entry().items()
+                if key not in ("tool_name", "issuing_tool_name")
+            },
+            id="replacement-keys-minus-two",
+        ),
+    ],
+)
+def test_signed_upload_entry_key_sets(entry: dict[str, Any]) -> None:
+    with pytest.raises(ValueError, match=_exactly(KEYS)):
+        _parse([entry])
+
+
+def test_signed_upload_entry_key_sets_are_tied_together() -> None:
+    assert signed_upload._ISSUER_ENTRY_KEYS == (
+        signed_upload._SETTINGS_ENTRY_KEYS - {"tool_name", "file_argument"}
+    )
+    assert set(_issuer_entry()) == set(signed_upload._ISSUER_ENTRY_KEYS)
+
+
+def _mixed_entries(replacements: int, issuers: int) -> list[dict[str, Any]]:
+    return [
+        *[_entry(tool_name=f"tool_{index}") for index in range(replacements)],
+        *[
+            _issuer_entry(issuing_tool_name=f"issue_{index}")
+            for index in range(issuers)
+        ],
+    ]
+
+
+def _issuer_also_replacement(position: int) -> str:
+    return (
+        f"signed_uploads[{position}].issuing_tool_name "
+        "is also the issuing tool of a replacement entry"
+    )
+
+
+CLASHING_ENTRIES = [
+    pytest.param(
+        [_entry(), _entry(issuing_tool_name="other_issuer")],
+        "signed_uploads[1].tool_name repeats an earlier entry",
+        id="rule1-two-replacements-same-tool",
+    ),
+    pytest.param(
+        [_issuer_entry(), _issuer_entry()],
+        "signed_uploads[1].issuing_tool_name repeats an earlier entry",
+        id="rule2-two-issuers-same-issuing-tool",
+    ),
+    pytest.param(
+        [_issuer_entry(), _entry()],
+        _issuer_also_replacement(0),
+        id="rule3-issuer-first",
+    ),
+    pytest.param(
+        [_entry(), _issuer_entry()],
+        _issuer_also_replacement(1),
+        id="rule3-issuer-last",
+    ),
+    pytest.param(
+        [_issuer_entry(issuing_tool_name="attach_document"), _entry()],
+        CLASH,
+        id="rule4-issuer-tool-is-a-replaced-tool",
+    ),
+    pytest.param(
+        [_issuer_entry(), _entry(), _entry()],
+        "signed_uploads[2].tool_name repeats an earlier entry",
+        id="mixed-issuer-then-duplicate-replacements",
+    ),
+    pytest.param(
+        [
+            _entry(),
+            _issuer_entry(issuing_tool_name="issue_a"),
+            _issuer_entry(issuing_tool_name="issue_a"),
+        ],
+        "signed_uploads[2].issuing_tool_name repeats an earlier entry",
+        id="mixed-replacement-then-duplicate-issuers",
+    ),
+    pytest.param(
+        [
+            _issuer_entry(issuing_tool_name="issue_a"),
+            _issuer_entry(issuing_tool_name="issue_a"),
+            _entry(),
+            _entry(),
+        ],
+        "signed_uploads[3].tool_name repeats an earlier entry",
+        id="rule1-is-checked-before-rule2",
+    ),
+    pytest.param(
+        _mixed_entries(10, 11),
+        "signed_uploads must not have more than 20 entries",
+        id="twenty-one-entries",
+    ),
+]
+
+
+@pytest.mark.parametrize(("raw", "message"), CLASHING_ENTRIES)
+def test_signed_upload_entries_clash(raw: Any, message: str) -> None:
+    with pytest.raises(ValueError, match=_exactly(message)):
+        _parse(raw)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        pytest.param(
+            [_issuer_entry(), _entry(issuing_tool_name="issue_other")],
+            id="different-issuing-tools",
+        ),
+        pytest.param(_mixed_entries(10, 10), id="twenty-entries"),
+    ],
+)
+def test_signed_upload_entries_accepts_compatible_entries(raw: Any) -> None:
+    assert len(_parse(raw)) == len(raw)
+
+
+# ---------------------------------------------------------------------------
+# The issuing tool's expiry of the file id
+# ---------------------------------------------------------------------------
+
+
+def _issuing_reply(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "file_id": "rf_abcdefgh",
+        "upload_url": "https://uploads.example.test/staged/abc?sig=1",
+        "method": "PUT",
+        "headers": {"Content-Type": "application/pdf"},
+        "url_expires_at": "2030-01-01T00:10:00Z",
+    }
+    payload.update(overrides)
+    payload = {k: v for k, v in payload.items() if v is not _MISSING}
+    return {"structured_content": payload, "content": []}
+
+
+_MISSING = object()
+_UTC = timezone.utc
+
+
+@pytest.mark.parametrize(
+    ("expires_at", "expected"),
+    [
+        pytest.param(
+            "2030-01-01T01:00:00Z",
+            datetime(2030, 1, 1, 1, 0, tzinfo=_UTC),
+            id="z-suffix",
+        ),
+        pytest.param(
+            "2030-01-01T09:00:00+08:00",
+            datetime(2030, 1, 1, 1, 0, tzinfo=_UTC),
+            id="offset-converted-to-utc",
+        ),
+        pytest.param(_MISSING, None, id="missing"),
+        pytest.param("x", None, id="not-iso"),
+        pytest.param(7, None, id="not-a-string"),
+        pytest.param(None, None, id="none"),
+        pytest.param("2030-01-01T01:00:00", None, id="no-timezone"),
+        pytest.param("9999-12-31T23:59:59-23:59", None, id="converts-out-of-range"),
+        pytest.param("0001-01-01T00:00:00+01:00", None, id="converts-below-range"),
+    ],
+)
+def test_parse_signed_upload_response_reads_file_id_expiry(
+    expires_at: Any, expected: Any
+) -> None:
+    ticket = parse_signed_upload_response(
+        _issuing_reply(expires_at=expires_at), size_bytes=3
+    )
+
+    assert ticket.file_id == "rf_abcdefgh"
+    assert ticket.file_id_expires_at == expected
+    if expected is not None:
+        assert ticket.file_id_expires_at.tzinfo is _UTC
+    # The expiry of the upload URL is read as before.
+    assert ticket.expires_at == datetime(2030, 1, 1, 0, 10, tzinfo=_UTC)
+
+
+# ---------------------------------------------------------------------------
+# Loading issuer entries through the MCP adapter
+# ---------------------------------------------------------------------------
+
+
+def _gated_targets(result: Any) -> dict[str, Any]:
+    # The loader wraps each adapter in the approval gate; ``_target`` is the adapter.
+    return {tool.name: tool._target for tool in result.tools}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("signed_uploads", "replaces_attach_document"),
+    [
+        pytest.param([_issuer_entry()], False, id="issuer-only"),
+        pytest.param(
+            [_issuer_entry(), _entry(issuing_tool_name="issue_other")],
+            True,
+            id="issuer-and-replacement-of-another-issuing-tool",
+        ),
+        pytest.param(None, False, id="no-settings"),
+    ],
+)
+async def test_issuer_entry_replaces_issuing_tool_with_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+    signed_uploads: Any,
+    replaces_attach_document: bool,
+) -> None:
+    _serve_tools(monkeypatch, *_ALL_TOOLS)
+    connection = _connection()
+    if signed_uploads is not None:
+        connection["signed_uploads"] = signed_uploads
+    visibility = mcp_adapter_module.ToolVisibility.PUBLIC
+    allow_users = ["user-42"]
+    workspace = SimpleNamespace(marker="workspace")
+
+    result = await load_mcp_tools_as_agent_tools(
+        {"docs": connection},
+        visibility=visibility,
+        allow_users=allow_users,
+        workspace=workspace,
+    )
+
+    assert result.failures == ()
+    assert [tool.name for tool in result.tools] == [
+        f"mcp_docs_{name}" for name in _ALL_TOOLS
+    ]
+    adapters = _gated_targets(result)
+    issuing_tool = adapters["mcp_docs_request_upload"]
+    if signed_uploads is None:
+        assert type(issuing_tool) is mcp_adapter_module.MCPToolAdapter
+    else:
+        assert type(issuing_tool) is mcp_adapter_module.SignedUploadIssuerAdapter
+    # The wrapper stands in the tool's place as that connector's own tool.
+    ordinary = _build_mcp_tool_adapter(
+        "docs",
+        connection,
+        _server_tool("request_upload"),
+        visibility=visibility,
+        allow_users=allow_users,
+        workspace=workspace,
+    )
+    assert issuing_tool.name == ordinary.name == "mcp_docs_request_upload"
+    assert issuing_tool.metadata.source_server == ordinary.metadata.source_server
+    assert issuing_tool.metadata.source_server == normalize_mcp_server_name("docs")
+    assert issuing_tool._visibility == ordinary._visibility == visibility
+    assert issuing_tool._allow_users == ordinary._allow_users == allow_users
+    assert issuing_tool._workspace is ordinary._workspace is workspace
+    assert issuing_tool.concurrency_safe == ordinary.concurrency_safe
+    # The other tools are unaffected.
+    assert (
+        adapters["mcp_docs_attach_document"]._signed_upload is not None
+    ) is replaces_attach_document
+    assert adapters["mcp_docs_other"]._signed_upload is None
+
+
+@pytest.mark.asyncio
+async def test_issuer_wrapper_is_admitted_by_a_server_scoped_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _serve_tools(monkeypatch, *_ALL_TOOLS)
+
+    result = await load_mcp_tools_as_agent_tools(
+        {"docs": _connection(signed_uploads=[_issuer_entry()])}
+    )
+
+    spec = ToolSelectionSpec.from_raw(tool_categories=["mcp:docs"])
+    allowed = spec.compute_allowed_names(list(_gated_targets(result).values()))
+    assert allowed is not None
+    assert "mcp_docs_request_upload" in allowed
+    other_spec = ToolSelectionSpec.from_raw(tool_categories=["mcp:elsewhere"])
+    other_allowed = other_spec.compute_allowed_names(
+        list(_gated_targets(result).values())
+    )
+    assert other_allowed is not None
+    assert "mcp_docs_request_upload" not in other_allowed
+
+
+@pytest.mark.asyncio
+async def test_issuer_wrapper_needs_the_listed_tool(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING)
+    _serve_tools(monkeypatch, "attach_document", "other")
+
+    result = await load_mcp_tools_as_agent_tools(
+        {"docs": _connection(signed_uploads=[_issuer_entry()])},
+        allow_users=["user-42"],
+    )
+
+    assert [tool.name for tool in result.tools] == [
+        "mcp_docs_attach_document",
+        "mcp_docs_other",
+    ]
+    assert result.failures == ()
+    assert result.loaded_servers == ("docs",)
+    warnings = [
+        record for record in caplog.records if record.levelno >= logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].args == ("docs", "request_upload")
+    assert "user-42" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_server_with_only_a_taken_over_issuing_tool_loads_the_wrapper(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING)
+    _serve_tools(monkeypatch, "request_upload")
+
+    result = await load_mcp_tools_as_agent_tools(
+        {"docs": _connection(signed_uploads=[_issuer_entry()])}
+    )
+
+    assert [tool.name for tool in result.tools] == ["mcp_docs_request_upload"]
+    assert (
+        type(_gated_targets(result)["mcp_docs_request_upload"])
+        is mcp_adapter_module.SignedUploadIssuerAdapter
+    )
+    assert result.loaded_servers == ("docs",)
+    assert result.failures == ()
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+@pytest.mark.asyncio
+async def test_hide_only_entry_hides_the_issuing_tool_without_a_wrapper(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING)
+    _serve_tools(monkeypatch, "request_upload", "other")
+    hide_only = _entry(tool_name="unlisted_tool", file_argument="document_file_id")
+
+    result = await load_mcp_tools_as_agent_tools(
+        {"docs": _connection(signed_uploads=[hide_only])}
+    )
+
+    assert [tool.name for tool in result.tools] == ["mcp_docs_other"]
+    assert _gated_targets(result)["mcp_docs_other"]._signed_upload is None
+    assert result.failures == ()
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
