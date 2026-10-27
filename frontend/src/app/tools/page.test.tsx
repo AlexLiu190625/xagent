@@ -686,7 +686,8 @@ describe("ToolsPage signed upload settings", () => {
     const fields = block.querySelectorAll("input, textarea")
     expect(fields.length).toBeGreaterThan(0)
     fields.forEach((field) => expect(field).toBeDisabled())
-    const radios = dialog.getAllByRole("radio")
+    expect(dialog.getByText("attach_document", { selector: "span" })).toBeInTheDocument()
+    const radios = within(block).getAllByRole("radio")
     expect(radios).toHaveLength(stored.length * 2)
     radios.forEach((radio) => expect(radio).toBeDisabled())
     const lastRowOther = dialog.getAllByRole("radio", { name: otherMode })[stored.length - 1]
@@ -793,6 +794,7 @@ describe("ToolsPage signed upload settings", () => {
       delete entry[key]
       return [`the issuer keys without ${key}`, entry, "replacement"]
     }),
+    ["four keys that are not the issuer keys", { tool_name: "attach_document", allowed_upload_hosts: ["uploads.example.test"], upload_path_prefix: "/staged/", content_types: { ".pdf": "application/pdf" } }, "replacement"],
     ["an empty object", {}, "replacement"],
     ["a value that is not an object", "request_upload", "replacement"],
   ]
