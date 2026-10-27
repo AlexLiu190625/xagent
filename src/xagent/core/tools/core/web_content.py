@@ -24,6 +24,15 @@ logger = logging.getLogger(__name__)
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 DEFAULT_MAX_CONTENT_BYTES = 10 * 1024 * 1024
 MAX_DISCOVERED_ASSETS = 50
+# Statuses a site returns when it refuses an automated client rather than
+# because the page is missing or the fetcher failed.
+SITE_BLOCKED_STATUS_CODES = frozenset({401, 403, 429, 451})
+SITE_BLOCKED_HINT = (
+    "The site refused automated access; this is a restriction on the site's "
+    "side, not a failure of this tool. Do not retry this URL. Tell the user "
+    "the source blocks automated access, and use another source instead, such "
+    "as search result snippets, an official feed, or content the user pastes."
+)
 HTML_CONTENT_TYPES = frozenset(
     {
         "",
@@ -74,6 +83,7 @@ class WebContentFetchResult:
     content_type: str = ""
     error: str | None = None
     assets: tuple[WebAssetReference, ...] = ()
+    blocked_by_site: bool = False
 
     @property
     def success(self) -> bool:
@@ -96,6 +106,7 @@ class WebContentFetchResult:
             "content_type": self.content_type,
             "error": self.error,
             "assets": [asset.as_dict() for asset in self.assets],
+            "blocked_by_site": self.blocked_by_site,
         }
 
 
@@ -253,12 +264,16 @@ class WebContentFetcher:
             status_code = e.response.status_code
             reason = e.response.reason_phrase
             error = f"HTTP {status_code} error for {url}: {reason}"
+            blocked_by_site = _is_site_blocked_response(e.response)
+            if blocked_by_site:
+                error = f"{error}. {SITE_BLOCKED_HINT}"
             logger.error("Webpage fetch failed: %s", error)
             return WebContentFetchResult(
                 url=url,
                 content="",
                 status_code=status_code,
                 error=error,
+                blocked_by_site=blocked_by_site,
             )
         except httpx.RequestError as e:
             error = f"Network error for {url}: {str(e)}"
@@ -423,6 +438,17 @@ class WebContentFetcher:
 
         markdown = converter.handle(str(soup)).strip()
         return markdown
+
+
+def _is_site_blocked_response(response: httpx.Response) -> bool:
+    """Return whether an error response means the site refused automated access."""
+
+    if response.status_code in SITE_BLOCKED_STATUS_CODES:
+        return True
+    # Cloudflare marks its bot challenge pages, which can use other statuses
+    # such as 503, with this header.
+    mitigated = str(response.headers.get("cf-mitigated", ""))
+    return mitigated.strip().lower() == "challenge"
 
 
 async def fetch_web_content(

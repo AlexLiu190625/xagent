@@ -50,6 +50,13 @@ class FetchWebContentResult(BaseModel):
     )
     content_type: str = Field(default="", description="HTTP content type")
     error: str | None = Field(default=None, description="Error message if failed")
+    blocked_by_site: bool = Field(
+        default=False,
+        description=(
+            "True when the site refused automated access (for example HTTP "
+            "401/403/429/451 or a bot challenge); do not retry the URL"
+        ),
+    )
     assets: list[WebAssetReferenceResult] = Field(
         default_factory=list,
         description=(

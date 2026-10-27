@@ -369,6 +369,61 @@ class TestFetchWebContentTool:
         assert result["content"] == ""
         assert result["status_code"] == 404
         assert "HTTP 404 error" in result["error"]
+        assert result["blocked_by_site"] is False
+        assert "refused automated access" not in result["error"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("status_code", "reason_phrase", "headers"),
+        [
+            (401, "Unauthorized", {}),
+            (403, "Forbidden", {}),
+            (429, "Too Many Requests", {}),
+            (451, "Unavailable For Legal Reasons", {}),
+            (503, "Service Unavailable", {"cf-mitigated": "challenge"}),
+        ],
+    )
+    async def test_fetch_flags_site_blocked_responses(
+        self, fetch_tool, status_code, reason_phrase, headers
+    ):
+        response = _MockStreamResponse(
+            status_code=status_code,
+            reason_phrase=reason_phrase,
+            headers=headers,
+            raise_status=True,
+        )
+
+        with patch(
+            "httpx.AsyncClient.stream", return_value=_MockStreamContext(response)
+        ):
+            result = await fetch_tool.run_json_async(
+                {"url": "https://example.com/news"}
+            )
+
+        assert result["success"] is False
+        assert result["status_code"] == status_code
+        assert result["blocked_by_site"] is True
+        assert f"HTTP {status_code} error" in result["error"]
+        assert "refused automated access" in result["error"]
+        assert "Do not retry this URL" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_fetch_does_not_flag_plain_server_error(self, fetch_tool):
+        response = _MockStreamResponse(
+            status_code=503,
+            reason_phrase="Service Unavailable",
+            raise_status=True,
+        )
+
+        with patch(
+            "httpx.AsyncClient.stream", return_value=_MockStreamContext(response)
+        ):
+            result = await fetch_tool.run_json_async(
+                {"url": "https://example.com/news"}
+            )
+
+        assert result["blocked_by_site"] is False
+        assert "refused automated access" not in result["error"]
 
     def test_args_validation(self):
         args = FetchWebContentArgs(url="https://example.com")
