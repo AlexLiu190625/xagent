@@ -5,6 +5,7 @@ import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group"
 import { Textarea } from "@/components/ui/textarea"
 import { useI18n } from "@/contexts/i18n-context"
 
@@ -16,8 +17,26 @@ interface SignedUploadContentTypeRow {
   contentType: string
 }
 
+/**
+ * How the host uses one entry. "replacement" uploads the file before a call to
+ * the tool that takes it and replaces that tool's file argument; "issuer" runs
+ * the issuing tool for the model and returns only the connector's file ID.
+ */
+export type SignedUploadMode = "replacement" | "issuer"
+
+// An entry with exactly these keys is an issuer entry; any other entry is read
+// as a replacement entry.
+const ISSUER_ENTRY_KEYS = [
+  "issuing_tool_name",
+  "allowed_upload_hosts",
+  "upload_path_prefix",
+  "content_types",
+] as const
+
 export interface SignedUploadRow {
   id: string
+  mode: SignedUploadMode
+  // toolName and fileArgument are always empty in an issuer row.
   toolName: string
   fileArgument: string
   issuingToolName: string
@@ -40,10 +59,17 @@ function textOrEmpty(value: unknown): string {
   return typeof value === "string" ? value : ""
 }
 
+function isIssuerEntry(item: Record<string, unknown>): boolean {
+  const keys = Object.keys(item)
+  return keys.length === ISSUER_ENTRY_KEYS.length
+    && ISSUER_ENTRY_KEYS.every((key) => keys.includes(key))
+}
+
 /**
  * Turn a stored signed_uploads value into editable rows, showing as much of a
  * stored entry as possible: a missing or mistyped field reads as empty and an
- * entry that is not an object reads as an empty row.
+ * entry that is not an object reads as an empty row. An entry with exactly the
+ * issuer keys reads as an issuer row and every other entry as a replacement row.
  */
 export function signedUploadRowsFromValue(
   value: unknown,
@@ -62,6 +88,7 @@ export function signedUploadRowsFromValue(
       : []
     return {
       id: nextId(),
+      mode: isIssuerEntry(item) ? "issuer" : "replacement",
       toolName: textOrEmpty(item.tool_name),
       fileArgument: textOrEmpty(item.file_argument),
       issuingToolName: textOrEmpty(item.issuing_tool_name),
@@ -76,7 +103,8 @@ export function signedUploadRowsFromValue(
  * Turn editable rows into the signed_uploads request value. Names and the path
  * prefix are trimmed, host lines are trimmed and blank ones dropped, file type
  * rows with both cells blank are dropped, and a row with nothing left is
- * dropped. Every other rule is left to the server.
+ * dropped. An issuer row writes only the issuer keys and a replacement row
+ * writes all six keys. Every other rule is left to the server.
  */
 export function signedUploadsFromRows(rows: SignedUploadRow[]): Record<string, unknown>[] {
   const entries: Record<string, unknown>[] = []
@@ -100,6 +128,15 @@ export function signedUploadsFromRows(rows: SignedUploadRow[]): Record<string, u
       && hosts.length === 0
       && contentTypePairs.length === 0
     ) {
+      continue
+    }
+    if (row.mode === "issuer") {
+      entries.push({
+        issuing_tool_name: issuingToolName,
+        allowed_upload_hosts: hosts,
+        upload_path_prefix: uploadPathPrefix,
+        content_types: Object.fromEntries(contentTypePairs),
+      })
       continue
     }
     entries.push({
@@ -149,6 +186,12 @@ export function SignedUploadsForm({
 
   const updateRow = (id: string, patch: Partial<SignedUploadRow>) => {
     updateRows(rows.map((row) => (row.id === id ? { ...row, ...patch } : row)))
+  }
+
+  // Switching mode drops the fields only a replacement row has.
+  const updateMode = (row: SignedUploadRow, mode: SignedUploadMode) => {
+    if (mode === row.mode) return
+    updateRow(row.id, { mode, toolName: "", fileArgument: "" })
   }
 
   const updateContentTypes = (
@@ -205,7 +248,8 @@ export function SignedUploadsForm({
                 <div key={row.id} className="space-y-3 rounded-md border bg-white p-3">
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-sm font-medium text-slate-700">
-                      {row.toolName.trim() || t("tools.mcp.signedUploads.newTool")}
+                      {(row.mode === "issuer" ? row.issuingToolName : row.toolName).trim()
+                        || t("tools.mcp.signedUploads.newTool")}
                     </span>
                     <Button
                       type="button"
@@ -221,25 +265,62 @@ export function SignedUploadsForm({
                   </div>
 
                   <div className="space-y-2">
-                    <Label htmlFor={fieldId("toolName")}>
-                      {t("tools.mcp.signedUploads.toolName")}
-                    </Label>
-                    <Input
-                      id={fieldId("toolName")}
-                      value={row.toolName}
-                      onChange={(event) => updateRow(row.id, { toolName: event.target.value })}
-                    />
+                    <Label id={fieldId("mode")}>{t("tools.mcp.signedUploads.mode")}</Label>
+                    <RadioGroup
+                      aria-labelledby={fieldId("mode")}
+                      value={row.mode}
+                      disabled={disabled}
+                      onValueChange={(value) =>
+                        updateMode(row, value === "issuer" ? "issuer" : "replacement")}
+                    >
+                      <div className="flex items-center space-x-2">
+                        <RadioGroupItem value="replacement" id={fieldId("modeReplacement")} />
+                        <Label
+                          htmlFor={fieldId("modeReplacement")}
+                          className="font-normal cursor-pointer"
+                        >
+                          {t("tools.mcp.signedUploads.modeReplacement")}
+                        </Label>
+                      </div>
+                      <div className="flex items-center space-x-2">
+                        <RadioGroupItem value="issuer" id={fieldId("modeIssuer")} />
+                        <Label htmlFor={fieldId("modeIssuer")} className="font-normal cursor-pointer">
+                          {t("tools.mcp.signedUploads.modeIssuer")}
+                        </Label>
+                      </div>
+                    </RadioGroup>
+                    <p className="text-xs text-slate-500">
+                      {row.mode === "issuer"
+                        ? t("tools.mcp.signedUploads.modeIssuerHint")
+                        : t("tools.mcp.signedUploads.modeReplacementHint")}
+                    </p>
                   </div>
-                  <div className="space-y-2">
-                    <Label htmlFor={fieldId("fileArgument")}>
-                      {t("tools.mcp.signedUploads.fileArgument")}
-                    </Label>
-                    <Input
-                      id={fieldId("fileArgument")}
-                      value={row.fileArgument}
-                      onChange={(event) => updateRow(row.id, { fileArgument: event.target.value })}
-                    />
-                  </div>
+
+                  {row.mode === "replacement" && (
+                    <>
+                      <div className="space-y-2">
+                        <Label htmlFor={fieldId("toolName")}>
+                          {t("tools.mcp.signedUploads.toolName")}
+                        </Label>
+                        <Input
+                          id={fieldId("toolName")}
+                          value={row.toolName}
+                          onChange={(event) => updateRow(row.id, { toolName: event.target.value })}
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <Label htmlFor={fieldId("fileArgument")}>
+                          {t("tools.mcp.signedUploads.fileArgument")}
+                        </Label>
+                        <Input
+                          id={fieldId("fileArgument")}
+                          value={row.fileArgument}
+                          onChange={(event) =>
+                            updateRow(row.id, { fileArgument: event.target.value })}
+                        />
+                      </div>
+                    </>
+                  )}
                   <div className="space-y-2">
                     <Label htmlFor={fieldId("issuingToolName")}>
                       {t("tools.mcp.signedUploads.issuingToolName")}
@@ -365,6 +446,7 @@ export function SignedUploadsForm({
               ...rows,
               {
                 id: nextRowId(),
+                mode: "replacement",
                 toolName: "",
                 fileArgument: "",
                 issuingToolName: "",
