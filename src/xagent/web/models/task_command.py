@@ -7,11 +7,13 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    SmallInteger,
     String,
     Text,
     UniqueConstraint,
     text,
 )
+from sqlalchemy.orm import deferred
 from sqlalchemy.sql import func
 
 from .database import Base
@@ -92,6 +94,17 @@ class TaskExecutionCommand(Base):  # type: ignore
             sqlite_where=_UNFINISHED_STATUS_CLAUSE,
             postgresql_where=_UNFINISHED_STATUS_CLAUSE,
         ),
+        # Ordered for the claimable command of one tenant key and dispatch class
+        # with the highest priority and, within it, the lowest id.
+        Index(
+            "ix_task_commands_claimable_fair_priority",
+            "fairness_key",
+            "dispatch_class",
+            text("priority DESC"),
+            "id",
+            sqlite_where=_CLAIMABLE_STATUS_CLAUSE,
+            postgresql_where=_CLAIMABLE_STATUS_CLAUSE,
+        ),
     )
 
     id = Column(Integer, primary_key=True)
@@ -150,6 +163,14 @@ class TaskExecutionCommand(Base):  # type: ignore
     # transaction and never updated after it commits. Rows that predate the
     # column read the empty string and count as an ordinary tenant.
     fairness_key = Column(String(64), nullable=False, server_default="", default="")
+    # The priority this command was accepted with, -10 to 10, higher first. Set
+    # by stage_task_command in the acceptance transaction, never updated after
+    # it commits; old rows and control commands read 0. It orders commands of one
+    # tenant key and class, only while fair-share dispatch is on. Deferred, so a
+    # query for commands does not select it.
+    priority = deferred(
+        Column(SmallInteger, nullable=False, server_default="0", default=0)
+    )
     attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
     failure_count = Column(Integer, nullable=False, default=0, server_default="0")
     defer_count = Column(Integer, nullable=False, default=0, server_default="0")

@@ -259,6 +259,7 @@ def _prepare_created_task_isolated(
     connector_runtime_context: tuple[dict[str, Any], ...],
     timezone: str | None = None,
     requested_dispatch_class: str | None = None,
+    requested_priority: int | None = None,
 ) -> _PreparedCreateTaskStart:
     """Create, claim, and commit the first turn in one DB transaction."""
 
@@ -287,6 +288,7 @@ def _prepare_created_task_isolated(
             source="sdk",
             is_visible=False,
             requested_dispatch_class=requested_dispatch_class,
+            dispatch_priority=requested_priority,
         )
         runtime_plan = prepare_create_connector_runtime(
             db=db,
@@ -617,6 +619,7 @@ async def create_sdk_task(
     connector_runtime_context: tuple[dict[str, Any], ...],
     timezone: str | None,
     requested_dispatch_class: str | None = None,
+    requested_priority: int | None = None,
 ) -> TaskStartResult:
     async def _prepare_and_schedule() -> tuple[_PreparedCreateTaskStart, TurnStarted]:
         prepared = await run_db_io_cancellation_safe(
@@ -629,6 +632,7 @@ async def create_sdk_task(
                 connector_runtime_context=connector_runtime_context,
                 timezone=timezone,
                 requested_dispatch_class=requested_dispatch_class,
+                requested_priority=requested_priority,
             )
         )
         try:
