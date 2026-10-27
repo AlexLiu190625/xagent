@@ -1063,6 +1063,19 @@ def test_search_returns_empty_past_result_window_without_calling_zendesk(monkeyp
     mock_request.assert_not_called()
 
 
+def test_search_past_result_window_respects_the_output_cap(monkeypatch):
+    monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 60)
+    mock_request = Mock()
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+    page = zendesk._MAX_SEARCH_RESULT_WINDOW // 100 + 1
+
+    raw = zendesk.zendesk_search("type:ticket", limit=100, page=page)
+
+    assert len(raw) <= 60
+    assert json.loads(raw)["status"] == "error"
+    mock_request.assert_not_called()
+
+
 def test_search_past_result_window_still_surfaces_missing_credentials(monkeypatch):
     # The past-window guard returns before ever calling _request(), which
     # is normally what validates ZENDESK_SUBDOMAIN/ACCESS_TOKEN -- a
@@ -2133,6 +2146,19 @@ def test_search_users_returns_empty_past_result_window_without_calling_zendesk(
     mock_request.assert_not_called()
 
 
+def test_search_users_past_result_window_respects_the_output_cap(monkeypatch):
+    monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 60)
+    mock_request = Mock()
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+    page = zendesk._MAX_USER_SEARCH_RESULT_WINDOW // 100 + 1
+
+    raw = zendesk.zendesk_search_users("jane@example.com", limit=100, page=page)
+
+    assert len(raw) <= 60
+    assert json.loads(raw)["status"] == "error"
+    mock_request.assert_not_called()
+
+
 def test_search_users_does_not_trip_the_unified_search_window(monkeypatch):
     # Regression for F6: reusing /search.json's 1,000-result ceiling for
     # /users/search.json (which supports 10,000) would silently return an
@@ -2354,6 +2380,7 @@ def test_request_forwards_explicitly_trusted_proxy(monkeypatch):
         ("zendesk_list_ticket_comments", {"ticket_id": "1", "after_cursor": None}),
         ("zendesk_list_users", {"after_cursor": None}),
         ("zendesk_list_organizations", {"after_cursor": None}),
+        ("zendesk_list_macros", {"after_cursor": None}),
     ],
 )
 async def test_optional_params_accept_explicit_none_through_tool_schema(
@@ -2380,6 +2407,7 @@ async def test_optional_params_accept_explicit_none_through_tool_schema(
                     "comments": [],
                     "users": [],
                     "organizations": [],
+                    "macros": [],
                     "meta": {"has_more": False},
                 }
             )
@@ -2402,6 +2430,8 @@ async def test_optional_params_accept_explicit_none_through_tool_schema(
         ("zendesk_add_internal_note", {"ticket_id": 1, "body": "hi"}),
         ("zendesk_get_user", {"user_id": 1}),
         ("zendesk_get_organization", {"organization_id": 1}),
+        ("zendesk_get_article", {"article_id": 1}),
+        ("zendesk_get_macro", {"macro_id": 1}),
         (
             "zendesk_update_ticket",
             {
@@ -2437,6 +2467,8 @@ async def test_id_params_accept_a_bare_int_through_tool_schema(
                     "ticket": {"id": 1},
                     "user": {"id": 1},
                     "organization": {"id": 1},
+                    "article": {"id": 1},
+                    "macro": {"id": 1},
                     "comments": [],
                     "audit": {"events": []},
                     "meta": {"has_more": False},
@@ -2466,6 +2498,10 @@ _ALL_TOOL_CALLS = [
     ("zendesk_search_users", {"query": "alice"}),
     ("zendesk_list_organizations", {}),
     ("zendesk_get_organization", {"organization_id": 1}),
+    ("zendesk_search_articles", {"query": "password"}),
+    ("zendesk_get_article", {"article_id": 1}),
+    ("zendesk_list_macros", {}),
+    ("zendesk_get_macro", {"macro_id": 1}),
 ]
 
 
@@ -2490,6 +2526,9 @@ async def test_every_tool_sends_the_access_token_as_bearer(
                 "user": {"id": 1},
                 "organizations": [],
                 "organization": {"id": 1},
+                "article": {"id": 1},
+                "macros": [],
+                "macro": {"id": 1},
                 "audit": {"events": []},
                 "meta": {"has_more": False},
             }
@@ -2527,3 +2566,423 @@ def test_zendesk_app_registry_uses_account_oauth():
     }
     # The release gate this connector's unverified write tools ship behind.
     assert zendesk_app["is_visible_in_connector"] is False
+
+
+def test_search_articles_sends_query_and_returns_article_summaries(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "results": [
+                    {
+                        "id": 360001,
+                        "title": "Reset your password",
+                        "html_url": "https://acme.zendesk.com/hc/en-us/articles/360001",
+                        "locale": "en-us",
+                        "section_id": 77,
+                        "snippet": "To <em>reset</em> your password...",
+                        "body": "<p>" + "x" * 500 + "</p>",
+                        "updated_at": "2026-10-01T00:00:00Z",
+                    }
+                ],
+                "count": 1,
+                "next_page": None,
+            }
+        )
+    )
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(zendesk.zendesk_search_articles(" reset ", limit=10, page=2))
+
+    assert result["status"] == "success"
+    assert result["count"] == 1
+    assert result["has_more"] is False
+    assert result["results"] == [
+        {
+            "id": 360001,
+            "title": "Reset your password",
+            "html_url": "https://acme.zendesk.com/hc/en-us/articles/360001",
+            "locale": "en-us",
+            "section_id": 77,
+            "snippet": "To <em>reset</em> your password...",
+            "updated_at": "2026-10-01T00:00:00Z",
+        }
+    ]
+    assert mock_request.call_args.kwargs["method"] == "GET"
+    assert mock_request.call_args.kwargs["url"] == (
+        "https://acme.zendesk.com/api/v2/help_center/articles/search.json"
+    )
+    assert mock_request.call_args.kwargs["params"] == {
+        "query": "reset",
+        "per_page": 10,
+        "page": 2,
+    }
+
+
+def test_search_articles_reports_more_pages_from_next_page(monkeypatch):
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "results": [{"id": 1, "title": "A"}],
+                    "count": 40,
+                    "next_page": "https://acme.zendesk.com/api/v2/help_center/articles/search.json?page=2",
+                }
+            )
+        ),
+    )
+
+    result = json.loads(zendesk.zendesk_search_articles("a", limit=1))
+
+    assert result["has_more"] is True
+
+
+@pytest.mark.parametrize("query", ["   ", None])
+def test_search_articles_requires_non_blank_query(monkeypatch, query):
+    mock_request = Mock()
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(zendesk.zendesk_search_articles(query))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_search_articles_returns_empty_past_result_window_without_calling_zendesk(
+    monkeypatch,
+):
+    # Help Center search serves at most 1,000 results: page 11 at 100 per
+    # page starts at result 1,001.
+    mock_request = Mock()
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(zendesk.zendesk_search_articles("a", limit=100, page=11))
+
+    assert result == {
+        "status": "success",
+        "results": [],
+        "count": None,
+        "has_more": False,
+        "truncated": False,
+    }
+    mock_request.assert_not_called()
+
+
+def test_search_articles_past_result_window_respects_the_output_cap(monkeypatch):
+    # The past-window early return must still go through the output cap: a
+    # configured cap smaller than the fixed success envelope may not be
+    # bypassed.
+    monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 60)
+    mock_request = Mock()
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    raw = zendesk.zendesk_search_articles("a", limit=100, page=11)
+
+    assert len(raw) <= 60
+    assert json.loads(raw)["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_search_articles_surfaces_a_help_center_error(monkeypatch):
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"error": "RecordNotFound", "description": "Not found"},
+                status_code=404,
+            )
+        ),
+    )
+
+    result = json.loads(zendesk.zendesk_search_articles("a"))
+
+    assert result["status"] == "error"
+    assert "HTTP 404" in result["message"]
+
+
+def test_get_article_returns_detail_with_body(monkeypatch):
+    article = {
+        "id": 360001,
+        "title": "Reset your password",
+        "html_url": "https://acme.zendesk.com/hc/en-us/articles/360001",
+        "locale": "en-us",
+        "section_id": 77,
+        "author_id": 9,
+        "draft": False,
+        "label_names": ["account"],
+        "body": "<p>Open <b>Settings</b>.</p>",
+        "created_at": "2026-09-01T00:00:00Z",
+        "updated_at": "2026-10-01T00:00:00Z",
+        "vote_sum": 3,
+    }
+    mock_request = Mock(return_value=MockResponse(json_data={"article": article}))
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(zendesk.zendesk_get_article(360001))
+
+    assert result == {
+        "status": "success",
+        "article": {
+            "id": 360001,
+            "title": "Reset your password",
+            "html_url": "https://acme.zendesk.com/hc/en-us/articles/360001",
+            "locale": "en-us",
+            "section_id": 77,
+            "author_id": 9,
+            "draft": False,
+            "label_names": ["account"],
+            "body": "<p>Open <b>Settings</b>.</p>",
+            "created_at": "2026-09-01T00:00:00Z",
+            "updated_at": "2026-10-01T00:00:00Z",
+        },
+    }
+    assert mock_request.call_args.kwargs["url"] == (
+        "https://acme.zendesk.com/api/v2/help_center/articles/360001.json"
+    )
+
+
+@pytest.mark.parametrize(
+    "article_url",
+    [
+        "https://acme.zendesk.com/hc/en-us/articles/360001-Reset-your-password",
+        "https://acme.zendesk.com/knowledge/articles/360001/en-us?brand_id=1",
+    ],
+)
+def test_get_article_accepts_a_help_center_or_knowledge_url(monkeypatch, article_url):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"article": {"id": 360001}})
+    )
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(zendesk.zendesk_get_article(article_url))
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["url"].endswith(
+        "/help_center/articles/360001.json"
+    )
+
+
+def test_get_article_shrinks_an_oversized_body_before_erroring(monkeypatch):
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"article": {"id": 1, "title": "T", "body": "x" * 5000}}
+            )
+        ),
+    )
+    monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 1000)
+
+    raw = zendesk.zendesk_get_article(1)
+    result = json.loads(raw)
+
+    assert len(raw) <= 1000
+    assert result["status"] == "success"
+    assert result["article"]["title"] == "T"
+    assert result["article"]["body_truncated"] is True
+    assert 0 < len(result["article"]["body"]) < 5000
+
+
+def test_get_article_surfaces_a_not_found_error(monkeypatch):
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"error": "RecordNotFound", "description": "Not found"},
+                status_code=404,
+            )
+        ),
+    )
+
+    result = json.loads(zendesk.zendesk_get_article(1))
+
+    assert result["status"] == "error"
+    assert "HTTP 404" in result["message"]
+
+
+def test_list_macros_pages_active_macros_by_cursor(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "macros": [
+                    {
+                        "id": 5,
+                        "title": "Close and redirect",
+                        "description": "Redirect to the Help Center",
+                        "active": True,
+                        "actions": [{"field": "status", "value": "solved"}],
+                        "updated_at": "2026-10-01T00:00:00Z",
+                    }
+                ],
+                "meta": {"has_more": True, "after_cursor": "cur2"},
+            }
+        )
+    )
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(zendesk.zendesk_list_macros(limit=1, after_cursor="cur1"))
+
+    assert result == {
+        "status": "success",
+        "macros": [
+            {
+                "id": 5,
+                "title": "Close and redirect",
+                "description": "Redirect to the Help Center",
+                "updated_at": "2026-10-01T00:00:00Z",
+            }
+        ],
+        "has_more": True,
+        "after_cursor": "cur2",
+        "truncated": False,
+    }
+    assert mock_request.call_args.kwargs["url"] == (
+        "https://acme.zendesk.com/api/v2/macros/active.json"
+    )
+    assert mock_request.call_args.kwargs["params"] == {
+        "page[size]": 1,
+        "page[after]": "cur1",
+        "include_boundary_indicators": "true",
+    }
+
+
+def test_list_macros_surfaces_a_permission_error(monkeypatch):
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"error": "Forbidden", "description": "Forbidden"},
+                status_code=403,
+            )
+        ),
+    )
+
+    result = json.loads(zendesk.zendesk_list_macros())
+
+    assert result["status"] == "error"
+    assert "HTTP 403" in result["message"]
+
+
+def test_get_macro_returns_its_actions_and_restriction(monkeypatch):
+    macro = {
+        "id": 5,
+        "title": "Close and redirect",
+        "description": "Redirect to the Help Center",
+        "active": True,
+        "actions": [
+            {"field": "status", "value": "solved"},
+            {"field": "comment_value_html", "value": "<p>See our guide.</p>"},
+        ],
+        "restriction": {"type": "Group", "id": 7, "ids": [7]},
+        "created_at": "2026-09-01T00:00:00Z",
+        "updated_at": "2026-10-01T00:00:00Z",
+        "position": 3,
+    }
+    mock_request = Mock(return_value=MockResponse(json_data={"macro": macro}))
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(zendesk.zendesk_get_macro(5))
+
+    assert result == {
+        "status": "success",
+        "macro": {
+            "id": 5,
+            "title": "Close and redirect",
+            "description": "Redirect to the Help Center",
+            "updated_at": "2026-10-01T00:00:00Z",
+            "active": True,
+            "actions": [
+                {"field": "status", "value": "solved"},
+                {"field": "comment_value_html", "value": "<p>See our guide.</p>"},
+            ],
+            "restriction": {"type": "Group", "id": 7, "ids": [7]},
+            "created_at": "2026-09-01T00:00:00Z",
+        },
+    }
+    assert mock_request.call_args.kwargs["url"] == (
+        "https://acme.zendesk.com/api/v2/macros/5.json"
+    )
+
+
+def test_get_macro_accepts_an_admin_center_url(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"macro": {"id": 5}}))
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(
+        zendesk.zendesk_get_macro(
+            "https://acme.zendesk.com/admin/workspaces/agent-workspace/macros/5"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["url"].endswith("/macros/5.json")
+
+
+def test_get_macro_errors_rather_than_dropping_actions_when_too_large(monkeypatch):
+    # A macro's actions are what it does; returning only some of them
+    # would misdescribe it, so an oversized macro is an error, not a cut.
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "macro": {
+                        "id": 5,
+                        "actions": [{"field": "comment_value", "value": "x" * 5000}],
+                    }
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 1000)
+
+    raw = zendesk.zendesk_get_macro(5)
+
+    assert len(raw) <= 1000
+    assert json.loads(raw)["status"] == "error"
+
+
+def test_search_articles_forces_has_more_when_output_truncated(monkeypatch):
+    big_results = [{"id": i, "title": "x" * 1000} for i in range(20)]
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"results": big_results, "count": 20, "next_page": None}
+            )
+        ),
+    )
+    monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 3000)
+
+    raw = zendesk.zendesk_search_articles("x", limit=20)
+    result = json.loads(raw)
+
+    assert len(raw) <= 3000
+    assert result["truncated"] is True
+    assert result["has_more"] is True
+    assert 0 < len(result["results"]) < 20
+
+
+def test_get_macro_surfaces_a_not_found_error(monkeypatch):
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"error": "RecordNotFound", "description": "Not found"},
+                status_code=404,
+            )
+        ),
+    )
+
+    result = json.loads(zendesk.zendesk_get_macro(5))
+
+    assert result["status"] == "error"
+    assert "HTTP 404" in result["message"]

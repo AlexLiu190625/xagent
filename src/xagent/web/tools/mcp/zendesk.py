@@ -86,6 +86,11 @@ _SUBDOMAIN_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 # interchangeable despite both being "search" endpoints.
 _MAX_SEARCH_RESULT_WINDOW = 1000
 _MAX_USER_SEARCH_RESULT_WINDOW = 10000
+# Help Center article search has its own documented ceiling, separate
+# from the two Support search endpoints above: "up to a maximum of 1000
+# results" (developer.zendesk.com/api-reference/help_center/
+# help-center-api/help_center_search/).
+_MAX_ARTICLE_SEARCH_RESULT_WINDOW = 1000
 
 # Accepts a ticket/user/organization id pasted as a Zendesk agent UI URL
 # (e.g. "https://acme.zendesk.com/agent/tickets/123") in addition to a bare
@@ -95,6 +100,11 @@ _MAX_USER_SEARCH_RESULT_WINDOW = 10000
 _TICKET_URL_ID_PATTERN = re.compile(r"/agent/tickets/(\d+)")
 _USER_URL_ID_PATTERN = re.compile(r"/agent/users/(\d+)")
 _ORGANIZATION_URL_ID_PATTERN = re.compile(r"/agent/organizations/(\d+)")
+# Help Center article URLs: the public page (/hc/en-us/articles/123-slug)
+# and the Knowledge admin editor (/knowledge/articles/123/en-us).
+_ARTICLE_URL_ID_PATTERN = re.compile(r"/articles/(\d+)")
+# Admin Center's macro editor (/admin/workspaces/agent-workspace/macros/123).
+_MACRO_URL_ID_PATTERN = re.compile(r"/macros/(\d+)")
 
 
 def _success(**payload: Any) -> str:
@@ -594,8 +604,9 @@ def _offset_page(
 def _past_search_window(page: int, max_results: int, ceiling: int) -> bool:
     """True once the requested page *starts* at or past Zendesk's documented
     search-window ceiling for the endpoint being called (1,000 for
-    /search.json, 10,000 for /users/search.json -- see
-    _MAX_SEARCH_RESULT_WINDOW / _MAX_USER_SEARCH_RESULT_WINDOW), i.e. the
+    /search.json and /help_center/articles/search.json, 10,000 for
+    /users/search.json -- see _MAX_SEARCH_RESULT_WINDOW /
+    _MAX_ARTICLE_SEARCH_RESULT_WINDOW / _MAX_USER_SEARCH_RESULT_WINDOW), i.e. the
     page cannot contain a single result Zendesk would serve.
 
     Deliberately the window's *start*, not its end: a page that merely
@@ -618,7 +629,7 @@ def _list_offset_paginated(
     extra_fields_fn: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> str:
     """Shared body for the offset-paginated search tools (zendesk_search,
-    zendesk_search_users) -- symmetric to _list_cursor_paginated below, so
+    zendesk_search_users, zendesk_search_articles) -- symmetric to _list_cursor_paginated below, so
     both pagination families in this file build their own truncation-aware
     flat envelope and cap it themselves, rather than routing through the
     generic success_with_capped_dict and patching has_more onto an
@@ -693,7 +704,7 @@ def _list_cursor_paginated(
     after_cursor: str | None,
 ) -> str:
     """Shared body for every cursor-paginated "list X" tool below (tickets,
-    ticket comments, users, organizations) -- only the path, response key,
+    ticket comments, users, organizations, macros) -- only the path, response key,
     and per-item summarizer differ between them."""
     max_results = _clamp_limit(limit)
     params: dict[str, Any] = {
@@ -818,17 +829,23 @@ def _build_ticket_detail_response(
     _add_comment already shrinks an oversized comment body, rather than
     letting one long ticket fail the whole call outright via
     _finalize_capped's blunter last-resort fallback."""
-    detail = _ticket_detail(ticket)
-    response = _success(ticket=detail)
-    description = detail.get("description")
-    while (
-        len(response) > max_output_length
-        and isinstance(description, str)
-        and description
-    ):
-        description = description[: len(description) // 2]
-        detail = {**detail, "description": description, "description_truncated": True}
-        response = _success(ticket=detail)
+    return _build_detail_response(
+        "ticket", _ticket_detail(ticket), "description", max_output_length
+    )
+
+
+def _build_detail_response(
+    key: str, detail: dict[str, Any], text_field: str, max_output_length: int
+) -> str:
+    """Return one object under `key`, halving its single long free-text
+    field (marking `<text_field>_truncated`) until the response fits, and
+    only then falling back to _finalize_capped's error."""
+    response = _success(**{key: detail})
+    text = detail.get(text_field)
+    while len(response) > max_output_length and isinstance(text, str) and text:
+        text = text[: len(text) // 2]
+        detail = {**detail, text_field: text, f"{text_field}_truncated": True}
+        response = _success(**{key: detail})
     return _finalize_capped(response, max_output_length)
 
 
@@ -874,6 +891,60 @@ def _search_result_summary(result: dict[str, Any]) -> dict[str, Any]:
         "result_type": result_type,
         "id": result.get("id"),
         "name": result.get("name") or result.get("subject"),
+    }
+
+
+def _article_summary(article: dict[str, Any]) -> dict[str, Any]:
+    """A Help Center search hit: the search response's own `snippet`
+    (the matched passage) instead of the HTML body, which only
+    zendesk_get_article returns -- a page of 25 full article bodies would
+    otherwise be truncated away almost every time."""
+    return {
+        "id": article.get("id"),
+        "title": article.get("title"),
+        "html_url": article.get("html_url"),
+        "locale": article.get("locale"),
+        "section_id": article.get("section_id"),
+        "snippet": article.get("snippet"),
+        "updated_at": article.get("updated_at"),
+    }
+
+
+def _article_detail(article: dict[str, Any]) -> dict[str, Any]:
+    """A single article, with its HTML body as Zendesk stores it."""
+    return {
+        "id": article.get("id"),
+        "title": article.get("title"),
+        "html_url": article.get("html_url"),
+        "locale": article.get("locale"),
+        "section_id": article.get("section_id"),
+        "author_id": article.get("author_id"),
+        "draft": article.get("draft"),
+        "label_names": article.get("label_names"),
+        "body": article.get("body"),
+        "created_at": article.get("created_at"),
+        "updated_at": article.get("updated_at"),
+    }
+
+
+def _macro_summary(macro: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": macro.get("id"),
+        "title": macro.get("title"),
+        "description": macro.get("description"),
+        "updated_at": macro.get("updated_at"),
+    }
+
+
+def _macro_detail(macro: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **_macro_summary(macro),
+        # Always true in zendesk_list_macros (it lists /macros/active), but
+        # a macro fetched by id can be inactive.
+        "active": macro.get("active"),
+        "actions": macro.get("actions"),
+        "restriction": macro.get("restriction"),
+        "created_at": macro.get("created_at"),
     }
 
 
@@ -1002,7 +1073,10 @@ def zendesk_search(query: str, limit: int = 25, page: int = 1) -> str:
             # subdomain/credential would otherwise be masked as "no
             # results" instead of surfacing as the usual config error.
             _ensure_configured()
-            return _success(results=[], count=None, has_more=False, truncated=False)
+            return _finalize_capped(
+                _success(results=[], count=None, has_more=False, truncated=False),
+                get_tool_max_output_length(),
+            )
         return _list_offset_paginated(
             "/search.json",
             "results",
@@ -1341,7 +1415,10 @@ def zendesk_search_users(query: str, limit: int = 25, page: int = 1) -> str:
             # identical guard for the config-validation/response-shape
             # rationale.
             _ensure_configured()
-            return _success(users=[], has_more=False, truncated=False)
+            return _finalize_capped(
+                _success(users=[], has_more=False, truncated=False),
+                get_tool_max_output_length(),
+            )
         return _list_offset_paginated(
             "/users/search.json",
             "users",
@@ -1398,6 +1475,108 @@ def zendesk_get_organization(organization_id: int | str) -> str:
         return _finalize_capped(response, get_tool_max_output_length())
     except Exception as e:
         logger.error(f"Error fetching Zendesk organization {organization_id}: {e}")
+        return _error_capped(str(e))
+
+
+@mcp.tool()
+def zendesk_search_articles(query: str, limit: int = 25, page: int = 1) -> str:
+    """
+    Search Help Center (Zendesk Knowledge) articles by keyword, e.g.
+    "reset password". Returns each article's title, URL, locale, section,
+    and the matched snippet; use zendesk_get_article for the full body.
+    limit: max articles to return (default 25, hard cap 100).
+    page: 1-based page number; pass the previous page + 1 to continue. If a
+    call is truncated for size (`truncated: true` in the response,
+    `has_more` forced true), re-run the search with a smaller `limit` from
+    `page=1` -- see zendesk_search's identical note for why.
+    """
+    try:
+        query = _require_non_blank(query, "query")
+        max_results = _clamp_limit(limit)
+        page = max(1, page)
+        if _past_search_window(page, max_results, _MAX_ARTICLE_SEARCH_RESULT_WINDOW):
+            # See zendesk_search's identical guard.
+            _ensure_configured()
+            return _finalize_capped(
+                _success(results=[], count=None, has_more=False, truncated=False),
+                get_tool_max_output_length(),
+            )
+        return _list_offset_paginated(
+            "/help_center/articles/search.json",
+            "results",
+            _article_summary,
+            {"query": query, "per_page": max_results, "page": page},
+            max_results,
+            extra_fields_fn=lambda result: {"count": result.get("count")},
+        )
+    except Exception as e:
+        # Logged length-bounded like zendesk_search: a query can carry
+        # end-user text.
+        logger.error(
+            "Error searching Zendesk Help Center articles for query of length "
+            f"{len(query or '')}: {e}"
+        )
+        return _error_capped(str(e))
+
+
+@mcp.tool()
+def zendesk_get_article(article_id: int | str) -> str:
+    """
+    Get a Help Center article by id, including its HTML body. A very long
+    body is cut to fit the output limit and marked `body_truncated: true`;
+    the cut can fall inside an HTML tag.
+    article_id: a bare numeric id, or the article's Help Center or
+    Knowledge URL.
+    """
+    try:
+        path_id = _resolve_path_id(article_id, _ARTICLE_URL_ID_PATTERN, "article_id")
+        result = _request("GET", f"/help_center/articles/{path_id}.json")
+        return _build_detail_response(
+            "article",
+            _article_detail(_unwrap(result, "article")),
+            "body",
+            get_tool_max_output_length(),
+        )
+    except Exception as e:
+        logger.error(f"Error fetching Zendesk Help Center article {article_id}: {e}")
+        return _error_capped(str(e))
+
+
+@mcp.tool()
+def zendesk_list_macros(limit: int = 25, after_cursor: str | None = None) -> str:
+    """
+    List the active macros the connected agent can use, with each macro's
+    title and description. Use zendesk_get_macro for what a macro does.
+    limit: max macros to return (default 25, hard cap 100).
+    after_cursor: pass the previous call's own after_cursor to fetch the
+    next page; omit for the first page.
+    """
+    try:
+        return _list_cursor_paginated(
+            "/macros/active.json", "macros", _macro_summary, limit, after_cursor
+        )
+    except Exception as e:
+        logger.error(f"Error listing Zendesk macros: {e}")
+        return _error_capped(str(e))
+
+
+@mcp.tool()
+def zendesk_get_macro(macro_id: int | str) -> str:
+    """
+    Get a macro by id, including its actions (the ticket fields it sets and
+    the comment it adds) and which groups or users it is restricted to.
+    macro_id: a bare numeric id (from zendesk_list_macros), or the macro's
+    Admin Center URL.
+    """
+    try:
+        path_id = _resolve_path_id(macro_id, _MACRO_URL_ID_PATTERN, "macro_id")
+        result = _request("GET", f"/macros/{path_id}.json")
+        # Not shrunk like an article body: a macro with only some of its
+        # actions would misdescribe what applying it does.
+        response = _success(macro=_macro_detail(_unwrap(result, "macro")))
+        return _finalize_capped(response, get_tool_max_output_length())
+    except Exception as e:
+        logger.error(f"Error fetching Zendesk macro {macro_id}: {e}")
         return _error_capped(str(e))
 
 
