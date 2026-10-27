@@ -4851,14 +4851,11 @@ ANY_RESUME_RUN = AnyResumeRun()
 
 
 class DispatchReservation:
-    __slots__ = ("task_id", "released", "opened")
+    __slots__ = ("task_id", "released")
 
-    def __init__(self, task_id: int, opened: bool) -> None:
+    def __init__(self, task_id: int) -> None:
         self.task_id = task_id
         self.released = False
-        # Whether this token made its task enter the active set, that is, took a
-        # new slot rather than joining a task that already held one.
-        self.opened = opened
 
 
 def _running_loop_time() -> float:
@@ -4950,6 +4947,17 @@ class BackgroundTaskManager:
             | frozenset(self._dispatch_reservations)
         )
 
+    def holds_execution(self, task_id: int) -> bool:
+        """Whether an execution of this process holds ``task_id``'s slot now.
+
+        An execution holds it from its registration (``register_task`` or
+        ``register_reserved_resume``) until its handle has finished, and a resume
+        coordinator until the manager drops it. A dispatch token alone does not:
+        these are the tables of the active set other than the tokens. Read-only
+        and with no await, so the answer is the state at the moment of the call.
+        """
+        return task_id in self._live_executions or task_id in self.resume_tasks
+
     def _record_cap_state(self, closed: bool, now: float) -> None:
         since = self._cap_closed_since
         if closed:
@@ -5029,8 +5037,7 @@ class BackgroundTaskManager:
         ``TenantListingRequired`` is raised instead of taking a slot between
         the two lines, so that the caller selects again with the listing.
         Reads the active set and adds the token with no await in between, so
-        concurrent dispatch attempts cannot both take the last slot. The token
-        records whether it made the task enter the active set. Records
+        concurrent dispatch attempts cannot both take the last slot. Records
         ``fairness_key`` for a task that was not yet active; a task already in
         the active set keeps its recorded key. A refusal or a raise leaves no
         trace.
@@ -5047,11 +5054,10 @@ class BackgroundTaskManager:
                 capped = snapshot.capped_tenant(queued_tenants)
                 if capped is not None and fairness_key == capped:
                     return None
-        opened = task_id not in snapshot.active_ids
-        if fairness_key is not None and opened:
+        if fairness_key is not None and task_id not in snapshot.active_ids:
             self._slot_keys[task_id] = fairness_key
         self._dispatch_reservations[task_id] += 1
-        return DispatchReservation(task_id, opened)
+        return DispatchReservation(task_id)
 
     def release_dispatch_slot(self, token: DispatchReservation | None) -> None:
         if token is None or token.released:

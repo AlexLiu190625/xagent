@@ -7,7 +7,6 @@ from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
 
 from sqlalchemy.orm import sessionmaker
 
@@ -496,6 +495,9 @@ def play(
     Fails with the seed and the whole world. After every scan the chosen command is
     settled and its task counted as holding a slot for its tenant.
     """
+    # The reference keeps no dispatch count: a world runs too few attempts to
+    # reach FAIR_SHARE_FALLBACK_AFTER_DISPATCHES.
+    assert attempts < transport.FAIR_SHARE_FALLBACK_AFTER_DISPATCHES
     rng = random.Random(seed)
     spec = random_world(rng, tenants=tenants, size=rng.randint(6, 45), **world_options)
     world.reset()
@@ -540,9 +542,9 @@ def play(
         if chosen is not None:
             done = by_id[chosen]
             if not cap.closed and done.kind not in CONTROL_KINDS:
-                # What the dispatch loop does once the pick holds a slot token.
-                token = SimpleNamespace(opened=done.task not in cap.active_ids)
-                transport._fair_count_reservation(one, token)
+                # What the dispatch loop does once the pick holds a slot token: the
+                # tasks of ``holds`` are the ones an execution holds.
+                transport._fair_count_dispatch(one, done.task not in cap.active_ids)
                 reference.count(cap, done)
             done.status = "completed"
             with world.sessions() as db:

@@ -82,7 +82,6 @@ from .task_lease_service import get_runner_id
 
 if TYPE_CHECKING:
     from .task_coordinator_service import TaskLease as TaskOwnerLease
-    from .task_execution import DispatchReservation
 
 logger = logging.getLogger(__name__)
 
@@ -1919,16 +1918,22 @@ def _fair_share_enabled() -> bool:
 # With the fair-share switch on, a scan with room asks each of the first
 # FAIR_SHARE_TENANTS_PER_SCAN ranked tenants for the oldest command it can claim among
 # the FAIR_SHARE_WINDOW oldest queued commands of one (tenant key, dispatch class). A
-# (tenant key, class) that has none is not asked again for FAIR_SHARE_SKIP_SECONDS,
-# and of every FAIR_SHARE_FALLBACK_EVERY new slots that counted attempts open, one
-# is opened by a fallback round, which reads the queue as it always did, so a command
-# that only the full scan can reach is not left behind forever. A fallback round that
-# opens a slot takes FAIR_SHARE_FALLBACK_EVERY - 1 off the balance the fair rounds add
-# to, so the share holds however many slots one wake-up frees.
+# (tenant key, class) that has none is not asked again for FAIR_SHARE_SKIP_SECONDS.
+# A fallback round reads the queue as it always did, so that a command only the full
+# scan can reach is not left behind. Fallback rounds aim at one in every
+# FAIR_SHARE_FALLBACK_EVERY new slots that counted attempts open: a fair round that
+# opens a slot adds one to a balance, a fallback round that opens one takes
+# FAIR_SHARE_FALLBACK_EVERY - 1 off, and attempts that read the balance together may
+# all become fallback rounds, so the share holds over time rather than slot by slot.
+# A dispatch that joins a task this process already executes opens no slot and leaves
+# the balance alone, so an attempt is also a fallback round once
+# FAIR_SHARE_FALLBACK_AFTER_DISPATCHES counted dispatches, joining ones included, have
+# gone by since the last counted dispatch of a fallback round.
 FAIR_SHARE_WINDOW = 16
 FAIR_SHARE_TENANTS_PER_SCAN = 4
 FAIR_SHARE_SKIP_SECONDS = 2.0
 FAIR_SHARE_FALLBACK_EVERY = 8
+FAIR_SHARE_FALLBACK_AFTER_DISPATCHES = 64
 
 # The oldest queued command of each (tenant key, dispatch class), by skipping from
 # one pair to the next through ix_task_commands_claimable_fair; a scan of the queue
@@ -2137,10 +2142,11 @@ class _FairState:
     def __init__(self) -> None:
         # The fallback rounds' balance: each new slot a counted fair round opens
         # adds one, each new slot a fallback round opens takes off
-        # FAIR_SHARE_FALLBACK_EVERY - 1. An attempt whose first scan has room is a
-        # fallback round when the balance has reached FAIR_SHARE_FALLBACK_EVERY - 1.
-        # It can be negative.
+        # FAIR_SHARE_FALLBACK_EVERY - 1. It can be negative.
         self.since_fallback = 0
+        # Counted dispatches since the last counted dispatch of a fallback round,
+        # whether or not they opened a slot.
+        self.dispatches_since_fallback = 0
         # Until when (``_fair_clock``) a (tenant key, dispatch class) is not asked.
         self.skips: dict[tuple[str, str], float] = {}
         # Window queries that found nothing since the diagnostics line last asked.
@@ -2183,27 +2189,31 @@ def _fair_record_miss(key: str, dispatch_class: str) -> None:
         _fair_state.misses += 1
 
 
-def _fair_count_reservation(
-    attempt: _FairAttempt, reservation: DispatchReservation
-) -> None:
-    """Move the fallback balance for the new slot a counted attempt is about to use.
+def _fair_count_dispatch(attempt: _FairAttempt, opened: bool) -> None:
+    """Record the dispatch of a counted attempt that is about to apply its command.
 
-    Called on the event loop once the attempt holds its token and the task's
-    ownership check has passed. An attempt whose slot is refused or released, or
-    whose ownership check raises, never counts; once it gets this far it has used
-    the slot and counts even if applying the command then fails. A token that
-    joined a task already holding a slot opened none and does not count. A
-    fallback round that opens a slot takes FAIR_SHARE_FALLBACK_EVERY - 1 off the
-    balance, any other round adds one; the lock is held for the memory update
-    only.
+    Called on the event loop once the attempt holds its slot token and the task's
+    ownership check has passed, with no await in between. ``opened`` is whether
+    no execution of this process held the task's slot at that moment, so that
+    applying the command takes a new one. An attempt whose slot is refused or
+    released, or whose ownership check raises, never gets here; one that does is
+    recorded even if applying the command then fails. A dispatch that opens a slot
+    moves the balance: a fallback round takes FAIR_SHARE_FALLBACK_EVERY - 1 off,
+    any other round adds one. A fallback round's dispatch sets the dispatch count
+    back to zero and any other dispatch adds one to it, whether or not it opens a
+    slot. The lock is held for the memory update only.
     """
-    if not (attempt.counted and reservation.opened):
+    if not attempt.counted:
         return
     with _fair_state_lock:
         if attempt.fallback:
-            _fair_state.since_fallback -= FAIR_SHARE_FALLBACK_EVERY - 1
+            _fair_state.dispatches_since_fallback = 0
+            if opened:
+                _fair_state.since_fallback -= FAIR_SHARE_FALLBACK_EVERY - 1
         else:
-            _fair_state.since_fallback += 1
+            _fair_state.dispatches_since_fallback += 1
+            if opened:
+                _fair_state.since_fallback += 1
 
 
 @dataclass
@@ -2212,8 +2222,8 @@ class _FairAttempt:
 
     ``decided`` is set by the first scan, which fixes whether the attempt is a
     fallback round; a rescan keeps that decision. ``counted`` is set when that
-    scan had room, and only a counted attempt moves the fallback balance, once it
-    opens a new slot (``_fair_count_reservation``). A scan the presence precheck
+    scan had room, and only a counted attempt is recorded once it dispatches
+    (``_fair_count_dispatch``). A scan the presence precheck
     ends because no command is open never reaches that decision, so it leaves
     ``decided`` unset. ``tenants`` is the listing of the queue, taken by the first
     scan that ranks or that is between the batch line and the limit, and reused by
@@ -2237,10 +2247,11 @@ def _ranks_tenants(
     """Whether this scan ranks tenants; the first scan fixes the attempt's round.
 
     A scan for one command, or with no room, reads the queue as it always did
-    and is not counted. Otherwise the first scan marks the attempt counted and
-    reads the fallback balance: once it has reached FAIR_SHARE_FALLBACK_EVERY - 1
-    the attempt is a fallback round for all its scans. It only reads the balance;
-    ``_fair_count_reservation`` moves it. A scan the presence precheck already
+    and is not counted. Otherwise the first scan marks the attempt counted, and
+    the attempt is a fallback round for all its scans once the balance has reached
+    FAIR_SHARE_FALLBACK_EVERY - 1 or the dispatch count has reached
+    FAIR_SHARE_FALLBACK_AFTER_DISPATCHES. It only reads them;
+    ``_fair_count_dispatch`` moves them. A scan the presence precheck already
     ended never calls this, so it is not counted and does not set ``decided``.
     """
     has_room = command_db_id is None and (cap is None or not cap.closed)
@@ -2251,6 +2262,8 @@ def _ranks_tenants(
             with _fair_state_lock:
                 attempt.fallback = (
                     _fair_state.since_fallback >= FAIR_SHARE_FALLBACK_EVERY - 1
+                    or _fair_state.dispatches_since_fallback
+                    >= FAIR_SHARE_FALLBACK_AFTER_DISPATCHES
                 )
     return has_room and not attempt.fallback
 
@@ -2610,7 +2623,9 @@ async def dispatch_one_task_command(
         skipped_task_ids.add(task_id)
 
     if attempt is not None and reservation is not None:
-        _fair_count_reservation(attempt, reservation)
+        _fair_count_dispatch(
+            attempt, not background_task_manager.holds_execution(task_id)
+        )
 
     async def apply() -> bool:
         try:
