@@ -477,9 +477,10 @@ async def test_the_attempt_that_applies_a_start_counts_its_new_slot_once(
     finish.set()
     results = await asyncio.wait_for(asyncio.gather(first, second), DB_PROGRESS_TIMEOUT)
 
+    # Both attempts scanned with room, so both are counted attempts.
     state = transport._fair_state
-    count = 0 if applies == "neither" else 1
-    assert (state.since_fallback, state.dispatches_since_fallback) == (count, count)
+    opened = 0 if applies == "neither" else 1
+    assert (state.since_fallback, state.attempts_since_fallback) == (opened, 2)
     assert results == [applies == "first", applies == "second"]
 
 

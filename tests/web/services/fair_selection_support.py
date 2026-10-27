@@ -495,9 +495,9 @@ def play(
     Fails with the seed and the whole world. After every scan the chosen command is
     settled and its task counted as holding a slot for its tenant.
     """
-    # The reference keeps no dispatch count: a world runs too few attempts to
-    # reach FAIR_SHARE_FALLBACK_AFTER_DISPATCHES.
-    assert attempts < transport.FAIR_SHARE_FALLBACK_AFTER_DISPATCHES
+    # The reference keeps no attempt count: a world runs too few attempts to pass
+    # FAIR_SHARE_FALLBACK_AFTER_ATTEMPTS.
+    assert attempts <= transport.FAIR_SHARE_FALLBACK_AFTER_ATTEMPTS
     rng = random.Random(seed)
     spec = random_world(rng, tenants=tenants, size=rng.randint(6, 45), **world_options)
     world.reset()

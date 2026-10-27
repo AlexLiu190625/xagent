@@ -358,16 +358,12 @@ def test_a_tenant_whose_oldest_commands_cannot_be_claimed_is_missed_then_skipped
 
 
 EVERY = transport.FAIR_SHARE_FALLBACK_EVERY
-AFTER = transport.FAIR_SHARE_FALLBACK_AFTER_DISPATCHES
+AFTER = transport.FAIR_SHARE_FALLBACK_AFTER_ATTEMPTS
 
 
-@pytest.mark.parametrize(
-    "field, line",
-    [("since_fallback", EVERY - 1), ("dispatches_since_fallback", AFTER)],
-    ids=["balance", "dispatch count"],
-)
-def test_a_scan_only_reads_the_balance_and_the_dispatch_count(
-    field, line, world, on, clock
+@pytest.mark.parametrize("line", ["balance", "attempt count"])
+def test_a_scan_only_reads_the_balance_and_only_adds_to_the_attempt_count(
+    line, world, on, clock
 ):
     for _ in range(16):
         world.add("a", pinned=True)
@@ -377,21 +373,27 @@ def test_a_scan_only_reads_the_balance_and_the_dispatch_count(
         world.add("b")
     cap = cap_of(occupancy={"b": 5})
     state = transport._fair_state
+    if line == "balance":
+        state.since_fallback = EVERY - 2
+    else:
+        state.attempts_since_fallback = AFTER - 20
 
-    # Scanning moves nothing: an attempt is a fair round until the balance or the
-    # dispatch count has reached its line.
-    setattr(state, field, line - 1)
-    for _ in range(20):
+    # A scan leaves the balance alone and adds one to the attempt count: an attempt
+    # is a fair round until the balance has reached its line or the attempt count
+    # is over its own.
+    rounds = []
+    for step in range(40):
+        if line == "balance" and step == 20:
+            state.since_fallback = EVERY - 1
         one = attempt()
-        assert scan(cap, attempt=one) == first_b
-        assert one.counted and not one.fallback
-    setattr(state, field, line)
-    for _ in range(20):
-        one = attempt()
-        assert scan(cap, attempt=one) == oldest_claimable
-        assert one.counted and one.fallback
-    expected = {"since_fallback": 0, "dispatches_since_fallback": 0, field: line}
-    assert {name: getattr(state, name) for name in expected} == expected
+        rounds.append((scan(cap, attempt=one), one.counted, one.fallback))
+    assert (
+        rounds == [(first_b, True, False)] * 20 + [(oldest_claimable, True, True)] * 20
+    )
+    if line == "balance":
+        assert (state.since_fallback, state.attempts_since_fallback) == (EVERY - 1, 40)
+    else:
+        assert (state.since_fallback, state.attempts_since_fallback) == (0, AFTER + 20)
 
 
 def test_attempts_that_decided_a_fallback_together_each_take_their_debt_off(
@@ -471,7 +473,7 @@ def test_a_command_of_a_task_leased_elsewhere_is_not_found_by_the_window(
     # a holds fewer slots, but its window is full of commands that wait for another
     # process, so b is served; only the round that reads everything reaches a. When
     # b's command joins a task that already runs here it opens no slot, and only the
-    # dispatch count brings that round.
+    # attempt count brings that round.
     for _ in range(fair_rounds):
         clock.now += transport.FAIR_SHARE_SKIP_SECONDS
         one = attempt()
@@ -745,7 +747,7 @@ def loop(world, on, monkeypatch):
         state = transport._fair_state
         before = state.since_fallback
         await transport.dispatch_one_task_command(executor, **kwargs)
-        return state.since_fallback - before, state.dispatches_since_fallback
+        return state.since_fallback - before, state.attempts_since_fallback
 
     return SimpleNamespace(manager=manager, plan=plan, run=run, world=world)
 
@@ -769,8 +771,8 @@ def run_the_last_task(loop, mp):
     loop.manager._track_live_execution(loop.world.task_of(loop.last), execution)
 
 
-def reach_the_dispatch_count(loop, mp):
-    transport._fair_state.dispatches_since_fallback = AFTER
+def reach_the_attempt_line(loop, mp):
+    transport._fair_state.attempts_since_fallback = AFTER
 
 
 def ask_for_the_last_by_id(loop, mp):
@@ -806,14 +808,14 @@ def switch_off(loop, mp):
     mp.setattr(transport, "_fair_share_memo", None)
 
 
-# The dispatch count every row starts from, unless a step sets it.
+# The attempt count every row starts from, unless a step sets it.
 COUNT = 5
-# row: (steps, the balance before, the change in the balance, the dispatch count after)
+# row: (steps, the balance before, the change in the balance, the attempt count after)
 LOOP_ROWS = {
     "a fair round that opens a slot": ([add("a")], 0, 1, COUNT + 1),
     "a fallback round that opens a slot": ([add("a")], EVERY - 1, -(EVERY - 1), 0),
-    "a fallback round the dispatch count forced": (
-        [add("a"), reach_the_dispatch_count],
+    "a fallback round the attempt count forced": (
+        [add("a"), reach_the_attempt_line],
         0,
         -(EVERY - 1),
         0,
@@ -824,22 +826,28 @@ LOOP_ROWS = {
         1,
         COUNT + 1,
     ),
-    "a second missing listing": ([add("a"), ask_for_a_listing(2)], 0, 0, COUNT),
+    "a second missing listing": ([add("a"), ask_for_a_listing(2)], 0, 0, COUNT + 1),
     "a slot opened after a busy coordinator and a rescan": (
         [add("a"), add("b"), keep_the_coordinator_busy_once],
         0,
         1,
         COUNT + 1,
     ),
-    "a refused slot": ([add("a"), refuse_slots], 0, 0, COUNT),
+    "a refused slot": ([add("a"), refuse_slots], 0, 0, COUNT + 1),
     "a forced fallback round whose slot is refused": (
-        [add("a"), reach_the_dispatch_count, refuse_slots],
+        [add("a"), reach_the_attempt_line, refuse_slots],
         0,
         0,
-        AFTER,
+        AFTER + 1,
     ),
     "nothing queued": ([], 0, 0, COUNT),
-    "a control command": ([add("a", kind="pause")], 0, 0, COUNT),
+    "a control command": ([add("a", kind="pause")], 0, 0, COUNT + 1),
+    "a fallback round that takes a control command": (
+        [add("a", kind="pause")],
+        EVERY - 1,
+        0,
+        COUNT + 1,
+    ),
     "a command asked for by id": ([add("a"), ask_for_the_last_by_id], 0, 0, COUNT),
     "a follow-up of a running task": (
         [add("a", kind="message"), run_the_last_task],
@@ -864,11 +872,11 @@ LOOP_ROWS = {
 
 
 @pytest.mark.parametrize("row", list(LOOP_ROWS))
-async def test_what_each_dispatch_attempt_does_to_the_balance_and_the_dispatch_count(
+async def test_what_each_dispatch_attempt_does_to_the_balance_and_the_attempt_count(
     row, loop, monkeypatch
 ):
     steps, before, change, count = LOOP_ROWS[row]
-    transport._fair_state.dispatches_since_fallback = COUNT
+    transport._fair_state.attempts_since_fallback = COUNT
     kwargs: dict = {}
     for step in steps:
         kwargs.update(step(loop, monkeypatch) or {})
@@ -901,8 +909,57 @@ async def test_a_failing_ownership_check_leaves_the_balance_alone(loop):
     with pytest.raises(RuntimeError):
         await loop.run()
 
-    assert transport._fair_state.since_fallback == 0
+    state = transport._fair_state
+    assert (state.since_fallback, state.attempts_since_fallback) == (0, 1)
     assert not loop.manager._dispatch_reservations
+
+
+@pytest.mark.parametrize("b_offers", ["pauses", "starts whose slot is refused"])
+async def test_a_start_behind_a_missed_window_gets_the_fallback_round_after_the_attempt_line(
+    b_offers, loop, clock, monkeypatch
+):
+    """A's 16 oldest commands are leased elsewhere and its START is behind them. B is
+    listed through an opening command leased elsewhere and offers every attempt a new
+    command that opens no slot, so no attempt moves the balance."""
+    world = loop.world
+    for _ in range(16):
+        world.add("a", pinned=True)
+    a_task = world.task_of(world.add("a"))
+    world.add("b", pinned=True)
+    if b_offers == "pauses":
+        kind, b_dispatched = "pause", "b"
+    else:
+        kind, b_dispatched = "start", None
+        real = loop.manager.reserve_dispatch_slot
+
+        def reserve(task_id, **kwargs):
+            if kwargs["fairness_key"] == "b":
+                return None
+            return real(task_id, **kwargs)
+
+        monkeypatch.setattr(loop.manager, "reserve_dispatch_slot", reserve)
+
+    dispatched = []
+    for _ in range(AFTER + 1):
+        clock.now += transport.FAIR_SHARE_SKIP_SECONDS
+        world.add("b", kind=kind)
+        before = len(loop.plan.ensured)
+        await transport.dispatch_one_task_command(None)
+        tasks = loop.plan.ensured[before:]
+        dispatched.append("a" if a_task in tasks else "b" if tasks else None)
+        with world.sessions() as db:
+            db.execute(
+                sa.update(TaskExecutionCommand)
+                .where(TaskExecutionCommand.task_id.in_(tasks))
+                .values(status="completed")
+            )
+            db.commit()
+
+    # Every attempt misses A's window and is counted; the attempt after AFTER of
+    # them is a fallback round, which reads past the window to A's START.
+    assert dispatched == [b_dispatched] * AFTER + ["a"]
+    state = transport._fair_state
+    assert (state.since_fallback, state.attempts_since_fallback) == (-(EVERY - 1), 0)
 
 
 class Wakeups:
@@ -910,14 +967,14 @@ class Wakeups:
 
     Every attempt picks before any of them takes a slot, as when one wake-up
     starts them all at once, and the attempts whose pick belongs to tenant a go
-    on first. A task already holding a token gets a token that takes no slot; a
-    task already executing has a busy coordinator, so a later attempt that picked
-    it sets it aside and scans again.
+    on first, or last when ``fallback_first`` is false. A task already holding a
+    token gets a token that takes no slot; a task already executing has a busy
+    coordinator, so a later attempt that picked it sets it aside and scans again.
     """
 
     ATTEMPTS = transport.DISPATCHER_CONCURRENCY
 
-    def __init__(self, world, monkeypatch) -> None:
+    def __init__(self, world, monkeypatch, fallback_first=True) -> None:
         self.world = world
         self.a_tasks: set[int] = set()
         self.free = 0
@@ -926,6 +983,7 @@ class Wakeups:
         self.opened: list[str] = []
         self.waiting: list[tuple[int, asyncio.Future]] = []
         self.picked: set[asyncio.Task] = set()
+        self.fallback_first = fallback_first
         monkeypatch.setattr(task_execution, "background_task_manager", self)
         monkeypatch.setattr(
             transport, "build_dispatch_cap_snapshot", lambda: cap_of(occupancy={"a": 5})
@@ -981,12 +1039,19 @@ class Wakeups:
             ordered = sorted(
                 self.waiting,
                 key=lambda entry: (
-                    entry[0] is None or entry[0].task_id not in self.a_tasks
+                    (entry[0] is None or entry[0].task_id not in self.a_tasks)
+                    == self.fallback_first
                 ),
             )
             self.waiting = []
-            for _, waiting_gate in ordered:
-                waiting_gate.set_result(None)
+
+            def release():
+                for _, waiting_gate in ordered:
+                    waiting_gate.set_result(None)
+
+            # Released from a callback, so that the attempt that completes the set
+            # waits too and every attempt goes on in the order above.
+            asyncio.get_running_loop().call_soon(release)
         await gate
         return found
 
@@ -1008,16 +1073,19 @@ class Wakeups:
         self.picked.clear()
 
 
+@pytest.mark.parametrize(
+    "fallback_first", [True, False], ids=["fallback first", "fair first"]
+)
 @pytest.mark.parametrize("freed", [1, 2])
 async def test_fallback_rounds_open_one_new_slot_in_every_fallback_period_however_many_a_wakeup_frees(
-    freed, world, on, clock, monkeypatch
+    freed, fallback_first, world, on, clock, monkeypatch
 ):
     """Tenant a holds more slots and queued first, so the fair rounds serve b and
     only a fallback round opens a slot for a. The attempts of one wake-up share one
-    decision, so who goes on first would not matter; it is fixed to the fallback
-    round going first, the one order in which counting every attempt gets the
-    share wrong."""
-    wakeups = Wakeups(world, monkeypatch)
+    decision, so who goes on first does not matter: with the fallback round first,
+    counting every attempt gets the share wrong, and with the fair rounds first,
+    reading the attempt count modulo the period does."""
+    wakeups = Wakeups(world, monkeypatch, fallback_first)
     wakeups.queue("a", 40)
     wakeups.queue("b", 80)
     slots = 64
@@ -1026,8 +1094,10 @@ async def test_fallback_rounds_open_one_new_slot_in_every_fallback_period_howeve
         await wakeups.wake(freed)
 
     assert len(wakeups.opened) == slots
-    # Counting every attempt gives 32 for freed = 1; clearing the balance on a
-    # fallback round instead of taking its share off gives 12 for freed = 2.
+    # With the fallback round first, counting every attempt gives 32 for freed = 1
+    # and clearing the balance on a fallback round instead of taking its share off
+    # gives 12 for freed = 2; with the fair rounds first, a fallback round on every
+    # eighth attempt gives 0.
     assert wakeups.opened.count("a") == slots // EVERY
 
 
@@ -1064,7 +1134,7 @@ def test_the_state_is_used_only_under_the_lock_and_no_statement_runs_under_it(
         for _ in range(5):
             world.add(tenant)
     lock = RecordingLock()
-    watched = {"since_fallback", "dispatches_since_fallback", "skips", "misses"}
+    watched = {"since_fallback", "attempts_since_fallback", "skips", "misses"}
 
     class Guarded(transport._FairState):
         def __getattribute__(self, name):
@@ -1079,7 +1149,7 @@ def test_the_state_is_used_only_under_the_lock_and_no_statement_runs_under_it(
 
     state = Guarded.__new__(Guarded)
     object.__setattr__(state, "since_fallback", 0)
-    object.__setattr__(state, "dispatches_since_fallback", 0)
+    object.__setattr__(state, "attempts_since_fallback", 0)
     object.__setattr__(state, "skips", {})
     object.__setattr__(state, "misses", 0)
     monkeypatch.setattr(transport, "_fair_state", state)
