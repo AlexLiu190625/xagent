@@ -582,6 +582,30 @@ class ReplyResponse(BaseModel):
     control_state: str = Field(..., description="Detailed task control state.")
 
 
+class CancelQuestionResponse(BaseModel):
+    """``POST /v1/chat/tasks/{task_id}/cancel-question`` -> 202 response.
+
+    The pending question was abandoned (not answered, not deleted), the
+    paused run was closed, and the task now accepts an append. Repeating
+    the call on the same cancelled run returns this same shape.
+    """
+
+    task_id: int = Field(..., description="Existing task primary key.")
+    status: str = Field(
+        ...,
+        description=(
+            "Task status after cancellation: 'completed' (the waiting run is "
+            "closed so the next turn can be appended)."
+        ),
+    )
+    run_id: Optional[str] = Field(
+        ..., description="The run whose pending question was cancelled."
+    )
+    state_version: int = Field(
+        ..., description="Monotonic version of the task control state."
+    )
+
+
 class CreateWorkforceRunRequest(BaseModel):
     """Body for ``POST /v1/workforces/{workforce_id}/runs``.
 

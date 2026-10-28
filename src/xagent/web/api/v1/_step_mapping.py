@@ -226,9 +226,10 @@ class PublicStepProjector:
         self._pending: Dict[Tuple[str, str], Dict[str, Any]] = {}
         # Completed-or-emitted-immediately steps. Filled in either by an
         # end event matching a pending start, or by a one-shot event like
-        # ``user_message`` / ``ai_message``. ``None`` when the caller
-        # opted out of retention (see the class docstring): those steps
-        # are still returned by ``feed``, they are just not kept after.
+        # ``user_message`` / ``ai_message`` / a question-channel
+        # ``agent_message``. ``None`` when the caller opted out of retention
+        # (see the class docstring): those steps are still returned by
+        # ``feed``, they are just not kept.
         self._finished: Optional[List[Dict[str, Any]]] = [] if retain_finished else None
         self._settlement_reopen_index: Dict[Tuple[str, str], int] = {}
         # ``dag_plan_*`` has no per-plan identifier in the event data, so
@@ -341,8 +342,9 @@ class PublicStepProjector:
 
         A start event returns the new ``running`` step; an end event
         (or failure event) returns the step now in its terminal state;
-        a one-shot event (``user_message`` / ``ai_message``) returns the
-        step it produces. Events that don't affect any public step --
+        a one-shot event (``user_message`` / ``ai_message`` / a
+        question-channel ``agent_message``) returns the step it produces.
+        Events that don't affect any public step --
         unexposed types, orphan ends, non-terminal sub-events of an
         exposed family -- return ``[]``.
 
@@ -363,7 +365,11 @@ class PublicStepProjector:
             if self._finished is not None:
                 self._finished.append(step)
             return [step]
-        if event_type == "ai_message":
+        # ``agent_message`` is shared by questions and progress notices (see
+        # ``_agent_outbound_event_type``); only the asking channel is a step.
+        if event_type == "ai_message" or (
+            event_type == "agent_message" and _is_question_agent_message(event)
+        ):
             step = _build_message_step(event, role="assistant")
             if self._finished is not None:
                 self._finished.append(step)
@@ -843,6 +849,20 @@ def _build_tool_start(
 
 
 # ===== message helpers =====
+
+
+def _is_question_agent_message(event: Any) -> bool:
+    """The question channel is ``expect_response`` or ``message_type``.
+
+    V2 display replay forces ``expect_response`` to False and keeps the
+    original intent in ``awaiting_response``; a waiting ``send_message`` can
+    carry any ``message_type``, so the three fields are read together.
+    """
+    return (
+        _data_get(event, "expect_response") is True
+        or _data_get(event, "awaiting_response") is True
+        or _data_get(event, "message_type") == "question"
+    )
 
 
 def _build_message_step(event: Any, *, role: str) -> Dict[str, Any]:

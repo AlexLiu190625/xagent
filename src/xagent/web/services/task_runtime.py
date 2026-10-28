@@ -87,6 +87,9 @@ SELECTED_FILE_IDS_AGENT_CONFIG_KEY = "selected_file_ids"
 # Reserved server-owned ``tasks.agent_config`` key whose reference data is added
 # to orchestrated-run and websocket execution messages, never to the transcript.
 PROMPT_CONTEXT_AGENT_CONFIG_KEY = "prompt_context"
+# Server-owned marker for a waiting task whose question was abandoned through
+# POST .../cancel-question; the run id separates a repeat from normal completion.
+QUESTION_CANCELLED_AGENT_CONFIG_KEY = "question_cancelled"
 # Durable server-owned marker for tasks whose MCP tool set must be built with a
 # trusted actor credential namespace. Only the literal boolean ``True`` marks a
 # task; false, malformed, and historical values preserve ordinary behavior.
@@ -235,6 +238,7 @@ CLIENT_RESERVED_AGENT_CONFIG_KEYS: frozenset[str] = frozenset(
         MCP_RUNTIME_AUTHORIZATION_POLICY_STDIO_KEY,
         SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
         PROMPT_CONTEXT_AGENT_CONFIG_KEY,
+        QUESTION_CANCELLED_AGENT_CONFIG_KEY,
         FILE_OPERATION_ACCESS_VERSION_KEY,
         "auth_mode",
         "guest_id",
@@ -267,6 +271,25 @@ def mcp_runtime_authorization_policy_identity(agent_config: Any) -> str | None:
     if not isinstance(value, str) or not value.strip():
         return None
     return value
+
+
+def question_cancel_marker(agent_config: Any) -> Mapping[str, Any] | None:
+    """The cancelled-question marker dict recorded on this task, if any."""
+
+    if not isinstance(agent_config, Mapping):
+        return None
+    value = agent_config.get(QUESTION_CANCELLED_AGENT_CONFIG_KEY)
+    return value if isinstance(value, Mapping) else None
+
+
+def question_cancelled_run_id(agent_config: Any) -> str | None:
+    """The run whose pending question this task abandoned, if recorded."""
+
+    value = question_cancel_marker(agent_config)
+    if value is None:
+        return None
+    run_id = value.get("run_id")
+    return run_id if isinstance(run_id, str) and run_id else None
 
 
 def sanitize_client_agent_config(agent_config: Any) -> dict[str, Any]:

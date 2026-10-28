@@ -194,6 +194,8 @@ def _call(route: str, task_id: int, full_key: str, owner: dict):
             headers=headers,
             json={**owner, "command_id": "cmd-expired", "message": message},
         )
+    if route == "cancel":
+        return client.post(f"/v1/chat/tasks/{task_id}/cancel-question", headers=headers)
     if route == "upload":
         return client.post(
             f"/v1/chat/files?task_id={task_id}",
@@ -203,7 +205,7 @@ def _call(route: str, task_id: int, full_key: str, owner: dict):
     raise AssertionError(route)
 
 
-TASK_ROUTES = ["get", "steps", "events", "append", "reply", "upload"]
+TASK_ROUTES = ["get", "steps", "events", "append", "reply", "cancel", "upload"]
 
 
 def _assert_expired(resp, task_id: int, expired_at: datetime = EXPIRED_AT) -> None:

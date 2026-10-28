@@ -308,6 +308,7 @@ ALLOWLIST = {
     ("POST", "/v1/chat/tasks"),
     ("POST", "/v1/chat/tasks/{task_id}/messages"),
     ("POST", "/v1/chat/tasks/{task_id}/reply"),
+    ("POST", "/v1/chat/tasks/{task_id}/cancel-question"),
     ("POST", "/v1/workforces/{workforce_id}/runs"),
 }
 EXCLUDE = {

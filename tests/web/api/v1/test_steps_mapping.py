@@ -20,6 +20,7 @@ from xagent.web.api.v1._step_mapping import (
     PublicStepProjector,
     map_trace_events_to_public_steps,
 )
+from xagent.web.services.task_event_display import convert_display_event
 
 
 def _ev(
@@ -590,6 +591,154 @@ def test_user_and_ai_messages_emit_two_message_steps_in_order():
     # Messages have started_at == completed_at and status='completed'
     assert steps[0]["started_at"] == steps[0]["completed_at"]
     assert steps[0]["status"] == "completed"
+
+
+def test_agent_message_without_question_channel_is_not_projected():
+    """An ordinary outbound notice is progress, not an assistant turn."""
+    steps = map_trace_events_to_public_steps(
+        [
+            _ev(
+                "agent_message",
+                data={
+                    "message": "still working",
+                    "message_type": "info",
+                    "expect_response": False,
+                },
+            )
+        ]
+    )
+    assert steps == []
+
+
+def test_question_agent_message_is_projected_as_assistant_message():
+    steps = map_trace_events_to_public_steps(
+        [
+            _ev(
+                "agent_message",
+                data={
+                    "message": "Which city?",
+                    "message_type": "question",
+                    "expect_response": True,
+                },
+            )
+        ]
+    )
+    assert steps == [
+        {
+            "id": steps[0]["id"],
+            "type": "message",
+            "status": "completed",
+            "started_at": steps[0]["started_at"],
+            "completed_at": steps[0]["completed_at"],
+            "data": {"role": "assistant", "content": "Which city?"},
+        }
+    ]
+
+
+def _v2_assistant_message_fact(*, sequence: int = 1) -> SimpleNamespace:
+    return SimpleNamespace(
+        kind="assistant_message",
+        payload_version=1,
+        payload={
+            "data": {
+                "content": "the final answer",
+                "message_type": "assistant_response",
+            },
+            "protocol_event_id": "assistant-fact",
+        },
+        event_id="assistant-fact",
+        task_id=1,
+        turn_id="turn-1",
+        occurred_at=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        sequence=sequence,
+        run_id="run-1",
+    )
+
+
+def test_v2_assistant_message_conversion_does_not_duplicate_steps_or_sse():
+    """``convert_display_event`` turns a v2 ``assistant_message`` into an
+    ``agent_message`` with ``expect_response=False`` and its real
+    ``message_type``. The same final answer also arrives as an
+    ``ai_message`` trace; projecting both would double it in ``/steps`` and
+    in the SSE sink. Both drivers must fold to one assistant step.
+    """
+    converted = convert_display_event(_v2_assistant_message_fact(), replay=True)
+    assert converted is not None
+    assert converted["event_type"] == "agent_message"
+    assert converted["data"]["expect_response"] is False
+    ai_message = _ev(
+        "ai_message",
+        data={"content": "the final answer"},
+        event_id="ai-answer",
+    )
+
+    steps = map_trace_events_to_public_steps([converted, ai_message])
+    assert [s["data"]["content"] for s in steps if s["type"] == "message"] == [
+        "the final answer"
+    ]
+
+    sse = PublicStepProjector(retain_finished=False)
+    sse_steps = []
+    for event in (converted, ai_message):
+        sse_steps.extend(sse.feed(event))
+    assert [s["data"]["content"] for s in sse_steps if s["type"] == "message"] == [
+        "the final answer"
+    ]
+
+
+def _v2_agent_message_fact(
+    *, message_type: str | None, expect_response: bool
+) -> SimpleNamespace:
+    data: dict[str, Any] = {
+        "message": "Shall I continue?",
+        "visible": True,
+        "expect_response": expect_response,
+        "metadata": {},
+    }
+    if message_type is not None:
+        data["message_type"] = message_type
+    return SimpleNamespace(
+        kind="agent_message",
+        payload_version=1,
+        payload={"data": data, "protocol_event_id": "agent-message-fact"},
+        event_id="agent-message-fact",
+        task_id=1,
+        turn_id="turn-1",
+        occurred_at=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        sequence=1,
+        run_id="run-1",
+        scope_id="root",
+    )
+
+
+@pytest.mark.parametrize("message_type", ["question", "confirmation", "info", None])
+def test_v2_replayed_waiting_message_still_projects_as_a_question_step(message_type):
+    """Replay forces ``expect_response`` False to avoid re-arming the client,
+    but a ``send_message(expect_response=True)`` of any type is still the
+    question the task is waiting on, so ``/steps`` must show it."""
+    converted = convert_display_event(
+        _v2_agent_message_fact(message_type=message_type, expect_response=True),
+        replay=True,
+    )
+    assert converted is not None
+    assert converted["data"]["expect_response"] is False
+
+    steps = map_trace_events_to_public_steps([converted])
+
+    assert [s["data"] for s in steps if s["type"] == "message"] == [
+        {"role": "assistant", "content": "Shall I continue?"}
+    ]
+
+
+@pytest.mark.parametrize("message_type", ["info", "confirmation"])
+def test_v2_replayed_notice_without_a_wait_is_not_projected(message_type):
+    converted = convert_display_event(
+        _v2_agent_message_fact(message_type=message_type, expect_response=False),
+        replay=True,
+    )
+    assert converted is not None
+    assert "awaiting_response" not in converted["data"]
+    assert map_trace_events_to_public_steps([converted]) == []
 
 
 # ===== filtering: non-exposed event types are dropped =====

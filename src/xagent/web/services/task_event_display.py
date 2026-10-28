@@ -304,6 +304,10 @@ def convert_display_event(
                 project_event_message(event)
             data["message_id"] = f"execution_message_{event.event_id}"
             if replay:
+                # Replay must not re-arm the client's wait state, but the
+                # step projection still needs to know this message asked.
+                if data.get("expect_response") is True:
+                    data["awaiting_response"] = True
                 data["expect_response"] = False
         if kind.startswith("llm_") or kind.endswith("_llm"):
             data = normalize_llm_trace_payload(data)

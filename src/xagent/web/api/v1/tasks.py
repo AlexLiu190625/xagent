@@ -38,6 +38,7 @@ from ...models.uploaded_file import UploadedFile
 from ...schemas.v1 import (
     AppendMessageRequest,
     AppendMessageResponse,
+    CancelQuestionResponse,
     CreateTaskRequest,
     CreateTaskResponse,
     PendingInteraction,
@@ -1034,6 +1035,71 @@ async def reply_to_waiting_task(
     from .task_reply import reply_to_task
 
     return await reply_to_task(task_id=task_id, request=request, principal=principal)
+
+
+@router.post(
+    "/chat/tasks/{task_id}/cancel-question",
+    status_code=202,
+    response_model=CancelQuestionResponse,
+)
+async def cancel_waiting_task_question(
+    task_id: int,
+    principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
+) -> CancelQuestionResponse:
+    """Abandon the pending question on a ``waiting_for_user`` task.
+
+    Reuses ``GET``'s ownership rule (another agent's task, another user's
+    agent, a missing id, or a non-SDK task all answer 404). The pending
+    interaction row is terminated rather than deleted, the paused run is
+    finalized to ``completed``, and the same task then accepts
+    ``POST /v1/chat/tasks/{id}/messages`` (fresh connector context, same
+    conversation). Repeating the call on the already-cancelled run returns
+    the same 202 body; any other non-waiting state answers 409.
+
+    A concurrent ``POST .../reply`` that claimed the answer slot first makes
+    this answer 409 ``task_busy``. Once this endpoint wins, a reply that
+    admitted against the old waiting state can still answer 409
+    ``task_busy`` when its own compare-and-swap loses; one that reads the
+    task afterwards answers 409 ``no_pending_interaction``.
+
+    Raises:
+        V1ApiError 401: missing / invalid / revoked key.
+        V1ApiError 404: task missing, not owned by the key, or not SDK-created.
+        V1ApiError 409: ``task_busy`` while a reply is in flight;
+            ``task_not_waiting`` for any other non-waiting state.
+        V1ApiError 410: ``task_expired`` for a retention-expired task.
+    """
+    from ...services.task_question_cancel import (
+        TaskQuestionCancelBusy,
+        TaskQuestionCancelNotWaiting,
+        cancel_task_question,
+    )
+
+    try:
+        result = await cancel_task_question(
+            task_id=task_id,
+            scope=_sdk_task_scope(principal),
+        )
+    except task_start_service.TaskStartRejected as exc:
+        _raise_start_rejection(exc)
+    except TaskQuestionCancelBusy as exc:
+        raise V1ApiError(
+            V1ErrorCode.TASK_BUSY,
+            409,
+            message="A reply is already in flight for this task; retry later.",
+        ) from exc
+    except TaskQuestionCancelNotWaiting as exc:
+        raise V1ApiError(V1ErrorCode.TASK_NOT_WAITING, 409) from exc
+    except TaskTurnError as exc:
+        raise_for_turn_rejection(exc.reason)
+
+    await record_key_usage(str(principal.key.key_prefix))
+    return CancelQuestionResponse(
+        task_id=result.task_id,
+        status=result.status,
+        run_id=result.run_id,
+        state_version=result.state_version,
+    )
 
 
 @router.get("/chat/tasks/{task_id}", response_model=TaskInfoResponse)

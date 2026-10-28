@@ -147,7 +147,10 @@ from .task_lease_service import (
     utc_now,
     validate_preacquired_task_lease_isolated,
 )
-from .task_runtime import mcp_runtime_authorization_policy_required
+from .task_runtime import (
+    mcp_runtime_authorization_policy_required,
+    question_cancelled_run_id,
+)
 from .task_settlement_report import RecordedInterruption, SettlementReport
 from .task_setup_snapshot import load_task_setup_snapshot_sync
 
@@ -2260,7 +2263,16 @@ def finish_turn(
     status = fresh.status
 
     if status == TaskStatus.COMPLETED:
-        if fresh.conversation_storage_version == 2:
+        output: str | None
+        if (
+            fresh.run_id is not None
+            and question_cancelled_run_id(fresh.agent_config) == fresh.run_id
+        ):
+            # cancel-question settled this run with no output. Its abandoned
+            # question is still the latest assistant row (only its type
+            # changes), so deriving the output would resurrect it.
+            output = None
+        elif fresh.conversation_storage_version == 2:
             from ..models.task_execution_event import TaskExecutionEvent
             from .task_event_display import event_data
 

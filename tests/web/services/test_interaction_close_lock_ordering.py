@@ -72,6 +72,7 @@ from xagent.web.services import (
     task_command_execution,
     task_execution,
     task_interaction_close,
+    task_question_cancel,
     task_resume,
 )
 
@@ -431,14 +432,58 @@ def _sa_update_targets(tree: ast.AST) -> list[str]:
 
 
 def test_close_module_issues_exactly_the_expected_update_statements() -> None:
-    """The whole module issues exactly three UPDATE statements: the close
-    (task_interaction_requests), its paired clear (tasks), and the
+    """The whole module issues exactly four UPDATE statements: the legacy
+    close (task_interaction_requests), its paired clear (tasks), the
     compensation paths' clear (tasks) -- both clears guarded by the same
-    NOT EXISTS clause. A fourth statement, or one against an unexpected
-    table, means either a duplicated write path or a table this design
-    never named."""
+    NOT EXISTS clause -- and the cancel-question termination
+    (task_interaction_requests). Any other statement, or one against an
+    unexpected table, means either a duplicated write path or a table this
+    design never named."""
     targets = _sa_update_targets(ast.parse(_source(task_interaction_close)))
-    assert targets == ["TaskInteractionRequest", "Task", "Task"], targets
+    assert targets == [
+        "TaskInteractionRequest",
+        "Task",
+        "Task",
+        "TaskInteractionRequest",
+    ], targets
+
+
+def test_cancel_claims_tasks_row_before_terminating_the_interaction() -> None:
+    """``_cancel_waiting_task`` must lock/write the ``tasks`` row before the
+    interaction termination UPDATE, matching every other close path's
+    tasks-then-interaction order. Counting statements cannot see this; the
+    source order of the two calls is what carries the lock obligation.
+    """
+    fn = _find_function(
+        ast.parse(_source(task_question_cancel)), "_cancel_waiting_task"
+    )
+
+    def _queries_task(node: ast.AST) -> bool:
+        return any(
+            isinstance(sub, ast.Call)
+            and isinstance(sub.func, ast.Attribute)
+            and sub.func.attr == "query"
+            and sub.args
+            and isinstance(sub.args[0], ast.Name)
+            and sub.args[0].id == "Task"
+            for sub in ast.walk(node)
+        )
+
+    claim = next(
+        node
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "update"
+        and _queries_task(node.func.value)
+    )
+    terminate_lines = _call_lines(
+        fn, attr="terminate_active_interaction_for_question_cancel"
+    )
+    assert len(terminate_lines) == 1, terminate_lines
+    assert claim.lineno < terminate_lines[0], (
+        "the tasks-row claim UPDATE must precede the interaction termination"
+    )
 
 
 def _calls_to(tree: ast.AST, *, name: str) -> bool:

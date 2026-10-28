@@ -713,3 +713,46 @@ def clear_interaction_marker_if_unpaired(
         )
         .values(interaction_protocol_version=None)
     )
+
+
+def terminate_active_interaction_for_question_cancel(
+    db: Session,
+    *,
+    task_id: int,
+    run_id: str | None,
+) -> int:
+    """Terminate the task's active interaction row when its question is abandoned.
+
+    Reuses the existing ``run_superseded`` reason rather than adding a
+    ``cancelled`` member: the column's CHECK constraint would need a migration,
+    and ``run_superseded`` is already the vocabulary's "the asking run no
+    longer owns this slot" outcome. Every reader already handles it.
+
+    Caller obligations: owns the transaction and has already taken the task
+    row's write lock/UPDATE first, which keeps this function's interaction
+    UPDATE off the lock-order front (see ``close_legacy_resume_interaction``).
+    The UPDATE is bound to ``run_id``: only the run whose claim won may have
+    its active slot retired.
+    """
+    if run_id is None or not interaction_requests_table_exists(db):
+        return 0
+    now = datetime.now(timezone.utc)
+    result = db.execute(
+        sa.update(TaskInteractionRequest)
+        .where(
+            TaskInteractionRequest.task_id == task_id,
+            TaskInteractionRequest.run_id == run_id,
+            TaskInteractionRequest.status == "active",
+            TaskInteractionRequest.active_slot.isnot(None),
+        )
+        .values(
+            status="terminated",
+            terminal_reason="run_superseded",
+            active_slot=None,
+            terminated_at=now,
+            updated_at=now,
+        )
+    )
+    rowcount = _rowcount(result)
+    clear_interaction_marker_if_unpaired(db, task_id=task_id, run_id=run_id)
+    return rowcount

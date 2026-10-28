@@ -151,6 +151,11 @@ class V1ErrorCode(str, Enum):
     # turn, or wait for the task to reach waiting_for_user.
     NO_PENDING_INTERACTION = "no_pending_interaction"
 
+    # ``POST /v1/chat/tasks/{id}/cancel-question`` was called on a task that
+    # is not waiting_for_user and carries no cancelled-question marker for its
+    # current run (pending / paused / completed normally / failed). 409.
+    TASK_NOT_WAITING = "task_not_waiting"
+
     # A reply's saved progress could not be read due to a transient
     # infrastructure failure. 503, retryable -- distinct from
     # ``interaction_not_resumable`` (which means resuming can never
@@ -216,6 +221,9 @@ _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
     ),
     V1ErrorCode.NO_PENDING_INTERACTION: (
         "This task has no pending question to answer."
+    ),
+    V1ErrorCode.TASK_NOT_WAITING: (
+        "This task is not waiting for an answer to a question."
     ),
     V1ErrorCode.REPLY_OUTCOME_UNKNOWN: (
         "Reply was accepted but its outcome is not yet known. "
