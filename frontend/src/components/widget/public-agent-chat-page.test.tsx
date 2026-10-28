@@ -1506,6 +1506,25 @@ describe("PublicAgentChatPage", () => {
             expect(app.sendMessage).not.toHaveBeenCalled()
           },
         },
+        {
+          name: "a lost connection reported before the task exists still raises the start screen's toast",
+          run: async () => {
+            createResponses.push(() => Promise.reject(
+              Object.assign(new Error("Connection lost"), { connectionLost: true }),
+            ))
+            await renderReady()
+
+            await deliver("1", "A")
+            await waitFor(() => expect(warn).toHaveBeenCalled())
+            await settle()
+
+            expect(toastMock.error.mock.calls).toEqual([["builds.list.chat.sendFailed"]])
+            expect(warn.mock.calls).toEqual([[W_SEND_FAILED]])
+            expect(screen.queryByText("widgetChat.messages.error_init")).toBeNull()
+            expect(app.setTaskId).not.toHaveBeenCalled()
+            expect(app.sendMessage).not.toHaveBeenCalled()
+          },
+        },
       ],
       sendFailsAfterTaskCreation: [
         {

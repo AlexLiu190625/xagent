@@ -6,7 +6,6 @@ import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 import { iconButtonClassName, WidgetChromeControls } from "@/components/widget/widget-chrome-controls"
 import { AppProvider, useApp, type AppProviderTransportConfig } from "@/contexts/app-context-chat"
-import { toast } from "@/components/ui/sonner"
 import { useWidgetInitialMessage } from "@/hooks/use-widget-initial-message"
 import { useWidgetOpenMessage, W_SEND_FAILED } from "@/hooks/use-widget-open-message"
 import { resolveReportedTimezone } from "@/hooks/use-websocket"
@@ -14,7 +13,8 @@ import { usePublicFileAccessPolicy } from "@/contexts/file-access-context"
 import { useI18n } from "@/contexts/i18n-context"
 import { uploadPublicChatFile } from "@/lib/public-chat-file-upload"
 import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
-import { clientErrorTranslationKey, readClientErrorCode } from "@/lib/client-errors"
+import { clientErrorTranslationKey } from "@/lib/client-errors"
+import { notifySendFailure } from "@/lib/send-failure-notice"
 import { normalizeTaskStatus } from "@/lib/task-status"
 import { requestPromptContext } from "@/lib/widget-parent-message"
 import {
@@ -426,24 +426,11 @@ function PublicConversationContent({
     openingTaskCreatedRef.current = false
     handleSend(openRequest.message, undefined, []).catch((error: unknown) => {
       console.warn(W_SEND_FAILED)
-      // The notice the start screen gives for its own send (ChatInput's send
-      // failure handling). Once the task exists that input has been replaced,
-      // so a lost connection shows nothing; every other failure raises the
-      // toast. A header error, when there is one, is handleSend's own.
-      if (typeof error === "object" && error !== null
-        && (error as { notificationHandled?: unknown }).notificationHandled === true) return
-      if (openingTaskCreatedRef.current && typeof error === "object" && error !== null
-        && (error as { connectionLost?: unknown }).connectionLost === true) return
-      const errorCode = typeof error === "object" && error !== null
-        ? readClientErrorCode((error as { errorCode?: unknown }).errorCode)
-        : null
-      const userFacing = typeof error === "object" && error !== null
-        && (error as { userFacing?: unknown }).userFacing === true
-      toast.error(errorCode
-        ? t(clientErrorTranslationKey(errorCode))
-        : userFacing && error instanceof Error
-          ? error.message
-          : t("builds.list.chat.sendFailed") || "Message was not sent")
+      // The notice the start screen's input raises for its own failed send,
+      // from the same helper. Once the task exists that input has been
+      // replaced, so a lost connection shows nothing; every other failure
+      // raises the toast. A header error, when there is one, is handleSend's own.
+      notifySendFailure(error, t, { suppressConnectionLost: openingTaskCreatedRef.current })
     })
   }, [
     handleNewConversation,
