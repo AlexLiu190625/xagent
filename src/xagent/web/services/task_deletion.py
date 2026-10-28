@@ -7,12 +7,14 @@ from sqlalchemy.orm import Session
 from ..models.task import (
     DAGExecution,
     Task,
+    TaskConnectorRuntimeContext,
     TraceCheckpointBlob,
     TraceEvent,
     TraceMessageBlob,
 )
 from ..models.task_auto_recovery import TaskAutoRecovery, TaskRecoveryEvent
 from ..models.task_interaction import TaskInteractionRequest
+from ..models.task_runtime_secret import TaskRuntimeSecret
 from ..models.trigger import TriggerRun, TriggerRunStatus
 from .task_file_lifecycle import (
     DetachmentReason,
@@ -135,6 +137,12 @@ def purge_task_rows(
         synchronize_session=False
     )
     db.query(DAGExecution).filter(DAGExecution.task_id == task_id).delete(
+        synchronize_session=False
+    )
+    db.query(TaskConnectorRuntimeContext).filter(
+        TaskConnectorRuntimeContext.task_id == task_id
+    ).delete(synchronize_session=False)
+    db.query(TaskRuntimeSecret).filter(TaskRuntimeSecret.task_id == task_id).delete(
         synchronize_session=False
     )
     db.delete(task)

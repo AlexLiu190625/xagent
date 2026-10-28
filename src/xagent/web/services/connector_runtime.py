@@ -190,6 +190,14 @@ def bind_ephemeral_runtime_values_to_run(
             )
 
 
+def drop_ephemeral_runtime_values_for_task(task_id: int) -> None:
+    """Drop retained local inputs for a task that no longer exists."""
+
+    with _EPHEMERAL_RUNTIME_VALUES_LOCK:
+        for key in [key for key in _EPHEMERAL_RUN_VALUES if key[0] == task_id]:
+            del _EPHEMERAL_RUN_VALUES[key]
+
+
 def clean_ephemeral_runtime_values_for_run(*, task_id: int, run_id: str) -> None:
     """Drop terminal/replaced runs and sweep expired local inputs."""
     from ..models.database import get_session_local

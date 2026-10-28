@@ -19,6 +19,8 @@ which is also used by the WebSocket UI path so both transports share
 one state machine.
 """
 
+import asyncio
+import logging
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Literal, NoReturn, Optional, cast
@@ -41,6 +43,7 @@ from ...schemas.v1 import (
     CancelQuestionResponse,
     CreateTaskRequest,
     CreateTaskResponse,
+    DeleteTaskResponse,
     PendingInteraction,
     PublicStep,
     ReplyRequest,
@@ -69,6 +72,15 @@ from ...services.managed_file_ref import (
 )
 from ...services.prompt_context import validate_signed_prompt_context
 from ...services.task_auto_resume import TerminalView, status_only_terminal_view
+from ...services.task_delete import (
+    TaskDeleteBusy,
+    TaskDeleteSnapshot,
+    TaskExtensionCleanupRejected,
+    commit_task_deletion,
+    finish_task_deletion,
+    task_delete_snapshot,
+    task_is_active_for_delete,
+)
 from ...services.task_execution_controller import TaskControlState
 from ...services.task_interaction_read import get_pending_interaction_question
 from ...services.task_orchestrator import (
@@ -85,6 +97,8 @@ from . import _events_stream
 from ._step_mapping import map_trace_events_to_public_steps
 from .deps import ApiKeyPrincipal, get_principal_from_api_key, record_key_usage
 from .errors import V1ApiError, V1ErrorCode, raise_for_turn_rejection
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -521,6 +535,33 @@ def _resolve_task_or_404(task_id: int, principal: ApiKeyPrincipal, db: Session) 
         )
     except task_start_service.TaskStartRejected as exc:
         _raise_start_rejection(exc)
+
+
+# A task an executor may still be writing to is refused rather than deleted
+# out from under it; a finished/paused/waiting task is deletable.
+def _raise_if_task_active_for_delete(db: Session, task: Task) -> None:
+    if task_is_active_for_delete(db, task):
+        raise V1ApiError(
+            V1ErrorCode.TASK_BUSY,
+            409,
+            message=(
+                "Task is running or has queued work; wait for it to finish before "
+                "deleting it."
+            ),
+        )
+
+
+def _load_task_delete_snapshot(
+    task_id: int,
+    principal: ApiKeyPrincipal,
+) -> TaskDeleteSnapshot:
+    """Authorize and guard one task inside a worker-owned short Session."""
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        task = _resolve_task_or_404(task_id, principal, db)
+        _raise_if_task_active_for_delete(db, task)
+        return task_delete_snapshot(task)
 
 
 def _task_file_source(file_record: UploadedFile) -> Literal["output", "upload"]:
@@ -1035,6 +1076,93 @@ async def reply_to_waiting_task(
     from .task_reply import reply_to_task
 
     return await reply_to_task(task_id=task_id, request=request, principal=principal)
+
+
+@router.delete("/chat/tasks/{task_id}", response_model=DeleteTaskResponse)
+async def delete_chat_task(
+    task_id: int,
+    principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
+) -> DeleteTaskResponse:
+    """Delete one SDK task and everything tied to it.
+
+    The task is resolved through the same ownership rule as
+    ``GET /v1/chat/tasks/{task_id}``: a task of another agent, another
+    user's agent, or a nonexistent id all answer the same 404. A task
+    that is executing, holds an unexpired execution lease, or has an
+    accepted command still queued answers 409 ``task_busy`` instead of
+    being deleted out from under its executor; wait for it to finish
+    and retry. The final re-check runs under a row lock, which is
+    effective on PostgreSQL only; SQLite leaves a small window between
+    the check and the delete.
+
+    The owned rows (trace events/blobs/checkpoints, chat messages, DAG
+    executions, interaction requests, connector runtime context, runtime
+    extension bindings), the uploaded-file bindings, and the workspace
+    are removed through the same helper the Web UI delete uses. External
+    cleanup that fails is recorded as a retryable obligation, never a
+    half state reported as success: ``workspace_cleanup_pending`` and
+    ``external_cleanup_pending`` in the response say whether anything is
+    still owed. Deleting twice answers 404.
+
+    Raises:
+        V1ApiError 401: missing / invalid / revoked key.
+        V1ApiError 404: task missing or not owned by the calling key.
+        V1ApiError 409: ``task_busy`` -- running or queued, retry after it ends.
+        V1ApiError 410: ``task_expired`` for a retention-expired task.
+        V1ApiError 503: a bound runtime extension could not release its
+            state; the task was not deleted.
+    """
+    snapshot = await run_db_io_cancellation_safe(
+        lambda: _load_task_delete_snapshot(task_id, principal)
+    )
+    try:
+        committed = await commit_task_deletion(snapshot, refuse_if_active=True)
+    except TaskDeleteBusy as exc:
+        raise V1ApiError(
+            V1ErrorCode.TASK_BUSY,
+            409,
+            message=(
+                "Task became active during deletion; wait for it to finish "
+                "before deleting it."
+            ),
+        ) from exc
+    except TaskExtensionCleanupRejected as exc:
+        raise V1ApiError(
+            V1ErrorCode.INTERNAL_ERROR,
+            503,
+            message="Runtime extension cleanup failed; the task was not deleted.",
+        ) from exc
+    if committed is None:
+        raise V1ApiError(V1ErrorCode.TASK_NOT_FOUND, 404)
+
+    # The rows are committed as gone: detach this task's WebSocket
+    # connections before the next await, then stop any in-process executor and
+    # close the sockets before the workspace is reclaimed, as the Web UI
+    # delete does. The guards above refuse a task that is leased or has queued
+    # work, so this only reaches executors that started in the window the
+    # pre-checks cannot close. The cleanup runs as its own task and is
+    # shielded, so a cancelled request cannot leave sockets detached but open.
+    from ...services.task_execution import background_task_manager
+    from ..websocket import manager as websocket_manager
+
+    connections = websocket_manager.detach_task_connections(task_id)
+
+    async def _cleanup_runtime_state() -> None:
+        await background_task_manager.cancel_task(task_id, timeout_seconds=0.05)
+        for connection in connections:
+            try:
+                await connection.close()
+            except Exception:
+                logger.warning("Failed to close WebSocket connection", exc_info=True)
+
+    await asyncio.shield(asyncio.create_task(_cleanup_runtime_state()))
+    outcome = await finish_task_deletion(committed)
+    await record_key_usage(str(principal.key.key_prefix))
+    return DeleteTaskResponse(
+        task_id=task_id,
+        workspace_cleanup_pending=outcome.workspace_cleanup_pending,
+        external_cleanup_pending=outcome.external_cleanup_pending,
+    )
 
 
 @router.post(

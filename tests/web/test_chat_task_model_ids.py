@@ -2392,7 +2392,7 @@ def test_delete_task_reports_concurrent_disappearance(
     user1_headers,
     monkeypatch,
 ):
-    import xagent.web.api.chat as chat_module
+    import xagent.web.services.task_delete as task_delete_module
     from xagent.web.models.database import get_db
     from xagent.web.models.task import Task
     from xagent.web.models.user import User
@@ -2407,7 +2407,9 @@ def test_delete_task_reports_concurrent_disappearance(
     finally:
         db.close()
 
-    monkeypatch.setattr(chat_module, "_delete_task_sync", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        task_delete_module, "_delete_task_rows_sync", lambda **_kwargs: None
+    )
 
     response = client.delete(f"/api/chat/task/{task_id}", headers=user1_headers)
 
@@ -2420,7 +2422,7 @@ def test_delete_task_core_failure_is_retry_safe_for_idempotent_provider(
     user1_headers,
     monkeypatch,
 ):
-    import xagent.web.api.chat as chat_module
+    import xagent.web.services.task_delete as task_delete_module
     from xagent.web.models.database import get_db
     from xagent.web.models.task import Task
     from xagent.web.models.user import User
@@ -2451,13 +2453,13 @@ def test_delete_task_core_failure_is_retry_safe_for_idempotent_provider(
     finally:
         db.close()
 
-    original_delete = chat_module._delete_task_sync
+    original_delete = task_delete_module._delete_task_rows_sync
 
     def fail_delete(**_kwargs):
         raise RuntimeError("core delete unavailable")
 
     try:
-        monkeypatch.setattr(chat_module, "_delete_task_sync", fail_delete)
+        monkeypatch.setattr(task_delete_module, "_delete_task_rows_sync", fail_delete)
         first = client.delete(f"/api/chat/task/{task_id}", headers=user1_headers)
         assert first.status_code == 500
         assert first.json()["detail"] == "Internal server error"
@@ -2468,7 +2470,9 @@ def test_delete_task_core_failure_is_retry_safe_for_idempotent_provider(
         finally:
             db.close()
 
-        monkeypatch.setattr(chat_module, "_delete_task_sync", original_delete)
+        monkeypatch.setattr(
+            task_delete_module, "_delete_task_rows_sync", original_delete
+        )
         second = client.delete(f"/api/chat/task/{task_id}", headers=user1_headers)
         assert second.status_code == 200
         assert [event for event, _task_id in provider.events] == [

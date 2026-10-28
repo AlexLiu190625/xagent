@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, NoReturn, Optional, Sequence, cast
+from typing import Any, Dict, List, NoReturn, Optional, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -27,7 +27,6 @@ from ..models.agent import Agent, is_workforce_generated_manager_agent
 from ..models.chat_message import TaskChatMessage
 from ..models.database import (
     get_db,
-    get_session_local,
     release_db_connection_if_clean,
 )
 from ..models.model import Model as DBModel
@@ -75,15 +74,11 @@ from ..services.managed_file_ref import async_ensure_uploaded_file_local_path
 from ..services.model_service import _get_visible_user_ids
 from ..services.public_trace_events import public_task_trace_filter
 from ..services.task_auto_recovery import current_auto_recovery_view
-from ..services.task_cleanup_obligations import (
-    CleanupObligation,
-    CleanupObligationStatus,
-    RecordedCleanupObligation,
-    captured_workspace_obligation,
-    describe_cleanup_failure,
-    extension_obligation,
-    record_cleanup_obligations_no_commit,
-    settle_cleanup_attempts_sync,
+from ..services.task_delete import (
+    TaskExtensionCleanupRejected,
+    commit_task_deletion,
+    finish_task_deletion,
+    load_task_delete_snapshot_sync,
 )
 from ..services.task_deletion import purge_task_rows
 from ..services.task_event_display import project_event_message
@@ -93,15 +88,9 @@ from ..services.task_runtime import (
     TaskRuntimeExtensionError,
     agent_config_with_task_extension_bindings,
     create_task_extensions,
-    delete_task_extensions,
     get_task_runtime_public_metadata,
-    registered_task_extensions,
     sanitize_client_agent_config,
-    task_extension_bindings_from_agent_config,
     validate_task_extension_requests,
-)
-from ..services.task_workspace_cleanup import (
-    capture_workspace_cleanup_target_best_effort,
 )
 from ..services.workforce_runtime import resolve_workforce_task_runtime
 from ..utils.db_timezone import format_datetime_for_api, safe_timestamp_to_unix
@@ -197,76 +186,6 @@ def _compensate_failed_task_extension_create(
     db.commit()
     if deleted:
         invalidate_task_cache(task_id)
-
-
-def _load_task_delete_snapshot_sync(
-    *,
-    task_id: int,
-    requester_user_id: int,
-    is_admin: bool,
-) -> tuple[str, int, Any, tuple[str, ...]] | None:
-    """Load detached delete inputs without sharing the request session.
-
-    The fourth element is the task's runtime-extension binding record, so
-    provider cleanup dispatches only to providers this task actually bound to.
-    """
-
-    session_factory = get_session_local()
-    delete_db = session_factory()
-    try:
-        query = delete_db.query(Task).filter(Task.id == task_id)
-        if not is_admin:
-            query = query.filter(Task.user_id == requester_user_id)
-        task = query.first()
-        if task is None:
-            return None
-        return (
-            str(task.title),
-            int(task.user_id),
-            task.source,
-            task_extension_bindings_from_agent_config(task.agent_config),
-        )
-    finally:
-        delete_db.close()
-
-
-def _delete_task_sync(
-    *,
-    task_id: int,
-    workspace: CleanupObligation,
-    extensions: Sequence[CleanupObligation] = (),
-) -> RecordedCleanupObligation | None:
-    """Delete one task in an operation-local session.
-
-    The external cleanup this deletion will owe commits with the rows, so it
-    is on record exactly when the rows are gone. The workspace obligation is
-    returned for the caller to settle after its inline removal, and is not due
-    for the retry driver before then; the extensions are nothing this caller
-    will attempt, so they are due at once.
-
-    Returns ``None`` when the task no longer exists.
-    """
-
-    session_factory = get_session_local()
-    delete_db = session_factory()
-    try:
-        deleted = purge_task_rows(
-            delete_db, task_id=task_id, detached_reason="task_deleted"
-        )
-        if not deleted:
-            delete_db.rollback()
-            return None
-        [recorded] = record_cleanup_obligations_no_commit(
-            delete_db, [workspace], inline_attempt=True
-        )
-        record_cleanup_obligations_no_commit(delete_db, extensions)
-        delete_db.commit()
-        return recorded
-    except Exception:
-        delete_db.rollback()
-        raise
-    finally:
-        delete_db.close()
 
 
 def _build_unique_workspace_target(base_dir: Path, filename: str) -> Path:
@@ -1811,7 +1730,7 @@ async def delete_task(
             )
         release_db_connection_if_clean(db)
         task_snapshot = await asyncio.to_thread(
-            _load_task_delete_snapshot_sync,
+            load_task_delete_snapshot_sync,
             task_id=task_id,
             requester_user_id=requester_user_id,
             is_admin=is_admin,
@@ -1822,93 +1741,16 @@ async def delete_task(
             # control for one, and a 410 here would gain a caller nothing
             # beyond what GET already discloses (#2565).
             raise HTTPException(status_code=404, detail="Task not found")
-        task_title, task_user_id, task_source, bound_extensions = task_snapshot
-        runtime_context = agent_runtime_service._task_runtime_context(
-            task_id=task_id,
-            user_id=task_user_id,
-            source=task_source,
-        )
-
         try:
-            # Only the providers this task actually bound to are dispatched, so
-            # an unrelated broken extension cannot block deletion.
-            unreleased = await delete_task_extensions(
-                runtime_context,
-                bound_extensions=bound_extensions,
-                force=force,
-            )
-        except TaskRuntimeExtensionError as exc:
-            logger.error(
-                "Runtime extension cleanup failed; preserving task %s for retry",
-                task_id,
-                exc_info=True,
-            )
+            committed = await commit_task_deletion(task_snapshot, force=force)
+        except TaskExtensionCleanupRejected as exc:
             raise HTTPException(
                 status_code=503,
                 detail=("Runtime extension cleanup failed; the task was not deleted"),
             ) from exc
-        if unreleased:
-            logger.error(
-                "Deleting task %s with unreleased runtime extension state for %s",
-                task_id,
-                ", ".join(unreleased),
-            )
-
-        # Captured while the row still exists: the workspace's base directory
-        # comes from this task's execution scope, and that scope is no longer
-        # resolvable once the row is gone. A capture that fails degrades to
-        # resolving at cleanup time -- no worse than not capturing at all --
-        # rather than blocking a deletion the caller already asked for.
-        workspace_target = await asyncio.to_thread(
-            capture_workspace_cleanup_target_best_effort, task_id, task_user_id
-        )
-
-        # Recorded with the row deletion, before anything is attempted: if the
-        # removal below fails, or this process dies before reaching it, the
-        # obligation is what the retry driver finds. A failed capture records
-        # the unscoped candidates the post-deletion fallback would probe, and
-        # is marked so that clearing them is not mistaken for a full cleanup.
-        workspace_owed = captured_workspace_obligation(
-            task_id, task_user_id, workspace_target
-        )
-        # Provider state still held past this point is one of two things. A
-        # provider that is not registered in this process was never asked, and
-        # stays owed until one that can release it is. A registered provider
-        # that failed was only deleted past because an admin forced it: that
-        # leak was accepted, so it is recorded for the reconciliation list but
-        # never retried.
-        registered = set(registered_task_extensions())
-        extensions_owed = []
-        for name in unreleased:
-            if name in registered:
-                status = CleanupObligationStatus.ABANDONED
-                reason: str | None = (
-                    "force delete accepted this runtime extension's state as "
-                    "leaked; it was not released"
-                )
-            else:
-                status = CleanupObligationStatus.PENDING
-                reason = None
-            extensions_owed.append(
-                extension_obligation(
-                    task_id=task_id,
-                    user_id=task_user_id,
-                    source=task_source,
-                    extension=name,
-                    status=status,
-                    reason=reason,
-                )
-            )
-
-        recorded_workspace = await asyncio.to_thread(
-            _delete_task_sync,
-            task_id=task_id,
-            workspace=workspace_owed,
-            extensions=extensions_owed,
-        )
-        if recorded_workspace is None:
+        if committed is None:
             raise HTTPException(status_code=404, detail="Task no longer exists")
-        invalidate_task_cache(task_id)
+        task_title = task_snapshot.task_title
 
         # Before the next await, not after it. The rows are committed as
         # deleted at this point, and everything below suspends: a cancelled
@@ -1939,49 +1781,10 @@ async def delete_task(
 
         asyncio.create_task(_cleanup_runtime_state())
 
-        # The task's own owner, not the requester: an admin deleting someone
-        # else's task would otherwise send cleanup at the admin's user-scoped
-        # workspace root and leave the owner's directory behind.
-        #
         # Past the commit above there is nothing left to roll back, so a
-        # cleanup failure cannot fail the request: reporting 500 here would
-        # tell the client the deletion did not happen, and its retry would get
-        # a 404. Report the deletion as done with cleanup outstanding instead.
-        #
-        # A capture that failed is already a pending cleanup: what follows can
-        # only look under the unscoped candidates, so a workspace written under
-        # a scope segment will not be found. Reporting it as cleaned would make
-        # this field silent in precisely the case it exists to surface.
-        #
-        # Off the event loop, like the account-level path and like the
-        # orchestrator's own call: removal is a recursive rmtree, and a
-        # workspace holding a large tree would otherwise stall every request on
-        # this worker.
-        workspace_error: str | None = None
-        try:
-            await asyncio.to_thread(
-                agent_runtime_service.get_agent_manager(request).remove_agent,
-                task_id,
-                task_user_id,
-                workspace_target=workspace_target,
-            )
-        except Exception as exc:
-            workspace_error = describe_cleanup_failure(exc)
-            logger.error(
-                "Task %s rows were deleted but its workspace cleanup failed; "
-                "the retry driver will re-attempt it",
-                task_id,
-                exc_info=True,
-            )
-        # Pending means the obligation is still in the table: a failed removal
-        # the driver will retry, or a scope nobody could resolve, which is on
-        # the operator's list.
-        [workspace_status] = await asyncio.to_thread(
-            settle_cleanup_attempts_sync,
-            get_session_local(),
-            [(recorded_workspace, workspace_error)],
-        )
-        workspace_cleanup_pending = workspace_status is not None
+        # cleanup failure cannot fail the request: report the deletion as done
+        # with the obligation still pending instead.
+        outcome = await finish_task_deletion(committed, request=request)
 
         logger.info(f"Task {task_id} deleted successfully")
 
@@ -1991,12 +1794,11 @@ async def delete_task(
             "task_id": task_id,
             # Always present, so a client can tell "cleaned up" from "rows
             # gone, resources outstanding" without inferring it from absence.
-            "workspace_cleanup_pending": workspace_cleanup_pending,
+            "workspace_cleanup_pending": outcome.workspace_cleanup_pending,
             # The workspace or any runtime-extension state is still owed --
             # to the retry driver, or to an operator for what it will not
             # retry.
-            "external_cleanup_pending": workspace_cleanup_pending
-            or bool(extensions_owed),
+            "external_cleanup_pending": outcome.external_cleanup_pending,
         }
 
     except HTTPException:

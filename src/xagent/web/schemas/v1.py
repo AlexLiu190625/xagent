@@ -582,6 +582,24 @@ class ReplyResponse(BaseModel):
     control_state: str = Field(..., description="Detailed task control state.")
 
 
+class DeleteTaskResponse(BaseModel):
+    """``DELETE /v1/chat/tasks/{task_id}`` -> 200 response.
+
+    The rows are gone when this is returned. The two flags say whether the
+    workspace or any other external resource (runtime-extension state, a
+    workspace that could not be removed) is still owed to the retry driver.
+    """
+
+    task_id: int = Field(..., description="The deleted task's id.")
+    workspace_cleanup_pending: bool = Field(
+        ..., description="The task workspace is still on disk and owed cleanup."
+    )
+    external_cleanup_pending: bool = Field(
+        ...,
+        description="The workspace or runtime-extension state is still owed cleanup.",
+    )
+
+
 class CancelQuestionResponse(BaseModel):
     """``POST /v1/chat/tasks/{task_id}/cancel-question`` -> 202 response.
 
