@@ -776,6 +776,10 @@ async def _request_oauth_refresh_with_retries(
 # meta_invalid_token_error_code) are Meta-specific and unambiguous, unlike
 # RFC 6749's own invalid_grant string, so they're listed here too rather
 # than trusted for every provider.
+# Google's dead-token signal additionally requires an exact response
+# description and HTTP 400, so it is handled by
+# oauth_provider_quirks.is_google_revoked_refresh_error instead of this
+# code-only table.
 _PROVIDER_DEAD_REFRESH_TOKEN_ERROR_CODES: dict[str, frozenset[str]] = {
     # GitHub's classic OAuth Apps token endpoint reports a dead
     # refresh_token via a 200 response with this code, not a 4xx.
@@ -809,8 +813,8 @@ class _OAuthRefreshPermanentlyInvalid(Exception):
     """
 
 
-def _oauth_refresh_error_code(
-    response: httpx.Response, provider_name: str
+def _oauth_refresh_error_code_from_payload(
+    data: Mapping[str, Any], provider_name: str
 ) -> str | None:
     """Best-effort OAuth ``error`` code from a failed refresh response body.
 
@@ -821,6 +825,19 @@ def _oauth_refresh_error_code(
     carry the same type/code-shaped keys isn't misread as Meta's.
     """
     from ..oauth_provider_quirks import meta_invalid_token_error_code
+
+    error = data.get("error")
+    if isinstance(error, str) and error:
+        return error
+    if provider_name.lower() == "meta":
+        return meta_invalid_token_error_code(error)
+    return None
+
+
+def _oauth_refresh_error_payload(
+    response: httpx.Response,
+) -> Mapping[str, Any] | None:
+    """Best-effort structured OAuth error body from one refresh response."""
 
     try:
         data = response.json()
@@ -833,18 +850,16 @@ def _oauth_refresh_error_code(
         # let an exotic exception escape uncaught to the caller's generic
         # handler and lose the status-code-bearing log line above it.
         return None
-    if not data or not isinstance(data, Mapping):
-        return None
-    error = data.get("error")
-    if isinstance(error, str) and error:
-        return error
-    if provider_name.lower() == "meta":
-        return meta_invalid_token_error_code(error)
-    return None
+    return data if data and isinstance(data, Mapping) else None
 
 
 def _is_permanent_oauth_refresh_error(
-    provider_name: str, status_code: int, error_code: str | None
+    provider_name: str,
+    status_code: int,
+    error_code: str | None,
+    *,
+    error_description: object = None,
+    error_subtype: object = None,
 ) -> bool:
     """Whether the provider's error body unambiguously says the refresh
     token itself is dead. Any other failure (an unrecognized error code, a
@@ -868,6 +883,14 @@ def _is_permanent_oauth_refresh_error(
     """
     if status_code >= 500:
         return False
+    if provider_name.lower() == "google" and status_code == 400:
+        from ..oauth_provider_quirks import is_google_revoked_refresh_error
+
+        return is_google_revoked_refresh_error(
+            error_code=error_code,
+            error_description=error_description,
+            error_subtype=error_subtype,
+        )
     return error_code in _PROVIDER_DEAD_REFRESH_TOKEN_ERROR_CODES.get(
         provider_name.lower(), frozenset()
     )
@@ -888,16 +911,29 @@ def _log_and_classify_failed_refresh(
     # token-endpoint text rather than a second, independently-tunable copy.
     from ..api.auth import _OAUTH_ERROR_MESSAGE_LIMIT
 
-    error_code = _oauth_refresh_error_code(response, provider_name)
+    payload = _oauth_refresh_error_payload(response)
+    error_code = (
+        _oauth_refresh_error_code_from_payload(payload, provider_name)
+        if payload
+        else None
+    )
+    error_description = payload.get("error_description") if payload else None
+    error_subtype = payload.get("error_subtype") if payload else None
+    classified_permanent = _is_permanent_oauth_refresh_error(
+        provider_name,
+        response.status_code,
+        error_code,
+        error_description=error_description,
+        error_subtype=error_subtype,
+    )
     logger.error(
-        "Failed to refresh %s token (status %s, error=%s)",
+        "Failed to refresh %s token (status %s, error=%s, classified_permanent=%s)",
         provider_name,
         response.status_code,
         (error_code or "unknown")[:_OAUTH_ERROR_MESSAGE_LIMIT],
+        classified_permanent,
     )
-    if _is_permanent_oauth_refresh_error(
-        provider_name, response.status_code, error_code
-    ):
+    if classified_permanent:
         raise _OAuthRefreshPermanentlyInvalid()
 
 
