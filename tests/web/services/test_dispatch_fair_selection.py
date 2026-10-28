@@ -356,6 +356,75 @@ def test_a_tenant_whose_oldest_commands_cannot_be_claimed_is_missed_then_skipped
     _, again = recorded(world, lambda: scan(cap, attempt=attempt()))
     assert windows_asked(again) == ["batch"]
     assert transport.drain_fair_misses() == 0
+    # b supplied the command both times, so no scan took the plain lookup.
+    assert transport.drain_fair_bypasses() == (0, 0)
+
+
+def test_scans_that_every_listed_tenant_misses_are_counted_until_drained(
+    world, on, clock
+):
+    for tenant in ("a", "b"):
+        for _ in range(16):
+            world.add(tenant, pinned=True)
+    oldest_claimable = world.add("a")
+    cap = cap_of()
+
+    # Both windows hold only commands leased elsewhere, so both tenants miss and
+    # the plain lookup decides. The next scan asks no tenant, both being skipped.
+    assert scan(cap, attempt=attempt()) == oldest_claimable
+    assert scan(cap, attempt=attempt()) == oldest_claimable
+
+    assert transport.drain_fair_misses() == 2
+    assert transport.drain_fair_bypasses() == (0, 2)
+    assert transport.drain_fair_bypasses() == (0, 0)
+
+
+def test_with_the_switch_off_no_scan_is_counted(world, clock, monkeypatch):
+    for tenant in ("a", "b"):
+        for _ in range(16):
+            world.add(tenant, pinned=True)
+    world.add("a")
+    monkeypatch.setenv(SWITCH, "false")
+    monkeypatch.setattr(transport, "_fair_share_memo", None)
+    transport._fair_state.since_fallback = EVERY - 1
+
+    scan(cap_of(), attempt=transport._new_fair_attempt())
+
+    assert transport.drain_fair_bypasses() == (0, 0)
+
+
+def test_a_queue_of_one_tenant_is_not_counted_as_all_missed(world, on, clock):
+    for _ in range(16):
+        world.add("a", pinned=True)
+    oldest_claimable = world.add("a")
+
+    assert scan(cap_of(), attempt=attempt()) == oldest_claimable
+    assert transport.drain_fair_bypasses() == (0, 0)
+
+
+@pytest.mark.parametrize("line", ["balance", "attempt count"])
+def test_each_attempt_decided_as_a_fallback_round_is_counted_once(
+    line, world, on, clock
+):
+    world.add("a")
+    world.add("b")
+    cap = cap_of()
+    if line == "balance":
+        transport._fair_state.since_fallback = EVERY - 1
+    else:
+        transport._fair_state.attempts_since_fallback = AFTER
+
+    one = attempt()
+    scan(cap, attempt=one)
+    scan(cap, attempt=one)
+    scan(cap, attempt=attempt(), command_db_id=1)
+
+    assert one.fallback
+    assert transport.drain_fair_bypasses() == (1, 0)
+    transport._fair_state.since_fallback = 0
+    transport._fair_state.attempts_since_fallback = 0
+    scan(cap, attempt=attempt())
+    assert transport.drain_fair_bypasses() == (0, 0)
 
 
 EVERY = transport.FAIR_SHARE_FALLBACK_EVERY
@@ -1147,7 +1216,14 @@ def test_the_state_is_used_only_under_the_lock_and_no_statement_runs_under_it(
         for _ in range(5):
             world.add(tenant)
     lock = RecordingLock()
-    watched = {"since_fallback", "attempts_since_fallback", "skips", "misses"}
+    watched = {
+        "since_fallback",
+        "attempts_since_fallback",
+        "skips",
+        "misses",
+        "fallbacks",
+        "all_missed",
+    }
 
     class Guarded(transport._FairState):
         def __getattribute__(self, name):
@@ -1165,6 +1241,8 @@ def test_the_state_is_used_only_under_the_lock_and_no_statement_runs_under_it(
     object.__setattr__(state, "attempts_since_fallback", 0)
     object.__setattr__(state, "skips", {})
     object.__setattr__(state, "misses", 0)
+    object.__setattr__(state, "fallbacks", 0)
+    object.__setattr__(state, "all_missed", 0)
     monkeypatch.setattr(transport, "_fair_state", state)
     monkeypatch.setattr(transport, "_fair_state_lock", lock)
     problems: list[str] = []

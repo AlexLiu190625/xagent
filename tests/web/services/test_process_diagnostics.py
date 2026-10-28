@@ -578,6 +578,8 @@ def _counters(**overrides) -> process_diagnostics.ExecutionCounters:
         "loop_lag_max_ms": 0.0,
         "loop_lag_samples": 0,
         "fair_misses": 0,
+        "fair_fallbacks": 0,
+        "fair_all_missed": 0,
     }
     fields.update(overrides)
     return process_diagnostics.ExecutionCounters(**fields)
@@ -619,11 +621,14 @@ async def test_a_process_that_dispatches_nothing_reports_no_slot_tenants(
     assert " slot_tenants=0 slot_top=0 " in counters.format_line()
 
 
-def test_the_line_carries_the_active_degradations_before_the_fair_misses():
+def test_the_line_carries_the_active_degradations_before_the_fair_counts():
     idle = _counters().format_line()
-    assert idle.endswith(" loop_lag_samples=0 degradations=- fair_misses=0")
+    assert idle.endswith(
+        " loop_lag_samples=0 degradations=- fair_misses=0 fair_fallbacks=0"
+        " fair_all_missed=0"
+    )
     line = _counters(degradations=("a_signal", "b_signal")).format_line()
-    assert line.endswith(" degradations=a_signal,b_signal fair_misses=0")
+    assert " degradations=a_signal,b_signal fair_misses=0 " in line
 
 
 @pytest.mark.asyncio
@@ -641,9 +646,11 @@ async def test_drain_reports_this_processes_degradations_sorted(manager, monkeyp
     assert "detail" not in line
 
 
-def test_the_line_ends_with_the_fair_misses_of_the_window():
-    line = _counters(fair_misses=2).format_line()
-    assert line.endswith(" loop_lag_samples=0 degradations=- fair_misses=2")
+def test_the_line_ends_with_the_fair_counts_of_the_window():
+    line = _counters(fair_misses=2, fair_fallbacks=3, fair_all_missed=4).format_line()
+    assert line.endswith(
+        " degradations=- fair_misses=2 fair_fallbacks=3 fair_all_missed=4"
+    )
 
 
 @pytest.mark.asyncio
@@ -660,5 +667,24 @@ async def test_a_window_reports_the_fair_misses_since_the_last_one(
     second = process_diagnostics.drain_execution_counters(now=20.0)
 
     assert (first.fair_misses, second.fair_misses) == (2, 0)
-    assert first.format_line().endswith(" fair_misses=2")
-    assert second.format_line().endswith(" fair_misses=0")
+    assert " fair_misses=2 " in first.format_line()
+    assert " fair_misses=0 " in second.format_line()
+
+
+@pytest.mark.asyncio
+async def test_a_window_reports_the_fallback_rounds_and_all_missed_scans_since_the_last_one(
+    manager, monkeypatch
+):
+    monkeypatch.setenv("XAGENT_TASK_EXECUTION_ROLE", "combined")
+    monkeypatch.setattr(process_diagnostics._window, "started_at", 0.0)
+    state = transport._FairState()
+    state.fallbacks, state.all_missed = 3, 1
+    monkeypatch.setattr(transport, "_fair_state", state)
+
+    first = process_diagnostics.drain_execution_counters(now=10.0)
+    second = process_diagnostics.drain_execution_counters(now=20.0)
+
+    assert (first.fair_fallbacks, first.fair_all_missed) == (3, 1)
+    assert (second.fair_fallbacks, second.fair_all_missed) == (0, 0)
+    assert first.format_line().endswith(" fair_fallbacks=3 fair_all_missed=1")
+    assert second.format_line().endswith(" fair_fallbacks=0 fair_all_missed=0")

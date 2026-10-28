@@ -2182,6 +2182,11 @@ class _FairState:
         self.skips: dict[tuple[str, str], float] = {}
         # Window queries that found nothing since the diagnostics line last asked.
         self.misses = 0
+        # Since the diagnostics line last asked: counted attempts decided as
+        # fallback rounds, and scans that ranked tenants but took the plain lookup
+        # because no tenant asked had a claimable command or none could be asked.
+        self.fallbacks = 0
+        self.all_missed = 0
 
 
 _fair_state = _FairState()
@@ -2201,6 +2206,18 @@ def drain_fair_misses() -> int:
         misses = _fair_state.misses
         _fair_state.misses = 0
     return misses
+
+
+def drain_fair_bypasses() -> tuple[int, int]:
+    """The fallback rounds and the all-missed scans since the last call, and start again.
+
+    The diagnostics line reports both counts for its window.
+    """
+    with _fair_state_lock:
+        bypasses = (_fair_state.fallbacks, _fair_state.all_missed)
+        _fair_state.fallbacks = 0
+        _fair_state.all_missed = 0
+    return bypasses
 
 
 def _fair_live_skips() -> frozenset[tuple[str, str]]:
@@ -2302,6 +2319,8 @@ def _ranks_tenants(
                     or _fair_state.attempts_since_fallback
                     > FAIR_SHARE_FALLBACK_AFTER_ATTEMPTS
                 )
+                if attempt.fallback:
+                    _fair_state.fallbacks += 1
     return has_room and not attempt.fallback
 
 
@@ -2379,6 +2398,8 @@ def _fair_pick(
             best = min(hits, key=lambda row: ages[row.dispatch_class])
             break
     if best is None:
+        with _fair_state_lock:
+            _fair_state.all_missed += 1
         return oldest_claimable()
     active = cap.active_ids if cap is not None else frozenset()
     older = _older_needing_no_new_slot(claimable, best.id, active)

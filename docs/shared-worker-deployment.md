@@ -58,7 +58,7 @@ Every app process (`combined` or `web` role) and every worker logs one INFO line
 per minute, including minutes with no work:
 
 ```
-runtime diagnostics role=worker pid=4242 window_s=60.0 inflight=1 resume_inflight=0 started_1m=2 finished_1m=1 ok=1 failed=0 cancelled=0 gate_held_s=0.0 slot_tenants=1 slot_top=1 loop_lag_max_ms=12.3 loop_lag_samples=0 degradations=- fair_misses=0
+runtime diagnostics role=worker pid=4242 window_s=60.0 inflight=1 resume_inflight=0 started_1m=2 finished_1m=1 ok=1 failed=0 cancelled=0 gate_held_s=0.0 slot_tenants=1 slot_top=1 loop_lag_max_ms=12.3 loop_lag_samples=0 degradations=- fair_misses=0 fair_fallbacks=0 fair_all_missed=0
 ```
 
 Read the lines per `pid`. A pid that keeps logging `inflight=0` is alive and
@@ -90,8 +90,18 @@ line is where a worker's degradations appear. `fair_misses` is how many times
 in the minute a query for the commands of one tenant key and dispatch class found
 nothing this process could claim; that pair is then skipped for two seconds. It
 is 0 when `XAGENT_DISPATCHER_FAIR_SHARE` is off and in a process that does not
-dispatch task commands. The line is not logged when `XAGENT_LOG_LEVEL` is above
-`INFO`.
+dispatch task commands. `fair_fallbacks` is how many dispatch attempts in the
+minute were fallback rounds, which take the oldest claimable command instead of
+ranking tenants; a fallback round that dispatched nothing counts too, so after a
+stretch of attempts that open no slot every attempt counts until one fallback
+round dispatches a command holding a slot token. `fair_all_missed` is how many
+scans in the minute ranked at least two tenant keys and still fell back to the
+oldest claimable command, if any, because no tenant asked had a command the
+process could claim or every tenant was skipped or held back; a scan repeated
+after a task is set aside counts again. Both are 0 when
+`XAGENT_DISPATCHER_FAIR_SHARE` is off and in a process that does not dispatch
+task commands. The line is not logged when `XAGENT_LOG_LEVEL` is
+above `INFO`.
 
 Runtime metrics (OpenTelemetry, OTLP/HTTP) are separate from this line and off
 unless configured (`XAGENT_RUNTIME_TELEMETRY_ENABLED` or an OTLP metrics
@@ -123,8 +133,9 @@ dispatch class reads it (both use one parse per value), and where the
 policy or classifier changes. The value
 in use is logged as `fair_share=` on the process's `dispatch policy` line, at its
 first dispatch snapshot and whenever the value, the policy or the classifier
-changes, so that line tells whether the switch is on; `fair_misses` is 0 both
-when it is off and when it is on with nothing missed.
+changes, so that line tells whether the switch is on; `fair_misses`,
+`fair_fallbacks` and `fair_all_missed` are 0 both when it is off and when it is on
+with nothing to count.
 
 `POST /v1/chat/tasks` takes an optional `dispatch_class`, `interactive` or
 `batch`, which is stored with the task exactly as sent. `XAGENT_DISPATCH_ACCEPT_REQUESTED_CLASS`
