@@ -1931,7 +1931,8 @@ def _fair_share_enabled() -> bool:
 # FAIR_SHARE_TENANTS_PER_SCAN ranked tenants for the best command it can claim among
 # the FAIR_SHARE_WINDOW highest-priority, then oldest, queued commands of one
 # (tenant key, dispatch class). A (tenant key, class) that has none is not asked
-# again for FAIR_SHARE_SKIP_SECONDS.
+# again for FAIR_SHARE_SKIP_SECONDS, unless its tenant is the only one ranked: no
+# other tenant could take that turn, so every scan asks it again.
 #
 # A fallback round reads the queue as it always did, so that a command only the full
 # scan can reach is not left behind. Fallback rounds aim at one in every
@@ -2188,14 +2189,16 @@ class _FairState:
         # and whether they dispatched at all.
         self.attempts_since_fallback = 0
         # Until when (``_fair_clock``) a (tenant key, dispatch class) is not asked.
+        # When only one tenant is ranked, ranking neither reads nor writes it.
         self.skips: dict[tuple[str, str], float] = {}
         # Window queries that found nothing since the diagnostics line last asked.
         # Attempts that read the skip table before one of them records a miss each
         # query and count the same (tenant key, class), so this counts lookups.
         self.misses = 0
         # Since the diagnostics line last asked: counted attempts decided as
-        # fallback rounds, and scans that ranked tenants but took the plain lookup
-        # because no tenant asked had a claimable command or none could be asked.
+        # fallback rounds, and scans that ranked at least two tenants but took the
+        # plain lookup because no tenant asked had a claimable command or none
+        # could be asked.
         self.fallbacks = 0
         self.all_missed = 0
 
@@ -2241,10 +2244,12 @@ def _fair_live_skips() -> frozenset[tuple[str, str]]:
         return frozenset(skips)
 
 
-def _fair_record_miss(key: str, dispatch_class: str) -> None:
+def _fair_record_miss(key: str, dispatch_class: str, skip: bool = True) -> None:
+    """Count a window query that found nothing and, with ``skip``, skip the pair."""
     until = _fair_clock() + FAIR_SHARE_SKIP_SECONDS
     with _fair_state_lock:
-        _fair_state.skips[(key, dispatch_class)] = until
+        if skip:
+            _fair_state.skips[(key, dispatch_class)] = until
         _fair_state.misses += 1
 
 
@@ -2377,7 +2382,10 @@ def _fair_pick(
     and the oldest claimable command older than that which needs no new slot
     (``_older_needing_no_new_slot``) is taken in its place. A (tenant key, class)
     with no claimable command in its window is missed and skipped for a while.
-    With no tenant ranked, the plain lookup decides. So it returns None only when
+    With no tenant listed, the plain lookup decides. A single listed tenant is
+    ranked too, so its windows are read by priority, but ranking neither reads
+    nor writes the skip table for it: no other tenant could take its turn, so
+    every scan asks each of its classes again. So it returns None only when
     ``oldest_claimable()`` does, which a fallback round reads instead: the attempt
     count leaves out the attempts that find nothing on that ground.
 
@@ -2402,14 +2410,16 @@ def _fair_pick(
     The listing is taken once per attempt, so a rescan may rank a queue that has
     moved on; at worst that costs one more window query or one more recorded miss.
     A task the attempt already set aside (``busy``) that fills the window of a tenant
-    makes that tenant miss and be skipped, as a task that cannot be claimed does.
+    makes that tenant miss and, unless it is the only tenant ranked, be skipped, as a
+    task that cannot be claimed does.
     """
     if attempt.tenants is None:
         attempt.tenants = _list_queued_tenants(db)
     tenants = _tenants_in_band(attempt.tenants, cap)
-    if len(tenants) <= 1:
+    if not tenants:
         return oldest_claimable()
-    skipped = skips()
+    alone = len(tenants) == 1
+    skipped = frozenset() if alone else skips()
     occupancy = cap.occupancy if cap is not None else {}
     ranked = sorted(
         (
@@ -2434,7 +2444,7 @@ def _fair_pick(
             else:
                 rows = [row] if (row := window.first()) is not None else []
             if not rows:
-                _fair_record_miss(key, dispatch_class)
+                _fair_record_miss(key, dispatch_class, skip=not alone)
                 continue
             hits.append(rows[0])
             ages[dispatch_class] = min(row.id for row in rows)
@@ -2442,8 +2452,11 @@ def _fair_pick(
             best = min(hits, key=lambda row: ages[row.dispatch_class])
             break
     if best is None:
-        with _fair_state_lock:
-            _fair_state.all_missed += 1
+        # A tenant ranked alone falls back with no other tenant passed over, so
+        # only a scan that ranked at least two is counted as all missed.
+        if not alone:
+            with _fair_state_lock:
+                _fair_state.all_missed += 1
         return oldest_claimable()
     active = cap.active_ids if cap is not None else frozenset()
     older = _older_needing_no_new_slot(claimable, best.id, active)
