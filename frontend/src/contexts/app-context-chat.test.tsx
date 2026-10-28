@@ -12190,3 +12190,161 @@ describe("projectAppState exact settlement routing", () => {
     expect(state.traceEvents.map(event => event.event_id)).toEqual(["orphan"])
   })
 })
+
+describe("sends in flight", () => {
+  let latestApp: ReturnType<typeof useApp> | null = null
+  let renders: Array<{ taskId: number | null; inFlight: boolean }> = []
+
+  function SendProbe() {
+    latestApp = useApp()
+    renders.push({ taskId: latestApp.state.taskId, inFlight: latestApp.isSendInFlight })
+    return null
+  }
+
+  const app = () => {
+    if (!latestApp) throw new Error("SendProbe is not mounted")
+    return latestApp
+  }
+  // Each change of isSendInFlight across renders, starting from the first.
+  const inFlightChanges = () => renders
+    .map(({ inFlight }) => inFlight)
+    .filter((inFlight, index, all) => index === 0 || inFlight !== all[index - 1])
+
+  beforeEach(() => {
+    latestApp = null
+    renders = []
+    webSocketOptions.current = null
+    webSocketOptions.all = []
+    wsHarness.isConnected = true
+    wsHarness.connectionPhase = "connected"
+    wsHarness.loginIdentity = "auth:0"
+    sendChatMessageMock.mockReset()
+    localStorage.clear()
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.useRealTimers()
+    localStorage.clear()
+  })
+
+  describe.each(["task", "session"] as const)("counts every exposed sendMessage call until it settles (%s transport)", (transport) => {
+    function mount() {
+      const view = transport === "session"
+        ? render(<AppProvider token="token" transport={makeSessionTransport()}><SendProbe /></AppProvider>)
+        : render(<AppProvider token="token"><SeedRunningTask /><SendProbe /></AppProvider>)
+      act(() => webSocketOptions.current?.onConnect?.())
+      return view
+    }
+
+    function holdAcknowledgement() {
+      const acknowledgement = deferred<{ client_message_id: string; turn_id: string }>()
+      sendChatMessageMock.mockReturnValueOnce(acknowledgement.promise)
+      return acknowledgement
+    }
+
+    const ack = (id: string) => ({ client_message_id: id, turn_id: id })
+
+    it("from the call until it is accepted", async () => {
+      mount()
+      const acknowledgement = holdAcknowledgement()
+      let send!: Promise<void>
+
+      act(() => { send = app().sendMessage("hi", { clientMessageId: "turn-1" }) })
+      expect(app().isSendInFlight).toBe(true)
+      await act(async () => {
+        acknowledgement.resolve(ack("turn-1"))
+        await send
+      })
+
+      expect(inFlightChanges()).toEqual([false, true, false])
+    })
+
+    it("from the call until it fails, handing the caller the same error", async () => {
+      mount()
+      const acknowledgement = holdAcknowledgement()
+      const rejection = new MessageDeliveryError("Message rejected.", "rejected")
+      let outcome: unknown = "pending"
+
+      act(() => {
+        void app().sendMessage("hi", { clientMessageId: "turn-1" }).catch((error) => { outcome = error })
+      })
+      expect(app().isSendInFlight).toBe(true)
+      await act(async () => {
+        acknowledgement.reject(rejection)
+        await Promise.resolve()
+      })
+      await waitFor(() => expect(outcome).toBe(rejection))
+
+      expect(inFlightChanges()).toEqual([false, true, false])
+    })
+
+    it("until the last of two concurrent calls settles", async () => {
+      mount()
+      const first = holdAcknowledgement()
+      const second = holdAcknowledgement()
+      let sends: Array<Promise<void>> = []
+
+      act(() => {
+        sends = [
+          app().sendMessage("one", { clientMessageId: "turn-1" }),
+          app().sendMessage("two", { clientMessageId: "turn-2" }),
+        ]
+      })
+      await act(async () => {
+        first.resolve(ack("turn-1"))
+        await sends[0]
+      })
+      expect(app().isSendInFlight).toBe(true)
+      await act(async () => {
+        second.resolve(ack("turn-2"))
+        await sends[1]
+      })
+
+      expect(inFlightChanges()).toEqual([false, true, false])
+    })
+
+    it.each(["accepted", "rejected"] as const)("and still hands the caller its outcome when it is %s after unmount", async (outcome) => {
+      const view = mount()
+      const acknowledgement = holdAcknowledgement()
+      const rejection = new MessageDeliveryError("Message rejected.", "rejected")
+      let send!: Promise<void>
+      act(() => { send = app().sendMessage("hi", { clientMessageId: "turn-1" }) })
+
+      view.unmount()
+      if (outcome === "accepted") {
+        acknowledgement.resolve(ack("turn-1"))
+        await expect(send).resolves.toBeUndefined()
+      } else {
+        acknowledgement.reject(rejection)
+        await expect(send).rejects.toBe(rejection)
+      }
+    })
+  })
+
+  it("keeps a send in flight from the moment it is called, with no render between setTaskId and the send", async () => {
+    vi.useFakeTimers()
+    wsHarness.isConnected = false
+    render(<AppProvider token="token"><SendProbe /></AppProvider>)
+    let failure: unknown
+    let delivery!: Promise<void>
+
+    // handleSend sets the new task and starts its first send with no await in
+    // between; nothing may render the new task without the send counted.
+    act(() => {
+      app().setTaskId(77, { navigate: false })
+      delivery = app().sendMessage("hi", { targetTaskId: 77 }).catch((error) => { failure = error })
+    })
+
+    expect(renders).not.toContainEqual({ taskId: 77, inFlight: false })
+    expect(renders[renders.length - 1]).toEqual({ taskId: 77, inFlight: true })
+
+    // No connection opens, so the queued send times out and settles.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000)
+    })
+    await delivery
+    expect(renders[renders.length - 1]).toEqual({ taskId: 77, inFlight: false })
+    expect(failure).toMatchObject({ disposition: "not_sent" })
+  })
+})

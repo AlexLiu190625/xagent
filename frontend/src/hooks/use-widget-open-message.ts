@@ -3,6 +3,9 @@ import { listenForOpenMessages } from "@/lib/widget-parent-message"
 
 export type WidgetOpenRequest = { seq: number; message: string }
 
+// The console warning every open-message driver gives when its send fails.
+export const W_SEND_FAILED = "Xagent Widget: the message from XagentWidget.open() could not be sent."
+
 interface UseWidgetOpenMessageOptions {
   enabled: boolean
 }
