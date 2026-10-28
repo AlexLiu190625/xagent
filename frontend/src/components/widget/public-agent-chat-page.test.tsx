@@ -1280,11 +1280,12 @@ describe("PublicAgentChatPage", () => {
     type GuestCase = { name: string; run: () => Promise<void> }
 
     // One key per guest-mode case of an open message; a new case needs a new
-    // key here and in the key list asserted below. Not in this table: an
-    // iframe reloaded after acknowledging, before the message was taken (the
-    // message is lost, a known residual with nothing to drive), and a persisted
-    // pagehide and pageshow (widget.js's side is covered in
-    // widget-open.test.ts, and the iframe side lands on the cases here).
+    // key in GuestCaseId, and the Record type then requires its entry here.
+    // Not in this table: an iframe reloaded after acknowledging, before the
+    // message was taken (the message is lost, a known residual with nothing to
+    // drive), and a persisted pagehide and pageshow (widget.js's side is
+    // covered in widget-open.test.ts, and the iframe side lands on the cases
+    // here).
     const GUEST_CASES: Record<GuestCaseId, readonly GuestCase[]> = {
       noConversation: [{
         name: "with no conversation, creates the task and sends the message to it",
@@ -1627,15 +1628,6 @@ describe("PublicAgentChatPage", () => {
         },
       }],
     }
-
-    it("covers every row of the guest-mode input table", () => {
-      expect(Object.keys(GUEST_CASES)).toEqual([
-        "noConversation", "finishedConversation", "agentStillAnswering",
-        "previousMessageStillStarting", "rapidClicks", "visitorSendInFlight",
-        "startScreenDraft", "taskCreationFails", "sendFailsAfterTaskCreation",
-        "shareLink", "workforceWidget", "authenticationPending", "pageUnmounted",
-      ])
-    })
 
     for (const [id, guestCases] of Object.entries(GUEST_CASES)) {
       for (const guestCase of guestCases) {
