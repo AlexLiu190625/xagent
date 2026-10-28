@@ -489,6 +489,44 @@ def test_append_message_through_workforce_key():
     assert body["workforce_id"] == workforce_id
 
 
+def test_append_rejects_prompt_context_for_a_workforce_key():
+    headers = _admin_headers()
+    workforce_id = _create_active_workforce(headers)
+    full_key = _create_workforce_key(headers, workforce_id)
+    run = client.post(
+        f"/v1/workforces/{workforce_id}/runs",
+        headers=_bearer(full_key),
+        json={"message": {"role": "user", "content": "first"}},
+    ).json()
+    task_id = run["task_id"]
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        task.status = TaskStatus.COMPLETED
+        db.commit()
+    finally:
+        db.close()
+
+    resp = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={
+            "workforce_id": workforce_id,
+            "message": {"role": "user", "content": "next"},
+            "prompt_context": {"date": "2026-10-20"},
+        },
+    )
+
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["error"]["code"] == "invalid_input"
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        assert "prompt_context" not in (task.agent_config or {})
+    finally:
+        db.close()
+
+
 def test_append_rejects_mismatched_workforce_id():
     headers = _admin_headers()
     workforce_id = _create_active_workforce(headers)

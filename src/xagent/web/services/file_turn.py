@@ -473,7 +473,7 @@ def append_uploaded_files_context(message: str, uploaded_files_context: str) -> 
     return f"{message.rstrip()}\n\n{uploaded_files_context}"
 
 
-_MAX_PROMPT_CONTEXT_DATA_BYTES = 4096
+PROMPT_CONTEXT_MAX_DATA_BYTES = 4096
 _PROMPT_CONTEXT_FIELD_NAME_RE = re.compile(PROMPT_CONTEXT_FIELD_NAME_PATTERN)
 
 
@@ -499,6 +499,24 @@ def _prompt_context_meanings(value: Mapping[str, Any], data: Mapping[str, Any]) 
     return "Field meanings (set by the agent owner):\n" + "".join(lines)
 
 
+def _serialize_prompt_context_data(
+    data: Mapping[str, Any],
+) -> Optional[tuple[str, int]]:
+    try:
+        serialized = json.dumps(
+            data, ensure_ascii=False, sort_keys=True, allow_nan=False
+        ).replace("`", "\\u0060")
+        return serialized, len(serialized.encode("utf-8"))
+    except ValueError:
+        return None
+
+
+def prompt_context_data_size(data: Mapping[str, Any]) -> Optional[int]:
+    """UTF-8 byte size of ``data`` as rendered, or None when unserializable."""
+    rendered = _serialize_prompt_context_data(data)
+    return None if rendered is None else rendered[1]
+
+
 def build_prompt_context_block(value: Any) -> Optional[str]:
     """Render server-supplied reference data as an idempotent LLM-only block."""
     if not isinstance(value, Mapping):
@@ -512,14 +530,11 @@ def build_prompt_context_block(value: Any) -> Optional[str]:
         for key, item in data.items()
     ):
         return None
-    try:
-        serialized = json.dumps(
-            data, ensure_ascii=False, sort_keys=True, allow_nan=False
-        ).replace("`", "\\u0060")
-        size = len(serialized.encode("utf-8"))
-    except ValueError:
+    rendered = _serialize_prompt_context_data(data)
+    if rendered is None:
         return None
-    if size > _MAX_PROMPT_CONTEXT_DATA_BYTES:
+    serialized, size = rendered
+    if size > PROMPT_CONTEXT_MAX_DATA_BYTES:
         return None
     trust = (
         "Signed by the integrator's backend."

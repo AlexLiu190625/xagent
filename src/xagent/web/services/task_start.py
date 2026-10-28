@@ -49,6 +49,7 @@ from .managed_file_ref import (
     DurableStorageOperationError,
     log_durable_storage_fault,
 )
+from .prompt_context import build_prompt_context_value
 from .task_command_transport import (
     _resolve_actor_subject,
     command_identity_matches_task,
@@ -71,6 +72,7 @@ from .task_orchestrator import (
     timezone_schedule_context,
 )
 from .task_resume import resume_a2a_task
+from .task_runtime import PROMPT_CONTEXT_AGENT_CONFIG_KEY
 
 logger = logging.getLogger(__name__)
 _TERMINAL_STATUSES = {TaskStatus.COMPLETED, TaskStatus.FAILED}
@@ -199,6 +201,16 @@ def _turn_payload(content: str, file_infos: list[dict[str, Any]]) -> TaskTurnPay
     )
 
 
+def _prompt_context_value_for_agent(
+    prompt_context: dict[str, Any] | None, agent: Agent
+) -> dict[str, Any] | None:
+    if prompt_context is None:
+        return None
+    return build_prompt_context_value(
+        prompt_context, agent.prompt_context_fields, signed=True
+    )
+
+
 def _store_connector_runtime_values_or_fail(
     *,
     task_id: int,
@@ -257,6 +269,7 @@ def _prepare_created_task_isolated(
     message: str,
     file_ids: tuple[str, ...],
     connector_runtime_context: tuple[dict[str, Any], ...],
+    prompt_context: dict[str, Any] | None = None,
     timezone: str | None = None,
     requested_dispatch_class: str | None = None,
     requested_priority: int | None = None,
@@ -271,6 +284,7 @@ def _prepare_created_task_isolated(
         agent = db.get(Agent, agent_id)
         if agent is None:
             raise TaskStartRejected("agent_not_found")
+        prompt_context_value = _prompt_context_value_for_agent(prompt_context, agent)
 
         file_infos = _resolve_turn_files(
             file_ids=list(file_ids),
@@ -290,6 +304,12 @@ def _prepare_created_task_isolated(
             requested_dispatch_class=requested_dispatch_class,
             dispatch_priority=requested_priority,
         )
+        if prompt_context_value is not None:
+            setattr(
+                task,
+                "agent_config",
+                {PROMPT_CONTEXT_AGENT_CONFIG_KEY: prompt_context_value},
+            )
         runtime_plan = prepare_create_connector_runtime(
             db=db,
             agent=agent,
@@ -419,6 +439,7 @@ def _prepare_append_turn_isolated(
     message: str,
     file_ids: tuple[str, ...],
     connector_runtime_context: tuple[dict[str, Any], ...],
+    prompt_context: dict[str, Any] | None = None,
 ) -> _PreparedAppendTurn:
     """Resolve append authorization and runtime inputs into detached values."""
 
@@ -440,6 +461,22 @@ def _prepare_append_turn_isolated(
         runtime_agent = db.get(Agent, int(task.agent_id))
         if runtime_agent is None:
             raise TaskStartRejected("runtime_agent_missing")
+        # ``None`` means absent (or explicit null): replay what the task has.
+        # A provided object replaces the stored value; ``{}`` clears the key.
+        if prompt_context is not None:
+            prompt_context_value = _prompt_context_value_for_agent(
+                prompt_context, runtime_agent
+            )
+            task_agent_config = (
+                dict(task.agent_config) if isinstance(task.agent_config, dict) else {}
+            )
+            if prompt_context_value is not None:
+                task_agent_config[PROMPT_CONTEXT_AGENT_CONFIG_KEY] = (
+                    prompt_context_value
+                )
+            else:
+                task_agent_config.pop(PROMPT_CONTEXT_AGENT_CONFIG_KEY, None)
+            setattr(task, "agent_config", task_agent_config)
         runtime_plan = prepare_append_connector_runtime(
             db=db,
             agent=runtime_agent,
@@ -620,6 +657,7 @@ async def create_sdk_task(
     timezone: str | None,
     requested_dispatch_class: str | None = None,
     requested_priority: int | None = None,
+    prompt_context: dict[str, Any] | None = None,
 ) -> TaskStartResult:
     async def _prepare_and_schedule() -> tuple[_PreparedCreateTaskStart, TurnStarted]:
         prepared = await run_db_io_cancellation_safe(
@@ -630,6 +668,7 @@ async def create_sdk_task(
                 message=message,
                 file_ids=file_ids,
                 connector_runtime_context=connector_runtime_context,
+                prompt_context=prompt_context,
                 timezone=timezone,
                 requested_dispatch_class=requested_dispatch_class,
                 requested_priority=requested_priority,
@@ -680,6 +719,7 @@ async def append_sdk_turn(
     message: str,
     file_ids: tuple[str, ...],
     connector_runtime_context: tuple[dict[str, Any], ...],
+    prompt_context: dict[str, Any] | None = None,
 ) -> TaskStartResult:
     async def _prepare_and_begin() -> tuple[_PreparedAppendTurn, TurnStarted]:
         # A runner may still be finishing local cleanup after its terminal
@@ -699,6 +739,7 @@ async def append_sdk_turn(
                 message=message,
                 file_ids=file_ids,
                 connector_runtime_context=connector_runtime_context,
+                prompt_context=prompt_context,
             )
         )
         try:

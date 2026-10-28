@@ -1,8 +1,9 @@
 """Unsigned prompt-context entry on the widget task-create path.
 
-Only the widget guest task-create accepts top-level ``prompt_context`` values;
-they are filtered against the agent's declarations, stamped unsigned, and
-stored on ``agent_config``. Every other entry point ignores the field.
+The widget guest task-create filters ``prompt_context`` against the agent's
+declarations, stamps it unsigned, and stores it on ``agent_config``. The
+authenticated web chat, share, and workforce widget entries still ignore or
+drop it; the v1 run-key task endpoints accept it separately as signed data.
 """
 
 from __future__ import annotations
@@ -202,7 +203,7 @@ def test_non_object_prompt_context_is_a_422(value: object) -> None:
     assert response.status_code == 422
 
 
-def test_only_the_widget_request_model_declares_prompt_context() -> None:
+def test_web_chat_request_model_does_not_declare_prompt_context() -> None:
     assert "prompt_context" in WidgetTaskCreateRequest.model_fields
     assert "prompt_context" not in TaskCreateRequest.model_fields
 

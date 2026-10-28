@@ -66,6 +66,7 @@ from ...services.hot_path_cache import (
 from ...services.managed_file_ref import (
     DurableStorageOperationError,
 )
+from ...services.prompt_context import validate_signed_prompt_context
 from ...services.task_auto_resume import TerminalView, status_only_terminal_view
 from ...services.task_execution_controller import TaskControlState
 from ...services.task_interaction_read import get_pending_interaction_question
@@ -262,6 +263,15 @@ def _raise_v1_file_binding_error(exc: TaskTurnFileBindingError) -> NoReturn:
     ) from exc
 
 
+def _validate_prompt_context(prompt_context: dict[str, Any] | None) -> None:
+    if prompt_context is None:
+        return
+    try:
+        validate_signed_prompt_context(prompt_context)
+    except ValueError as exc:
+        raise V1ApiError(V1ErrorCode.INVALID_INPUT, 422, message=str(exc)) from exc
+
+
 def _raise_v1_connector_runtime_error(exc: ConnectorRuntimeError) -> NoReturn:
     try:
         code = V1ErrorCode(exc.code)
@@ -349,6 +359,7 @@ async def create_chat_task(
             exception message stays out of the response.
     """
     agent_identity = principal.agent
+    _validate_prompt_context(request.prompt_context)
     if agent_identity is None or request.agent_id != agent_identity.id:
         raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
 
@@ -365,6 +376,7 @@ async def create_chat_task(
             timezone=request.timezone,
             requested_dispatch_class=request.dispatch_class,
             requested_priority=request.priority,
+            prompt_context=request.prompt_context,
         )
     except task_start_service.TaskStartRejected as exc:
         _raise_start_rejection(exc)
@@ -944,6 +956,13 @@ async def append_message_to_task(
             (use ``reply`` instead).
         500: any other unexpected error (V1 envelope via global handler).
     """
+    _validate_prompt_context(request.prompt_context)
+    if request.prompt_context is not None and principal.workforce is not None:
+        raise V1ApiError(
+            V1ErrorCode.INVALID_INPUT,
+            422,
+            message="prompt_context is not supported for workforce keys.",
+        )
     try:
         started = await task_start_service.append_sdk_turn(
             task_id=task_id,
@@ -956,6 +975,7 @@ async def append_message_to_task(
             connector_runtime_context=tuple(
                 item.model_dump() for item in request.connector_runtime_context or ()
             ),
+            prompt_context=request.prompt_context,
         )
     except task_start_service.TaskStartRejected as exc:
         _raise_start_rejection(exc)
