@@ -8,6 +8,7 @@ type SessionConversationPhase = ReturnType<typeof useApp>["sessionConversationSt
 export const W_UNSUPPORTED = "Xagent Widget: this chat server cannot start a new conversation for XagentWidget.open(); the message was not sent."
 export const W_RELOAD_REQUIRED = "Xagent Widget: the chat must be reloaded before XagentWidget.open() can send a message; the message was not sent."
 export const W_RESET_FAILED = "Xagent Widget: a new conversation could not be started; the message from XagentWidget.open() was not sent."
+export const W_RESET_SUPERSEDED = "Xagent Widget: a new conversation was started, but the chat moved to another conversation before XagentWidget.open() could send its message; the message was not sent."
 export const W_SESSION_ENDED = "Xagent Widget: the chat session has ended; the message from XagentWidget.open() was not sent."
 
 // What a ready driver does with an open message in each phase: send it as the
@@ -144,7 +145,7 @@ export function useSessionOpenMessage({
       // Its reset succeeded, yet the conversation is bound again: drop it
       // rather than start a second new conversation for the same message.
       if (current.reset) {
-        settle(null, W_RESET_FAILED)
+        settle(null, W_RESET_SUPERSEDED)
         return
       }
       const resetting: ActiveOpenMessage = { ...current, stage: "resetting" }

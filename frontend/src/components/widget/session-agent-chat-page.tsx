@@ -190,6 +190,11 @@ function SessionConversationContent({
     onMessage: (message) => handleStartMessage(message, []),
   })
 
+  const sendStartMessageForOpen = useCallback(
+    (message: string) => handleStartMessage(message, []),
+    [handleStartMessage],
+  )
+
   const openMessage = useWidgetOpenMessage({ enabled: true })
   useSessionOpenMessage({
     request: openMessage.request,
@@ -202,7 +207,7 @@ function SessionConversationContent({
     isConversationResetPending,
     isAttachmentBusy,
     startNewConversation: startNewConversationForOpen,
-    sendStartMessage: (message) => handleStartMessage(message, []),
+    sendStartMessage: sendStartMessageForOpen,
   })
 
   if (status === "waiting" || (status === "refreshing" && !agent)) {

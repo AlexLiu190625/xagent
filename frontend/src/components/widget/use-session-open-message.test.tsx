@@ -6,6 +6,7 @@ import { W_SEND_FAILED, type WidgetOpenRequest } from "@/hooks/use-widget-open-m
 import {
   W_RELOAD_REQUIRED,
   W_RESET_FAILED,
+  W_RESET_SUPERSEDED,
   W_SESSION_ENDED,
   W_UNSUPPORTED,
   useSessionOpenMessage,
@@ -174,7 +175,7 @@ describe("useSessionOpenMessage", () => {
     }
     const WAITING_CASES: Record<Phase, WaitingCase> = {
       // Its reset already succeeded once, so it is dropped, not reset again.
-      bound: { starts: 1, sends: [], warns: [[W_RESET_FAILED]] },
+      bound: { starts: 1, sends: [], warns: [[W_RESET_SUPERSEDED]] },
       replacement_ready: { starts: 1, sends: [["A"]], warns: [] },
       unbound: { starts: 1, sends: [["A"]], warns: [] },
       reset_requested: { starts: 1, sends: [], warns: [] },
@@ -322,7 +323,7 @@ describe("useSessionOpenMessage", () => {
 
       expect(startNewConversation).toHaveBeenCalledTimes(1)
       expect(sendStartMessage).not.toHaveBeenCalled()
-      expect(warn.mock.calls).toEqual([[W_RESET_FAILED]])
+      expect(warn.mock.calls).toEqual([[W_RESET_SUPERSEDED]])
     }, 2_000)
 
     it("drops the message when the new conversation cannot be started", async () => {
