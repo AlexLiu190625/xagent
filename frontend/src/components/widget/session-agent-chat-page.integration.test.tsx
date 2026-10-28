@@ -1516,3 +1516,38 @@ describe("SessionAgentChatPage file attachments", () => {
     })
   })
 })
+
+describe("SessionAgentChatPage opens a new conversation from the host page", () => {
+  beforeEach(() => {
+    MockWebSocket.instances = []
+    MockWebSocket.failConstruction = false
+    MockWebSocket.constructionCount = 0
+    localStorage.clear()
+    sessionStorage.clear()
+    vi.stubGlobal("WebSocket", MockWebSocket)
+    vi.spyOn(console, "log").mockImplementation(() => {})
+    Object.defineProperty(window, "parent", { configurable: true, value: EMBEDDED_PARENT })
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+    if (originalParentDescriptor) Object.defineProperty(window, "parent", originalParentDescriptor)
+  })
+
+  it("offers the attach marker alongside the liveness marker", async () => {
+    render(<SessionAgentChatPage />)
+    dispatchSession()
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+
+    expect(MockWebSocket.instances[0].protocols).toEqual([
+      "xagent-session-v1",
+      `xagent-session-token.${SESSION_TOKEN}`,
+      "xagent-session-liveness-v1",
+      "xagent-session-attach-v1",
+      "xagent-session-binding-v1",
+      "xagent-session-task.unbound",
+    ])
+  })
+})

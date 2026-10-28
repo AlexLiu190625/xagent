@@ -36,6 +36,8 @@ const SESSION_PROTOCOL = "xagent-session-v1"
 // does not know the marker ignores it, and the connection then runs without
 // dead-connection detection.
 const SESSION_LIVENESS_PROTOCOL = "xagent-session-liveness-v1"
+// Asks the session server to announce when attach, including any resume replay, has finished.
+const SESSION_ATTACH_PROTOCOL = "xagent-session-attach-v1"
 type SessionTerminalPresentation = "expired" | "unavailable"
 
 const SESSION_TERMINAL_PRESENTATION: Readonly<Record<string, SessionTerminalPresentation>> = {
@@ -371,6 +373,7 @@ export function SessionAgentChatPage() {
         SESSION_PROTOCOL,
         `xagent-session-token.${bridge.session.token}`,
         SESSION_LIVENESS_PROTOCOL,
+        SESSION_ATTACH_PROTOCOL,
       ],
       expectedProtocol: SESSION_PROTOCOL,
       chatTaskIdMode: "omit",

@@ -253,6 +253,7 @@ describe("SessionAgentChatPage", () => {
         "xagent-session-v1",
         `xagent-session-token.${SESSION_TOKEN}`,
         "xagent-session-liveness-v1",
+        "xagent-session-attach-v1",
       ],
       expectedProtocol: "xagent-session-v1",
       chatTaskIdMode: "omit",
