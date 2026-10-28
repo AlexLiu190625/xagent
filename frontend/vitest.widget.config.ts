@@ -218,6 +218,7 @@ export default defineConfig({
       "src/components/widget/widget-session.test.ts",
       "src/components/widget/widget-chrome.test.ts",
       "src/components/widget/widget-chrome-controls.test.tsx",
+      "src/components/widget/widget-open.test.ts",
       "src/components/widget/public-agent-chat-page.test.tsx",
       "src/components/widget/session-agent-chat-page.test.tsx",
       "src/components/widget/session-agent-chat-page.integration.test.tsx",
