@@ -4098,6 +4098,51 @@ describe("useWebSocket normalized connections", () => {
       })
     })
 
+    describe("connection capabilities", () => {
+      it.each([
+        ["heartbeat", ["heartbeat"], ["heartbeat"], true],
+        ["heartbeat and attach completion", ["heartbeat", "conversation_attached"], ["heartbeat", "conversation_attached"], true],
+        ["attach completion only", ["conversation_attached"], ["conversation_attached"], false],
+        ["an empty list", [], [], false],
+        ["no capability array", "heartbeat", [], false],
+        ["non-string entries", [1, "conversation_attached", null], ["conversation_attached"], false],
+      ] as const)("reports connection capabilities to the caller: %s", (_name, capabilities, reported, heartbeat) => {
+        const onConnectionCapabilities = vi.fn()
+        const onMessage = vi.fn()
+        mountChat({ onConnectionCapabilities, onMessage })
+        const socket = socketAt(0)
+        act(() => socket.open())
+        act(() => socket.receive({ type: "connection_capabilities", capabilities }))
+
+        expect(onConnectionCapabilities.mock.calls).toEqual([[reported]])
+        expect(onMessage.mock.calls.map(([message]) => message.type)).not.toContain("connection_capabilities")
+        advance(DEAD_AFTER_MS)
+        if (heartbeat) {
+          expect(socket.close).toHaveBeenCalledWith(1000, "Connection liveness timeout")
+        } else {
+          expect(socket.close).not.toHaveBeenCalled()
+        }
+      })
+
+      it("reports connection capabilities to the caller only for the current socket", () => {
+        vi.spyOn(Math, "random").mockReturnValue(0.5)
+        const onConnectionCapabilities = vi.fn()
+        mountChat({ onConnectionCapabilities })
+        const first = socketAt(0)
+        act(() => first.open())
+        act(() => first.triggerClose(1006))
+        advance(RECONNECT_BASE_DELAY_MS)
+        const second = socketAt(1)
+        act(() => second.open())
+
+        act(() => first.receive({ type: "connection_capabilities", capabilities: ["heartbeat", "conversation_attached"] }))
+        expect(onConnectionCapabilities).not.toHaveBeenCalled()
+
+        act(() => second.receive({ type: "connection_capabilities", capabilities: ["heartbeat"] }))
+        expect(onConnectionCapabilities.mock.calls).toEqual([[["heartbeat"]]])
+      })
+    })
+
     it("reconnect chain backs off to the cap and never gives up", () => {
       const random = vi.spyOn(Math, "random")
         .mockReturnValueOnce(0)
@@ -4535,6 +4580,40 @@ describe("useWebSocket normalized connections", () => {
       ])
       expect(MockWebSocket.instances).toHaveLength(1)
       expect(hook.result.current.connectionPhase).toBe("lost")
+    })
+
+    // One row per remaining way a socket is retired with a reconnect in view;
+    // the dead rule is the test above. The embedding page owns every Session
+    // reconnect and hands over a new connection identity with each one.
+    it.each([
+      ["a handshake timeout", () => {
+        vi.advanceTimersByTime(10_000)
+      }],
+      ["a server close its owner leaves to the default policy", (socket: MockWebSocket) => {
+        socket.open()
+        socket.triggerClose(1006)
+      }],
+      ["a transport error", (socket: MockWebSocket) => {
+        socket.open()
+        socket.triggerError()
+      }],
+    ] as const)("session transport never schedules its own reconnect after %s", (_name, retire) => {
+      vi.spyOn(console, "error").mockImplementation(() => {})
+      mountChat({
+        url: undefined,
+        taskId: undefined,
+        connection: sessionConnection(),
+        onSessionConnectionClose: () => "default",
+        onSessionConnectionFailure: vi.fn(),
+      })
+      const socket = socketAt(0)
+      socket.protocol = "xagent-session-v1"
+
+      act(() => retire(socket))
+      expect(vi.getTimerCount()).toBe(0)
+      advance(RECONNECT_MAX_DELAY_MS + 1)
+
+      expect(MockWebSocket.instances).toHaveLength(1)
     })
 
     describe("connection phase", () => {
