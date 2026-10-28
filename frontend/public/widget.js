@@ -8,7 +8,6 @@
   var W_NO_INSTANCE = 'Xagent Widget: XagentWidget.open() was called, but no chat widget is active on this page.';
   var W_BAD_OPTIONS = 'Xagent Widget: XagentWidget.open() expects an options object; opening the chat without sending a message.';
   var W_UNKNOWN_OPTIONS_PREFIX = 'Xagent Widget: XagentWidget.open() ignored unknown option(s): ';
-  var W_BAD_MESSAGE = 'Xagent Widget: XagentWidget.open() message must be a non-empty string of at most 2000 characters; opening the chat without sending it.';
 
   // Shared by every widget.js instance on the page: open() targets the newest
   // instance that is still live, and falls back to an older one once the newer
@@ -1140,7 +1139,9 @@
     if (raw === undefined) return null;
     var value = typeof raw === 'string' ? raw.trim() : '';
     if (!value || value.length > MAX_INITIAL_MESSAGE_LENGTH) {
-      console.warn(W_BAD_MESSAGE);
+      // Built here rather than beside the W_* texts at the top: the limit is
+      // assigned further down than they are, so it is still undefined there.
+      console.warn('Xagent Widget: XagentWidget.open() message must be a non-empty string of at most ' + MAX_INITIAL_MESSAGE_LENGTH + ' characters; opening the chat without sending it.');
       return null;
     }
     return value;
