@@ -630,10 +630,12 @@ def test_a_control_command_with_a_stale_key_does_not_hide_the_commands_ahead_of_
 
     chosen = scan(cap, attempt=attempt())
 
-    # One tenant has work that opens an execution, so the scan reads as it always
-    # did: no window is asked, nothing is missed or skipped.
+    # The pause makes no tenant of its own, so a is ranked alone. Its window holds
+    # the sixteen commands that wait elsewhere and misses, without a skip, and the
+    # plain lookup takes the seventeenth, the row it takes with the switch off.
     assert chosen == off == seventeenth
-    assert transport.drain_fair_misses() == 0
+    assert transport.drain_fair_misses() == 1
+    assert transport._fair_state.skips == {}
 
 
 def test_a_queue_with_no_interactive_command_between_the_lines_reads_as_today(
@@ -1514,11 +1516,104 @@ def test_an_interactive_command_that_waits_elsewhere_does_not_hold_back_batch_wo
     assert scan(cap, attempt=attempt()) == batch
 
 
-def test_one_tenant_alone_is_read_by_age_and_not_by_priority(world, on, clock):
-    oldest = world.add("a", priority=0)
-    world.add("a", priority=5)
+def test_one_tenant_alone_is_read_by_priority(world, on, clock):
+    world.add("a", priority=0)
+    higher = world.add("a", priority=5)
 
+    assert scan(cap_of(), attempt=attempt()) == higher
+
+
+def test_the_only_queued_tenant_takes_its_highest_priority_interactive_work_first(
+    world, on, clock
+):
+    ids = {
+        name: world.add("a", "interactive", priority=p)
+        for name, p in (("low", -5), ("five", 5), ("five again", 5), ("top", 10))
+    }
+
+    picks = []
+    for _ in ids:
+        chosen = scan(cap_of(), attempt=attempt())
+        picks.append(next(name for name, number in ids.items() if number == chosen))
+        settle(world, chosen)
+
+    assert picks == ["top", "five", "five again", "low"]
+
+
+def test_between_the_lines_a_tenant_with_only_batch_work_does_not_turn_priority_off(
+    world, on, clock
+):
+    world.add("a", "interactive", priority=0)
+    higher = world.add("a", "interactive", priority=9)
+    world.add("b", "batch")
+
+    # Only a has interactive work, so a is the one tenant ranked.
+    assert BATCH_CLOSED.batch_closed
+    assert scan(BATCH_CLOSED, attempt=attempt()) == higher
+
+
+def test_the_only_ranked_tenant_whose_window_misses_takes_the_oldest_row_unskipped(
+    world, on, clock
+):
+    oldest = world.add("a", priority=0)
+    first = world.add("a", pinned=True, priority=5)
+    for _ in range(15):
+        world.follow_up(world.task_of(first), "a", priority=5)
+
+    # No other tenant could take the turn, so the plain lookup decides in the same
+    # scan and the pair is not skipped: the next scan reads the window again.
     assert scan(cap_of(), attempt=attempt()) == oldest
+    assert transport.drain_fair_misses() == 1
+    assert transport._fair_state.skips == {}
+
+
+def test_a_class_of_the_only_ranked_tenant_that_missed_is_asked_again_next_scan(
+    world, on, clock
+):
+    world.add("a", "interactive", pinned=True)
+    assert scan(cap_of(), attempt=attempt()) is None
+
+    widget = world.add("a", "interactive", priority=10)
+    world.add("a", "batch")
+
+    # Had the interactive class been skipped, the newer batch command would win.
+    assert scan(cap_of(), attempt=attempt()) == widget
+
+
+def test_a_miss_while_ranked_alone_keeps_the_tenant_counted_for_the_cap(
+    world, on, clock
+):
+    held = world.add("a", "interactive")
+    band = cap_of(
+        active=[901, 902],
+        occupancy={"a": 2},
+        policy=DispatchPolicy(limit=3, interactive_reserve=1),
+    )
+    assert band.in_reserve_band
+
+    # a alone, its window missing because the attempt set its task aside.
+    assert scan(band, attempt=attempt(), busy=(world.task_of(held),)) is None
+    world.add("b", "interactive", pinned=True)
+
+    # a holds the most slots and b is queued, so a may not take the reserve slot.
+    assert scan(band, attempt=attempt()) is None
+
+
+def test_a_skip_left_from_two_ranked_tenants_is_not_read_once_one_is_left(
+    world, on, clock
+):
+    older = world.add("a", "interactive", priority=0)
+    other = world.add("b", "batch")
+    cap = cap_of(occupancy={"b": 1})
+
+    # a ranks first; its window misses because the attempt set its task aside, and
+    # with b ranked too the pair is skipped.
+    assert scan(cap, attempt=attempt(), busy=(world.task_of(older),)) == other
+    assert ("a", "interactive") in transport._fair_state.skips
+    settle(world, other)
+    widget = world.add("a", "interactive", priority=10)
+
+    assert scan(cap, attempt=attempt()) == widget
 
 
 def test_a_window_full_of_commands_that_wait_elsewhere_is_missed_until_the_fallback_round(
@@ -1624,17 +1719,32 @@ def test_without_an_interactive_reserve_no_command_is_held_for_its_class(
         )
 
 
-def test_a_queue_of_one_tenant_is_scanned_as_before_plus_one_listing(world, on, clock):
+def test_a_queue_of_one_tenant_follows_the_reference(world, on, clock):
     for seed in range(200):
-        rng = random.Random(20_000 + seed)
+        play(
+            world,
+            clock,
+            20_000 + seed,
+            tenants=1,
+            reserves=lambda limit: range(limit),
+        )
+
+
+def test_a_shallow_queue_of_one_tenant_at_one_priority_is_scanned_as_before(
+    world, on, clock
+):
+    for seed in range(200):
+        rng = random.Random(40_000 + seed)
         spec = random_world(
             rng,
             tenants=1,
-            size=rng.randint(4, 30),
+            size=rng.randint(4, 16),
             answers=False,
             admission=False,
             heavy=False,
         )
+        for cmd in spec.commands:
+            cmd.priority = 0
         world.reset()
         store_world(world, spec)
         transport._fair_state = transport._FairState()
@@ -1652,11 +1762,10 @@ def test_a_queue_of_one_tenant_is_scanned_as_before_plus_one_listing(world, on, 
         )
         assert not cap.closed
 
-        off, off_seen = recorded(world, lambda: scan(cap))
-        on_choice, on_seen = recorded(world, lambda: scan(cap, attempt=attempt()))
+        off = scan(cap)
+        on_choice = scan(cap, attempt=attempt())
 
         assert on_choice == off, f"seed {seed}: {spec.commands}"
-        assert len(on_seen) == len(off_seen) + 1, f"seed {seed}: {spec.commands}"
 
 
 def test_a_scan_that_finds_no_open_command_is_not_counted(world, on, clock):
