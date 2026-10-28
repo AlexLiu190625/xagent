@@ -2096,7 +2096,12 @@ async def update_model(
         .filter(AutoModelCandidate.target_model_id == db_model.id)
         .all()
     )
-    if auto_candidates and "abilities" in update_data:
+    # Sequential failover takes each candidate's modalities from its saved
+    # target, so only routing-mode bindings must keep matching their profile.
+    routing_candidates = [
+        candidate for candidate in auto_candidates if candidate.config.mode == "routing"
+    ]
+    if routing_candidates and "abilities" in update_data:
         from ..services.auto_model_service import (
             load_router_profile_catalog,
             validate_candidate_modalities,
@@ -2104,7 +2109,7 @@ async def update_model(
 
         try:
             catalog = load_router_profile_catalog()
-            for candidate in auto_candidates:
+            for candidate in routing_candidates:
                 validate_candidate_modalities(
                     catalog,
                     str(candidate.routing_model_id),
