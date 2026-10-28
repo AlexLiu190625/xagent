@@ -956,6 +956,26 @@ describe("useWebSocket normalized connections", () => {
     expect(MockWebSocket.instances[0].protocols).toEqual(["xagent-auth-v1", "xagent-auth-token.token"])
   })
 
+  it("carries an explicit public guest token in the handshake header, never the built URL", async () => {
+    const buildWebSocketUrl = vi.fn(({ baseUrl, taskId }: { baseUrl: string; taskId: number }) =>
+      `${baseUrl}/api/widget/chat/ws/${taskId}`)
+    renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 7,
+      token: "guest.jwt-token",
+      buildWebSocketUrl,
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    expect(buildWebSocketUrl).toHaveBeenCalledWith({ baseUrl: "ws://localhost", taskId: 7 })
+    expect(MockWebSocket.instances[0].url).toBe("ws://localhost/api/widget/chat/ws/7")
+    expect(MockWebSocket.instances[0].url).not.toContain("guest.jwt-token")
+    expect(MockWebSocket.instances[0].protocols).toEqual([
+      "xagent-auth-v1",
+      "xagent-auth-token.guest.jwt-token",
+    ])
+  })
+
   it("keeps the task id in the legacy chat frame", async () => {
     const { result } = renderHook(() => useWebSocket({
       url: "ws://localhost",
@@ -3959,7 +3979,8 @@ describe("useWebSocket normalized connections", () => {
     it("login identity never carries credentials and moves only with the principal", () => {
       const external = (token: string): WebSocketConnection => ({
         identity: "legacy-task:7",
-        url: `ws://h/api/widget/chat/ws/7?token=${token}`,
+        url: "ws://h/api/widget/chat/ws/7",
+        loginToken: token,
         taskId: 7,
         chatTaskIdMode: "required",
         credentialOwner: { kind: "external" },

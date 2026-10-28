@@ -429,7 +429,9 @@ export interface UseWebSocketOptions {
   url?: string
   taskId?: number
   token?: string
-  buildWebSocketUrl?: (params: { baseUrl: string; taskId: number; token?: string }) => string
+  /** Builds the socket URL only. Credentials ride the handshake headers
+   * (see websocketAuthProtocols), never the URL, so no token is passed in. */
+  buildWebSocketUrl?: (params: { baseUrl: string; taskId: number }) => string
   uploadFiles?: (files: File[], params: { taskId?: number | null; taskType: string }) => Promise<Array<{ file_id: string; name?: string; size?: number; type?: string }>>
   connection?: WebSocketConnection | null
   deliveryGeneration?: number
@@ -498,12 +500,9 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         ? buildWebSocketUrl({
           baseUrl,
           taskId,
-          token: effectiveToken,
         })
         : `${baseUrl}/ws/chat/${taskId}?liveness=heartbeat`,
-      loginToken: !buildWebSocketUrl && effectiveToken
-        ? effectiveToken
-        : undefined,
+      loginToken: effectiveToken || undefined,
       taskId,
       chatTaskIdMode: "required",
       credentialOwner: !hasExplicitToken && authToken

@@ -196,16 +196,17 @@ function expectPublicProviderToken() {
     linksOpenInNewTab: "enabled",
   })
   expect(app.startScreenProps?.voiceInputEnabled).toBe(false)
+  // The guest token rides the handshake header / Authorization header, so
+  // neither the socket URL nor any file URL carries it.
   expect(app.provider?.transport?.buildWebSocketUrl?.({
     baseUrl: "wss://api.example",
     taskId: 42,
-    token: app.provider?.token,
-  })).toBe("wss://api.example/api/widget/chat/ws/42?token=public-access-token")
+  })).toBe("wss://api.example/api/widget/chat/ws/42")
   expect(app.provider?.transport?.fileAccess?.inlinePreviewUrl("public-file")).toBe(
-    "https://api.example/api/files/public/preview/public-file?token=public-access-token",
+    "https://api.example/api/files/public/preview/public-file",
   )
   expect(app.provider?.transport?.fileAccess?.inlineDownloadUrl("public-file")).toBe(
-    "https://api.example/api/files/public/download/public-file?token=public-access-token",
+    "https://api.example/api/files/public/download/public-file",
   )
   expect(app.provider?.transport?.uploadFiles).toEqual(expect.any(Function))
 }
@@ -805,8 +806,7 @@ describe("PublicAgentChatPage", () => {
     expect(app.provider?.transport?.buildWebSocketUrl?.({
       baseUrl: "wss://api.example",
       taskId: 42,
-      token: app.provider?.token,
-    })).toBe("wss://api.example/api/share/chat/ws/42?token=public-access-token")
+    })).toBe("wss://api.example/api/share/chat/ws/42")
     // A share visitor already has the full page; unlike the embedded widget
     // iframe, an in-tab navigation away from it is ordinary browser behavior.
     expect(app.provider?.transport?.capabilities?.linksOpenInNewTab).toBe("disabled")

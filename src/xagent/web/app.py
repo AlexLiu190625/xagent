@@ -1317,10 +1317,16 @@ async def validation_exception_handler(
         ``{"detail": [sanitized_errors]}`` shape that the web UI and
         in-house clients already parse.
     """
-    import traceback
-
-    logger.error(f"Validation error in {request.url}: {str(exc)}")
-    logger.error(f"Traceback: {traceback.format_exc()}")
+    # Path only: the query string can carry credentials (a stale client's
+    # ?token=, a file ticket). Error locations/types only: ``str(exc)`` and a
+    # formatted traceback both echo the rejected input values, which may be
+    # secrets from a body or query.
+    logger.error(
+        "Validation error in %s %s: %s",
+        request.method,
+        request.url.path,
+        [(error.get("loc"), error.get("type")) for error in exc.errors()],
+    )
 
     if request.url.path.startswith("/api/a2a/"):
         errors = exc.errors()
@@ -1403,7 +1409,10 @@ async def global_exception_handler(request: Request, exc: Exception) -> Any:
     """
     import traceback
 
-    logger.error(f"Unhandled exception in {request.url}: {exc}")
+    # Path only: never log the query string, which can carry credentials.
+    logger.error(
+        "Unhandled exception in %s %s: %s", request.method, request.url.path, exc
+    )
     logger.error(f"Traceback: {traceback.format_exc()}")
 
     if request.url.path.startswith("/api/a2a/"):

@@ -2591,7 +2591,7 @@ export interface AppProviderTransportConfig {
    * transports must opt out; the authenticated page keeps its legacy default.
    */
   legacyErrorProse?: "trusted" | "untrusted"
-  buildWebSocketUrl?: (params: { baseUrl: string; taskId: number; token?: string }) => string
+  buildWebSocketUrl?: (params: { baseUrl: string; taskId: number }) => string
   /**
    * Owns every file URL and request made below this provider. Public
    * transports use this to keep guest credentials instance-scoped.

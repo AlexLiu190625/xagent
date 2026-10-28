@@ -650,8 +650,10 @@ export function PublicAgentChatPage({
       // an ordinary full page, where in-tab navigation is expected behavior.
       linksOpenInNewTab: authMode === "widget" ? "enabled" : "disabled",
     },
-    buildWebSocketUrl: ({ baseUrl, taskId, token }) =>
-      `${baseUrl}/${authMode === "share" ? "api/share" : "api/widget"}/chat/ws/${taskId}${token ? `?token=${token}` : ""}`,
+    // The guest token rides the WebSocket handshake headers (the shared
+    // xagent-auth-v1 subprotocol scheme), never the URL.
+    buildWebSocketUrl: ({ baseUrl, taskId }) =>
+      `${baseUrl}/${authMode === "share" ? "api/share" : "api/widget"}/chat/ws/${taskId}`,
     fileAccess,
     uploadFiles: (files, params) =>
       Promise.all(files.map((file) =>
