@@ -469,22 +469,25 @@ def test_a_scan_only_reads_the_balance_and_only_adds_to_the_attempt_count(
         assert (state.since_fallback, state.attempts_since_fallback) == (0, AFTER + 20)
 
 
+@pytest.mark.parametrize("together", [2, 3])
 def test_attempts_that_decided_a_fallback_together_each_take_their_debt_off(
-    world, on, clock
+    together, world, on, clock
 ):
     world.add("a")
     world.add("b")
     cap = cap_of()
     transport._fair_state.since_fallback = EVERY - 1
-    first, second = attempt(), attempt()
-    scan(cap, attempt=first)
-    scan(cap, attempt=second)
-    assert first.fallback and second.fallback
+    attempts = [attempt() for _ in range(together)]
+    for one in attempts:
+        scan(cap, attempt=one)
+    assert all(one.fallback for one in attempts)
 
-    transport._fair_count_dispatch(first, True)
-    transport._fair_count_dispatch(second, True)
+    for one in attempts:
+        transport._fair_count_dispatch(one, True)
 
-    assert transport._fair_state.since_fallback == -(EVERY - 1)
+    # The debt is not cut at one period, so the slots these rounds opened together
+    # are paid back.
+    assert transport._fair_state.since_fallback == -(EVERY - 1) * (together - 1)
     later = attempt()
     scan(cap, attempt=later)
     assert not later.fallback
@@ -897,6 +900,12 @@ LOOP_ROWS = {
     "a fallback round the attempt count forced": (
         [add("a"), reach_the_attempt_line],
         0,
+        0,
+        0,
+    ),
+    "a fallback round both lines brought": (
+        [add("a"), reach_the_attempt_line],
+        EVERY - 1,
         -(EVERY - 1),
         0,
     ),
@@ -1141,10 +1150,11 @@ async def test_a_start_behind_a_missed_window_gets_the_fallback_round_after_the_
             db.commit()
 
     # Every attempt misses A's window and is counted; the attempt after AFTER of
-    # them is a fallback round, which reads past the window to A's START.
+    # them is a fallback round, which reads past the window to A's START. The
+    # attempt count brought it, so it leaves the balance alone.
     assert dispatched == expected
     state = transport._fair_state
-    assert (state.since_fallback, state.attempts_since_fallback) == (-(EVERY - 1), 0)
+    assert (state.since_fallback, state.attempts_since_fallback) == (0, 0)
 
 
 class Wakeups:
@@ -1283,6 +1293,41 @@ async def test_fallback_rounds_open_one_new_slot_in_every_fallback_period_howeve
     # and clearing the balance on a fallback round instead of taking its share off
     # gives 12 for freed = 2; with the fair rounds first, a fallback round on every
     # eighth attempt gives 0.
+    assert wakeups.opened.count("a") == slots // EVERY
+
+
+@pytest.mark.parametrize(
+    "fallback_first", [True, False], ids=["fallback first", "fair first"]
+)
+async def test_after_a_stretch_of_fair_rounds_that_open_no_slot_the_share_is_back_at_once(
+    fallback_first, world, on, clock, monkeypatch
+):
+    """For twenty attempt periods the fair rounds dispatch commands that open no
+    slot, as when they join running tasks, and only the fallback rounds the attempt
+    count brings open one. Then every wake-up frees one slot, as in the test above:
+    the fallback rounds open one in every FAIR_SHARE_FALLBACK_EVERY new slots from
+    the first period on, instead of after the fair rounds have paid a debt back."""
+    state = transport._fair_state
+    for _ in range(20):
+        one = attempt()
+        while not one.fallback:
+            one = attempt()
+            transport._ranks_tenants(one, None, None)
+            transport._fair_count_attempt(one)
+            transport._fair_count_dispatch(one, one.fallback)
+    assert (state.since_fallback, state.attempts_since_fallback) == (0, 0)
+
+    wakeups = Wakeups(world, monkeypatch, fallback_first)
+    wakeups.queue("a", 40)
+    wakeups.queue("b", 160)
+    slots = 128
+    for _ in range(slots):
+        await wakeups.wake(1)
+
+    assert len(wakeups.opened) == slots
+    # Taking a period's share off for each forced round leaves a debt of 140 here,
+    # and only the attempt count brings fallback rounds until it is paid: 7.
+    # Keeping the balance at or above one period's debt gives 15.
     assert wakeups.opened.count("a") == slots // EVERY
 
 

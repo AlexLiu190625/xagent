@@ -1936,9 +1936,10 @@ def _fair_share_enabled() -> bool:
 # A fallback round reads the queue as it always did, so that a command only the full
 # scan can reach is not left behind. Fallback rounds aim at one in every
 # FAIR_SHARE_FALLBACK_EVERY new slots that counted attempts open: a fair round that
-# opens a slot adds one to a balance, a fallback round that opens one takes
-# FAIR_SHARE_FALLBACK_EVERY - 1 off, and attempts that read the balance together may
-# all become fallback rounds, so the share holds over time rather than slot by slot.
+# opens a slot adds one to a balance, a fallback round the balance brought that
+# opens one takes FAIR_SHARE_FALLBACK_EVERY - 1 off, and attempts that read the
+# balance together may all become fallback rounds, so the share holds over time
+# rather than slot by slot.
 # An attempt that opens no slot leaves the balance alone: one that joins a task this
 # process already executes, takes a control command, has its slot refused or picks
 # nothing. So every counted attempt whose scan finds a command also adds one to an
@@ -1949,10 +1950,12 @@ def _fair_share_enabled() -> bool:
 # must not bring a fallback round. Once FAIR_SHARE_FALLBACK_AFTER_ATTEMPTS attempts
 # have been counted, every attempt is a fallback round until one does; an attempt
 # decides its round before it is counted, so up to DISPATCHER_CONCURRENCY - 1 more
-# may go by first. A fallback round the attempt count brings also takes
-# FAIR_SHARE_FALLBACK_EVERY - 1 off when it opens a slot, and the balance has no
-# floor, so after a stretch of attempts that open no slot the fair rounds pay that
-# back before the balance brings a fallback round again.
+# may go by first. Only a fallback round whose first scan read the balance at its
+# line takes FAIR_SHARE_FALLBACK_EVERY - 1 off when it opens a slot; one the attempt
+# count alone brings leaves the balance alone, so a stretch of attempts that open no
+# slot leaves no debt for the fair rounds to pay back. The balance goes below zero
+# only when attempts that read it at its line together each open a slot, so it stays
+# at or above -(FAIR_SHARE_FALLBACK_EVERY - 1) * (DISPATCHER_CONCURRENCY - 1).
 FAIR_SHARE_WINDOW = 16
 FAIR_SHARE_TENANTS_PER_SCAN = 4
 FAIR_SHARE_SKIP_SECONDS = 2.0
@@ -2176,8 +2179,9 @@ class _FairState:
 
     def __init__(self) -> None:
         # The fallback rounds' balance: each new slot a counted fair round opens
-        # adds one, each new slot a fallback round opens takes off
-        # FAIR_SHARE_FALLBACK_EVERY - 1. It has no floor and can be negative.
+        # adds one, each new slot a fallback round that read it at its line opens
+        # takes off FAIR_SHARE_FALLBACK_EVERY - 1. It is negative only after
+        # attempts that read it at its line together each opened a slot.
         self.since_fallback = 0
         # Counted attempts that found a command since a fallback round last
         # dispatched a command holding a slot token, whatever they then dispatched
@@ -2269,18 +2273,19 @@ def _fair_count_dispatch(attempt: _FairAttempt, opened: bool) -> None:
     command is applied leaves it counted as joining. An attempt whose slot is refused or
     released, or whose ownership check raises, never gets here; one that does is
     recorded even if applying the command then fails. A dispatch that opens a slot
-    moves the balance: a fallback round takes FAIR_SHARE_FALLBACK_EVERY - 1 off,
-    any other round adds one. A fallback round's dispatch also sets the attempt
-    count back to zero, whether or not it opens a slot; the attempt itself was
-    counted by the scan that found its command (``_fair_count_attempt``). The lock
-    is held for the memory update only.
+    moves the balance: a fallback round whose first scan read the balance at its
+    line takes FAIR_SHARE_FALLBACK_EVERY - 1 off, one the attempt count alone
+    brought leaves it alone, and any other round adds one. A fallback round's
+    dispatch also sets the attempt count back to zero, whether or not it opens a
+    slot; the attempt itself was counted by the scan that found its command
+    (``_fair_count_attempt``). The lock is held for the memory update only.
     """
     if not attempt.counted:
         return
     with _fair_state_lock:
         if attempt.fallback:
             _fair_state.attempts_since_fallback = 0
-            if opened:
+            if opened and attempt.at_balance_line:
                 _fair_state.since_fallback -= FAIR_SHARE_FALLBACK_EVERY - 1
         elif opened:
             _fair_state.since_fallback += 1
@@ -2296,14 +2301,17 @@ class _FairAttempt:
     finds a command (``_fair_count_attempt``), and only a counted attempt is
     recorded once it dispatches (``_fair_count_dispatch``). A scan the
     presence precheck ends because no command is open never reaches that
-    decision, so it leaves ``decided`` unset. ``tenants`` is the listing of the
-    queue, taken by the first scan that ranks or that is between the batch line
-    and the limit, and reused by the rescans of the same attempt.
+    decision, so it leaves ``decided`` unset. ``at_balance_line`` is set when that
+    scan read the balance at its line, so that the attempt's dispatch takes its
+    share off the balance. ``tenants`` is the listing of the queue, taken by the
+    first scan that ranks or that is between the batch line and the limit, and
+    reused by the rescans of the same attempt.
     """
 
     decided: bool = False
     counted: bool = False
     fallback: bool = False
+    at_balance_line: bool = False
     tenants: dict[str, dict[str, int]] | None = None
 
 
@@ -2323,11 +2331,12 @@ def _ranks_tenants(
     balance has reached FAIR_SHARE_FALLBACK_EVERY - 1 or the attempt count has
     reached FAIR_SHARE_FALLBACK_AFTER_ATTEMPTS. So once that many counted attempts
     have found a command since a fallback round last dispatched a command holding
-    a slot token, every attempt is a fallback round until one does. It only reads
-    both: ``_fair_count_attempt`` adds the attempt to the attempt count once the
-    scan finds a command, and ``_fair_count_dispatch`` moves the balance and sets
-    the attempt count back. A scan the presence precheck already ended never calls
-    this, so it is not counted and does not set ``decided``.
+    a slot token, every attempt is a fallback round until one does; only an
+    attempt that read the balance at its line is marked to take its share off. It
+    only reads both: ``_fair_count_attempt`` adds the attempt to the attempt count
+    once the scan finds a command, and ``_fair_count_dispatch`` moves the balance
+    and sets the attempt count back. A scan the presence precheck already ended
+    never calls this, so it is not counted and does not set ``decided``.
     """
     has_room = command_db_id is None and (cap is None or not cap.closed)
     if not attempt.decided:
@@ -2335,8 +2344,11 @@ def _ranks_tenants(
         if has_room:
             attempt.counted = True
             with _fair_state_lock:
-                attempt.fallback = (
+                attempt.at_balance_line = (
                     _fair_state.since_fallback >= FAIR_SHARE_FALLBACK_EVERY - 1
+                )
+                attempt.fallback = (
+                    attempt.at_balance_line
                     or _fair_state.attempts_since_fallback
                     >= FAIR_SHARE_FALLBACK_AFTER_ATTEMPTS
                 )
