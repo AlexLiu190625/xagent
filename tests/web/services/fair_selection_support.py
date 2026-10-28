@@ -155,12 +155,17 @@ WORLDS = {
 
 CLASSES = ("batch", "interactive")
 CONTROL_KINDS = {"pause", "cancel"}
+OPENING_KINDS = {"start", "resume", "resume_input", "message"}
 QUEUED = ("pending", "processing")
 
 
 @dataclass
 class Cmd:
-    """One command of a random world; ``id`` and ``task`` are filled in when stored."""
+    """One command of a random world; ``id`` and ``task`` are filled in when stored.
+
+    Commands with the same ``group`` share a task, and -1 is a task of its own.
+    ``claimed`` is a command claimed once and back in pending.
+    """
 
     tenant: str
     dispatch_class: str
@@ -170,6 +175,8 @@ class Cmd:
     unavailable: bool = False
     ticketed: bool = False
     priority: int = 0
+    claimed: bool = False
+    group: int = -1
     id: int = 0
     task: int = 0
 
@@ -192,7 +199,9 @@ def random_world(
     """A queue of ``size`` commands over ``tenants`` tenants, with the awkward cases in it.
 
     Some commands wait on a task leased elsewhere, some are not yet due, some
-    belong to a tenant whose admission bucket is full, some are settled. With
+    belong to a tenant whose admission bucket is full, some are settled, and
+    some were claimed once and are pending again. Many tasks hold several
+    commands, so a command can wait behind an earlier one of its task. With
     ``heavy``, a tenant may have sixteen pinned commands ahead of its first
     claimable one.
     """
@@ -215,16 +224,18 @@ def random_world(
     for _ in range(size):
         name = rng.choice(names)
         kind = rng.choice(kinds)
+        status = rng.choices(["pending", "processing", "completed"], [8, 1, 2])[0]
         commands.append(
             Cmd(
                 name,
                 "interactive" if kind == "resume_input" else rng.choice(CLASSES),
                 kind,
-                rng.choices(["pending", "processing", "completed"], [8, 1, 2])[0],
+                status,
                 pinned=rng.random() < 0.1,
                 unavailable=rng.random() < 0.07,
                 ticketed=name in full and kind not in CONTROL_KINDS,
                 priority=rng.choice((-3, 0, 0, 0, 5, 10)),
+                claimed=status == "pending" and rng.random() < 0.1,
             )
         )
     # Pauses and cancels whose key is not the key of any tenant with work, as when
@@ -241,7 +252,27 @@ def random_world(
         ]
     if rng.random() < 0.3:
         rng.shuffle(commands)
+    group_tasks(rng, commands)
     return RandomWorld(leading + commands, full)
+
+
+def group_tasks(rng: random.Random, commands: list[Cmd]) -> None:
+    """Put many commands into the task of an earlier command of their tenant.
+
+    A pause or cancel with a stale key may join any task. A task's lease is the
+    task's, so its commands take the first one's ``pinned``.
+    """
+    groups: list[list[Cmd]] = []
+    for cmd in commands:
+        stale = cmd.tenant.startswith("stale:")
+        joinable = [g for g in groups if stale or g[0].tenant == cmd.tenant]
+        if joinable and rng.random() < 0.6:
+            members = rng.choice(joinable)
+            cmd.group, cmd.pinned = members[0].group, members[0].pinned
+            members.append(cmd)
+        else:
+            cmd.group = len(groups)
+            groups.append([cmd])
 
 
 def store_world(world: "World", spec: RandomWorld) -> None:
@@ -285,18 +316,25 @@ def store_world(world: "World", spec: RandomWorld) -> None:
                     owner_attempt_id=f"held-{tenant}",
                 )
             )
+        tasks: dict[int, int] = {}
         for number, cmd in enumerate(spec.commands):
-            task = Task(
-                user_id=world.user,
-                title="t",
-                status=TaskStatus.PENDING,
-                runner_id="other" if cmd.pinned else None,
-                lease_expires_at=later if cmd.pinned else None,
-            )
-            db.add(task)
-            db.flush()
+            if cmd.group >= 0 and cmd.group in tasks:
+                task_id = tasks[cmd.group]
+            else:
+                task = Task(
+                    user_id=world.user,
+                    title="t",
+                    status=TaskStatus.PENDING,
+                    runner_id="other" if cmd.pinned else None,
+                    lease_expires_at=later if cmd.pinned else None,
+                )
+                db.add(task)
+                db.flush()
+                task_id = task.id
+                if cmd.group >= 0:
+                    tasks[cmd.group] = task_id
             row = TaskExecutionCommand(
-                task_id=task.id,
+                task_id=task_id,
                 command_id=f"c{number}",
                 kind=cmd.kind,
                 payload={},
@@ -305,15 +343,16 @@ def store_world(world: "World", spec: RandomWorld) -> None:
                 fairness_key=cmd.tenant,
                 priority=cmd.priority,
                 retry_available_at=later if cmd.unavailable else None,
+                attempt_count=1 if cmd.claimed else 0,
             )
             db.add(row)
             db.flush()
-            cmd.id, cmd.task = row.id, task.id
+            cmd.id, cmd.task = row.id, row.task_id
             if cmd.ticketed:
                 db.add(
                     TaskAdmissionTicket(
                         command_id=row.id,
-                        task_id=task.id,
+                        task_id=row.task_id,
                         bucket_key=f"bucket:{cmd.tenant}",
                     )
                 )
@@ -321,10 +360,14 @@ def store_world(world: "World", spec: RandomWorld) -> None:
 
 
 class Reference:
-    """The selection rules read straight off the specification, over plain objects.
+    """The documented selection rules, rewritten over plain objects.
 
-    It shares no code with the dispatcher. ``clock`` is the time source the test
-    moves; the reference keeps its own fallback balance and skip table.
+    It shares no code or constants with the dispatcher. The order of the commands of
+    one task follows the docstrings of ``_unfinished_earlier_command`` and
+    ``_held_below_cap`` clause for clause, so a misreading shared with them is caught
+    by the hand-written cases in test_dispatch_batch_line_overtake.py and
+    test_dispatch_cap_cancel_overtake.py, not here. ``clock`` is the time source the
+    test moves; the reference keeps its own fallback balance and skip table.
     """
 
     def __init__(
@@ -345,6 +388,11 @@ class Reference:
         self.fallback_every = 8
         self.tenant_cap = True
         self.last_capped: str | None = None
+        # Counted per call, every scan: calls of claimable that turn a command down
+        # only for the order of its own task, and calls of behind_own_task in which
+        # a control passes an earlier opening command at the batch line or the limit.
+        self.held_back = 0
+        self.passed = 0
 
     def claimable(self, cmd: Cmd, cap, busy) -> bool:
         if cmd.status not in QUEUED or cmd.pinned or cmd.unavailable:
@@ -354,9 +402,65 @@ class Reference:
         if cap.batch_closed:
             needs_no_slot = cmd.kind in CONTROL_KINDS or cmd.task in cap.active_ids
             if cap.closed:
-                return needs_no_slot
-            return needs_no_slot or cmd.dispatch_class == "interactive"
+                allowed = needs_no_slot
+            else:
+                allowed = needs_no_slot or cmd.dispatch_class == "interactive"
+            if not allowed:
+                return False
+        # Last, so that ``held_back`` counts only commands no other check here holds.
+        if self.behind_own_task(cmd, cap):
+            self.held_back += 1
+            return False
         return True
+
+    def behind_own_task(self, cmd: Cmd, cap) -> bool:
+        """Whether an earlier queued command of ``cmd``'s task keeps it back.
+
+        A pause or cancel passes an earlier pending command that waits for its
+        admission ticket. With the batch line reached it also passes an earlier
+        pending, never-claimed command that would open an execution and that this
+        process would not start now, unless the control's own task holds a slot:
+        at the limit any such command, below it one held at the batch line.
+        """
+        passed_batch_line = False
+        for earlier in self.commands:
+            if (
+                earlier.task != cmd.task
+                or earlier.id >= cmd.id
+                or earlier.status not in QUEUED
+            ):
+                continue
+            if cmd.kind in CONTROL_KINDS and earlier.status == "pending":
+                if earlier.ticketed:
+                    continue
+                if (
+                    cap.batch_closed
+                    and earlier.kind in OPENING_KINDS
+                    and not earlier.claimed
+                    and cmd.task not in cap.active_ids
+                    and (cap.closed or self.held_at_batch_line(earlier))
+                ):
+                    passed_batch_line = True
+                    continue
+            return True
+        if passed_batch_line:
+            # Counts only a pass over an opening command by the batch line or the
+            # limit rule, not a pass over a command that waits for its ticket.
+            self.passed += 1
+        return False
+
+    def held_at_batch_line(self, cmd: Cmd) -> bool:
+        """A batch command, or one behind a pending, never-claimed batch command of
+        its task that would open an execution: commands of a task run in order."""
+        return cmd.dispatch_class == "batch" or any(
+            head.task == cmd.task
+            and head.id <= cmd.id
+            and head.status == "pending"
+            and not head.claimed
+            and head.kind in OPENING_KINDS
+            and head.dispatch_class == "batch"
+            for head in self.commands
+        )
 
     def capped_tenant(self, cap) -> str | None:
         if not self.tenant_cap or not cap.batch_closed or cap.closed:
@@ -511,7 +615,10 @@ def play(
     """Run ``attempts`` scans of one random world and compare each with the reference.
 
     Fails with the seed and the whole world. After every scan the chosen command is
-    settled and its task counted as holding a slot for its tenant.
+    settled and its task counted as holding a slot for its tenant. A pause or cancel
+    that passed earlier commands of its task leaves them pending, as a rejected
+    control does in production; the dispatcher reads only that the control is
+    finished.
     """
     # The reference keeps no attempt count: a world runs too few attempts to pass
     # FAIR_SHARE_FALLBACK_AFTER_ATTEMPTS.
@@ -527,10 +634,11 @@ def play(
         limit=limit, interactive_reserve=rng.choice(reserves(limit))
     )
     queued = [c for c in spec.commands if c.status in QUEUED]
-    holds = [
-        (c.task, c.tenant)
-        for c in rng.sample(queued, k=rng.randint(0, min(limit - 1, len(queued))))
-    ]
+    holds: list[tuple[int, str]] = []
+    for c in rng.sample(queued, k=rng.randint(0, min(limit - 1, len(queued)))):
+        # A task holds one slot, for the tenant of the first command drawn from it.
+        if all(task != c.task for task, _ in holds):
+            holds.append((c.task, c.tenant))
     reference = Reference(spec.commands, clock, spec.full_tenants)
     by_id = {c.id: c for c in spec.commands}
     for step in range(attempts):
@@ -572,4 +680,7 @@ def play(
                 holds.append((done.task, done.tenant))
         if holds and rng.random() < 0.2:
             holds.pop(rng.randrange(len(holds)))
+    if stats is not None:
+        for name in ("held_back", "passed"):
+            stats[name] = stats.get(name, 0) + getattr(reference, name)
     return spec

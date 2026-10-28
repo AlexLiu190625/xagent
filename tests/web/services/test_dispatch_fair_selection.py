@@ -13,6 +13,8 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql, sqlite
 
 from tests.web.services.fair_selection_support import (
+    CONTROL_KINDS,
+    OPENING_KINDS,
     QUEUED,
     WORLDS,
     FakeClock,
@@ -1419,6 +1421,15 @@ def test_the_dispatcher_follows_the_reference_over_random_worlds(world, on, cloc
     # The worlds hold a tenant back, and holding it back changes some choice.
     assert stats.get("capped", 0) > 0
     assert stats.get("changed", 0) > 0
+    # The order of the commands of one task keeps commands back, and a control
+    # passes an earlier opening command at the batch line or at the limit.
+    assert stats.get("held_back", 0) > 0
+    assert stats.get("passed", 0) > 0
+
+
+def test_the_reference_kinds_are_the_dispatchers():
+    assert OPENING_KINDS == task_dispatch_cap.EXECUTION_OPENING_KINDS
+    assert CONTROL_KINDS == task_dispatch_cap.CAP_OVERTAKING_CONTROL_KINDS
 
 
 def test_without_an_interactive_reserve_no_command_is_held_for_its_class(
