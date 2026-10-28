@@ -36,6 +36,7 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/hooks/use-file-mention.ts",
         "src/hooks/use-websocket.ts",
         "src/hooks/use-widget-initial-message.ts",
+        "src/hooks/use-widget-open-message.ts",
         "src/lib/api-wrapper.ts",
         "src/lib/auth-cache.ts",
         "src/lib/connector-runtime-api.ts",
@@ -126,6 +127,9 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
           statements: 40, branches: 60, functions: 60, lines: 40,
         },
         "src/hooks/use-widget-initial-message.ts": {
+          statements: 100, branches: 100, functions: 100, lines: 100,
+        },
+        "src/hooks/use-widget-open-message.ts": {
           statements: 100, branches: 100, functions: 100, lines: 100,
         },
         "src/hooks/use-websocket.ts": { statements: 80, branches: 75, functions: 65, lines: 80 },
@@ -226,6 +230,7 @@ export default defineConfig({
       "src/hooks/use-file-mention.test.tsx",
       "src/hooks/use-websocket.test.ts",
       "src/hooks/use-widget-initial-message.test.tsx",
+      "src/hooks/use-widget-open-message.test.tsx",
       "src/lib/api-wrapper.test.ts",
       "src/lib/auth-cache.test.ts",
       "src/ci/dependency-security.test.ts",
