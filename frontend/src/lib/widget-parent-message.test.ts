@@ -221,10 +221,20 @@ describe("requestInitialMessage", () => {
 })
 
 describe("listenForOpenMessages", () => {
+  // Every listener a test starts, so a failing test cannot leave one behind.
+  let stops: Array<() => void> = []
   afterEach(() => {
+    for (const stop of stops) stop()
+    stops = []
     vi.unstubAllGlobals()
     vi.restoreAllMocks()
   })
+
+  function listen(onMessage: (message: string, id: string) => void) {
+    const stop = listenForOpenMessages(onMessage)
+    stops.push(stop)
+    return stop
+  }
 
   function send(
     data: Record<string, unknown>,
@@ -249,7 +259,7 @@ describe("listenForOpenMessages", () => {
   ])("requests, then acknowledges and delivers $name", ({ id, value, expected }) => {
     const post = stubParent()
     const onMessage = vi.fn()
-    const stop = listenForOpenMessages(onMessage)
+    const stop = listen(onMessage)
 
     send({ id, value })
 
@@ -275,7 +285,7 @@ describe("listenForOpenMessages", () => {
   ])("ignores $name without acknowledging it", ({ data }) => {
     const post = stubParent()
     const onMessage = vi.fn()
-    const stop = listenForOpenMessages(onMessage)
+    const stop = listen(onMessage)
 
     send(data)
 
@@ -287,7 +297,7 @@ describe("listenForOpenMessages", () => {
   it("ignores a message from another source without acknowledging it", () => {
     const post = stubParent()
     const onMessage = vi.fn()
-    const stop = listenForOpenMessages(onMessage)
+    const stop = listen(onMessage)
 
     send({ id: "1", value: "hi" }, window as unknown as MessageEventSource)
 
@@ -299,7 +309,7 @@ describe("listenForOpenMessages", () => {
   it("stops listening after cleanup", () => {
     const post = stubParent()
     const onMessage = vi.fn()
-    listenForOpenMessages(onMessage)()
+    listen(onMessage)()
 
     send({ id: "1", value: "hi" })
 
@@ -310,7 +320,7 @@ describe("listenForOpenMessages", () => {
   it("neither requests nor listens on a direct visit", () => {
     const post = vi.spyOn(window, "postMessage")
     const onMessage = vi.fn()
-    const stop = listenForOpenMessages(onMessage)
+    const stop = listen(onMessage)
 
     // Here window.parent === window, so the source check alone would accept this.
     send({ id: "1", value: "hi" }, window as unknown as MessageEventSource)

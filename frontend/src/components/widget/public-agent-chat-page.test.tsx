@@ -1277,11 +1277,12 @@ describe("PublicAgentChatPage", () => {
       | "G8" | "G9" | "G10" | "G11" | "G12" | "G13"
     type GuestCase = { name: string; run: () => Promise<void> }
 
-    // One key per row of the guest-mode input table. Not in this table:
-    // G-R5 (an iframe reloaded after acknowledging, before the message was
-    // taken: the message is lost; a known residual with nothing to drive), and
-    // G-B1 to G-B3 (a persisted pagehide and pageshow: widget.js's side is
-    // covered in widget-open.test.ts; the iframe side lands on the rows here).
+    // One key per guest-mode case, G1 to G13; a new case needs a new key and
+    // an entry in the key list asserted below. Not in this table: G-R5 (an
+    // iframe reloaded after acknowledging, before the message was taken: the
+    // message is lost, a known residual with nothing to drive) and G-B1 to
+    // G-B3 (a persisted pagehide and pageshow: widget.js's side is covered in
+    // widget-open.test.ts, and the iframe side lands on the cases here).
     const GUEST_CASES: Record<GuestCaseId, readonly GuestCase[]> = {
       G1: [{
         name: "with no conversation, creates the task and sends the message to it",
@@ -1372,7 +1373,7 @@ describe("PublicAgentChatPage", () => {
       ],
       G6: [
         {
-          name: "waits for the visitor's own start-screen send (M1)",
+          name: "waits for the visitor's own start-screen send",
           run: async () => {
             const visitorCreate = deferred<Response>()
             createResponses.push(() => visitorCreate.promise)
@@ -1398,7 +1399,7 @@ describe("PublicAgentChatPage", () => {
           },
         },
         {
-          name: "waits for the visitor's own conversation-panel send (M2)",
+          name: "waits for the visitor's own conversation-panel send",
           run: async () => {
             holdDeliveries = true
             await renderReady({ storedTaskId: 42 })
@@ -1423,10 +1424,10 @@ describe("PublicAgentChatPage", () => {
           },
         },
         {
-          // A form answer (M5) and a form's skip-connector send (M6) both go
-          // through useApp().sendMessage, so at this double they are the same
+          // A form answer and a form's skip-connector send both go through
+          // useApp().sendMessage, so at this double they are the same
           // in-flight count; one row stands for both.
-          name: "waits for a form answer sent through useApp().sendMessage (M5, M6)",
+          name: "waits for a form answer sent through useApp().sendMessage",
           run: async () => {
             await renderReady({ storedTaskId: 42 })
             act(() => {

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest"
-import { MAX_INITIAL_MESSAGE_LENGTH } from "@/lib/widget-parent-message"
+import { MAX_INITIAL_MESSAGE_LENGTH, listenForOpenMessages } from "@/lib/widget-parent-message"
 
 import { evaluateWidgetScript, widgetScript } from "@/test-utils/widget-script"
 
@@ -97,6 +97,12 @@ function deliveriesOfType(instance: Instance, type: string) {
 
 const openDeliveries = (instance: Instance) => deliveriesOfType(instance, "open_message")
 const delivery = (id: string, value: string) => ({ xagent: true, v: 1, type: "open_message", id, value })
+
+function firePageTransition(type: "pagehide" | "pageshow") {
+  const event = new Event(type) as PageTransitionEvent & { persisted: boolean }
+  Object.defineProperty(event, "persisted", { value: true })
+  window.dispatchEvent(event)
+}
 
 async function teardown(instance: Instance) {
   instance.container.remove()
@@ -332,16 +338,18 @@ describe("XagentWidget.open", () => {
     open({ message: "A" })
     expect(openDeliveries(instance)).toEqual([delivery("1", "A")])
 
+    // One request keeps every later call deliverable at once.
+    fromIframe(instance, "open_message_ack", { id: "1" })
+    open({ message: "B" })
+    expect(openDeliveries(instance)).toEqual([delivery("1", "A"), delivery("2", "B")])
+
     // A reloaded iframe asks again without having acknowledged.
     fromIframe(instance, "open_message_request")
-    expect(openDeliveries(instance)).toEqual([delivery("1", "A"), delivery("1", "A")])
+    expect(openDeliveries(instance)).toEqual([delivery("1", "A"), delivery("2", "B"), delivery("2", "B")])
 
-    fromIframe(instance, "open_message_ack", { id: "1" })
+    fromIframe(instance, "open_message_ack", { id: "2" })
     fromIframe(instance, "open_message_request")
-    expect(openDeliveries(instance)).toHaveLength(2)
-
-    open({ message: "B" })
-    expect(openDeliveries(instance)).toEqual([delivery("1", "A"), delivery("1", "A"), delivery("2", "B")])
+    expect(openDeliveries(instance)).toHaveLength(3)
   })
 
   describe("routes open() to the newest live instance", () => {
@@ -424,5 +432,71 @@ describe("XagentWidget.open", () => {
     fromIframe(instance, "open_message_request")
 
     expect(openDeliveries(instance)).toEqual([delivery("1", "A"), delivery("1", "A")])
+  })
+
+  describe("round-trips an open message and its acknowledgement between the real widget.js and the iframe listener", () => {
+    it.each([
+      { name: "a short message", message: "hi" },
+      { name: "a message at the shared length cap", message: "x".repeat(MAX_INITIAL_MESSAGE_LENGTH) },
+    ])("$name", ({ message }) => {
+      const instance = mountGuest()
+      const parentPost = vi.fn()
+      vi.stubGlobal("parent", { postMessage: parentPost })
+      const onMessage = vi.fn()
+      const stop = listenForOpenMessages(onMessage)
+      // Every message below is the real output of the other side, passed on
+      // unchanged: a renamed type or field on either side breaks the trip.
+      const toWidget = (data: unknown) => window.dispatchEvent(new MessageEvent("message", {
+        data,
+        origin: HOST,
+        source: instance.iframe.contentWindow,
+      }))
+      const [[request]] = parentPost.mock.calls
+
+      toWidget(request)
+      open({ message })
+      expect(instance.post).toHaveBeenCalledTimes(1)
+      const [[delivered]] = instance.post.mock.calls
+      window.dispatchEvent(new MessageEvent("message", {
+        data: delivered,
+        source: window.parent as unknown as MessageEventSource,
+      }))
+
+      expect(onMessage.mock.calls).toEqual([[message, (delivered as { id: string }).id]])
+      expect(parentPost).toHaveBeenCalledTimes(2)
+      const [, [acknowledgement]] = parentPost.mock.calls
+      toWidget(acknowledgement)
+      toWidget(request)
+
+      expect(instance.post).toHaveBeenCalledTimes(1)
+      stop()
+    })
+  })
+
+  describe("keeps a pending open message across a persisted pagehide and pageshow", () => {
+    it.each<{ mode: string; attributes: Record<string, string>; requestedBefore: boolean }>([
+      { mode: "guest", attributes: { "data-widget-key": "widget-secret" }, requestedBefore: false },
+      { mode: "guest", attributes: { "data-widget-key": "widget-secret" }, requestedBefore: true },
+      { mode: "Session", attributes: { "data-encrypted-context": GRANT }, requestedBefore: false },
+      { mode: "Session", attributes: { "data-encrypted-context": GRANT }, requestedBefore: true },
+    ])("$mode mode, iframe asked before the freeze: $requestedBefore", ({ attributes, requestedBefore }) => {
+      const instance = mount(attributes)!
+      if (requestedBefore) fromIframe(instance, "open_message_request")
+      open({ message: "A" })
+      expect(openDeliveries(instance)).toEqual(requestedBefore ? [delivery("1", "A")] : [])
+
+      firePageTransition("pagehide")
+      firePageTransition("pageshow")
+      // The restore itself posts nothing again.
+      expect(openDeliveries(instance)).toEqual(requestedBefore ? [delivery("1", "A")] : [])
+
+      fromIframe(instance, "open_message_request")
+      const afterRequest = requestedBefore ? 2 : 1
+      expect(openDeliveries(instance)).toEqual(Array(afterRequest).fill(delivery("1", "A")))
+
+      fromIframe(instance, "open_message_ack", { id: "1" })
+      fromIframe(instance, "open_message_request")
+      expect(openDeliveries(instance)).toHaveLength(afterRequest)
+    })
   })
 })
