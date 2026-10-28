@@ -21,10 +21,10 @@ one state machine.
 
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Any, NoReturn, Optional, cast
+from typing import Any, Literal, NoReturn, Optional, cast
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import TypeAdapter
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -34,6 +34,7 @@ from ....core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ...config import is_allowed_file
 from ...models.database import get_session_local
 from ...models.task import Task, TaskStatus, TraceEvent
+from ...models.uploaded_file import UploadedFile
 from ...schemas.v1 import (
     AppendMessageRequest,
     AppendMessageResponse,
@@ -44,6 +45,8 @@ from ...schemas.v1 import (
     ReplyRequest,
     ReplyResponse,
     StepsResponse,
+    TaskFileInfo,
+    TaskFilesResponse,
     TaskInfoResponse,
     UploadedFileInfo,
     UploadFilesResponse,
@@ -71,6 +74,11 @@ from ...services.task_orchestrator import (
     TaskTurnFileBindingError,
     TaskTurnNotFoundError,
 )
+from ...services.uploaded_file_store import (
+    UploadedFileVersionSnapshot,
+    snapshot_uploaded_file_version,
+)
+from ...utils.db_timezone import normalize_datetime_from_db
 from . import _events_stream
 from ._step_mapping import map_trace_events_to_public_steps
 from .deps import ApiKeyPrincipal, get_principal_from_api_key, record_key_usage
@@ -500,6 +508,92 @@ def _resolve_task_or_404(task_id: int, principal: ApiKeyPrincipal, db: Session) 
         )
     except task_start_service.TaskStartRejected as exc:
         _raise_start_rejection(exc)
+
+
+def _task_file_source(file_record: UploadedFile) -> Literal["output", "upload"]:
+    # ``workspace_category`` is set by workspace registration; uploads leave
+    # it NULL, so anything but the output category is an attachment.
+    return "output" if file_record.workspace_category == "output" else "upload"
+
+
+def _list_chat_task_files_sync(
+    task_id: int, principal: ApiKeyPrincipal
+) -> TaskFilesResponse:
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        task = _resolve_task_or_404(task_id, principal, db)
+        records = (
+            db.query(UploadedFile)
+            .filter(UploadedFile.task_id == int(task.id))
+            .order_by(UploadedFile.created_at.asc(), UploadedFile.id.asc())
+            .all()
+        )
+        files: list[TaskFileInfo] = []
+        for record in records:
+            if (
+                record.detached_reason is not None
+                or record.storage_status == "compensating"
+            ):
+                continue
+            created_at = (
+                normalize_datetime_from_db(record.created_at)
+                if record.created_at is not None
+                else None
+            )
+            files.append(
+                TaskFileInfo(
+                    file_id=str(record.file_id),
+                    filename=str(record.filename),
+                    file_size=int(record.file_size or 0),
+                    mime_type=record.mime_type,
+                    created_at=created_at,
+                    source=_task_file_source(record),
+                )
+            )
+        return TaskFilesResponse(files=files)
+
+
+def _load_download_file_snapshot(
+    file_id: str, principal: ApiKeyPrincipal
+) -> UploadedFileVersionSnapshot:
+    """Authorize one SDK download and detach its storage metadata.
+
+    Task-bound files require the task to be reachable through this key (the
+    same scope every other v1 task route uses). A never-attached upload is
+    allowed only to the user who uploaded it. Every refusal is a 404 so file
+    existence is not disclosed.
+    """
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        record = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
+        if (
+            record is None
+            or record.detached_reason is not None
+            or record.storage_status == "compensating"
+        ):
+            raise V1ApiError(V1ErrorCode.FILE_NOT_FOUND, 404)
+        if record.task_id is not None:
+            try:
+                _resolve_task_or_404(int(record.task_id), principal, db)
+            except V1ApiError as exc:
+                raise V1ApiError(V1ErrorCode.FILE_NOT_FOUND, 404) from exc
+        elif int(record.user_id) != principal.owner_user_id:
+            raise V1ApiError(V1ErrorCode.FILE_NOT_FOUND, 404)
+        return snapshot_uploaded_file_version(record)
+
+
+def _raise_v1_file_download_error(exc: HTTPException) -> NoReturn:
+    if exc.status_code >= 500:
+        _raise_v1_storage_unavailable(exc)
+    if exc.status_code == 409:
+        raise V1ApiError(
+            V1ErrorCode.INTERNAL_ERROR,
+            409,
+            message="File integrity verification failed. Please re-upload this file.",
+        ) from exc
+    # 403 (path containment) and 404 both stay non-disclosing on the SDK surface.
+    raise V1ApiError(V1ErrorCode.FILE_NOT_FOUND, 404) from exc
 
 
 def _load_task_info_snapshot(
@@ -1005,6 +1099,53 @@ async def get_chat_task_steps(
     return await run_db_io_cancellation_safe(
         lambda: _get_chat_task_steps_sync(task_id, principal)
     )
+
+
+@router.get("/chat/tasks/{task_id}/files", response_model=TaskFilesResponse)
+async def get_chat_task_files(
+    task_id: int,
+    principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
+) -> TaskFilesResponse:
+    """List the files bound to a task.
+
+    Covers both files the agent produced in the task workspace and files
+    attached to one of its turns. Authorization is the same task scope every
+    other ``/v1/chat/tasks/{task_id}/*`` route uses.
+
+    Raises:
+        V1ApiError 401: missing / invalid / revoked key.
+        V1ApiError 404: task missing or not accessible with this key.
+        V1ApiError 410: the task was expired by the retention policy.
+    """
+    return await run_db_io_cancellation_safe(
+        lambda: _list_chat_task_files_sync(task_id, principal)
+    )
+
+
+@router.get("/chat/files/{file_id}/download", response_model=None)
+async def download_chat_file(
+    file_id: str,
+    principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
+) -> Response:
+    """Download one file as an attachment.
+
+    A task-bound file is served only when its task is reachable through this
+    key; an unbound upload only to the user who uploaded it. Failures use the
+    stable v1 error envelope and answer 404 rather than 403.
+    """
+    from ..files import build_registered_file_download_response
+
+    snapshot = await run_db_io_cancellation_safe(
+        lambda: _load_download_file_snapshot(file_id, principal)
+    )
+    try:
+        return await build_registered_file_download_response(
+            snapshot,
+            owner_user_id=int(snapshot.user_id),
+            disposition="attachment",
+        )
+    except HTTPException as exc:
+        _raise_v1_file_download_error(exc)
 
 
 @router.get("/chat/tasks/{task_id}/events")

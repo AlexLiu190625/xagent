@@ -19,8 +19,10 @@ import io
 import threading
 from dataclasses import replace
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
@@ -82,13 +84,15 @@ from ..conftest import (
 )
 
 
-def _create_agent_with_key_for(headers: dict[str, str]) -> tuple[int, str]:
+def _create_agent_with_key_for(
+    headers: dict[str, str], *, name: str = "v1 tasks test agent"
+) -> tuple[int, str]:
     """Create an agent + api key under the user owning ``headers``."""
     agent_resp = client.post(
         "/api/agents",
         headers=headers,
         json={
-            "name": "v1 tasks test agent",
+            "name": name,
             "description": "test",
             "instructions": "you are a test agent",
             "execution_mode": "balanced",
@@ -4468,3 +4472,282 @@ def test_an_append_ignores_the_field_and_inherits_the_tasks_priority(shared_mode
 
     assert appended.status_code == 202, appended.text
     assert _stored_priorities(task_id) == (4, [4, 4])
+
+
+# ===== GET /v1/chat/tasks/{id}/files + GET /v1/chat/files/{id}/download =====
+
+
+@pytest.fixture
+def isolated_uploads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Point uploads and durable storage at this test's own temporary tree."""
+
+    from xagent.core.file_storage.factory import get_unscoped_file_storage
+    from xagent.web import config as web_config
+    from xagent.web.api import files as files_api
+
+    uploads_dir = tmp_path / "uploads"
+    uploads_dir.mkdir()
+    objects_dir = tmp_path / "objects"
+    monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", objects_dir.as_uri())
+    get_unscoped_file_storage.cache_clear()
+    monkeypatch.setattr(web_config, "get_uploads_dir", lambda: uploads_dir)
+    monkeypatch.setattr(files_api, "get_uploads_dir", lambda: uploads_dir)
+    yield uploads_dir
+    get_unscoped_file_storage.cache_clear()
+
+
+def _agent_owner_user_id(agent_id: int) -> int:
+    db = _direct_db_session()
+    try:
+        return int(db.query(Agent.user_id).filter(Agent.id == agent_id).scalar())
+    finally:
+        db.close()
+
+
+def _add_task_file(
+    *,
+    task_id: int,
+    user_id: int,
+    uploads_dir: Path,
+    filename: str,
+    content: bytes,
+    category: str | None,
+    created_at: datetime | None = None,
+    mime_type: str | None = "text/plain",
+    storage_path: Path | None = None,
+) -> str:
+    """Insert one registered file row and write its local bytes."""
+
+    from xagent.web.models.uploaded_file import UploadedFile
+
+    file_id = str(uuid4())
+    path = storage_path or (
+        uploads_dir
+        / f"user_{user_id}"
+        / f"task_{task_id}"
+        / (category or "input")
+        / filename
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    db = _direct_db_session()
+    try:
+        db.add(
+            UploadedFile(
+                file_id=file_id,
+                user_id=user_id,
+                task_id=task_id,
+                filename=filename,
+                storage_path=str(path),
+                storage_status="legacy",
+                workspace_category=category,
+                mime_type=mime_type,
+                file_size=len(content),
+                created_at=created_at or datetime.now(UTC),
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+    return file_id
+
+
+def test_list_task_files_returns_outputs_and_uploads_in_order(isolated_uploads):
+    agent_id, full_key = _create_agent_with_key()
+    user_id = _agent_owner_user_id(agent_id)
+    task_id = _create_task(full_key, agent_id, content="produce a file")
+
+    output_id = _add_task_file(
+        task_id=task_id,
+        user_id=user_id,
+        uploads_dir=isolated_uploads,
+        filename="lesson_plan.txt",
+        content=b"plan bytes",
+        category="output",
+        created_at=datetime(2026, 1, 1, 8, 0, 0, tzinfo=UTC),
+    )
+    upload_id = _add_task_file(
+        task_id=task_id,
+        user_id=user_id,
+        uploads_dir=isolated_uploads,
+        filename="source.txt",
+        content=b"source bytes",
+        category=None,
+        created_at=datetime(2026, 1, 1, 9, 0, 0, tzinfo=UTC),
+    )
+    # Another task's file must never leak into this list.
+    other_task_id = _create_task(full_key, agent_id, content="another task")
+    _add_task_file(
+        task_id=other_task_id,
+        user_id=user_id,
+        uploads_dir=isolated_uploads,
+        filename="other.txt",
+        content=b"other bytes",
+        category="output",
+    )
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}/files", headers=_bearer(full_key))
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert set(body) == {"files"}
+    files = body["files"]
+    assert [item["file_id"] for item in files] == [output_id, upload_id]
+    assert [item["source"] for item in files] == ["output", "upload"]
+    assert set(files[0]) == {
+        "file_id",
+        "filename",
+        "file_size",
+        "mime_type",
+        "created_at",
+        "source",
+    }
+    assert files[0]["filename"] == "lesson_plan.txt"
+    assert files[0]["file_size"] == len(b"plan bytes")
+    assert files[0]["mime_type"] == "text/plain"
+    assert datetime.fromisoformat(
+        files[0]["created_at"].replace("Z", "+00:00")
+    ) == datetime(2026, 1, 1, 8, 0, 0, tzinfo=UTC)
+
+
+def test_task_files_are_scoped_to_the_key_that_can_reach_the_task(isolated_uploads):
+    admin_headers = _admin_headers()
+    agent_a, key_a = _create_agent_with_key()
+    user_a = _agent_owner_user_id(agent_a)
+    task_a = _create_task(key_a, agent_a, content="task owned by key A")
+    file_a = _add_task_file(
+        task_id=task_a,
+        user_id=user_a,
+        uploads_dir=isolated_uploads,
+        filename="secret_plan.txt",
+        content=b"plan bytes",
+        category="output",
+    )
+
+    # Same user, different agent/key: still not this task's scope.
+    _agent_a2, key_a2 = _create_agent_with_key_for(
+        admin_headers, name="v1 tasks second agent"
+    )
+    # Different user entirely.
+    bob_headers = _register_second_user()
+    _agent_b, key_b = _create_agent_with_key_for(bob_headers)
+
+    listed = client.get(f"/v1/chat/tasks/{task_a}/files", headers=_bearer(key_a))
+    assert listed.status_code == 200, listed.text
+    downloaded = client.get(f"/v1/chat/files/{file_a}/download", headers=_bearer(key_a))
+    assert downloaded.status_code == 200, downloaded.text
+    assert downloaded.content == b"plan bytes"
+
+    for foreign_key in (key_a2, key_b):
+        list_resp = client.get(
+            f"/v1/chat/tasks/{task_a}/files", headers=_bearer(foreign_key)
+        )
+        assert list_resp.status_code == 404, list_resp.text
+        assert list_resp.json()["error"]["code"] == "task_not_found"
+
+        download_resp = client.get(
+            f"/v1/chat/files/{file_a}/download", headers=_bearer(foreign_key)
+        )
+        assert download_resp.status_code == 404, download_resp.text
+        assert download_resp.json()["error"]["code"] == "file_not_found"
+        assert b"plan bytes" not in download_resp.content
+
+
+def test_download_unbound_upload_is_owner_scoped(isolated_uploads):
+    agent_a, key_a = _create_agent_with_key()
+    _agent_owner_user_id(agent_a)
+
+    uploaded = client.post(
+        "/v1/chat/files",
+        headers=_bearer(key_a),
+        files=[("files", ("draft.txt", b"draft bytes", "text/plain"))],
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    file_id = uploaded.json()["files"][0]["file_id"]
+
+    owner_download = client.get(
+        f"/v1/chat/files/{file_id}/download", headers=_bearer(key_a)
+    )
+    assert owner_download.status_code == 200, owner_download.text
+    assert owner_download.content == b"draft bytes"
+
+    bob_headers = _register_second_user()
+    _agent_b, key_b = _create_agent_with_key_for(bob_headers)
+    foreign_download = client.get(
+        f"/v1/chat/files/{file_id}/download", headers=_bearer(key_b)
+    )
+    assert foreign_download.status_code == 404, foreign_download.text
+    assert foreign_download.json()["error"]["code"] == "file_not_found"
+    assert b"draft bytes" not in foreign_download.content
+
+
+def test_download_task_output_streams_bytes_as_attachment(isolated_uploads):
+    from urllib.parse import quote
+
+    agent_id, full_key = _create_agent_with_key()
+    user_id = _agent_owner_user_id(agent_id)
+    task_id = _create_task(full_key, agent_id, content="generate a file")
+    content = b"binary\x00output"
+    filename = "成绩单 2026.txt"
+    file_id = _add_task_file(
+        task_id=task_id,
+        user_id=user_id,
+        uploads_dir=isolated_uploads,
+        filename=filename,
+        content=content,
+        category="output",
+    )
+
+    resp = client.get(f"/v1/chat/files/{file_id}/download", headers=_bearer(full_key))
+
+    assert resp.status_code == 200, resp.text
+    assert resp.content == content
+    assert resp.headers["content-type"].startswith("text/plain")
+    assert resp.headers["x-content-type-options"] == "nosniff"
+    disposition = resp.headers["content-disposition"]
+    assert disposition.startswith("attachment;")
+    assert f"filename*=UTF-8''{quote(filename, safe='')}" in disposition
+
+
+def test_download_unknown_traversal_and_outside_paths_are_404(
+    isolated_uploads, tmp_path: Path
+):
+    agent_id, full_key = _create_agent_with_key()
+    user_id = _agent_owner_user_id(agent_id)
+    task_id = _create_task(full_key, agent_id, content="task")
+
+    unknown = client.get(
+        f"/v1/chat/files/{uuid4()}/download", headers=_bearer(full_key)
+    )
+    assert unknown.status_code == 404
+    assert unknown.json()["error"]["code"] == "file_not_found"
+
+    missing_task = client.get(
+        f"/v1/chat/tasks/{task_id + 999}/files", headers=_bearer(full_key)
+    )
+    assert missing_task.status_code == 404
+    assert missing_task.json()["error"]["code"] == "task_not_found"
+
+    traversal = client.get(
+        "/v1/chat/files/%2e%2e%2f%2e%2e%2fetc%2fpasswd/download",
+        headers=_bearer(full_key),
+    )
+    assert traversal.status_code == 404
+
+    outside_path = tmp_path / "outside.txt"
+    outside_path.write_bytes(b"outside secret")
+    outside_id = _add_task_file(
+        task_id=task_id,
+        user_id=user_id,
+        uploads_dir=isolated_uploads,
+        filename="outside.txt",
+        content=b"outside secret",
+        category="output",
+        storage_path=outside_path,
+    )
+    outside = client.get(
+        f"/v1/chat/files/{outside_id}/download", headers=_bearer(full_key)
+    )
+    assert outside.status_code == 404, outside.text
+    assert outside.json()["error"]["code"] == "file_not_found"
+    assert b"outside secret" not in outside.content

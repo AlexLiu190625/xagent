@@ -172,6 +172,37 @@ class UploadFilesResponse(BaseModel):
     files: List[UploadedFileInfo]
 
 
+TaskFileSource = Literal["output", "upload"]
+
+
+class TaskFileInfo(BaseModel):
+    """One file bound to a task, as listed by ``GET .../tasks/{id}/files``."""
+
+    file_id: str
+    filename: str
+    file_size: int
+    mime_type: Optional[str] = None
+    created_at: Optional[datetime] = None
+    source: TaskFileSource = Field(
+        ...,
+        description=(
+            "``output`` for a file the agent produced in the task workspace; "
+            "``upload`` for a file attached to the task. Derived from the "
+            "stored workspace category, so it is ``upload`` when that "
+            "category is absent or is not ``output``."
+        ),
+    )
+
+
+class TaskFilesResponse(BaseModel):
+    """``GET /v1/chat/tasks/{task_id}/files`` response body."""
+
+    files: List[TaskFileInfo] = Field(
+        default_factory=list,
+        description="Files bound to the task, oldest first.",
+    )
+
+
 class RuntimeKeyResponse(BaseModel):
     """Runtime API key returned once after creation or rotation."""
 

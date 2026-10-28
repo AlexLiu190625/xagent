@@ -91,6 +91,7 @@ from ..services.managed_file_ref import (
     DurableObjectMissingError,
     DurableStorageOperationError,
     ManagedFileRef,
+    UploadedFileLocalPathRecord,
     guess_media_type,
     log_durable_storage_fault,
 )
@@ -440,6 +441,119 @@ def _accel_redirect_response(
             "X-Accel-Redirect": internal_uri,
             "Content-Disposition": _content_disposition_header(disposition, filename),
         },
+    )
+
+
+def _registered_file_response(
+    path: Path,
+    *,
+    filename: str,
+    media_type: str,
+    disposition: str,
+) -> FileResponse:
+    return FileResponse(
+        path=str(path),
+        filename=filename,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": _content_disposition_header(disposition, filename),
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+async def build_registered_file_download_response(
+    file_record: UploadedFileLocalPathRecord,
+    *,
+    owner_user_id: int,
+    disposition: str,
+) -> Response:
+    """Serve one registered file, shared by the JWT and SDK download routes.
+
+    ``disposition`` is the caller's policy (``inline`` for the JWT route,
+    ``attachment`` for the SDK); path containment and durable fallback stay
+    identical for both.
+    """
+
+    file_ref = ManagedFileRef(file_record)
+    local_path = file_ref.local_path
+    filename = str(file_record.filename)
+    media_type = guess_media_type(filename)
+    local_path_is_trusted = _is_under_uploads(local_path, owner_user_id)
+    redirect_response = _durable_redirect_response(
+        file_ref,
+        filename=filename,
+        media_type=media_type,
+        disposition=disposition,
+    )
+    if redirect_response is not None:
+        return redirect_response
+    if local_path_is_trusted and local_path.exists() and local_path.is_file():
+        accel_response = _accel_redirect_response(
+            local_path,
+            owner_user_id=owner_user_id,
+            filename=filename,
+            media_type=media_type,
+            disposition=disposition,
+        )
+        if accel_response is not None:
+            return accel_response
+        return _registered_file_response(
+            local_path,
+            filename=filename,
+            media_type=media_type,
+            disposition=disposition,
+        )
+    if file_ref.has_durable_object:
+        try:
+            if local_path_is_trusted:
+                restored_path = await async_managed_copy(file_ref, restore_local=True)
+                accel_response = _accel_redirect_response(
+                    restored_path,
+                    owner_user_id=owner_user_id,
+                    filename=filename,
+                    media_type=media_type,
+                    disposition=disposition,
+                )
+                if accel_response is not None:
+                    return accel_response
+            else:
+                restored_path = await async_managed_copy(
+                    file_ref, allow_existing_local=False
+                )
+            return _registered_file_response(
+                restored_path,
+                filename=filename,
+                media_type=media_type,
+                disposition=disposition,
+            )
+        except DurableObjectIntegrityError as exc:
+            raise _file_integrity_failed() from exc
+        except FilePublicationUnavailable as exc:
+            raise HTTPException(status_code=404, detail="File not found") from exc
+        except DurableObjectMissingError:
+            restored_path = file_ref.local_path
+            _ensure_under_uploads(restored_path, owner_user_id)
+            return _registered_file_response(
+                restored_path,
+                filename=filename,
+                media_type=media_type,
+                disposition=disposition,
+            )
+        except DurableStorageOperationError as exc:
+            _raise_durable_storage_unavailable(
+                exc, "download", file_id=str(file_record.file_id)
+            )
+    _ensure_under_uploads(local_path, owner_user_id)
+
+    if not local_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    return _registered_file_response(
+        local_path,
+        filename=filename,
+        media_type=media_type,
+        disposition=disposition,
     )
 
 
@@ -1550,90 +1664,13 @@ async def download_file(
     # Check access permissions
     if file_record:
         _check_file_access(file_record, user)
-        file_ref = ManagedFileRef(file_record)
-        file_name = str(file_record.filename)
-        media_type = guess_media_type(file_name)
-        local_path_is_trusted = _is_under_uploads(full_path, owner_user_id)
-        content_disposition = _inline_download_disposition(media_type)
-        redirect_response = _durable_redirect_response(
-            file_ref,
-            filename=file_name,
-            media_type=media_type,
-            disposition=content_disposition,
+        return await build_registered_file_download_response(
+            file_record,
+            owner_user_id=owner_user_id,
+            disposition=_inline_download_disposition(
+                guess_media_type(str(file_record.filename))
+            ),
         )
-        if redirect_response is not None:
-            return redirect_response
-        if local_path_is_trusted and full_path.exists() and full_path.is_file():
-            accel_response = _accel_redirect_response(
-                full_path,
-                owner_user_id=owner_user_id,
-                filename=file_name,
-                media_type=media_type,
-                disposition=content_disposition,
-            )
-            if accel_response is not None:
-                return accel_response
-            return FileResponse(
-                path=str(full_path),
-                filename=file_name,
-                media_type=media_type,
-                headers={
-                    "Content-Disposition": _content_disposition_header(
-                        content_disposition, file_name
-                    ),
-                    "X-Content-Type-Options": "nosniff",
-                },
-            )
-        if file_ref.has_durable_object:
-            try:
-                if local_path_is_trusted:
-                    restored_path = await async_managed_copy(
-                        file_ref, restore_local=True
-                    )
-                    accel_response = _accel_redirect_response(
-                        restored_path,
-                        owner_user_id=owner_user_id,
-                        filename=file_name,
-                        media_type=media_type,
-                        disposition=content_disposition,
-                    )
-                    if accel_response is not None:
-                        return accel_response
-                else:
-                    restored_path = await async_managed_copy(
-                        file_ref, allow_existing_local=False
-                    )
-                return FileResponse(
-                    path=str(restored_path),
-                    filename=file_name,
-                    media_type=media_type,
-                    headers={
-                        "Content-Disposition": _content_disposition_header(
-                            content_disposition, file_name
-                        ),
-                        "X-Content-Type-Options": "nosniff",
-                    },
-                )
-            except DurableObjectIntegrityError as exc:
-                raise _file_integrity_failed() from exc
-            except FilePublicationUnavailable as exc:
-                raise HTTPException(status_code=404, detail="File not found") from exc
-            except DurableObjectMissingError:
-                restored_path = file_ref.local_path
-                _ensure_under_uploads(restored_path, owner_user_id)
-                return FileResponse(
-                    path=str(restored_path),
-                    filename=file_name,
-                    media_type=media_type,
-                    headers={
-                        "Content-Disposition": _content_disposition_header(
-                            content_disposition, file_name
-                        ),
-                        "X-Content-Type-Options": "nosniff",
-                    },
-                )
-            except DurableStorageOperationError as exc:
-                _raise_durable_storage_unavailable(exc, "download", file_id=file_id)
     else:
         # For legacy files without records, check ownership
         if owner_user_id != _user_id_value(user) and not _is_admin_user(user):

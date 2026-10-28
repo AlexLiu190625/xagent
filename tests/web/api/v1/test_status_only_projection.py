@@ -312,6 +312,8 @@ ALLOWLIST = {
 }
 EXCLUDE = {
     ("POST", "/v1/chat/files"),
+    ("GET", "/v1/chat/files/{file_id}/download"),
+    ("GET", "/v1/chat/tasks/{task_id}/files"),
     ("GET", "/v1/chat/tasks/{task_id}/steps"),
     ("GET", "/v1/me"),
     ("GET", "/v1/templates"),
