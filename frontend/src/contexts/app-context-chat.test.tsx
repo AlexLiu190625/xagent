@@ -50,6 +50,7 @@ const webSocketOptions = vi.hoisted(() => ({
     }, connectionIdentity: string) => void
     onMessage?: (message: TestWebSocketMessage) => void
     onConnect?: (openedTaskId?: number) => void
+    onConnectionCapabilities?: (capabilities: readonly string[]) => void
     uploadFiles?: unknown
     token?: string
   },
@@ -129,6 +130,7 @@ vi.mock("@/hooks/use-websocket", async (importOriginal) => ({
     }, connectionIdentity: string) => void
     onMessage?: (message: TestWebSocketMessage) => void
     onConnect?: (openedTaskId?: number) => void
+    onConnectionCapabilities?: (capabilities: readonly string[]) => void
     uploadFiles?: unknown
     token?: string
   }) => {
@@ -194,7 +196,7 @@ import { toast } from "sonner"
 type TaskControlMessage = Parameters<typeof extractTaskControlEnvelope>[0]
 
 function StateProbe() {
-  const { state } = useApp()
+  const { state, sessionConversationAttachment } = useApp()
   const allTraceEvents = [
     ...state.traceEvents,
     ...state.messages.flatMap((message) => message.traceEvents || []),
@@ -262,6 +264,7 @@ function StateProbe() {
       <div data-testid="preview-open">{String(state.filePreview.isOpen)}</div>
       <div data-testid="processing">{String(state.isProcessing)}</div>
       <div data-testid="stream-recovery">{state.streamRecoveryTaskId ?? ""}</div>
+      <div data-testid="session-conversation-attachment">{sessionConversationAttachment}</div>
     </>
   )
 }
@@ -9163,6 +9166,268 @@ describe("AppProvider websocket message routing", () => {
       expect(screen.getByTestId("stop-state").textContent).toBe("timed_out")
     } finally {
       vi.useRealTimers()
+    }
+  })
+})
+
+describe("session conversation attachment", () => {
+  const ATTACH_CAPABILITIES = ["heartbeat", "conversation_attached"] as const
+  const attachedFrame = (): TestWebSocketMessage => ({
+    type: "conversation_attached",
+    timestamp: "2026-10-28T00:00:00Z",
+    data: { type: "conversation_attached" },
+  })
+  const futureFrame = (): TestWebSocketMessage => ({
+    type: "some_future_frame",
+    timestamp: "2026-10-28T00:00:00Z",
+    data: { type: "some_future_frame" },
+  })
+  const attachment = () =>
+    screen.getByTestId("session-conversation-attachment").textContent
+  const socket = () => webSocketOptions.current
+  const tree = (transport?: AppProviderTransportConfig) => (
+    <AppProvider token="token" transport={transport}>
+      <SessionControlsProbe />
+      <StateProbe />
+      <StateCapture />
+    </AppProvider>
+  )
+
+  let capturedState: ReturnType<typeof useApp>["state"] | null = null
+  function StateCapture() {
+    capturedState = useApp().state
+    return null
+  }
+  const currentState = () => {
+    if (!capturedState) throw new Error("AppProvider is not mounted")
+    return capturedState
+  }
+
+  beforeEach(() => {
+    webSocketOptions.current = null
+    webSocketOptions.all = []
+    sessionControls = null
+    capturedState = null
+    wsHarness.isConnected = true
+    wsHarness.connectionPhase = "connected"
+    sendRawMessageMock.mockReset()
+    sendRawMessageMock.mockReturnValue("sent")
+    sendChatMessageMock.mockReset()
+    sendChatMessageMock.mockResolvedValue({
+      client_message_id: "turn-optimistic",
+      turn_id: "turn-optimistic",
+    })
+    localStorage.clear()
+    ;(window as typeof window & { clearDuplicateMessageCache?: () => void })
+      .clearDuplicateMessageCache?.()
+  })
+
+  afterEach(() => {
+    cleanup()
+    wsHarness.isConnected = true
+    localStorage.clear()
+  })
+
+  const attachCurrentSocket = () => {
+    act(() => socket()?.onConnect?.())
+    act(() => socket()?.onConnectionCapabilities?.(ATTACH_CAPABILITIES))
+    act(() => socket()?.onMessage?.(attachedFrame()))
+  }
+
+  const renderAttached = () => {
+    const transport = makeSessionTransport()
+    const view = render(tree(transport))
+    attachCurrentSocket()
+    expect(attachment()).toBe("attached")
+    return { ...view, transport }
+  }
+
+  describe("exposes the current socket's conversation attachment", () => {
+    it("stays pending until the socket that declared it announces attach completion", () => {
+      render(tree(makeSessionTransport()))
+      act(() => socket()?.onConnect?.())
+      expect(attachment()).toBe("pending")
+
+      act(() => socket()?.onConnectionCapabilities?.(ATTACH_CAPABILITIES))
+      expect(attachment()).toBe("pending")
+
+      act(() => socket()?.onMessage?.(attachedFrame()))
+      expect(attachment()).toBe("attached")
+    })
+
+    it("is unsupported when the socket's server does not declare it", () => {
+      render(tree(makeSessionTransport()))
+      act(() => socket()?.onConnect?.())
+      act(() => socket()?.onConnectionCapabilities?.(["heartbeat"]))
+
+      expect(attachment()).toBe("unsupported")
+    })
+
+    it("returns to pending once the connection drops", () => {
+      const { rerender, transport } = renderAttached()
+      wsHarness.isConnected = false
+      rerender(tree(transport))
+
+      expect(attachment()).toBe("pending")
+    })
+
+    // Not reachable in production: every Session reconnect comes with a new
+    // connection identity. Kept as a defensive check of the reset on open.
+    it("returns to pending when a new socket opens under the same identity", () => {
+      renderAttached()
+      act(() => socket()?.onConnect?.())
+
+      expect(attachment()).toBe("pending")
+    })
+
+    it("voids the attachment as soon as the connection identity changes", () => {
+      const { rerender } = renderAttached()
+      rerender(tree(makeSessionTransport(makeSessionConnection("session-two"))))
+      expect(attachment()).toBe("pending")
+
+      act(() => socket()?.onConnect?.())
+      expect(attachment()).toBe("pending")
+      act(() => socket()?.onConnectionCapabilities?.(ATTACH_CAPABILITIES))
+      expect(attachment()).toBe("pending")
+      act(() => socket()?.onMessage?.(attachedFrame()))
+      expect(attachment()).toBe("attached")
+    })
+
+    it("ignores an announcement that arrives before any declared capability", () => {
+      render(tree(makeSessionTransport()))
+      act(() => socket()?.onConnect?.())
+      act(() => socket()?.onMessage?.(attachedFrame()))
+      expect(attachment()).toBe("pending")
+
+      // The ignored announcement is not remembered for a later declaration.
+      act(() => socket()?.onConnectionCapabilities?.(ATTACH_CAPABILITIES))
+      expect(attachment()).toBe("pending")
+    })
+
+    it("ignores an announcement from the previous identity's socket", () => {
+      const { rerender } = render(tree(makeSessionTransport()))
+      const previousOnMessage = socket()?.onMessage
+      act(() => socket()?.onConnect?.())
+      rerender(tree(makeSessionTransport(makeSessionConnection("session-two"))))
+      act(() => socket()?.onConnect?.())
+      act(() => socket()?.onConnectionCapabilities?.(ATTACH_CAPABILITIES))
+
+      act(() => previousOnMessage?.(attachedFrame()))
+      expect(attachment()).toBe("pending")
+
+      act(() => socket()?.onMessage?.(attachedFrame()))
+      expect(attachment()).toBe("attached")
+    })
+
+    it("is pending for a transport that is not a Session", () => {
+      render(tree())
+      expect(socket()?.onConnectionCapabilities).toBeUndefined()
+      act(() => socket()?.onConnect?.())
+      act(() => socket()?.onMessage?.(attachedFrame()))
+
+      expect(attachment()).toBe("pending")
+    })
+
+    // Not reachable in production, like the same-identity reopen above: this
+    // checks the reset on disconnect on its own, without the reset on open.
+    it("stays pending when the connection returns without a new socket opening", () => {
+      const { rerender, transport } = renderAttached()
+      wsHarness.isConnected = false
+      rerender(tree(transport))
+      wsHarness.isConnected = true
+      rerender(tree(transport))
+
+      expect(attachment()).toBe("pending")
+    })
+  })
+
+  type Phase = ReturnType<typeof useApp>["sessionConversationState"]
+  const BOUND_TASK_ID = 91
+  const reachBound = () => {
+    act(() => socket()?.onMessage?.(taskInfoMessage(BOUND_TASK_ID)))
+  }
+  const reachReplacementReady = async () => {
+    reachBound()
+    const reset = getSessionControls().startNewConversation()
+    await act(async () => {
+      socket()?.onMessage?.({
+        type: "conversation_reset",
+        timestamp: "2026-10-28T00:00:01Z",
+        data: {},
+      })
+      await reset
+    })
+  }
+  // A literal per phase: adding a phase fails type checking until it is listed.
+  const REACH_PHASE: Record<Phase, () => Promise<void>> = {
+    unbound: async () => {},
+    bound: async () => reachBound(),
+    reset_requested: async () => {
+      reachBound()
+      act(() => {
+        void getSessionControls().startNewConversation().catch(() => {})
+      })
+    },
+    replacement_ready: reachReplacementReady,
+    replacement_sending: async () => {
+      await reachReplacementReady()
+      sendChatMessageMock.mockReturnValueOnce(new Promise(() => {}))
+      act(() => {
+        void getSessionControls()
+          .sendMessage("Replacement", { clientMessageId: "attachment-sending" })
+          .catch(() => {})
+      })
+    },
+    replacement_awaiting_task: async () => {
+      await reachReplacementReady()
+      await act(async () => {
+        await getSessionControls().sendMessage("Replacement", {
+          clientMessageId: "attachment-awaiting",
+        })
+      })
+    },
+    reload_required: async () => {
+      reachBound()
+      act(() => socket()?.onMessage?.({
+        type: "conversation_reload_required",
+        timestamp: "2026-10-28T00:00:01Z",
+        task_id: BOUND_TASK_ID,
+        data: {},
+      }))
+    },
+  }
+  const PHASES = Object.keys(REACH_PHASE) as Phase[]
+  const FRAMES = [attachedFrame, futureFrame]
+
+  it("lists every session phase", () => {
+    expect(PHASES).toHaveLength(7)
+  })
+
+  it.each(
+    PHASES.flatMap(phase => FRAMES.map(frame => [frame().type, phase, frame] as const))
+  )("ignores %s frames in the %s phase", async (frameType, phase, frame) => {
+    render(tree(makeSessionTransport()))
+    act(() => socket()?.onConnect?.())
+    act(() => socket()?.onConnectionCapabilities?.(ATTACH_CAPABILITIES))
+    await REACH_PHASE[phase]()
+    await waitFor(() => {
+      expect(currentState().sessionConversation.phase).toBe(phase)
+    })
+    const conversation = currentState().sessionConversation
+    const messages = currentState().messages
+
+    act(() => socket()?.onMessage?.(frame()))
+
+    expect(currentState().sessionConversation).toEqual(conversation)
+    expect(currentState().messages).toEqual(messages)
+    if (phase === "replacement_sending" && frameType === "conversation_attached") {
+      // More frames than the pre-adoption buffer holds.
+      act(() => {
+        for (let index = 0; index < 65; index += 1) {
+          socket()?.onMessage?.(frame())
+        }
+      })
+      expect(currentState().sessionConversation).toEqual(conversation)
     }
   })
 })
