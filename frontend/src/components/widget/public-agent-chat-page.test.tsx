@@ -1273,18 +1273,20 @@ describe("PublicAgentChatPage", () => {
     }
 
     type GuestCaseId =
-      | "G1" | "G2" | "G3" | "G4" | "G5" | "G6" | "G7"
-      | "G8" | "G9" | "G10" | "G11" | "G12" | "G13"
+      | "noConversation" | "finishedConversation" | "agentStillAnswering"
+      | "previousMessageStillStarting" | "rapidClicks" | "visitorSendInFlight"
+      | "startScreenDraft" | "taskCreationFails" | "sendFailsAfterTaskCreation"
+      | "shareLink" | "workforceWidget" | "authenticationPending" | "pageUnmounted"
     type GuestCase = { name: string; run: () => Promise<void> }
 
-    // One key per guest-mode case, G1 to G13; a new case needs a new key and
-    // an entry in the key list asserted below. Not in this table: G-R5 (an
-    // iframe reloaded after acknowledging, before the message was taken: the
-    // message is lost, a known residual with nothing to drive) and G-B1 to
-    // G-B3 (a persisted pagehide and pageshow: widget.js's side is covered in
+    // One key per guest-mode case of an open message; a new case needs a new
+    // key here and in the key list asserted below. Not in this table: an
+    // iframe reloaded after acknowledging, before the message was taken (the
+    // message is lost, a known residual with nothing to drive), and a persisted
+    // pagehide and pageshow (widget.js's side is covered in
     // widget-open.test.ts, and the iframe side lands on the cases here).
     const GUEST_CASES: Record<GuestCaseId, readonly GuestCase[]> = {
-      G1: [{
+      noConversation: [{
         name: "with no conversation, creates the task and sends the message to it",
         run: async () => {
           await renderReady()
@@ -1296,11 +1298,11 @@ describe("PublicAgentChatPage", () => {
           expect(app.sendMessage.mock.calls).toEqual([["A", { targetTaskId: 101 }, []]])
         },
       }],
-      G2: [{
+      finishedConversation: [{
         name: "ends a finished conversation first, then creates the task in a later render",
         run: () => startsWithStoredConversation(false),
       }],
-      G3: [{
+      agentStillAnswering: [{
         name: "ends a conversation whose agent is still running, without stopping it",
         run: async () => {
           await startsWithStoredConversation(true)
@@ -1310,7 +1312,7 @@ describe("PublicAgentChatPage", () => {
           ])
         },
       }],
-      G4: [{
+      previousMessageStillStarting: [{
         name: "holds a message that arrives while the previous one is still being sent",
         run: async () => {
           holdDeliveries = true
@@ -1335,7 +1337,7 @@ describe("PublicAgentChatPage", () => {
           ])
         },
       }],
-      G5: [
+      rapidClicks: [
         {
           name: "rapid clicks while one is starting: the last waiting one replaces the others",
           run: async () => {
@@ -1371,7 +1373,7 @@ describe("PublicAgentChatPage", () => {
           },
         },
       ],
-      G6: [
+      visitorSendInFlight: [
         {
           name: "waits for the visitor's own start-screen send",
           run: async () => {
@@ -1450,7 +1452,7 @@ describe("PublicAgentChatPage", () => {
           },
         },
       ],
-      G7: [{
+      startScreenDraft: [{
         name: "clears the start-screen draft once the opening send succeeds",
         run: async () => {
           await renderReady()
@@ -1469,7 +1471,7 @@ describe("PublicAgentChatPage", () => {
           expect(app.startScreenProps!.inputValue).toBe("")
         },
       }],
-      G8: [
+      taskCreationFails: [
         {
           name: "a failed task creation shows the start screen's header error and toast, then the next message still goes",
           run: async () => {
@@ -1505,7 +1507,7 @@ describe("PublicAgentChatPage", () => {
           },
         },
       ],
-      G9: [
+      sendFailsAfterTaskCreation: [
         {
           name: "a send that timed out waiting for the task connection raises the generic toast",
           run: () => failsAfterTaskCreation(
@@ -1540,7 +1542,7 @@ describe("PublicAgentChatPage", () => {
           ),
         },
       ],
-      G10: [{
+      shareLink: [{
         name: "a share link neither asks for nor sends open messages",
         run: async () => {
           renderSharePage()
@@ -1553,7 +1555,7 @@ describe("PublicAgentChatPage", () => {
           expect(creates()).toEqual([])
         },
       }],
-      G11: [{
+      workforceWidget: [{
         name: "a workforce widget starts each message in task creation and still sends one at a time",
         run: async () => {
           const firstCreate = deferred<Response>()
@@ -1578,7 +1580,7 @@ describe("PublicAgentChatPage", () => {
           expect(app.sendMessage).not.toHaveBeenCalled()
         },
       }],
-      G12: [{
+      authenticationPending: [{
         name: "before authentication completes, nothing asks for or takes a message",
         run: async () => {
           authResponse = () => new Promise(() => {})
@@ -1592,7 +1594,7 @@ describe("PublicAgentChatPage", () => {
           expect(creates()).toEqual([])
         },
       }],
-      G13: [{
+      pageUnmounted: [{
         name: "after the page unmounts, a message is neither acknowledged nor sent",
         run: async () => {
           const view = await renderReady()
@@ -1609,7 +1611,10 @@ describe("PublicAgentChatPage", () => {
 
     it("covers every row of the guest-mode input table", () => {
       expect(Object.keys(GUEST_CASES)).toEqual([
-        "G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8", "G9", "G10", "G11", "G12", "G13",
+        "noConversation", "finishedConversation", "agentStillAnswering",
+        "previousMessageStillStarting", "rapidClicks", "visitorSendInFlight",
+        "startScreenDraft", "taskCreationFails", "sendFailsAfterTaskCreation",
+        "shareLink", "workforceWidget", "authenticationPending", "pageUnmounted",
       ])
     })
 
