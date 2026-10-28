@@ -109,12 +109,15 @@ of its slots, instead of the oldest claimable command of all; tenants that hold
 as many slots are ordered by their oldest queued command that opens an execution.
 Fairness is computed in each process from the slots of that process alone. All
 processes read one queue, so on a tie every process prefers the same tenant, the
-one with the older oldest queued command; once that tenant holds one more slot in
-a process, the tie there is broken and the other tenant goes first. Across a
-deployment of N dispatching processes, the preferred tenant can therefore hold up
-to N more slots than a tenant it tied with, one per process. That bound is from
-the ranking alone: fallback rounds take the oldest claimable command whatever its
-tenant, and can add to it.
+one with the older oldest queued command. Once that tenant holds one more slot in
+a process, a ranking that reads the updated slot counts breaks the tie there and
+the other tenant goes first. Across a deployment of N dispatching processes, the
+preferred tenant therefore tends to lead a tenant it tied with by one slot per
+process, N in all. N is not a strict bound. The dispatch attempts of one process
+run concurrently, and each ranks from the slot counts it read just before its
+scan, so several attempts can prefer the same tenant before any of them sees the
+slot another one took. Fallback rounds, which take the oldest claimable command
+whatever its tenant, can add to the lead as well.
 Only executions the process started through its dispatcher count for a tenant,
 as for `slot_tenants`: a resume started another way, such as one for a task that
 waited for an A2A or a user reply, holds a slot of the cap but counts for no

@@ -2330,10 +2330,13 @@ def _fair_pick(
     With no tenant ranked, the plain lookup decides.
 
     The ranking uses the slots of this process only. Every process reads one queue,
-    so on a tie they all prefer the tenant with the older oldest queued command,
-    and that tenant can hold up to one more slot than a tenant it tied with in each
-    process; one more slot in a process breaks the tie there. Fallback rounds take
-    the oldest claimable command whatever its tenant and are not part of that bound.
+    so on a tie they all prefer the tenant with the older oldest queued command. A
+    later ranking that sees that tenant's new slot breaks the tie in this process,
+    so the tenant tends to lead by one slot per process. That is not a strict bound:
+    ``cap.occupancy`` is copied when the attempt takes its snapshot, so concurrent
+    attempts can rank from the same older counts and prefer the same tenant before
+    any of them sees the slot another one took. Fallback rounds take the oldest
+    claimable command whatever its tenant and can add to the lead.
 
     Within a tenant key and class the window is read by priority. When both
     classes have a candidate, the one with the older side wins: the batch side by
