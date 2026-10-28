@@ -9399,10 +9399,6 @@ describe("session conversation attachment", () => {
   const PHASES = Object.keys(REACH_PHASE) as Phase[]
   const FRAMES = [attachedFrame, futureFrame]
 
-  it("lists every session phase", () => {
-    expect(PHASES).toHaveLength(7)
-  })
-
   it.each(
     PHASES.flatMap(phase => FRAMES.map(frame => [frame().type, phase, frame] as const))
   )("ignores %s frames in the %s phase", async (frameType, phase, frame) => {

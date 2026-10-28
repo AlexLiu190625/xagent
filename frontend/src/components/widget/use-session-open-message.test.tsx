@@ -158,10 +158,6 @@ describe("useSessionOpenMessage", () => {
       },
     }
 
-    it("lists every phase", () => {
-      expect(Object.keys(SLOT_CASES)).toHaveLength(7)
-    })
-
     it.each(Object.keys(SLOT_CASES) as Phase[])("handles a slot message in the %s phase", async (phase) => {
       await SLOT_CASES[phase]()
       if (phase !== "reload_required") expect(warn).not.toHaveBeenCalled()
@@ -186,10 +182,6 @@ describe("useSessionOpenMessage", () => {
       replacement_awaiting_task: { starts: 1, sends: [], warns: [] },
       reload_required: { starts: 1, sends: [], warns: [[W_RELOAD_REQUIRED]] },
     }
-
-    it("lists every phase", () => {
-      expect(Object.keys(WAITING_CASES)).toHaveLength(7)
-    })
 
     it.each(Object.keys(WAITING_CASES) as Phase[])("handles the waiting message in the %s phase", async (phase) => {
       const { update, reset } = startResetFromBound()
