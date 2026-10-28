@@ -318,7 +318,9 @@ def store_world(world: "World", spec: RandomWorld) -> None:
             )
         tasks: dict[int, int] = {}
         for number, cmd in enumerate(spec.commands):
-            if cmd.group < 0 or cmd.group not in tasks:
+            if cmd.group >= 0 and cmd.group in tasks:
+                task_id = tasks[cmd.group]
+            else:
                 task = Task(
                     user_id=world.user,
                     title="t",
@@ -328,9 +330,11 @@ def store_world(world: "World", spec: RandomWorld) -> None:
                 )
                 db.add(task)
                 db.flush()
-                tasks[cmd.group] = task.id
+                task_id = task.id
+                if cmd.group >= 0:
+                    tasks[cmd.group] = task_id
             row = TaskExecutionCommand(
-                task_id=tasks[cmd.group],
+                task_id=task_id,
                 command_id=f"c{number}",
                 kind=cmd.kind,
                 payload={},
@@ -356,11 +360,14 @@ def store_world(world: "World", spec: RandomWorld) -> None:
 
 
 class Reference:
-    """The selection rules read straight off the specification, over plain objects.
+    """The documented selection rules, rewritten over plain objects.
 
-    It shares no code with the dispatcher, the order of the commands of one task
-    included. ``clock`` is the time source the test moves; the reference keeps its
-    own fallback balance and skip table.
+    It shares no code or constants with the dispatcher. The order of the commands of
+    one task follows the docstrings of ``_unfinished_earlier_command`` and
+    ``_held_below_cap`` clause for clause, so a misreading shared with them is caught
+    by the hand-written cases in test_dispatch_batch_line_overtake.py and
+    test_dispatch_cap_cancel_overtake.py, not here. ``clock`` is the time source the
+    test moves; the reference keeps its own fallback balance and skip table.
     """
 
     def __init__(
@@ -381,19 +388,29 @@ class Reference:
         self.fallback_every = 8
         self.tenant_cap = True
         self.last_capped: str | None = None
+        # Counted per call, every scan: calls of claimable that turn a command down
+        # only for the order of its own task, and calls of behind_own_task in which
+        # a control passes an earlier opening command at the batch line or the limit.
+        self.held_back = 0
+        self.passed = 0
 
     def claimable(self, cmd: Cmd, cap, busy) -> bool:
         if cmd.status not in QUEUED or cmd.pinned or cmd.unavailable:
             return False
         if cmd.task in busy or cmd.ticketed and cmd.tenant in self.full:
             return False
-        if self.behind_own_task(cmd, cap):
-            return False
         if cap.batch_closed:
             needs_no_slot = cmd.kind in CONTROL_KINDS or cmd.task in cap.active_ids
             if cap.closed:
-                return needs_no_slot
-            return needs_no_slot or cmd.dispatch_class == "interactive"
+                allowed = needs_no_slot
+            else:
+                allowed = needs_no_slot or cmd.dispatch_class == "interactive"
+            if not allowed:
+                return False
+        # Last, so that ``held_back`` counts only commands no other check here holds.
+        if self.behind_own_task(cmd, cap):
+            self.held_back += 1
+            return False
         return True
 
     def behind_own_task(self, cmd: Cmd, cap) -> bool:
@@ -405,6 +422,7 @@ class Reference:
         process would not start now, unless the control's own task holds a slot:
         at the limit any such command, below it one held at the batch line.
         """
+        passed_batch_line = False
         for earlier in self.commands:
             if (
                 earlier.task != cmd.task
@@ -422,8 +440,13 @@ class Reference:
                     and cmd.task not in cap.active_ids
                     and (cap.closed or self.held_at_batch_line(earlier))
                 ):
+                    passed_batch_line = True
                     continue
             return True
+        if passed_batch_line:
+            # Counts only a pass over an opening command by the batch line or the
+            # limit rule, not a pass over a command that waits for its ticket.
+            self.passed += 1
         return False
 
     def held_at_batch_line(self, cmd: Cmd) -> bool:
@@ -592,7 +615,10 @@ def play(
     """Run ``attempts`` scans of one random world and compare each with the reference.
 
     Fails with the seed and the whole world. After every scan the chosen command is
-    settled and its task counted as holding a slot for its tenant.
+    settled and its task counted as holding a slot for its tenant. A pause or cancel
+    that passed earlier commands of its task leaves them pending, as a rejected
+    control does in production; the dispatcher reads only that the control is
+    finished.
     """
     # The reference keeps no attempt count: a world runs too few attempts to pass
     # FAIR_SHARE_FALLBACK_AFTER_ATTEMPTS.
@@ -654,4 +680,7 @@ def play(
                 holds.append((done.task, done.tenant))
         if holds and rng.random() < 0.2:
             holds.pop(rng.randrange(len(holds)))
+    if stats is not None:
+        for name in ("held_back", "passed"):
+            stats[name] = stats.get(name, 0) + getattr(reference, name)
     return spec
