@@ -2548,6 +2548,8 @@ interface AppContextType {
   stopState: SessionStopState
   isConversationResetPending: boolean
   isMessageDeliveryPending: boolean
+  // Some sendMessage call has not settled yet, on any transport.
+  isSendInFlight: boolean
   isSessionInteractionLocked: boolean
   sessionConversationState: SessionConversationState["phase"]
   setTaskId: (taskId: number | null, options?: { navigate?: boolean }) => void
@@ -7963,6 +7965,26 @@ export function AppProvider({
     state.taskId,
   ])
 
+  // The sendMessage every consumer gets, counted from the call until it
+  // settles, for isSendInFlight. Counting around the call covers every caller
+  // of useApp().sendMessage, and the count rises before sendMessage runs, so no
+  // render can show a send that has started without it. The result and any
+  // error pass through unchanged.
+  const sendCallsInFlightRef = useRef(0)
+  const [sendCallsInFlight, setSendCallsInFlight] = useState(0)
+  const trackedSendMessage = useCallback<AppContextType["sendMessage"]>(async (...args) => {
+    sendCallsInFlightRef.current += 1
+    setSendCallsInFlight(sendCallsInFlightRef.current)
+    try {
+      return await sendMessage(...args)
+    } finally {
+      sendCallsInFlightRef.current -= 1
+      // Defensive only: React already drops an update to an unmounted
+      // provider without a warning, so nothing observable depends on this.
+      if (mountedRef.current) setSendCallsInFlight(sendCallsInFlightRef.current)
+    }
+  }, [sendMessage])
+
   const startNewConversation = useCallback((): Promise<void> => {
     const existingReset = sessionResetFlightRef.current
     if (existingReset) return existingReset.promise
@@ -8296,7 +8318,7 @@ export function AppProvider({
           agentCardsEnabled,
           voiceInputEnabled,
           taskControlsEnabled,
-          sendMessage,
+          sendMessage: trackedSendMessage,
           executeTask,
           pauseTask,
           resumeTask,
@@ -8313,6 +8335,7 @@ export function AppProvider({
           isConversationResetPending:
             state.sessionConversation.phase === "reset_requested",
           isMessageDeliveryPending: messageDeliveryCount > 0,
+          isSendInFlight: sendCallsInFlight > 0,
           isSessionInteractionLocked:
             state.sessionConversation.phase === "reload_required",
           sessionConversationState: state.sessionConversation.phase,
