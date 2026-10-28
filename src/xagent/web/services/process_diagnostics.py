@@ -6,7 +6,8 @@ INFO line per window, whether or not anything happened::
     runtime diagnostics role=worker pid=4242 window_s=60.0 inflight=1
     resume_inflight=0 started_1m=2 finished_1m=1 ok=1 failed=0 cancelled=0
     gate_held_s=0.0 slot_tenants=1 slot_top=1 loop_lag_max_ms=12.3
-    loop_lag_samples=0 degradations=- fair_misses=0
+    loop_lag_samples=0 degradations=- fair_misses=0 fair_fallbacks=0
+    fair_all_missed=0
 
 The line is unconditional and has no switch: a process whose pid stops
 appearing for two windows is gone or has a blocked event loop, and an idle
@@ -69,6 +70,18 @@ Field meanings:
   is ``0`` when ``XAGENT_DISPATCHER_FAIR_SHARE`` is off and in a process that
   does not dispatch task commands. Read ``fair_share=`` on the dispatch policy
   line to tell whether the switch is on.
+- ``fair_fallbacks``: how many dispatch attempts in the window were fallback
+  rounds, which read the queue oldest first instead of ranking tenants. It
+  counts the decision, so a fallback round that dispatched nothing counts too:
+  once the attempt count has forced fallback rounds, every attempt is one until
+  a fallback round dispatches a command holding a slot token.
+- ``fair_all_missed``: how many scans in the window ranked at least two tenant
+  keys and then fell back to the oldest claimable command, if any, because no
+  tenant asked had a command this process could claim, or every tenant was
+  skipped or held back so that none was asked. It counts scans, so an attempt
+  that scans again after setting a task aside can count twice. Both are ``0`` when
+  ``XAGENT_DISPATCHER_FAIR_SHARE`` is off and in a process that does not
+  dispatch task commands.
 """
 
 from __future__ import annotations
@@ -104,6 +117,8 @@ class ExecutionCounters:
     loop_lag_max_ms: float
     loop_lag_samples: int
     fair_misses: int
+    fair_fallbacks: int
+    fair_all_missed: int
     degradations: tuple[str, ...] = ()
 
     @property
@@ -123,7 +138,9 @@ class ExecutionCounters:
             f"loop_lag_max_ms={self.loop_lag_max_ms:.1f} "
             f"loop_lag_samples={self.loop_lag_samples} "
             f"degradations={','.join(self.degradations) or '-'} "
-            f"fair_misses={self.fair_misses}"
+            f"fair_misses={self.fair_misses} "
+            f"fair_fallbacks={self.fair_fallbacks} "
+            f"fair_all_missed={self.fair_all_missed}"
         )
 
 
@@ -166,7 +183,7 @@ def drain_execution_counters(now: float | None = None) -> ExecutionCounters:
     """
 
     from .ops_signals import active_degradations
-    from .task_command_transport import drain_fair_misses
+    from .task_command_transport import drain_fair_bypasses, drain_fair_misses
     from .task_execution import background_task_manager
 
     if now is None:
@@ -178,6 +195,7 @@ def drain_execution_counters(now: float | None = None) -> ExecutionCounters:
     gate_held_s = min(background_task_manager.drain_gate_held_seconds(now), window_s)
     slot_tenants, slot_top = background_task_manager.slot_tenant_counts()
     fair_misses = drain_fair_misses()
+    fair_fallbacks, fair_all_missed = drain_fair_bypasses()
     counters = ExecutionCounters(
         role=_resolve_role(),
         pid=os.getpid(),
@@ -195,6 +213,8 @@ def drain_execution_counters(now: float | None = None) -> ExecutionCounters:
         loop_lag_samples=_window.lag_samples,
         degradations=tuple(sorted(active_degradations())),
         fair_misses=fair_misses,
+        fair_fallbacks=fair_fallbacks,
+        fair_all_missed=fair_all_missed,
     )
     _window.started_at = now
     _window.lag_max_ms = 0.0
