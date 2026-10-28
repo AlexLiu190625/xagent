@@ -353,6 +353,7 @@ interface WebSocketCallbacks {
     connectionIdentity: string,
   ) => void
   onConnect?: (openedTaskId: number | undefined) => void
+  onConnectionCapabilities?: (capabilities: readonly string[]) => void
   onDisconnect?: () => void
   onError?: (error: Error) => void
   onMessage?: (message: WebSocketMessage) => void
@@ -451,6 +452,9 @@ export interface UseWebSocketOptions {
   // Receives the task of the socket that opened, which can differ from the
   // caller's current task while a task switch is still being rendered.
   onConnect?: (openedTaskId: number | undefined) => void
+  // Receives the capability list of the socket that sent it; the frame itself
+  // is never passed to onMessage.
+  onConnectionCapabilities?: (capabilities: readonly string[]) => void
   onDisconnect?: () => void
   onError?: (error: Error) => void
 }
@@ -476,6 +480,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     autoConnect = true,
     onMessage,
     onConnect,
+    onConnectionCapabilities,
     onDisconnect,
     onError,
   } = options
@@ -568,6 +573,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     onSessionConnectionClose,
     onSessionConnectionFailure,
     onConnect,
+    onConnectionCapabilities,
     onDisconnect,
     onError,
     onMessage,
@@ -1036,6 +1042,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       onSessionConnectionClose,
       onSessionConnectionFailure,
       onConnect,
+      onConnectionCapabilities,
       onDisconnect,
       onError,
       onMessage,
@@ -1320,6 +1327,11 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
               owner.heartbeatEnabled = true
               watchLiveness(owner)
             }
+            owner.callbacks.onConnectionCapabilities?.(
+              Array.isArray(data.capabilities)
+                ? data.capabilities.filter((entry: unknown): entry is string => typeof entry === "string")
+                : [],
+            )
             return
           }
           if (data.type === "heartbeat") return

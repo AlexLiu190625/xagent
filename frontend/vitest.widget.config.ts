@@ -27,6 +27,7 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/components/widget/public-agent-chat-page.tsx",
         "src/components/widget/session-agent-chat-page.tsx",
         "src/components/widget/use-session-attachments.ts",
+        "src/components/widget/use-session-open-message.ts",
         "src/components/widget/use-widget-session.ts",
         "src/components/widget/widget-chrome-controls.tsx",
         "src/contexts/app-context-chat.tsx",
@@ -85,6 +86,9 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         },
         "src/components/widget/use-session-attachments.ts": {
           statements: 90, branches: 85, functions: 75, lines: 90,
+        },
+        "src/components/widget/use-session-open-message.ts": {
+          statements: 100, branches: 100, functions: 100, lines: 100,
         },
         "src/components/widget/use-widget-session.ts": {
           statements: 95, branches: 80, functions: 90, lines: 95,
@@ -227,6 +231,7 @@ export default defineConfig({
       "src/components/widget/session-agent-chat-page.test.tsx",
       "src/components/widget/session-agent-chat-page.integration.test.tsx",
       "src/components/widget/use-session-attachments.test.tsx",
+      "src/components/widget/use-session-open-message.test.tsx",
       "src/components/widget/use-widget-session.test.tsx",
       "src/contexts/app-context-chat.test.tsx",
       "src/contexts/auth-context.test.tsx",
