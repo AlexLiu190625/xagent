@@ -4,6 +4,7 @@ import asyncio
 import logging
 import random
 import threading
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -450,9 +451,9 @@ def test_a_scan_only_reads_the_balance_and_only_adds_to_the_attempt_count(
     else:
         state.attempts_since_fallback = AFTER - 20
 
-    # A scan leaves the balance alone and adds one to the attempt count: an attempt
-    # is a fair round until the balance has reached its line or the attempt count
-    # is over its own.
+    # A scan that finds a command leaves the balance alone and adds one to the
+    # attempt count: an attempt is a fair round until the balance has reached its
+    # line or the attempt count has reached its own.
     rounds = []
     for step in range(40):
         if line == "balance" and step == 20:
@@ -880,6 +881,13 @@ def switch_off(loop, mp):
     mp.setattr(transport, "_fair_share_memo", None)
 
 
+def sit_between_the_lines(loop, mp):
+    """One batch slot of two taken, so only interactive commands can be claimed."""
+    band = cap_of(active=[900], policy=POLICY)
+    assert band.in_reserve_band
+    mp.setattr(transport, "build_dispatch_cap_snapshot", lambda: band)
+
+
 # The attempt count every row starts from, unless a step sets it.
 COUNT = 5
 # row: (steps, the balance before, the change in the balance, the attempt count after)
@@ -913,6 +921,24 @@ LOOP_ROWS = {
         AFTER + 1,
     ),
     "nothing queued": ([], 0, 0, COUNT),
+    "nothing claimable: a task leased elsewhere": (
+        [add("a", pinned=True), add("b", pinned=True)],
+        0,
+        0,
+        COUNT,
+    ),
+    "nothing claimable: a retry not yet due": (
+        [add("a", unavailable=True), add("b", unavailable=True)],
+        0,
+        0,
+        COUNT,
+    ),
+    "nothing claimable: batch commands between the lines": (
+        [add("a"), add("b"), sit_between_the_lines],
+        0,
+        0,
+        COUNT,
+    ),
     "a control command": ([add("a", kind="pause")], 0, 0, COUNT + 1),
     "a fallback round that takes a control command": (
         [add("a", kind="pause")],
@@ -984,6 +1010,81 @@ async def test_a_failing_ownership_check_leaves_the_balance_alone(loop):
     state = transport._fair_state
     assert (state.since_fallback, state.attempts_since_fallback) == (0, 1)
     assert not loop.manager._dispatch_reservations
+
+
+def test_a_fallback_round_that_finds_nothing_leaves_the_attempt_count_on_its_line(
+    world, on, clock
+):
+    world.add("a", pinned=True)
+    world.add("b", pinned=True)
+    transport._fair_state.attempts_since_fallback = AFTER
+    one = attempt()
+
+    assert scan(cap_of(), attempt=one) is None
+
+    assert one.fallback
+    assert transport._fair_state.attempts_since_fallback == AFTER
+
+
+async def test_polling_on_the_batch_line_does_not_bring_a_fallback_round(
+    loop, monkeypatch
+):
+    """A holds both batch slots for longer than the attempt line takes to poll by.
+    Once one frees, A holds one and B none, so B's younger command goes first."""
+    world = loop.world
+    for _ in range(3):
+        world.add("a")
+    b = world.add("b")
+    policy = DispatchPolicy(limit=3, interactive_reserve=1)
+    band = cap_of(active=[900, 901], occupancy={"a": 2}, policy=policy)
+    freed = cap_of(active=[900], occupancy={"a": 1}, policy=policy)
+    assert band.in_reserve_band and not freed.in_reserve_band
+
+    monkeypatch.setattr(transport, "build_dispatch_cap_snapshot", lambda: band)
+    for _ in range(AFTER + 10):
+        assert await loop.run() == (0, 0)
+    monkeypatch.setattr(transport, "build_dispatch_cap_snapshot", lambda: freed)
+
+    assert await loop.run() == (1, 1)
+    assert loop.plan.ensured == [world.task_of(b)]
+
+
+def test_a_fair_round_finds_nothing_exactly_when_a_fallback_round_would(
+    world, on, clock
+):
+    """Attempts that find nothing are left out of the attempt count. That passes no
+    command over only while a fair round and a fallback round agree on it."""
+    found_nothing = 0
+    for seed in range(80):
+        rng = random.Random(30_000 + seed)
+        spec = random_world(rng, tenants=rng.randint(2, 6), size=rng.randint(4, 30))
+        if seed % 4 == 0:
+            # Every command open and none claimable here.
+            for command in spec.commands:
+                command.pinned = True
+        world.reset()
+        store_world(world, spec)
+        limit = rng.randint(2, 6)
+        policy = DispatchPolicy(limit=limit, interactive_reserve=rng.randrange(limit))
+        queued = [c for c in spec.commands if c.status in QUEUED]
+        for step in range(5):
+            holds = rng.sample(queued, k=rng.randint(0, min(limit - 1, len(queued))))
+            cap = DispatchCapSnapshot(
+                policy=policy,
+                active_ids=frozenset(c.task for c in holds),
+                occupancy=dict(Counter(c.tenant for c in holds)),
+            )
+            busy = tuple(c.task for c in spec.commands if rng.random() < 0.05)
+            forced = transport._FairAttempt(decided=True, counted=True, fallback=True)
+            oldest = scan(cap, attempt=forced, busy=busy)
+            transport._fair_state.attempts_since_fallback = 0
+            fair = attempt()
+            chosen = scan(cap, attempt=fair, busy=busy)
+            assert not fair.fallback
+            assert (chosen is None) == (oldest is None), f"seed {seed} step {step}"
+            found_nothing += chosen is None
+            clock.now += rng.uniform(0, 3)
+    assert found_nothing >= 40
 
 
 @pytest.mark.parametrize(
