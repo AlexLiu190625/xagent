@@ -1723,9 +1723,9 @@ def hash_password(password: str) -> str:
     """Hash a password with bcrypt (with a SHA-256 pre-hash for long inputs).
 
     The pre-hash avoids bcrypt's historical 72-byte input truncation while the
-    resulting value remains a standard bcrypt string. Existing unsalted
-    SHA-256 rows are accepted by ``verify_password`` once and transparently
-    upgraded by the login path.
+    resulting value remains a standard bcrypt string. Legacy unsalted SHA-256
+    rows are wrapped into this format by the
+    ``20261027_wrap_legacy_password_hashes`` migration.
     """
     password_material = (
         hashlib.sha256(password.encode("utf-8")).hexdigest().encode("ascii")
@@ -1754,8 +1754,10 @@ def verify_password(password: str, password_hash: str) -> bool:
         except (ValueError, UnicodeEncodeError):
             return False
 
-    # Legacy rows were stored as a bare SHA-256 digest. Keep this fallback
-    # only for migration; successful authentication is upgraded immediately.
+    # Legacy rows were stored as a bare SHA-256 digest. The
+    # 20261027_wrap_legacy_password_hashes migration wraps them in bcrypt; this
+    # fallback only covers rows written by an older release after that ran, and
+    # successful authentication upgrades them immediately.
     legacy_digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
     valid = secrets.compare_digest(legacy_digest, password_hash)
     if not valid:
