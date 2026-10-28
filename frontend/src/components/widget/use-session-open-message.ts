@@ -51,8 +51,12 @@ export interface UseSessionOpenMessageInput {
 // (`active`), a newer message waits in the slot and replaces any older one
 // still there. Nothing is sent until the current socket has attached, so a
 // conversation the server is still replaying is reset first instead of
-// receiving the message. A failure is never retried, and a message is reset at
-// most once.
+// receiving the message. Attaching does not prove there is no previous
+// conversation: if the server's replay finds nothing to send (its task was
+// deleted or changed owner after the attach check), the page stays unbound and
+// the message is sent as a first message, exactly as one typed on the start
+// screen would be. A failure is never retried, and a message is reset at most
+// once.
 export function useSessionOpenMessage({
   request,
   take,
