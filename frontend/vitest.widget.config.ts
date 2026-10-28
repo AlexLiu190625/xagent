@@ -43,6 +43,7 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/lib/files-disabled-presentation.ts",
         "src/lib/remark-currency-safe-math.ts",
         "src/lib/remark-preserve-table-content.ts",
+        "src/lib/send-failure-notice.ts",
         "src/lib/widget-parent-message.ts",
         "src/lib/widget-session-upload.ts",
         "src/contexts/presentation-capabilities.tsx",
@@ -95,6 +96,9 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
           statements: 95, branches: 90, functions: 95, lines: 95,
         },
         "src/lib/widget-parent-message.ts": {
+          statements: 100, branches: 100, functions: 100, lines: 100,
+        },
+        "src/lib/send-failure-notice.ts": {
           statements: 100, branches: 100, functions: 100, lines: 100,
         },
         "src/lib/files-disabled-presentation.ts": {
@@ -245,6 +249,7 @@ export default defineConfig({
       "src/lib/widget-parent-message.test.ts",
       "src/lib/widget-session-upload.test.ts",
       "src/lib/client-errors.test.ts",
+      "src/lib/send-failure-notice.test.ts",
     ],
   },
 })
