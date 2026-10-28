@@ -2186,6 +2186,8 @@ class _FairState:
         # Until when (``_fair_clock``) a (tenant key, dispatch class) is not asked.
         self.skips: dict[tuple[str, str], float] = {}
         # Window queries that found nothing since the diagnostics line last asked.
+        # Attempts that read the skip table before one of them records a miss each
+        # query and count the same (tenant key, class), so this counts lookups.
         self.misses = 0
         # Since the diagnostics line last asked: counted attempts decided as
         # fallback rounds, and scans that ranked tenants but took the plain lookup
@@ -2366,6 +2368,15 @@ def _fair_pick(
     With no tenant ranked, the plain lookup decides. So it returns None only when
     ``oldest_claimable()`` does, which a fallback round reads instead: the attempt
     count leaves out the attempts that find nothing on that ground.
+
+    The ranking uses the slots of this process only. Every process reads one queue,
+    so on a tie they all prefer the tenant with the older oldest queued command. A
+    later ranking that sees that tenant's new slot breaks the tie in this process,
+    so the tenant tends to lead by one slot per process. That is not a strict bound:
+    ``cap.occupancy`` is copied when the attempt takes its snapshot, so concurrent
+    attempts can rank from the same older counts and prefer the same tenant before
+    any of them sees the slot another one took. Fallback rounds take the oldest
+    claimable command whatever its tenant and can add to the lead.
 
     Within a tenant key and class the window is read by priority. When both
     classes have a candidate, the one with the older side wins: the batch side by
