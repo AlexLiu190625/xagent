@@ -26,6 +26,8 @@ const PHASE_ROUTE: Readonly<Record<SessionConversationPhase, "send" | "reset" | 
 interface ActiveOpenMessage {
   message: string
   stage: "waiting" | "resetting" | "sending"
+  // Set once a reset for this message has succeeded.
+  reset: boolean
 }
 
 export interface UseSessionOpenMessageInput {
@@ -49,7 +51,8 @@ export interface UseSessionOpenMessageInput {
 // (`active`), a newer message waits in the slot and replaces any older one
 // still there. Nothing is sent until the current socket has attached, so a
 // conversation the server is still replaying is reset first instead of
-// receiving the message. A failure is never retried.
+// receiving the message. A failure is never retried, and a message is reset at
+// most once.
 export function useSessionOpenMessage({
   request,
   take,
@@ -121,7 +124,7 @@ export function useSessionOpenMessage({
     let current: ActiveOpenMessage
     if ("seq" in next) {
       take(next.seq)
-      current = { message: next.message, stage: "waiting" }
+      current = { message: next.message, stage: "waiting", reset: false }
     } else {
       current = next
     }
@@ -134,19 +137,25 @@ export function useSessionOpenMessage({
     }
 
     if (route === "reset") {
-      const resetting: ActiveOpenMessage = { message: current.message, stage: "resetting" }
+      // Its reset succeeded, yet the conversation is bound again: drop it
+      // rather than start a second new conversation for the same message.
+      if (current.reset) {
+        settle(null, W_RESET_FAILED)
+        return
+      }
+      const resetting: ActiveOpenMessage = { ...current, stage: "resetting" }
       activeRef.current = resetting
       // An acknowledged reset moves the phase on before this promise
       // resolves, so the render it triggers sends the message into the new
-      // conversation; a phase back at bound starts another reset.
+      // conversation; a phase still or again at bound drops it (above).
       startNewConversation().then(
-        () => settle({ message: resetting.message, stage: "waiting" }),
+        () => settle({ message: resetting.message, stage: "waiting", reset: true }),
         () => settle(null, W_RESET_FAILED),
       )
       return
     }
 
-    activeRef.current = { message: current.message, stage: "sending" }
+    activeRef.current = { ...current, stage: "sending" }
     sendStartMessage(current.message).then(
       () => settle(null),
       () => settle(null, W_SEND_FAILED),

@@ -177,7 +177,8 @@ describe("useSessionOpenMessage", () => {
       warns: string[][]
     }
     const WAITING_CASES: Record<Phase, WaitingCase> = {
-      bound: { starts: 2, sends: [], warns: [] },
+      // Its reset already succeeded once, so it is dropped, not reset again.
+      bound: { starts: 1, sends: [], warns: [[W_RESET_FAILED]] },
       replacement_ready: { starts: 1, sends: [["A"]], warns: [] },
       unbound: { starts: 1, sends: [["A"]], warns: [] },
       reset_requested: { starts: 1, sends: [], warns: [] },
@@ -315,6 +316,23 @@ describe("useSessionOpenMessage", () => {
   })
 
   describe("failures", () => {
+    it("resets a message at most once when the conversation stays bound", async () => {
+      // Throws from the second call on, so a missing guard fails here at once
+      // instead of resetting without end.
+      startNewConversation.mockImplementation(() => {
+        if (startNewConversation.mock.calls.length > 1) {
+          throw new Error("reset a second time")
+        }
+        return Promise.resolve()
+      })
+      mount({ sessionConversationState: "bound" })
+      await act(async () => { deliver("A") })
+
+      expect(startNewConversation).toHaveBeenCalledTimes(1)
+      expect(sendStartMessage).not.toHaveBeenCalled()
+      expect(warn.mock.calls).toEqual([[W_RESET_FAILED]])
+    }, 2_000)
+
     it("drops the message when the new conversation cannot be started", async () => {
       const { update, reset } = startResetFromBound()
       await settle(() => reset.reject(new Error("reset refused")))
