@@ -113,7 +113,9 @@ def test_cached_admission_predicate_compiles_identically(
     cached = compiled_scan(dialect_name, shared=shared, cap=cap)
 
     monkeypatch.setattr(
-        admission, "admission_eligible", admission._build_admission_eligible
+        admission,
+        "admission_eligible",
+        lambda: admission._build_admission_eligible(by_priority=False),
     )
     rebuilt_first = compiled_scan(dialect_name, shared=shared, cap=cap)
     rebuilt_second = compiled_scan(dialect_name, shared=shared, cap=cap)

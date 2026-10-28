@@ -159,9 +159,10 @@ adopt it.
 onto the start, appended messages, manual and automatic resumes and answers; pause
 and cancel carry 0. A deployment classifier may return its own priority for a
 command. With `XAGENT_DISPATCHER_FAIR_SHARE` off the value is stored and changes
-nothing. With it on, it takes effect only while the process sees at least two tenant
-keys with queued commands, and it only orders commands of the same tenant key and
-dispatch class: of the sixteen highest-priority queued commands of that pair, the
+nothing. With it on, outside an admission bucket it takes effect only while the
+process sees at least two tenant keys with queued commands, and it only orders
+commands of the same tenant key and dispatch class: of the sixteen highest-priority
+queued commands of that pair, the
 highest priority, then the oldest, that can be claimed is taken. When both classes
 of a tenant key have a candidate, the batch candidate is compared by its id and the
 interactive side by the smallest id among the claimable interactive commands of its
@@ -171,16 +172,23 @@ running in the process, still goes first, and a class the dispatcher has set asi
 for a while is not asked, so only the other class counts. Answers to waiting tasks
 are still taken first, oldest first. The fallback round, the step that takes an
 older command needing no new slot, a scan with no free slot (a process at its limit
-or on hold), and the path for a single queued tenant key ignore priority. Low-
+or on hold), and the path for a single queued tenant key ignore priority, apart from
+the admission bucket order described below. Low-
 priority commands of a tenant key can be starved by a steady stream of higher-
 priority ones from the same key. If the sixteen highest-priority queued commands of
 a tenant key and class all wait for tasks leased by other processes, the tenant
 keeps being missed, even when a lower- priority command of it could run, until a
 fallback round happens to take it: that round takes the oldest claimable command of
 the whole table, which is not necessarily one of this tenant. With an admission hook
-installed, the same happens to a tenant whose command at the head of an admission
-queue has lower priority than the sixteen behind it, so do not enable admission
-together with priorities until admission waiters are ordered by priority.
+installed and the switch on, an admission bucket is ordered by priority as well: its
+head is the waiting command with the highest priority, the oldest among equals, so
+priority applies within a bucket on every path, including the fallback round and a
+single queued tenant key. The order spans the whole bucket, so keep each bucket
+within one tenant key and dispatch class; a bucket shared by several tenant keys lets
+one tenant's priority move its commands ahead of another tenant's. Processes that
+disagree on the switch disagree on which waiter is the head, and when each head
+belongs to a task leased by the other process, the bucket waits until the values
+agree.
 
 ## Configuration and upgrade
 
@@ -324,8 +332,9 @@ the original unaccepted selection; it cannot modify a newer replacement run.
 When a host installs an execution admission policy, an SDK or A2A reply is
 committed as a durable RESUME_INPUT command together with its admission ticket.
 If that ticket is provably waiting for capacity when ingress checks it (the
-bucket is full, an older runnable waiter precedes it, or startup pacing has not
-yet released it), the V1 reply endpoint answers `202` with `status: "queued"`
+bucket is full, a runnable waiter is ahead of it in the bucket, or startup pacing
+has not yet released it), the V1 reply endpoint answers `202` with
+`status: "queued"`
 immediately instead of holding the request for
 `XAGENT_TASK_REPLY_WAIT_TIMEOUT_SECONDS` and returning `504 reply_outcome_unknown`. The response carries the accepted
 `command_id`, the `run_id` the task is waiting on, the acceptance
@@ -359,13 +368,15 @@ governed A2A reply keeps the existing wait and `504 reply_outcome_unknown`
 and the durable reply still runs when capacity opens.
 
 Within a bucket the oldest waiting command runs first, including for prompt
-dispatch by ID, and buckets stay independent of each other. A waiter is the
+dispatch by ID, and buckets stay independent of each other. With
+`XAGENT_DISPATCHER_FAIR_SHARE` on, the waiting command with the highest priority
+runs first instead, the oldest among equals. A waiter is the
 bucket head only while it is its own task's next runnable command and needs a
 slot: a command behind any earlier unfinished command of its own task, or
 guidance that joins its task's running execution, is not a head and never
 delays other tasks' commands in that bucket. Per-task order still applies to
 the task's own commands, and a head whose business-retry deadline has not
-passed still delays later work in the same bucket.
+passed still delays the waiters behind it in the same bucket.
 
 ## Runtime credential lifetime
 

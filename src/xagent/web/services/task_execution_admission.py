@@ -506,7 +506,7 @@ def _held_ticket(ticket: type[TaskAdmissionTicket]) -> ColumnElement[bool]:
     )
 
 
-_cached_admission_eligible: tuple[object, ColumnElement[bool]] | None = None
+_cached_admission_eligible: tuple[object, bool, ColumnElement[bool]] | None = None
 
 
 def admission_eligible() -> ColumnElement[bool]:
@@ -515,10 +515,12 @@ def admission_eligible() -> ColumnElement[bool]:
     The expression is built once per process and shared by every caller. It is
     immutable and holds no per-call state, so every time dependency inside it
     must go through ``task_admission_pacing.database_time``; the cache is keyed
-    on that function object, read from the module on each call.
+    on that function object, read from the module on each call, and on whether
+    fair-share dispatch is on, which decides how waiters are ordered.
 
     The cached expression is rebuilt only when
-    ``task_admission_pacing.database_time`` is replaced. Replacing the helper
+    ``task_admission_pacing.database_time`` is replaced or the fair-share
+    setting changes. Replacing the helper
     functions in this module that build the predicate (``startup_eligible``,
     ``_live_count``, ``_older_waiter``, ``_held_ticket``, ``_behind_own_task``,
     ``_joins_running_execution``) does not rebuild it; call
@@ -527,11 +529,16 @@ def admission_eligible() -> ColumnElement[bool]:
     """
     global _cached_admission_eligible
     clock = task_admission_pacing.database_time
+    by_priority = _waiters_by_priority()
     cached = _cached_admission_eligible
-    if cached is None or cached[0] is not clock:
-        cached = (clock, _build_admission_eligible())
+    if cached is None or cached[0] is not clock or cached[1] is not by_priority:
+        cached = (
+            clock,
+            by_priority,
+            _build_admission_eligible(by_priority=by_priority),
+        )
         _cached_admission_eligible = cached
-    return cached[1]
+    return cached[2]
 
 
 def reset_admission_eligible_cache() -> None:
@@ -540,7 +547,7 @@ def reset_admission_eligible_cache() -> None:
     _cached_admission_eligible = None
 
 
-def _build_admission_eligible() -> ColumnElement[bool]:
+def _build_admission_eligible(*, by_priority: bool) -> ColumnElement[bool]:
     blocked = exists(
         select(1)
         .select_from(TaskAdmissionTicket)
@@ -560,7 +567,7 @@ def _build_admission_eligible() -> ColumnElement[bool]:
             or_(
                 _live_count(TaskAdmissionTicket.bucket_key, excluding_task_id=Task.id)
                 >= TaskAdmissionBucket.capacity,
-                _older_waiter(),
+                _older_waiter(by_priority=by_priority),
                 ~startup_eligible(),
             ),
         )
@@ -611,12 +618,25 @@ def _behind_own_task(command: type[TaskExecutionCommand]) -> ColumnElement[bool]
     )
 
 
-def _older_waiter() -> ColumnElement[bool]:
-    """An older unheld ticket in the bucket whose command needs the next slot.
+def _waiters_by_priority() -> bool:
+    """Whether bucket waiters are ordered by command priority before age."""
+    # Imported here: the transport module imports this one.
+    from .task_command_transport import _fair_share_enabled
+
+    return _fair_share_enabled()
+
+
+def _older_waiter(*, by_priority: bool) -> ColumnElement[bool]:
+    """An unheld ticket ahead in the bucket whose command needs the next slot.
 
     The bucket head is the oldest waiting command that will take this
     bucket's next slot, even while a retry deadline, startup pacing, or
-    routing still holds it. A command behind its own task's earlier open
+    routing still holds it. With ``by_priority`` the head is the waiting
+    command with the highest priority, the oldest among equals; priority is
+    fixed when the command is accepted, so the order is the same at every
+    evaluation. That order spans every command in the bucket, so a bucket
+    holding several tenant keys lets one tenant's priority move it ahead of
+    another's. A command behind its own task's earlier open
     command, whichever bucket that command waits in or runs under, cannot
     use this bucket's capacity yet, and guidance that joins its task's
     running execution never needs a slot of its own; neither is the head,
@@ -624,6 +644,21 @@ def _older_waiter() -> ColumnElement[bool]:
     """
     ticket, command = aliased(TaskAdmissionTicket), aliased(TaskExecutionCommand)
     task = aliased(Task)
+    ahead: ColumnElement[bool] = ticket.command_id < TaskAdmissionTicket.command_id
+    if by_priority:
+        # Read through the ticket so the claim recheck, whose query has no
+        # command row, and the scan both resolve the waiter's own priority.
+        own = aliased(TaskExecutionCommand)
+        priority = (
+            select(own.priority)
+            .where(own.id == TaskAdmissionTicket.command_id)
+            .correlate(TaskAdmissionTicket)
+            .scalar_subquery()
+        )
+        ahead = or_(
+            command.priority > priority,
+            and_(command.priority == priority, ahead),
+        )
     return exists(
         select(1)
         .select_from(ticket)
@@ -631,7 +666,7 @@ def _older_waiter() -> ColumnElement[bool]:
         .join(task, task.id == ticket.task_id)
         .where(
             ticket.bucket_key == TaskAdmissionTicket.bucket_key,
-            ticket.command_id < TaskAdmissionTicket.command_id,
+            ahead,
             ~_held_ticket(ticket),
             command.status.notin_(_TERMINAL),
             ~_behind_own_task(command),
@@ -685,7 +720,9 @@ def reserve_task_admission(db: Session, command_id: int, lease: TaskLease) -> bo
     ):
         return True
     if db.scalar(
-        select(_older_waiter()).where(TaskAdmissionTicket.command_id == command_id)
+        select(_older_waiter(by_priority=_waiters_by_priority())).where(
+            TaskAdmissionTicket.command_id == command_id
+        )
     ):
         return False
     active = db.scalar(

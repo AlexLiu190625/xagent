@@ -166,8 +166,9 @@ class TaskExecutionCommand(Base):  # type: ignore
     # The priority this command was accepted with, -10 to 10, higher first. Set
     # by stage_task_command in the acceptance transaction, never updated after
     # it commits; old rows and control commands read 0. It orders commands of one
-    # tenant key and class, only while fair-share dispatch is on. Deferred, so a
-    # query for commands does not select it.
+    # tenant key and class, and the waiters of an admission bucket, only while
+    # fair-share dispatch is on. Deferred, so a query for commands does not
+    # select it.
     priority = deferred(
         Column(SmallInteger, nullable=False, server_default="0", default=0)
     )
