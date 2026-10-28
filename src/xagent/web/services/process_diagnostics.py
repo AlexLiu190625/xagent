@@ -66,6 +66,9 @@ Field meanings:
 - ``fair_misses``: how many times in the window a query for the commands of one
   tenant key and dispatch class found nothing this process could claim, so that
   the pair was skipped for a while. Counted per window like ``started_1m``. It
+  counts lookups, not tenants: dispatch attempts woken together can each read
+  the skip table before any of them records a miss, so one pair can be looked up
+  and counted once per concurrent attempt. It
   is ``0`` when ``XAGENT_DISPATCHER_FAIR_SHARE`` is off and in a process that
   does not dispatch task commands. Read ``fair_share=`` on the dispatch policy
   line to tell whether the switch is on.

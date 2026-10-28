@@ -89,6 +89,9 @@ reports them only for a web process; a worker has no HTTP endpoint, so this
 line is where a worker's degradations appear. `fair_misses` is how many times
 in the minute a query for the commands of one tenant key and dispatch class found
 nothing this process could claim; that pair is then skipped for two seconds. It
+counts lookups, not tenants: dispatch attempts woken together can each read the
+skip table before any of them records a miss, so one pair can be looked up and
+counted once per concurrent attempt in the same wake-up. It
 is 0 when `XAGENT_DISPATCHER_FAIR_SHARE` is off and in a process that does not
 dispatch task commands. The line is not logged when `XAGENT_LOG_LEVEL` is above
 `INFO`.
@@ -104,6 +107,14 @@ selects commands exactly as before. With it on, a process that has room for a ne
 execution takes the oldest claimable command of the tenant that holds the fewest
 of its slots, instead of the oldest claimable command of all; tenants that hold
 as many slots are ordered by their oldest queued command that opens an execution.
+Fairness is computed in each process from the slots of that process alone. All
+processes read one queue, so on a tie every process prefers the same tenant, the
+one with the older oldest queued command; once that tenant holds one more slot in
+a process, the tie there is broken and the other tenant goes first. Across a
+deployment of N dispatching processes, the preferred tenant can therefore hold up
+to N more slots than a tenant it tied with, one per process. That bound is from
+the ranking alone: fallback rounds take the oldest claimable command whatever its
+tenant, and can add to it.
 Only executions the process started through its dispatcher count for a tenant,
 as for `slot_tenants`: a resume started another way, such as one for a task that
 waited for an A2A or a user reply, holds a slot of the cap but counts for no
