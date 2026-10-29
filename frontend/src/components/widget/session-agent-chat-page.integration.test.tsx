@@ -1518,59 +1518,62 @@ describe("SessionAgentChatPage file attachments", () => {
   })
 })
 
-describe("SessionAgentChatPage opens a new conversation from the host page", () => {
-  const ATTACH_CAPABILITIES = {
-    type: "connection_capabilities",
-    capabilities: ["heartbeat", "conversation_attached"],
-  }
-  const ATTACHED = { type: "conversation_attached" }
-  let warn = vi.fn()
+// Shared by the host-page message suites below.
+const ATTACH_CAPABILITIES = {
+  type: "connection_capabilities",
+  capabilities: ["heartbeat", "conversation_attached"],
+}
+const ATTACHED = { type: "conversation_attached" }
 
-  const mountActive = async () => {
-    render(<SessionAgentChatPage />)
-    dispatchSession()
-    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
-    const socket = MockWebSocket.instances[0]
-    act(() => socket.open("xagent-session-v1"))
-    return socket
-  }
-  const receive = (socket: MockWebSocket, frame: Record<string, unknown>) => {
-    act(() => socket.onmessage?.({ data: JSON.stringify(frame) } as MessageEvent))
-  }
-  const sentFrames = (socket: MockWebSocket) =>
-    socket.send.mock.calls.map((call) => JSON.parse(call[0] as string) as Record<string, unknown>)
-  const sentTypes = (socket: MockWebSocket) => sentFrames(socket).map((frame) => frame.type)
-  const taskInfo = (taskId: number) => ({
-    type: "trace_event",
-    timestamp: "2026-10-28T00:00:00Z",
+const mountActive = async () => {
+  render(<SessionAgentChatPage />)
+  dispatchSession()
+  await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+  const socket = MockWebSocket.instances[0]
+  act(() => socket.open("xagent-session-v1"))
+  return socket
+}
+const receive = (socket: MockWebSocket, frame: Record<string, unknown>) => {
+  act(() => socket.onmessage?.({ data: JSON.stringify(frame) } as MessageEvent))
+}
+const sentFrames = (socket: MockWebSocket) =>
+  socket.send.mock.calls.map((call) => JSON.parse(call[0] as string) as Record<string, unknown>)
+const sentTypes = (socket: MockWebSocket) => sentFrames(socket).map((frame) => frame.type)
+const taskInfo = (taskId: number) => ({
+  type: "trace_event",
+  timestamp: "2026-10-28T00:00:00Z",
+  data: {
+    event_id: `task-info-${taskId}`,
+    event_type: "task_info",
     data: {
-      event_id: `task-info-${taskId}`,
-      event_type: "task_info",
-      data: {
-        id: taskId,
-        title: `Task ${taskId}`,
-        status: "running",
-        description: "Session task",
-        created_at: "2026-10-28T00:00:00Z",
-        updated_at: "2026-10-28T00:00:00Z",
-      },
+      id: taskId,
+      title: `Task ${taskId}`,
+      status: "running",
+      description: "Session task",
+      created_at: "2026-10-28T00:00:00Z",
+      updated_at: "2026-10-28T00:00:00Z",
+    },
+  },
+})
+const replayEarlierConversation = (socket: MockWebSocket, extra: Array<Record<string, unknown>> = []) => {
+  receive(socket, taskInfo(41))
+  receive(socket, {
+    type: "trace_event",
+    task_id: 41,
+    timestamp: "2026-10-28T00:00:01Z",
+    data: {
+      event_id: "earlier-answer",
+      event_type: "agent_message",
+      data: { message: "Earlier answer", content: "Earlier answer", role: "assistant" },
     },
   })
-  const replayEarlierConversation = (socket: MockWebSocket, extra: Array<Record<string, unknown>> = []) => {
-    receive(socket, taskInfo(41))
-    receive(socket, {
-      type: "trace_event",
-      task_id: 41,
-      timestamp: "2026-10-28T00:00:01Z",
-      data: {
-        event_id: "earlier-answer",
-        event_type: "agent_message",
-        data: { message: "Earlier answer", content: "Earlier answer", role: "assistant" },
-      },
-    })
-    receive(socket, { type: "historical_data_complete", task_id: 41, timestamp: "2026-10-28T00:00:02Z" })
-    for (const frame of extra) receive(socket, frame)
-  }
+  receive(socket, { type: "historical_data_complete", task_id: 41, timestamp: "2026-10-28T00:00:02Z" })
+  for (const frame of extra) receive(socket, frame)
+}
+
+describe("SessionAgentChatPage opens a new conversation from the host page", () => {
+  let warn = vi.fn()
+
   const deliverOpenMessage = (value: string, id = "1") => {
     act(() => {
       window.dispatchEvent(new MessageEvent("message", {
@@ -1695,5 +1698,87 @@ describe("SessionAgentChatPage opens a new conversation from the host page", () 
       "xagent-session-binding-v1",
       "xagent-session-task.unbound",
     ])
+  })
+})
+
+describe("SessionAgentChatPage sends the host page's initial message", () => {
+  const INITIAL_MESSAGE = "Hi, I'd like a quote"
+  let initialRequests = 0
+
+  // Acts as widget.js after the visitor has already opened the panel: it
+  // answers every initial_message_request with the message, as soon as a
+  // posted message can arrive.
+  const answerInitialMessageRequests = () => {
+    const forward = EMBEDDED_PARENT.postMessage
+    vi.spyOn(EMBEDDED_PARENT, "postMessage").mockImplementation((...args) => {
+      const [data] = args as [Record<string, unknown>]
+      if (data?.type !== "initial_message_request") return forward(...args)
+      initialRequests += 1
+      setTimeout(() => {
+        window.dispatchEvent(new MessageEvent("message", {
+          data: { xagent: true, v: 1, type: "initial_message", value: INITIAL_MESSAGE },
+          source: EMBEDDED_PARENT as unknown as MessageEventSource,
+        }))
+      }, 0)
+    })
+  }
+
+  beforeEach(() => {
+    MockWebSocket.instances = []
+    MockWebSocket.failConstruction = false
+    MockWebSocket.constructionCount = 0
+    localStorage.clear()
+    sessionStorage.clear()
+    vi.stubGlobal("WebSocket", MockWebSocket)
+    vi.spyOn(console, "log").mockImplementation(() => {})
+    Object.defineProperty(window, "parent", { configurable: true, value: EMBEDDED_PARENT })
+    initialRequests = 0
+    answerInitialMessageRequests()
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+    if (originalParentDescriptor) Object.defineProperty(window, "parent", originalParentDescriptor)
+  })
+
+  // Long enough for the answer to a request, had one been posted, to arrive.
+  const letHostAnswer = () => act(() => new Promise<void>((resolve) => setTimeout(resolve, 20)))
+
+  it("sends nothing into a conversation the server restores", async () => {
+    const socket = await mountActive()
+    receive(socket, ATTACH_CAPABILITIES)
+    // The replay follows the open, so the host page may answer before it.
+    await letHostAnswer()
+    replayEarlierConversation(socket)
+    receive(socket, ATTACHED)
+    await letHostAnswer()
+
+    expect(sentTypes(socket)).toEqual([])
+    expect(initialRequests).toBe(0)
+  })
+
+  it("sends the message to a visitor without a conversation once the socket attaches", async () => {
+    const socket = await mountActive()
+    receive(socket, ATTACH_CAPABILITIES)
+    expect(initialRequests).toBe(0)
+    expect(sentTypes(socket)).toEqual([])
+
+    receive(socket, ATTACHED)
+
+    await waitFor(() => expect(sentTypes(socket)).toEqual(["chat"]))
+    expect(sentFrames(socket)[0].message).toBe(INITIAL_MESSAGE)
+    expect(initialRequests).toBe(1)
+  })
+
+  it("sends the message on the open socket when the server does not announce attach completion", async () => {
+    const socket = await mountActive()
+    expect(initialRequests).toBe(0)
+
+    receive(socket, { type: "connection_capabilities", capabilities: ["heartbeat"] })
+
+    await waitFor(() => expect(sentTypes(socket)).toEqual(["chat"]))
+    expect(sentFrames(socket)[0].message).toBe(INITIAL_MESSAGE)
   })
 })

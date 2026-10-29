@@ -184,7 +184,13 @@ function SessionConversationContent({
   }, [startNewConversation])
 
   useWidgetInitialMessage({
-    ready: status === "active" && agent !== null && isConnected,
+    // An open socket does not yet tell whether the server is restoring a
+    // conversation, because its replay arrives after the open. Attach
+    // completion follows that replay, so the page knows from there on. A
+    // server that does not announce it leaves only the open socket to go on.
+    // Both "attached" and "unsupported" describe the current open socket only.
+    ready: status === "active" && agent !== null
+      && sessionConversationAttachment !== "pending",
     // A first send queued during the initial connect has no task yet.
     hasConversation: state.taskId !== null || isMessageDeliveryPending,
     onMessage: (message) => handleStartMessage(message, []),

@@ -921,10 +921,11 @@ describe("SessionAgentChatPage", () => {
       post.mock.calls.filter(([data]) => data.type === "initial_message_request")
     )
 
-    it("sends the delivered message once the connection is open", async () => {
+    it("sends the delivered message once the socket has attached", async () => {
       const post = stubParent()
       setBridge("active", activeSession())
       app.isConnected = true
+      app.sessionConversationAttachment = "attached"
       app.sendMessage.mockResolvedValue(undefined)
 
       render(<SessionAgentChatPage />)
@@ -939,7 +940,7 @@ describe("SessionAgentChatPage", () => {
       expect(app.sendMessage).toHaveBeenCalledTimes(1)
     })
 
-    it("does not send after a first message queued before the connection opened", () => {
+    it("does not send after a first message queued before the socket attached", () => {
       const post = stubParent()
       setBridge("active", activeSession())
       app.isConnected = false
@@ -947,6 +948,7 @@ describe("SessionAgentChatPage", () => {
       const { rerender } = render(<SessionAgentChatPage />)
 
       app.isConnected = true
+      app.sessionConversationAttachment = "attached"
       rerender(<SessionAgentChatPage />)
 
       expect(initialRequests(post)).toEqual([])
@@ -962,10 +964,33 @@ describe("SessionAgentChatPage", () => {
       expect(initialRequests(post)).toEqual([])
     })
 
+    it("waits for the open socket to attach before asking", () => {
+      const post = stubParent()
+      setBridge("active", activeSession())
+      app.isConnected = true
+      app.sessionConversationAttachment = "pending"
+
+      render(<SessionAgentChatPage />)
+
+      expect(initialRequests(post)).toEqual([])
+    })
+
+    it("asks on the open socket when its server does not announce attach completion", async () => {
+      const post = stubParent()
+      setBridge("active", activeSession())
+      app.isConnected = true
+      app.sessionConversationAttachment = "unsupported"
+
+      render(<SessionAgentChatPage />)
+
+      await waitFor(() => expect(initialRequests(post)).toHaveLength(1))
+    })
+
     it("does not ask while a conversation already exists", () => {
       const post = stubParent()
       setBridge("active", activeSession())
       app.isConnected = true
+      app.sessionConversationAttachment = "attached"
       app.state.taskId = 7
 
       render(<SessionAgentChatPage />)
@@ -977,6 +1002,7 @@ describe("SessionAgentChatPage", () => {
       const post = stubParent()
       setBridge("active", activeSession())
       app.isConnected = true
+      app.sessionConversationAttachment = "attached"
       app.sendMessage.mockRejectedValue(new Error("delivery failed"))
 
       render(<SessionAgentChatPage />)
