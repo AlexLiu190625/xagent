@@ -32,8 +32,10 @@ import xagent.web.models.task_interaction as task_interaction_module
 import xagent.web.services.chat_history_service as chat_history_service_module
 import xagent.web.services.task_interaction_read as task_interaction_read_module
 import xagent.web.services.task_interaction_service as task_interaction_service_module
+import xagent.web.services.task_question_cancel as task_question_cancel_module
 import xagent.web.services.task_resume as task_resume_module
 import xagent.web.services.task_start as task_start_module
+import xagent.web.services.task_stream_snapshot as task_stream_snapshot_module
 
 pytestmark = pytest.mark.skipif(
     sys.version_info < (3, 11),
@@ -41,7 +43,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 # ---------------------------------------------------------------------------
-# Import guard: the module half (five modules, zero import expected)
+# Import guard: the module half (nine modules, zero import expected)
 # ---------------------------------------------------------------------------
 
 _IMPORT_GUARD_MODULES = {
@@ -60,15 +62,17 @@ _IMPORT_GUARD_MODULES = {
     # function half below is what covers the reference itself.
     "task_interaction_read.py": task_interaction_read_module,
     "v1/tasks.py": v1_tasks_module,
+    # Two more read-side consumers: the stream snapshot loader reads the
+    # pending question of a waiting task, and the question-cancel service
+    # reads it and then closes the active row.
+    "task_stream_snapshot.py": task_stream_snapshot_module,
+    "task_question_cancel.py": task_question_cancel_module,
 }
 
-# websocket.py is explicitly, by name, exempted from the module-half check:
-# it hosts both a read-side consumer (_load_historical_stream_snapshot_sync)
-# and two finalizers that will eventually need to import interaction_rollout
-# once the gate is wired into task finalization. A guard that would be
-# deleted the day that wiring lands is not a guard worth having at the
-# module level -- see the function-half check below, which covers this
-# module with an assertion that survives that wiring.
+# websocket.py is exempted by name from the module-half check. Its
+# read-side consumer (_load_historical_stream_snapshot_sync) is a closure
+# seed of the function-half check below, which binds that function's own
+# scope rather than every import in the module.
 _WEBSOCKET_IMPORT_EXEMPTION = frozenset({"websocket.py"})
 
 
@@ -114,7 +118,7 @@ def test_tw1c_websocket_module_half_exemption_is_named_and_exactly_one_module():
 
 # ---------------------------------------------------------------------------
 # Reference guard: the function half (websocket.py's replacement for
-# module-level zero-import: 7 closure seeds, own-scope-only banned-name scan)
+# module-level zero-import: 8 closure seeds, own-scope-only banned-name scan)
 # ---------------------------------------------------------------------------
 
 _BANNED_NAMES = frozenset(
@@ -141,7 +145,7 @@ _BANNED_NAMES = frozenset(
     }
 )
 
-# The 7 closure seeds are not 3: get_task and get_task_status's own bodies
+# The 8 closure seeds are not 3: get_task and get_task_status's own bodies
 # (the code outside their nested _get_task_sync / _get_task_status_sync
 # definitions) are themselves part of the read path -- they are the
 # *callers* of the nested sync functions, not reachable *from* them, so a
@@ -150,7 +154,9 @@ _BANNED_NAMES = frozenset(
 # alongside the tuple adapter: the adapter's own entry point is the one
 # function every waiting-status read now funnels through, and the fifth
 # consumption point (v1's task info snapshot builder) had no closure-half
-# coverage at all before this.
+# coverage at all before this. The stream snapshot loader is a seed for the
+# same reason as the v1 snapshot builder: it reads the pending question
+# directly.
 _CLOSURE_SEEDS = [
     ("chat.py", "get_task"),
     ("chat.py", "get_task._get_task_sync"),
@@ -159,6 +165,7 @@ _CLOSURE_SEEDS = [
     ("websocket.py", "_load_historical_stream_snapshot_sync"),
     ("task_interaction_read.py", "get_pending_interaction_question"),
     ("v1/tasks.py", "_load_task_info_snapshot"),
+    ("task_stream_snapshot.py", "load_task_stream_snapshots"),
 ]
 
 _SOURCE_BY_LABEL = {
@@ -166,6 +173,7 @@ _SOURCE_BY_LABEL = {
     "websocket.py": websocket_module,
     "task_interaction_read.py": task_interaction_read_module,
     "v1/tasks.py": v1_tasks_module,
+    "task_stream_snapshot.py": task_stream_snapshot_module,
 }
 
 
@@ -249,7 +257,7 @@ def _own_scope_identifiers(func_node) -> set[str]:
 
 
 def _scan_closure_for_banned_names() -> dict[str, set[str]]:
-    """For each of the 7 closure seeds, the banned names (if any) found in
+    """For each of the 8 closure seeds, the banned names (if any) found in
     its own scope. Real production files, always re-parsed from disk."""
     hits: dict[str, set[str]] = {}
     trees = {
@@ -269,7 +277,7 @@ def test_tw1b_closure_seeds_reference_no_banned_names():
     # block in get_task / get_task_status, not as direct ast.Module.body
     # children -- a scanner that only checked Module.body would silently
     # never find either one, turning this into an always-green false guard.
-    # _find_qualified_function (used above to resolve the 7 closure seeds)
+    # _find_qualified_function (used above to resolve the 8 closure seeds)
     # walks through control-flow wrappers for exactly this reason.
     hits = _scan_closure_for_banned_names()
     assert hits == {}, f"read-side consumer(s) reference the rollout module: {hits}"
