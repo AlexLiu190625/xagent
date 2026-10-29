@@ -2054,9 +2054,13 @@ describe("TaskConversationPanel", () => {
       expect(chatInputProps.current?.files).toEqual([a])
     })
 
-    it("still clears every file after a send when files are enabled", async () => {
+    it.each([
+      ["the conversation's own send", false],
+      ["a caller's onSend", true],
+    ])("keeps files added while %s is in flight when files are enabled", async (_kind, viaCaller) => {
       const { onSend, finish } = pendingSend()
-      render(<TaskConversationPanel mode="page" onSend={onSend} />)
+      if (!viaCaller) sendMessageMock.mockImplementation(onSend)
+      render(<TaskConversationPanel mode="page" onSend={viaCaller ? onSend : undefined} />)
       const [a, b] = [txt("a.txt"), txt("b.txt")]
       pick([a])
       let sending!: Promise<void> | void
@@ -2066,7 +2070,7 @@ describe("TaskConversationPanel", () => {
       await act(async () => { finish(); await sending })
 
       expect(onSend).toHaveBeenCalledWith("draft", undefined, [a])
-      expect(chatInputProps.current?.files).toEqual([])
+      expect(chatInputProps.current?.files).toEqual([b])
     })
 
     it("shows the files the caller holds and reports every change to it", async () => {
