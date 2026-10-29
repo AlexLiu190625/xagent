@@ -166,9 +166,13 @@ import {
   VERSIONED_TASK_EVENT_TYPES,
   createInitialState,
   extractTaskControlEnvelope,
+  initialSessionStop,
+  isFrameForStopIntent,
   projectAppState,
   projectErrorFrameForDisplay,
+  reduceSessionStop,
   type AppProviderTransportConfig,
+  type SessionStop,
   useApp,
 } from "./app-context-chat"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
@@ -11643,8 +11647,281 @@ describe("error frame display projection", () => {
     // exercise stateVersion being undefined rather than a value we chose.
     const controlEnvelope = extractTaskControlEnvelope(frame)
     expect(
-      projectErrorFrameForDisplay(frame, { trustLegacyErrorProse, translate, controlEnvelope }),
-    ).toEqual(expected)
+      projectErrorFrameForDisplay(frame, {
+        trustLegacyErrorProse,
+        translate,
+        controlEnvelope,
+        stopIntentTaskId: null,
+      }),
+    ).toEqual({ ...expected, endsStopIntent: false, isVisitorStoppedTurn: false })
+  })
+
+  const stopFrame = (overrides: Record<string, unknown>) => ({
+    type: "task_error",
+    timestamp: "2026-05-27T05:00:02Z",
+    task_id: 7,
+    task: { id: 7, status: "failed" },
+    message: "This response was interrupted.",
+    error: "This response was interrupted.",
+    code: "external_turn_interrupted",
+    ...overrides,
+  }) as unknown as TaskControlMessage
+
+  it.each([
+    {
+      name: "the interrupted terminal frame of the task the visitor stopped",
+      frame: stopFrame({}),
+      stopIntentTaskId: 7,
+      endsStopIntent: true,
+      isVisitorStoppedTurn: true,
+    },
+    {
+      name: "the interrupted terminal frame when no stop was asked for",
+      frame: stopFrame({}),
+      stopIntentTaskId: null,
+      endsStopIntent: false,
+      isVisitorStoppedTurn: false,
+    },
+    {
+      name: "the interrupted terminal frame of a task other than the stopped one",
+      frame: stopFrame({}),
+      stopIntentTaskId: 8,
+      endsStopIntent: false,
+      isVisitorStoppedTurn: false,
+    },
+    {
+      name: "an interrupted terminal frame that names no task",
+      frame: stopFrame({ task_id: undefined, task: { status: "failed" } }),
+      stopIntentTaskId: 7,
+      endsStopIntent: false,
+      isVisitorStoppedTurn: false,
+    },
+    {
+      name: "a terminal frame with another code for the stopped task",
+      frame: stopFrame({ code: "missing_runtime_context" }),
+      stopIntentTaskId: 7,
+      endsStopIntent: true,
+      isVisitorStoppedTurn: false,
+    },
+    {
+      name: "a terminal frame with no code for the stopped task",
+      frame: stopFrame({ code: undefined }),
+      stopIntentTaskId: 7,
+      endsStopIntent: true,
+      isVisitorStoppedTurn: false,
+    },
+    {
+      name: "a non-terminal rejection for the stopped task",
+      frame: stopFrame({ type: "error", task: { id: 7, status: "running" } }),
+      stopIntentTaskId: 7,
+      endsStopIntent: false,
+      isVisitorStoppedTurn: false,
+    },
+  ])("derives the stop outcome of $name", ({
+    frame,
+    stopIntentTaskId,
+    endsStopIntent,
+    isVisitorStoppedTurn,
+  }) => {
+    const projected = projectErrorFrameForDisplay(frame, {
+      trustLegacyErrorProse: true,
+      translate,
+      controlEnvelope: extractTaskControlEnvelope(frame),
+      stopIntentTaskId,
+    })
+    expect(projected.endsStopIntent).toBe(endsStopIntent)
+    expect(projected.isVisitorStoppedTurn).toBe(isVisitorStoppedTurn)
+  })
+})
+
+describe("session stop reducer", () => {
+  const stop = (overrides: Partial<SessionStop>): SessionStop => ({
+    ...initialSessionStop,
+    ...overrides,
+  })
+
+  it.each([
+    { intentTaskId: null, frameTaskId: undefined, matches: false },
+    { intentTaskId: null, frameTaskId: 7, matches: false },
+    { intentTaskId: 7, frameTaskId: undefined, matches: false },
+    { intentTaskId: 7, frameTaskId: 8, matches: false },
+    { intentTaskId: 7, frameTaskId: 7, matches: true },
+  ])(
+    "matches intent $intentTaskId against frame task $frameTaskId: $matches",
+    ({ intentTaskId, frameTaskId, matches }) => {
+      expect(isFrameForStopIntent(intentTaskId, frameTaskId)).toBe(matches)
+    },
+  )
+
+  it("starts idle with no intent and no bound task", () => {
+    expect(initialSessionStop).toEqual({
+      control: "idle",
+      intentTaskId: null,
+      boundTaskId: null,
+    })
+  })
+
+  it.each(["idle", "stopping", "timed_out", "not_sent"] as const)(
+    "a sent stop from %s records the intent and arms a fresh window",
+    (control) => {
+      expect(
+        reduceSessionStop(stop({ control, intentTaskId: 3, boundTaskId: 7 }), {
+          type: "STOP_SENT",
+          taskId: 7,
+        }),
+      ).toEqual({
+        next: { control: "stopping", intentTaskId: 7, boundTaskId: 7 },
+        effect: "arm_timeout",
+      })
+    },
+  )
+
+  it.each(["idle", "stopping", "timed_out", "not_sent"] as const)(
+    "a refused stop from %s shows not_sent and leaves the intent and any window alone",
+    (control) => {
+      expect(
+        reduceSessionStop(stop({ control, intentTaskId: 7, boundTaskId: 7 }), {
+          type: "STOP_NOT_SENT",
+        }),
+      ).toEqual({
+        next: { control: "not_sent", intentTaskId: 7, boundTaskId: 7 },
+        effect: null,
+      })
+    },
+  )
+
+  it.each(["stopping", "not_sent"] as const)(
+    "the window running out from %s shows timed_out and keeps the intent",
+    (control) => {
+      expect(
+        reduceSessionStop(stop({ control, intentTaskId: 7, boundTaskId: 7 }), {
+          type: "STOP_TIMED_OUT",
+        }),
+      ).toEqual({
+        next: { control: "timed_out", intentTaskId: 7, boundTaskId: 7 },
+        effect: null,
+      })
+    },
+  )
+
+  it.each(["idle", "stopping", "timed_out", "not_sent"] as const)(
+    "the stopped task's terminal failure from %s ends the intent and releases the control",
+    (control) => {
+      expect(
+        reduceSessionStop(stop({ control, intentTaskId: 7, boundTaskId: 7 }), {
+          type: "STOPPED_TASK_FAILED",
+        }),
+      ).toEqual({
+        next: { control: "idle", intentTaskId: null, boundTaskId: 7 },
+        effect: "clear_timeout",
+      })
+    },
+  )
+
+  it.each(["idle", "stopping", "timed_out", "not_sent"] as const)(
+    "the stopped task's completion from %s ends the intent and leaves the control alone",
+    (control) => {
+      expect(
+        reduceSessionStop(stop({ control, intentTaskId: 7, boundTaskId: 7 }), {
+          type: "TASK_COMPLETED",
+          taskId: 7,
+        }),
+      ).toEqual({
+        next: { control, intentTaskId: null, boundTaskId: 7 },
+        effect: null,
+      })
+    },
+  )
+
+  it.each([
+    { name: "another task", intentTaskId: 7, taskId: 8 },
+    { name: "a frame that names no task", intentTaskId: 7, taskId: undefined },
+    { name: "no intent", intentTaskId: null, taskId: 7 },
+    { name: "no intent and a frame that names no task", intentTaskId: null, taskId: undefined },
+  ])("a completion with $name changes nothing", ({ intentTaskId, taskId }) => {
+    const state = stop({ control: "stopping", intentTaskId, boundTaskId: 7 })
+    const result = reduceSessionStop(state, { type: "TASK_COMPLETED", taskId })
+    expect(result.next).toBe(state)
+    expect(result.effect).toBeNull()
+  })
+
+  it.each(["idle", "stopping", "timed_out", "not_sent"] as const)(
+    "a stop that did not apply from %s releases the control and keeps the intent",
+    (control) => {
+      expect(
+        reduceSessionStop(stop({ control, intentTaskId: 7, boundTaskId: 7 }), {
+          type: "STOP_NOT_APPLIED",
+          taskId: 7,
+        }),
+      ).toEqual({
+        next: { control: "idle", intentTaskId: 7, boundTaskId: 7 },
+        effect: "clear_timeout",
+      })
+    },
+  )
+
+  it.each([
+    { name: "another task", intentTaskId: 7, taskId: 8 },
+    { name: "a frame that names no task", intentTaskId: 7, taskId: undefined },
+    { name: "no intent", intentTaskId: null, taskId: 7 },
+    { name: "no intent and a frame that names no task", intentTaskId: null, taskId: undefined },
+  ])("a stop-not-applied frame with $name changes nothing", ({ intentTaskId, taskId }) => {
+    const state = stop({ control: "stopping", intentTaskId, boundTaskId: 7 })
+    const result = reduceSessionStop(state, { type: "STOP_NOT_APPLIED", taskId })
+    expect(result.next).toBe(state)
+    expect(result.effect).toBeNull()
+  })
+
+  it.each([
+    ...(["CONNECTION_CHANGED", "STOP_UNAVAILABLE"] as const).flatMap((type) =>
+      (["idle", "stopping", "timed_out", "not_sent"] as const).map((control) => ({
+        type,
+        control,
+      })),
+    ),
+  ])("$type from $control releases the control and keeps the intent", ({ type, control }) => {
+    expect(
+      reduceSessionStop(stop({ control, intentTaskId: 7, boundTaskId: 7 }), { type }),
+    ).toEqual({
+      next: { control: "idle", intentTaskId: 7, boundTaskId: 7 },
+      effect: "clear_timeout",
+    })
+  })
+
+  it("the first bound task is recorded and keeps the intent", () => {
+    expect(
+      reduceSessionStop(stop({ control: "stopping", intentTaskId: 7 }), {
+        type: "TASK_BOUND",
+        taskId: 7,
+      }),
+    ).toEqual({
+      next: { control: "stopping", intentTaskId: 7, boundTaskId: 7 },
+      effect: null,
+    })
+  })
+
+  it("the same bound task again keeps the intent", () => {
+    expect(
+      reduceSessionStop(stop({ control: "stopping", intentTaskId: 7, boundTaskId: 7 }), {
+        type: "TASK_BOUND",
+        taskId: 7,
+      }),
+    ).toEqual({
+      next: { control: "stopping", intentTaskId: 7, boundTaskId: 7 },
+      effect: null,
+    })
+  })
+
+  it("a different bound task ends the intent and leaves the control alone", () => {
+    expect(
+      reduceSessionStop(stop({ control: "stopping", intentTaskId: 7, boundTaskId: 7 }), {
+        type: "TASK_BOUND",
+        taskId: 8,
+      }),
+    ).toEqual({
+      next: { control: "stopping", intentTaskId: null, boundTaskId: 8 },
+      effect: null,
+    })
   })
 })
 
