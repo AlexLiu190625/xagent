@@ -321,9 +321,10 @@ class TurnStarted:
     response WITHOUT re-reading the ORM (``begin_turn`` no longer touches
     the caller's session), plus the live bg handle.
 
-    The snapshot fields (``status`` / ``updated_at`` / ``before_message_id``)
-    are read inside the isolated worker-thread transaction, so callers do
-    not pay an on-loop ``db.refresh`` to learn the post-claim state.
+    The snapshot fields (``status`` / ``updated_at`` / ``before_message_id``
+    / ``accepted_at``) are read inside the isolated worker-thread
+    transaction, so callers do not pay an on-loop ``db.refresh`` to learn the
+    post-claim state.
     ``task_source`` is internal (passed to ``_schedule_bg``); ``background_task``
     is the scheduler handle (workforce / tests await it).
     """
@@ -337,6 +338,7 @@ class TurnStarted:
     run_id: str = ""
     state_version: int = 0
     control_state: str = TaskControlState.RUNNING.value
+    accepted_at: Optional[datetime] = None
 
 
 class TaskTurnOrchestrator:
@@ -768,6 +770,10 @@ class _AcceptedTurn:
     state_version: int = 0
     control_state: str = TaskControlState.RUNNING.value
     agent_config: Optional[dict[str, Any]] = None
+    # When the turn was accepted: the claimed row's update time in process,
+    # the START command's creation time when queued (the row's values are not
+    # changed, so its update time is the previous turn's).
+    accepted_at: Optional[datetime] = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1062,6 +1068,7 @@ def _turn_started_snapshot(
         state_version=claimed.state_version,
         control_state=claimed.control_state,
         background_task=background_task,
+        accepted_at=claimed.accepted_at,
     )
 
 
@@ -1141,6 +1148,7 @@ def _persist_accepted_turn_no_commit(
         state_version=int(state_version),
         control_state=str(control_state),
         agent_config=agent_config if isinstance(agent_config, dict) else None,
+        accepted_at=updated_at,
     )
 
 
@@ -1576,8 +1584,15 @@ def _claim_turn_no_commit(
         if not staged.created or not staged.payload_matches:
             # A new accepted run cannot adopt a different earlier command.
             raise TaskTurnError("turn_identity_conflict")
+        from ..models.task_command import TaskExecutionCommand
+
+        command_created_at = (
+            db.query(TaskExecutionCommand.created_at)
+            .filter(TaskExecutionCommand.id == staged.staged_db_id)
+            .scalar()
+        )
         return _EnqueuedTurn(
-            **vars(accepted),
+            **vars(replace(accepted, accepted_at=command_created_at)),
             command_db_id=staged.staged_db_id,
             command_payload=start.model_dump(mode="json"),
         )
