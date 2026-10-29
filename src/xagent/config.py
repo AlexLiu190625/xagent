@@ -328,6 +328,8 @@ TOBY_PERSONAL_STDIO_ENABLED = "XAGENT_TOBY_PERSONAL_STDIO_ENABLED"
 TRUSTED_EGRESS_PROXY = "XAGENT_TRUSTED_EGRESS_PROXY"
 MODEL_PRIVATE_ENDPOINTS = "XAGENT_MODEL_PRIVATE_ENDPOINTS"
 MODEL_PRIVATE_CIDRS = "XAGENT_MODEL_PRIVATE_CIDRS"
+MCP_PRIVATE_ENDPOINTS = "XAGENT_MCP_PRIVATE_ENDPOINTS"
+MCP_PRIVATE_CIDRS = "XAGENT_MCP_PRIVATE_CIDRS"
 
 TOOL_MAX_OUTPUT_LENGTH = "XAGENT_TOOL_MAX_OUTPUT_LENGTH"
 TOOL_MAX_RECURSION_DEPTH = "XAGENT_TOOL_MAX_RECURSION_DEPTH"
@@ -1127,6 +1129,16 @@ def get_model_private_endpoints() -> list[str]:
 def get_model_private_cidrs() -> list[str]:
     """Operator-only DNS address constraints for private model origins."""
     return _csv_env(MODEL_PRIVATE_CIDRS)
+
+
+def get_mcp_private_endpoints() -> list[str]:
+    """Operator-only exact remote MCP origins, including scheme and port; default deny."""
+    return _csv_env(MCP_PRIVATE_ENDPOINTS)
+
+
+def get_mcp_private_cidrs() -> list[str]:
+    """Operator-only DNS address constraints for private remote MCP origins."""
+    return _csv_env(MCP_PRIVATE_CIDRS)
 
 
 def get_mcp_oauth_proxy_url() -> str | None:
