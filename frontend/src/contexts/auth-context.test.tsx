@@ -703,3 +703,61 @@ describe("AuthProvider storage synchronization", () => {
     )
   })
 })
+
+describe("AuthProvider expiry check on page wake-up", () => {
+  const wakeEvents: Record<string, () => void> = {
+    "the page becomes visible": () => document.dispatchEvent(new Event("visibilitychange")),
+    "the window regains focus": () => window.dispatchEvent(new Event("focus")),
+    "the browser comes back online": () => window.dispatchEvent(new Event("online")),
+  }
+
+  beforeEach(() => {
+    localStorage.clear()
+    Object.defineProperty(navigator, "locks", {
+      configurable: true,
+      value: { request: vi.fn(async (_name: string, callback: () => Promise<unknown>) => callback()) },
+    })
+    vi.mocked(apiRequest).mockImplementation(async () => new Response(null, { status: 404 }))
+    vi.mocked(refreshStoredAccessToken).mockReset()
+    vi.mocked(refreshStoredAccessToken).mockResolvedValue({ status: "not_current", accessToken: null })
+  })
+  afterEach(() => {
+    Reflect.deleteProperty(document, "visibilityState")
+  })
+
+  it.each(Object.keys(wakeEvents))("refreshes a token near expiry as soon as %s", async event => {
+    writeAuthCache({ id: "1", username: "alice" }, "expiring-token", "refresh-token", 60, 3600)
+    render(<AuthProvider><AuthProbe /></AuthProvider>)
+    await screen.findByText("expiring-token")
+    expect(refreshStoredAccessToken).not.toHaveBeenCalled()
+
+    act(() => wakeEvents[event]())
+
+    await waitFor(() => expect(refreshStoredAccessToken).toHaveBeenCalledWith(
+      expect.objectContaining({ accessToken: "expiring-token", refreshToken: "refresh-token" }),
+    ))
+  })
+
+  it("does not refresh when the page turns hidden", async () => {
+    writeAuthCache({ id: "1", username: "alice" }, "expiring-token", "refresh-token", 60, 3600)
+    render(<AuthProvider><AuthProbe /></AuthProvider>)
+    await screen.findByText("expiring-token")
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "hidden" })
+
+    act(() => wakeEvents["the page becomes visible"]())
+
+    expect(refreshStoredAccessToken).not.toHaveBeenCalled()
+  })
+
+  it("does not refresh a token that is far from expiry", async () => {
+    writeAuthCache({ id: "1", username: "alice" }, "fresh-token", "refresh-token", 3600, 7200)
+    render(<AuthProvider><AuthProbe /></AuthProvider>)
+    await screen.findByText("fresh-token")
+
+    act(() => {
+      for (const fire of Object.values(wakeEvents)) fire()
+    })
+
+    expect(refreshStoredAccessToken).not.toHaveBeenCalled()
+  })
+})
