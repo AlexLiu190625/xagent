@@ -1644,7 +1644,7 @@ async def test_reproducible_decision_fault_settles_as_before(
     task, _row, _events = _state(factory, ids["task"])
     if path == "exception" and failure == "checkpoint_read":
         # The legacy settlement itself classifies the run's tool effect from
-        # the same checkpoint (run_has_unknown_tool_effect) and has always
+        # the same checkpoint (unknown_tool_effect_of_run) and has always
         # kept the lease when that read raises; unchanged here.
         assert task.status == TaskStatus.RUNNING
         assert (task.runner_id, task.run_id) == (lease.runner_id, lease.run_id)

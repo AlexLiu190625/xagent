@@ -237,7 +237,8 @@ def read_committed_tool_outcome(
         if event.kind in {"tool_execution_end", "tool_execution_failed"}:
             if data.get("interrupted") is True:
                 raise UnknownToolEffectError(
-                    "Interrupted tool attempt has no confirmed result"
+                    "Interrupted tool attempt has no confirmed result",
+                    tool_attempt_id=str(tool_call["tool_attempt_id"]),
                 )
             if "result" not in data:
                 raise CheckpointCorruptError(
@@ -251,7 +252,8 @@ def read_committed_tool_outcome(
             }
     if outcome is None:
         raise UnknownToolEffectError(
-            "Tool attempt started without a committed result; automatic replay is unsafe"
+            "Tool attempt started without a committed result; automatic replay is unsafe",
+            tool_attempt_id=str(tool_call["tool_attempt_id"]),
         )
     return outcome
 
