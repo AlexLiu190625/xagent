@@ -1,9 +1,13 @@
 """Static AST guards enforcing the hard invariant: the interaction rollout
 mode can decide whether a NEW native row gets produced, and nothing else.
 It can never affect how an already-published row is read, answered, or
-closed. Covers the import/reference guards on read-side consumers, the
-counted-call-site guards on the module's own public symbols, and the
-guard machinery's own self-check.
+closed. The only exception is the resume command seam's handling of an
+active interaction row it could not read: whether it refuses follows this
+process's frozen mode and topology (see
+``native_publication_enabled_in_this_process``); a row it did read is
+handled the same way under every mode. Covers the import/reference guards
+on read-side consumers, the counted-call-site guards on the module's own
+public symbols, and the guard machinery's own self-check.
 
 Everything here parses real source files with the standard library ``ast``
 module under whatever interpreter runs pytest. This suite must run under
@@ -118,6 +122,9 @@ _BANNED_NAMES = frozenset(
         "interaction_rollout",
         "evaluate_native_publication",
         "get_interaction_rollout_policy",
+        # The resume seam's accessor: its one production call site is
+        # pinned by the counted-call-site guard below.
+        "native_publication_enabled_in_this_process",
         # Included even though the production call-count guard below would
         # also catch a read-side consumer calling this: a fail-closed guard
         # should never depend on a second guard to notice the same
@@ -649,6 +656,34 @@ def test_tw2c_get_interaction_rollout_policy_has_at_most_two_whitelisted_sites()
     assert len(hits) <= 2, f"more than 2 call sites: {hits}"
     for site in seen:
         assert site in _GET_POLICY_SITE_WHITELIST, f"unlisted call site: {site}"
+
+
+def _call_site_functions(symbol: str) -> list[tuple[str, str | None]]:
+    """``(file name, enclosing function)`` of every production call of
+    ``symbol``, one entry per call."""
+    return [
+        (path.name, _enclosing_function_name(_parse(path), lineno))
+        for path, lineno in _count_calls(symbol)
+    ]
+
+
+def test_tw2e_native_publication_enabled_in_this_process_has_one_call_in_resume_task():
+    assert _call_site_functions("native_publication_enabled_in_this_process") == [
+        ("task_command_execution.py", "resume_task")
+    ]
+
+
+def test_tw2f_native_publication_enabled_in_this_process_is_imported_by_name_once():
+    imports = []
+    for path in _iter_src_files():
+        for node in ast.walk(_parse(path)):
+            if isinstance(node, ast.ImportFrom):
+                imports.extend(
+                    (path.name, alias.asname)
+                    for alias in node.names
+                    if alias.name == "native_publication_enabled_in_this_process"
+                )
+    assert imports == [("task_command_execution.py", None)]
 
 
 def test_tw2d_validate_interaction_rollout_at_startup_runs_at_both_host_entries():
