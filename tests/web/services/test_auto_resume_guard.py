@@ -1025,22 +1025,24 @@ async def test_resume_task_skips_an_unverifiable_interaction_read_without_an_err
         result, reply = await _resume(factory, task_id)
 
     reply.assert_not_awaited()
+    skipped_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == commands.__name__
+        and record.levelno == logging.INFO
+        and record.getMessage().startswith("auto resume skipped")
+    ]
     if (mode, shared_task_execution) == ("native", True):
         assert result.outcome is ResumeCommandOutcome.AUTO_SKIPPED
         assert result.reason_code == "interaction_unverifiable"
         handler.manager.try_reserve_resume.assert_not_called()
-        assert [
-            record.getMessage()
-            for record in caplog.records
-            if record.name == commands.__name__
-            and record.levelno == logging.INFO
-            and record.getMessage().startswith("auto resume skipped")
-        ] == [
+        assert skipped_lines == [
             f"auto resume skipped task_id={task_id} run_id={RUN} "
             "why=interaction_unverifiable component=auto-resume"
         ]
     else:
         assert result.outcome is ResumeCommandOutcome.SCHEDULED
+        assert skipped_lines == []
 
 
 @pytest.mark.asyncio

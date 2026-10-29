@@ -619,10 +619,11 @@ class ResumeCommandOutcome(str, enum.Enum):
     ALREADY_IN_PROGRESS = "already_in_progress"
     DEFERRED = "deferred"
     REJECTED = "rejected"
-    # An automatic resume that does not go ahead this time (the task moved
-    # on, automatic resume was switched off, or the seam could not proceed
-    # without its user). A success: the command completes without an error
-    # reply.
+    # An automatic resume that does not go ahead this time: the task moved
+    # on, automatic resume was switched off, the task has an unanswered
+    # question that waits for its user, or its active interaction row could
+    # not be read and housekeeping tries again later. A success: the
+    # command completes without an error reply.
     AUTO_SKIPPED = "auto_skipped"
 
 
