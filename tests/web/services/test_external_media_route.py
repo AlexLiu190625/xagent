@@ -27,6 +27,11 @@ from xagent.web.services.uploaded_file_cleanup_publication import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_s2s_base(monkeypatch):
+    monkeypatch.delenv("XAGENT_S2S_API_BASE_URL", raising=False)
+
+
 @pytest.fixture(scope="module")
 def db() -> Session:
     engine = create_engine(
