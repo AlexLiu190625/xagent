@@ -1,5 +1,6 @@
 import asyncio
 import json
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1392,6 +1393,53 @@ async def test_shared_start_turn_with_files_traces_the_transcript_text(
     # and the file ids; no display message survives it. The scheduler resolves
     # the files, and the user_message trace event must still show the
     # transcript text with the file chips.
+    captured, _, enriched = await _schedule_file_turn(
+        db_session,
+        monkeypatch,
+        tmp_path,
+        shared=True,
+        turn_id="turn-start",
+        transcript="Summarize this",
+        context={},
+    )
+
+    assert captured["agent_task"] == enriched
+    agent_context = captured["agent_context"]
+    assert agent_context["display_message"] == "Summarize this"
+    assert [info["file_id"] for info in agent_context["file_info"]] == ["fid-notes"]
+    user_messages = await _run_agent_and_record_user_messages(
+        tmp_path,
+        task=captured["agent_task"],
+        request_context=agent_context,
+    )
+
+    assert [event["message"] for event in user_messages] == ["Summarize this"]
+    assert user_messages[0]["turn_id"] == "turn-start"
+    assert [chip["file_id"] for chip in user_messages[0]["files"]] == ["fid-notes"]
+
+
+async def _schedule_file_turn(
+    db_session,
+    monkeypatch,
+    tmp_path,
+    *,
+    shared: bool,
+    turn_id: str,
+    transcript: str,
+    context: dict,
+    with_attachments: bool = False,
+    before_schedule: Callable[[], None] | None = None,
+) -> tuple[dict, list[list[dict]], str]:
+    """Run a turn carrying ``fid-notes`` through the scheduler.
+
+    ``shared`` turns shared task execution on, as on a host consuming START
+    commands, or off, as on a combined host without ``XAGENT_WORKER_COUNT``.
+    ``with_attachments`` also carries the file chips an in-process caller
+    persists with the turn. ``before_schedule`` runs after the files were
+    resolved for the execution message and before the run starts. Returns what
+    the agent was asked to run (empty when it never ran), every file list
+    registered with the agent service, and the execution message.
+    """
     user = _create_user(db_session, 1, "owner")
     lease = _task_lease(10)
     _create_task(
@@ -1415,10 +1463,11 @@ async def test_shared_start_turn_with_files_traces_the_transcript_text(
         file_ids=["fid-notes"], owner_user_id=1, db=db_session, task_id=10
     )
     assert missing == []
-    enriched = append_uploaded_files_context(
-        "Summarize this", build_uploaded_files_context(file_infos)
+    execution_message = append_uploaded_files_context(
+        transcript, build_uploaded_files_context(file_infos)
     )
     captured: dict = {}
+    registered: list[list[dict]] = []
 
     class BroadcastManager:
         async def broadcast_to_task(self, event, task_id):
@@ -1443,12 +1492,20 @@ async def test_shared_start_turn_with_files_traces_the_transcript_text(
     async def no_heartbeat(*args, **kwargs):
         return None
 
+    def record_registration(agent_service, file_info_list):
+        registered.append([dict(info) for info in file_info_list])
+
     _wire_execute_task_background(monkeypatch, db_session, BroadcastManager())
     monkeypatch.setattr(
         task_execution_service, "background_task_manager", BackgroundTaskManager()
     )
     monkeypatch.setattr(
-        task_orchestrator, "get_shared_task_execution_enabled", lambda: True
+        task_execution_service,
+        "_register_uploaded_files_for_agent",
+        record_registration,
+    )
+    monkeypatch.setattr(
+        task_orchestrator, "get_shared_task_execution_enabled", lambda: shared
     )
     monkeypatch.setattr(task_orchestrator, "run_task_lease_heartbeat", no_heartbeat)
     monkeypatch.setattr(
@@ -1463,6 +1520,8 @@ async def test_shared_start_turn_with_files_traces_the_transcript_text(
     )
     monkeypatch.setattr(task_orchestrator, "_get_agent_manager", AgentManager)
 
+    if before_schedule is not None:
+        before_schedule()
     await task_orchestrator._schedule_bg(
         task_id=10,
         task_owner_user_id=int(user.id),
@@ -1470,28 +1529,119 @@ async def test_shared_start_turn_with_files_traces_the_transcript_text(
         run_id=lease.run_id,
         task_lease=lease,
         payload=TaskTurnPayload(
-            transcript_message="Summarize this",
-            execution_message=enriched,
+            transcript_message=transcript,
+            execution_message=execution_message,
+            attachments=(
+                _normalize_attachments_for_persistence(file_infos)
+                if with_attachments
+                else None
+            ),
             file_ids=("fid-notes",),
-            turn_id="turn-start",
+            turn_id=turn_id,
         ),
         force_fresh=False,
-        context={},
+        context=context,
     )
+    return captured, registered, execution_message
 
-    assert captured["agent_task"] == enriched
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transcript", ["Summarize this", ""])
+async def test_in_process_turn_resolves_file_ids_for_agent_and_trace(
+    db_session, monkeypatch, tmp_path, transcript
+):
+    # Without shared task execution, an SDK turn reaches the scheduler with
+    # file ids and no file info. The agent registration and the user_message
+    # trace event read only file info, so the scheduler resolves it here too.
+    # A file-only turn ("") is traced only because it carries file chips.
+    captured, registered, _ = await _schedule_file_turn(
+        db_session,
+        monkeypatch,
+        tmp_path,
+        shared=False,
+        turn_id="turn-in-process",
+        transcript=transcript,
+        context={},
+        with_attachments=True,
+    )
     agent_context = captured["agent_context"]
-    assert agent_context["display_message"] == "Summarize this"
+
     assert [info["file_id"] for info in agent_context["file_info"]] == ["fid-notes"]
+    assert [[info["file_id"] for info in batch] for batch in registered] == [
+        ["fid-notes"]
+    ]
     user_messages = await _run_agent_and_record_user_messages(
         tmp_path,
         task=captured["agent_task"],
         request_context=agent_context,
     )
 
-    assert [event["message"] for event in user_messages] == ["Summarize this"]
-    assert user_messages[0]["turn_id"] == "turn-start"
+    assert [event["message"] for event in user_messages] == [transcript]
+    assert user_messages[0]["turn_id"] == "turn-in-process"
     assert [chip["file_id"] for chip in user_messages[0]["files"]] == ["fid-notes"]
+
+
+@pytest.mark.asyncio
+async def test_in_process_turn_keeps_file_info_already_in_context(
+    db_session, monkeypatch, tmp_path
+):
+    # The web UI path resolves files before scheduling and hands their file
+    # info over in the context; the in-process run must not replace it.
+    captured, registered, _ = await _schedule_file_turn(
+        db_session,
+        monkeypatch,
+        tmp_path,
+        shared=False,
+        turn_id="turn-in-process",
+        transcript="Summarize this",
+        context={"file_info": [_UPLOADED_FILE_INFO]},
+        with_attachments=True,
+    )
+
+    assert captured["agent_context"]["file_info"] == [_UPLOADED_FILE_INFO]
+    assert registered == [[_UPLOADED_FILE_INFO]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("unbind", ["compensating", "bytes_removed"])
+async def test_turn_fails_when_its_file_no_longer_binds_at_run_start(
+    db_session, monkeypatch, tmp_path, shared, unbind
+):
+    # The file resolved when the turn was accepted but no longer binds when
+    # the run starts and the context carries no file info. The run fails
+    # before the agent sees the turn, and nothing is registered with it.
+    def unbind_file():
+        record = (
+            db_session.query(UploadedFile)
+            .filter(UploadedFile.file_id == "fid-notes")
+            .one()
+        )
+        if unbind == "compensating":
+            record.storage_status = "compensating"
+            db_session.commit()
+        else:
+            Path(record.storage_path).unlink()
+
+    captured, registered, _ = await _schedule_file_turn(
+        db_session,
+        monkeypatch,
+        tmp_path,
+        shared=shared,
+        turn_id="turn-unbindable",
+        transcript="Summarize this",
+        context={},
+        with_attachments=not shared,
+        before_schedule=unbind_file,
+    )
+
+    # ``execute_task`` records every call in ``captured``.
+    assert captured == {}
+    assert registered == []
+    db_session.expire_all()
+    task = db_session.get(Task, 10)
+    assert task.status == TaskStatus.FAILED
+    assert "Files are no longer bindable: fid-notes" in str(task.error_message)
 
 
 @pytest.mark.asyncio
