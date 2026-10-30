@@ -2355,11 +2355,13 @@ def get_google_restricted_scopes() -> bool:
 
 
 def get_google_shared_oauth_grants_enabled() -> bool:
-    """Prefer explicitly-associated shared Google grants at runtime.
+    """Enable shared Google authorization, callback writes, and resolution.
 
-    Disabled by default while the shared-grant storage and authorization flow
-    are rolled out separately. Legacy per-app credentials remain the fallback
-    even when the flag is enabled.
+    When enabled, login unions scopes from current catalog associations,
+    callbacks mirror one shared credential into app-specific compatibility
+    rows, and runtime prefers an explicitly-associated shared grant. Turning
+    the flag off restores the legacy read path, but not independent per-app
+    refresh tokens; a scope-incompatible adopted app may still need reconnect.
     """
     return _get_bool_env(GOOGLE_SHARED_OAUTH_GRANTS_ENABLED, False)
 

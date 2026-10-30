@@ -712,6 +712,9 @@ async def list_connected_accounts(
         user_id=cast(int, user.id),
         resource_owner_key=None,
     )
+    from ..models.google_oauth_grant import GoogleOAuthGrant
+
+    query = query.filter(~UserOAuth.id.in_(db.query(GoogleOAuthGrant.oauth_account_id)))
 
     if provider:
         query = query.filter(UserOAuth.provider == provider)
@@ -891,6 +894,16 @@ async def delete_connected_account(
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
 
+    from ..models.google_oauth_grant import GoogleOAuthGrant
+
+    if (
+        db.query(GoogleOAuthGrant.id)
+        .filter(GoogleOAuthGrant.oauth_account_id == int(account.id))
+        .first()
+        is not None
+    ):
+        raise HTTPException(status_code=404, detail="Account not found")
+
     # Snapshot before the delete: it's a bulk-free single-row delete here,
     # but the same "read the token before it's gone" constraint applies as
     # in mcp.py's disconnect endpoints -- this must run before db.delete,
@@ -908,6 +921,15 @@ async def delete_connected_account(
         ),
     )
 
+    from ..services.google_oauth_grants import (
+        detach_google_shared_oauth_legacy_account,
+    )
+
+    detach_google_shared_oauth_legacy_account(
+        db,
+        user_id=cast(int, user.id),
+        legacy_oauth_account_id=int(account.id),
+    )
     db.delete(account)
     db.commit()
 

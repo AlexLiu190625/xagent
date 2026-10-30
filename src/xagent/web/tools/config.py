@@ -938,7 +938,11 @@ def _log_and_classify_failed_refresh(
 
 
 async def refresh_oauth_token_if_needed(
-    db: Any, oauth_account: Any, provider_name: str
+    db: Any,
+    oauth_account: Any,
+    provider_name: str,
+    *,
+    flush_changes: bool = True,
 ) -> bool:
     """Check if token is expired (or close to expiring) and refresh if needed."""
     from ..models.user_oauth import is_undecryptable_oauth_token
@@ -1033,7 +1037,8 @@ async def refresh_oauth_token_if_needed(
                         oauth_account.expires_at = datetime.now(
                             timezone.utc
                         ) + timedelta(seconds=int(data["expires_in"]))
-                    db.flush([oauth_account])
+                    if flush_changes:
+                        db.flush([oauth_account])
                     logger.info(
                         f"Successfully refreshed {provider_name} token for user {oauth_account.user_id}"
                     )
@@ -1276,7 +1281,8 @@ async def refresh_oauth_token_if_needed(
                     oauth_account.expires_at = datetime.now(timezone.utc) + timedelta(
                         seconds=int(data["expires_in"])
                     )
-                db.flush([oauth_account])
+                if flush_changes:
+                    db.flush([oauth_account])
                 logger.info(
                     f"Successfully refreshed {provider_name} token for user {oauth_account.user_id}"
                 )
@@ -4048,13 +4054,42 @@ class WebToolConfig(BaseToolConfig):
         )
         account_id = int(oauth_account.id)
         attempted_refresh_token = oauth_account.refresh_token
+        attempted_credential_generation = (
+            str(oauth_account.access_token),
+            cast(str | None, oauth_account.refresh_token),
+            str(oauth_account.scope or ""),
+        )
+        attempted_refresh_values = {
+            "access_token": oauth_account.access_token,
+            "refresh_token": oauth_account.refresh_token,
+            "expires_at": oauth_account.expires_at,
+            "instance_url": oauth_account.instance_url,
+        }
         ordinary_gmail = is_ordinary_gmail(oauth_account)
+        shared_google_account = (
+            str(oauth_account.provider) == "google"
+            and oauth_account.resource_owner_key is None
+        )
+        shared_gmail_refresh_tokens: dict[int, str | None] = {}
+        if shared_google_account:
+            from ..services.google_oauth_grants import (
+                gmail_legacy_accounts_for_shared_google_oauth,
+            )
+
+            shared_gmail_refresh_tokens = {
+                int(account.id): cast(str | None, account.refresh_token)
+                for account in gmail_legacy_accounts_for_shared_google_oauth(
+                    oauth_db, oauth_account_id=account_id
+                )
+            }
         permanently_invalid = False
         try:
+            refresh_options = {"flush_changes": False} if shared_google_account else {}
             is_valid = await refresh_oauth_token_if_needed(
                 oauth_db,
                 oauth_account,
                 str(provider_name) if provider_name else "",
+                **refresh_options,
             )
         except _OAuthRefreshPermanentlyInvalid:
             is_valid = False
@@ -4103,7 +4138,7 @@ class WebToolConfig(BaseToolConfig):
                 ).filter(UserOAuth.id == account_id)
                 if oauth_db.get_bind().dialect.name != "sqlite":
                     reread_query = reread_query.with_for_update()
-                elif not ordinary_gmail:
+                elif not ordinary_gmail and not shared_google_account:
                     oauth_db.execute(
                         text("UPDATE user_oauth SET id = id WHERE id = :id"),
                         {"id": account_id},
@@ -4152,6 +4187,61 @@ class WebToolConfig(BaseToolConfig):
                         oauth_account=oauth_account,
                         expected_refresh_token=attempted_refresh_token,
                     )
+                elif (
+                    str(oauth_account.provider) == "google"
+                    and oauth_account.resource_owner_key is None
+                ):
+                    # A shared row deliberately uses provider="google", but a
+                    # Gmail association still owns watch state on its mirrored
+                    # legacy row. Quiesce that mailbox before tombstoning the
+                    # shared token so a dead grant cannot leave an ACTIVE watch
+                    # retrying indefinitely.
+                    from ..services.gmail_provisioning import (
+                        mark_gmail_oauth_reconnect_required,
+                    )
+                    from ..services.google_oauth_grants import (
+                        gmail_legacy_accounts_for_shared_google_oauth,
+                    )
+
+                    gmail_accounts = gmail_legacy_accounts_for_shared_google_oauth(
+                        oauth_db, oauth_account_id=int(oauth_account.id)
+                    )
+                    for gmail_account in gmail_accounts:
+                        gmail_account_id = int(gmail_account.id)
+                        if gmail_account_id not in shared_gmail_refresh_tokens:
+                            # The association appeared while the failed refresh
+                            # was in flight; it was not authorized by that
+                            # attempt and must not be quiesced by it.
+                            continue
+                        mark_gmail_oauth_reconnect_required(
+                            oauth_db,
+                            oauth_account=gmail_account,
+                            # Fence on the mirror value observed before the
+                            # refresh await. A concurrent reconnect changes the
+                            # row and therefore supersedes this failure, while
+                            # a historically stale mirror is still quiesced.
+                            expected_refresh_token=shared_gmail_refresh_tokens[
+                                gmail_account_id
+                            ],
+                        )
+                    shared_reread_query = scoped_user_oauth_query(
+                        oauth_db, user_id=user_id, resource_owner_key=None
+                    ).filter(UserOAuth.id == account_id)
+                    if oauth_db.get_bind().dialect.name == "sqlite":
+                        oauth_db.execute(
+                            text("UPDATE user_oauth SET id = id WHERE id = :id"),
+                            {"id": account_id},
+                        )
+                    else:
+                        shared_reread_query = shared_reread_query.with_for_update()
+                    oauth_account = shared_reread_query.populate_existing().first()
+                    if (
+                        oauth_account is not None
+                        and oauth_account.refresh_token == attempted_refresh_token
+                    ):
+                        oauth_account.access_token = ""
+                        oauth_account.refresh_token = None
+                        oauth_account.expires_at = None
                 else:
                     oauth_account.access_token = ""
                     oauth_account.refresh_token = None
@@ -4162,6 +4252,72 @@ class WebToolConfig(BaseToolConfig):
                 refresh_failed=True,
                 credential_present=True,
             )
+
+        if str(oauth_account.provider) == "google":
+            from ..services.google_oauth_grants import (
+                mirror_shared_google_oauth_credentials,
+            )
+
+            refreshed_values = {
+                "access_token": oauth_account.access_token,
+                "refresh_token": oauth_account.refresh_token,
+                "expires_at": oauth_account.expires_at,
+                "instance_url": oauth_account.instance_url,
+            }
+            refresh_changed_row = oauth_db.is_modified(
+                oauth_account, include_collections=False
+            ) or any(
+                refreshed_values[field] != attempted_refresh_values[field]
+                for field in refreshed_values
+            )
+            if shared_google_account and refresh_changed_row:
+                # Provider I/O ran without a database row lock. Discard its
+                # unflushed ORM write, then serialize write-back against the
+                # credential generation that was actually sent to Google. A
+                # callback or another refresh that committed meanwhile wins.
+                oauth_db.rollback()
+            elif refresh_changed_row:
+                # Actor refreshes are serialized by their credential lock and
+                # the refresh helper normally flushes itself. Keep test doubles
+                # and alternate helpers on the same contract before re-reading.
+                oauth_db.flush([oauth_account])
+            if refresh_changed_row:
+                shared_query = scoped_user_oauth_query(
+                    oauth_db,
+                    user_id=user_id,
+                    resource_owner_key=resource_owner_key,
+                ).filter(UserOAuth.id == account_id)
+                if oauth_db.get_bind().dialect.name == "sqlite":
+                    shared_query.update(
+                        {UserOAuth.id: UserOAuth.id}, synchronize_session=False
+                    )
+                else:
+                    shared_query = shared_query.with_for_update()
+                current_shared = shared_query.populate_existing().one_or_none()
+                if current_shared is None:
+                    oauth_db.rollback()
+                    return _LegacyOAuthTokenResolution(
+                        access_token=None,
+                        refresh_failed=True,
+                        credential_present=False,
+                    )
+                oauth_account = current_shared
+                current_generation = (
+                    str(oauth_account.access_token),
+                    cast(str | None, oauth_account.refresh_token),
+                    str(oauth_account.scope or ""),
+                )
+                if (
+                    shared_google_account
+                    and current_generation == attempted_credential_generation
+                ):
+                    for field, value in refreshed_values.items():
+                        setattr(oauth_account, field, value)
+                mirror_shared_google_oauth_credentials(
+                    oauth_db,
+                    oauth_account=oauth_account,
+                    skip_gmail_tombstones=True,
+                )
 
         access_token = str(oauth_account.access_token)
         instance_url = getattr(oauth_account, "instance_url", None)
