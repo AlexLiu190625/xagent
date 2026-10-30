@@ -1,5 +1,6 @@
 import asyncio
 import json
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1427,14 +1428,17 @@ async def _schedule_file_turn(
     transcript: str,
     context: dict,
     with_attachments: bool = False,
+    before_schedule: Callable[[], None] | None = None,
 ) -> tuple[dict, list[list[dict]], str]:
     """Run a turn carrying ``fid-notes`` through the scheduler.
 
     ``shared`` turns shared task execution on, as on a host consuming START
     commands, or off, as on a combined host without ``XAGENT_WORKER_COUNT``.
     ``with_attachments`` also carries the file chips an in-process caller
-    persists with the turn. Returns what the agent was asked to run, every
-    file list registered with the agent service, and the execution message.
+    persists with the turn. ``before_schedule`` runs after the files were
+    resolved for the execution message and before the run starts. Returns what
+    the agent was asked to run (empty when it never ran), every file list
+    registered with the agent service, and the execution message.
     """
     user = _create_user(db_session, 1, "owner")
     lease = _task_lease(10)
@@ -1516,6 +1520,8 @@ async def _schedule_file_turn(
     )
     monkeypatch.setattr(task_orchestrator, "_get_agent_manager", AgentManager)
 
+    if before_schedule is not None:
+        before_schedule()
     await task_orchestrator._schedule_bg(
         task_id=10,
         task_owner_user_id=int(user.id),
@@ -1594,6 +1600,48 @@ async def test_in_process_turn_keeps_file_info_already_in_context(
 
     assert captured["agent_context"]["file_info"] == [_UPLOADED_FILE_INFO]
     assert registered == [[_UPLOADED_FILE_INFO]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("unbind", ["compensating", "bytes_removed"])
+async def test_turn_fails_when_its_file_no_longer_binds_at_run_start(
+    db_session, monkeypatch, tmp_path, shared, unbind
+):
+    # The file resolved when the turn was accepted but no longer binds when
+    # the run starts and the context carries no file info. The run fails
+    # before the agent sees the turn, and nothing is registered with it.
+    def unbind_file():
+        record = (
+            db_session.query(UploadedFile)
+            .filter(UploadedFile.file_id == "fid-notes")
+            .one()
+        )
+        if unbind == "compensating":
+            record.storage_status = "compensating"
+            db_session.commit()
+        else:
+            Path(record.storage_path).unlink()
+
+    captured, registered, _ = await _schedule_file_turn(
+        db_session,
+        monkeypatch,
+        tmp_path,
+        shared=shared,
+        turn_id="turn-unbindable",
+        transcript="Summarize this",
+        context={},
+        with_attachments=not shared,
+        before_schedule=unbind_file,
+    )
+
+    # ``execute_task`` records every call in ``captured``.
+    assert captured == {}
+    assert registered == []
+    db_session.expire_all()
+    task = db_session.get(Task, 10)
+    assert task.status == TaskStatus.FAILED
+    assert "Files are no longer bindable: fid-notes" in str(task.error_message)
 
 
 @pytest.mark.asyncio
