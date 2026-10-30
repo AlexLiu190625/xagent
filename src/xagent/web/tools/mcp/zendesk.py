@@ -593,9 +593,9 @@ def _cursor_page(
 def _offset_page(
     payload: dict[str, Any], list_key: str, limit: int
 ) -> tuple[list[Any], bool]:
-    """Slice one page of an offset-paginated Zendesk response (search.json/
-    users/search.json only support offset pagination, not the cursor style
-    every other list endpoint here uses)."""
+    """Slice one page of an offset-paginated Zendesk response (the search
+    endpoints and the side conversation endpoints only support offset
+    pagination, not the cursor style the other list endpoints here use)."""
     page, items = _extract_list_field(payload, list_key, limit)
     has_more = bool(payload.get("next_page")) or len(items) > limit
     return page, has_more
@@ -628,8 +628,9 @@ def _list_offset_paginated(
     limit: int,
     extra_fields_fn: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> str:
-    """Shared body for the offset-paginated search tools (zendesk_search,
-    zendesk_search_users, zendesk_search_articles) -- symmetric to _list_cursor_paginated below, so
+    """Shared body for the offset-paginated tools (zendesk_search,
+    zendesk_search_users, zendesk_search_articles, and the two side
+    conversation tools) -- symmetric to _list_cursor_paginated below, so
     both pagination families in this file build their own truncation-aware
     flat envelope and cap it themselves, rather than routing through the
     generic success_with_capped_dict and patching has_more onto an
@@ -945,6 +946,47 @@ def _macro_detail(macro: dict[str, Any]) -> dict[str, Any]:
         "actions": macro.get("actions"),
         "restriction": macro.get("restriction"),
         "created_at": macro.get("created_at"),
+    }
+
+
+def _side_conversation_summary(conversation: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": conversation.get("id"),
+        "subject": conversation.get("subject"),
+        "state": conversation.get("state"),
+        "preview_text": conversation.get("preview_text"),
+        "participants": conversation.get("participants"),
+        "created_at": conversation.get("created_at"),
+        "updated_at": conversation.get("updated_at"),
+        "message_added_at": conversation.get("message_added_at"),
+    }
+
+
+def _side_conversation_event_summary(event: dict[str, Any]) -> dict[str, Any]:
+    """One event in a side conversation's history. A message event carries
+    its plain-text body, falling back to html_body when that is empty (then
+    `body_is_html` is true, so a caller can tell markup from plain text); a
+    state change carries `updates` and no message."""
+    message = event.get("message")
+    return {
+        "id": event.get("id"),
+        "type": event.get("type"),
+        "created_at": event.get("created_at"),
+        "actor": event.get("actor"),
+        "updates": event.get("updates"),
+        "message": (
+            {
+                "subject": message.get("subject"),
+                "from": message.get("from"),
+                "to": message.get("to"),
+                "body": message.get("body") or message.get("html_body"),
+                "body_is_html": not message.get("body")
+                and bool(message.get("html_body")),
+                "attachments": message.get("attachments"),
+            }
+            if isinstance(message, dict)
+            else None
+        ),
     }
 
 
@@ -1577,6 +1619,103 @@ def zendesk_get_macro(macro_id: int | str) -> str:
         return _finalize_capped(response, get_tool_max_output_length())
     except Exception as e:
         logger.error(f"Error fetching Zendesk macro {macro_id}: {e}")
+        return _error_capped(str(e))
+
+
+@mcp.tool()
+def zendesk_list_side_conversations(
+    ticket_id: int | str, limit: int = 25, page: int = 1
+) -> str:
+    """
+    List the side conversations on a ticket: the separate threads agents
+    start with people outside the ticket (other teams, vendors). Returns
+    each one's subject, state, preview text, and participants; use
+    zendesk_get_side_conversation for its messages.
+    ticket_id: a bare numeric id, or a full ticket URL copied from the
+    Zendesk agent UI. Zendesk answers HTTP 403, not 404, for a ticket that
+    doesn't exist.
+    limit: max side conversations to return (default 25, hard cap 100).
+    page: 1-based page number; pass the previous page + 1 to continue. If a
+    call is truncated for size (`truncated: true`, `has_more` forced true),
+    re-run with a smaller `limit` from `page=1` instead -- see
+    zendesk_search's identical note for why.
+    """
+    try:
+        path_id = _resolve_path_id(ticket_id, _TICKET_URL_ID_PATTERN, "ticket_id")
+        max_results = _clamp_limit(limit)
+        return _list_offset_paginated(
+            f"/tickets/{path_id}/side_conversations.json",
+            "side_conversations",
+            _side_conversation_summary,
+            # Offset paging only: this endpoint rejects page[size] with
+            # "page must be an integer".
+            {"per_page": max_results, "page": max(1, page)},
+            max_results,
+            extra_fields_fn=lambda result: {"count": result.get("count")},
+        )
+    except Exception as e:
+        logger.error(
+            f"Error listing side conversations on Zendesk ticket {ticket_id}: {e}"
+        )
+        return _error_capped(str(e))
+
+
+@mcp.tool()
+def zendesk_get_side_conversation(
+    ticket_id: int | str,
+    side_conversation_id: str,
+    limit: int = 25,
+    page: int = 1,
+) -> str:
+    """
+    Get one side conversation on a ticket with a page of its history: each
+    message's sender, recipients, subject, body (plain text, or the HTML
+    body when the plain text is empty; `body_is_html` is true in that
+    case), and attachments, plus state changes. If the response is too
+    large, events are dropped (`truncated: true`, `has_more` forced true)
+    while the side conversation itself is kept; re-run with a smaller
+    `limit` from `page=1` to read them.
+    ticket_id: a bare numeric id, or a full ticket URL copied from the
+    Zendesk agent UI. Zendesk answers HTTP 403, not 404, for a ticket that
+    doesn't exist.
+    side_conversation_id: the `id` from zendesk_list_side_conversations (a
+    UUID string, not a number).
+    limit: max history events to return (default 25, hard cap 100).
+    page: 1-based page number of the history; pass the previous page + 1 to
+    continue.
+    """
+    try:
+        ticket_path_id = _resolve_path_id(
+            ticket_id, _TICKET_URL_ID_PATTERN, "ticket_id"
+        )
+        conversation_path_id = url_path_id(side_conversation_id, "side_conversation_id")
+        path = f"/tickets/{ticket_path_id}/side_conversations/{conversation_path_id}"
+        conversation = _unwrap(_request("GET", f"{path}.json"), "side_conversation")
+        detail = {
+            **_side_conversation_summary(conversation),
+            "state_updated_at": conversation.get("state_updated_at"),
+        }
+        max_results = _clamp_limit(limit)
+        return _list_offset_paginated(
+            f"{path}/events.json",
+            "events",
+            _side_conversation_event_summary,
+            # Offset paging only: like the side conversation list, this
+            # endpoint rejects page[size] with "page must be an integer".
+            {"per_page": max_results, "page": max(1, page)},
+            max_results,
+            # Fixed fields ride alongside the page and are never trimmed;
+            # only the events list shrinks to fit the output cap.
+            extra_fields_fn=lambda result: {
+                "side_conversation": detail,
+                "count": result.get("count"),
+            },
+        )
+    except Exception as e:
+        logger.error(
+            f"Error fetching side conversation {side_conversation_id} on Zendesk "
+            f"ticket {ticket_id}: {e}"
+        )
         return _error_capped(str(e))
 
 

@@ -2432,6 +2432,11 @@ async def test_optional_params_accept_explicit_none_through_tool_schema(
         ("zendesk_get_organization", {"organization_id": 1}),
         ("zendesk_get_article", {"article_id": 1}),
         ("zendesk_get_macro", {"macro_id": 1}),
+        ("zendesk_list_side_conversations", {"ticket_id": 1}),
+        (
+            "zendesk_get_side_conversation",
+            {"ticket_id": 1, "side_conversation_id": "5c62"},
+        ),
         (
             "zendesk_update_ticket",
             {
@@ -2469,6 +2474,9 @@ async def test_id_params_accept_a_bare_int_through_tool_schema(
                     "organization": {"id": 1},
                     "article": {"id": 1},
                     "macro": {"id": 1},
+                    "side_conversations": [],
+                    "side_conversation": {"id": "5c62"},
+                    "events": [],
                     "comments": [],
                     "audit": {"events": []},
                     "meta": {"has_more": False},
@@ -2502,6 +2510,11 @@ _ALL_TOOL_CALLS = [
     ("zendesk_get_article", {"article_id": 1}),
     ("zendesk_list_macros", {}),
     ("zendesk_get_macro", {"macro_id": 1}),
+    ("zendesk_list_side_conversations", {"ticket_id": 1}),
+    (
+        "zendesk_get_side_conversation",
+        {"ticket_id": 1, "side_conversation_id": "5c62"},
+    ),
 ]
 
 
@@ -2529,6 +2542,9 @@ async def test_every_tool_sends_the_access_token_as_bearer(
                 "article": {"id": 1},
                 "macros": [],
                 "macro": {"id": 1},
+                "side_conversations": [],
+                "side_conversation": {"id": "5c62"},
+                "events": [],
                 "audit": {"events": []},
                 "meta": {"has_more": False},
             }
@@ -2986,3 +3002,389 @@ def test_get_macro_surfaces_a_not_found_error(monkeypatch):
 
     assert result["status"] == "error"
     assert "HTTP 404" in result["message"]
+
+
+_SIDE_CONVERSATION = {
+    "id": "5c623337-d419-11f1-8809-7698c7f03fad",
+    "ticket_id": 1,
+    "subject": "Shipping delay",
+    "state": "open",
+    "preview_text": "Can you confirm the new ship date?",
+    "participants": [
+        {"user_id": 7, "name": "Agent", "email": "agent@acme.com"},
+        {"user_id": 8, "name": "Vendor", "email": "vendor@example.com"},
+    ],
+    "created_at": "2026-10-30T04:21:21.440Z",
+    "updated_at": "2026-10-30T04:21:22.661Z",
+    "message_added_at": "2026-10-30T04:21:21.440Z",
+    "state_updated_at": "2026-10-30T04:21:21.440Z",
+    "external_ids": {},
+    "url": "https://acme.zendesk.com/api/v2/tickets/1/side_conversations/5c62",
+}
+
+_SIDE_CONVERSATION_SUMMARY = {
+    "id": "5c623337-d419-11f1-8809-7698c7f03fad",
+    "subject": "Shipping delay",
+    "state": "open",
+    "preview_text": "Can you confirm the new ship date?",
+    "participants": [
+        {"user_id": 7, "name": "Agent", "email": "agent@acme.com"},
+        {"user_id": 8, "name": "Vendor", "email": "vendor@example.com"},
+    ],
+    "created_at": "2026-10-30T04:21:21.440Z",
+    "updated_at": "2026-10-30T04:21:22.661Z",
+    "message_added_at": "2026-10-30T04:21:21.440Z",
+}
+
+
+def test_list_side_conversations_pages_by_page_number(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "side_conversations": [_SIDE_CONVERSATION],
+                "count": 3,
+                "next_page": "https://acme.zendesk.com/api/v2/tickets/1/side_conversations.json?page=3",
+                "previous_page": None,
+            }
+        )
+    )
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(zendesk.zendesk_list_side_conversations(1, limit=1, page=2))
+
+    assert result == {
+        "status": "success",
+        "side_conversations": [_SIDE_CONVERSATION_SUMMARY],
+        "count": 3,
+        "has_more": True,
+        "truncated": False,
+    }
+    assert mock_request.call_args.kwargs["method"] == "GET"
+    assert mock_request.call_args.kwargs["url"] == (
+        "https://acme.zendesk.com/api/v2/tickets/1/side_conversations.json"
+    )
+    assert mock_request.call_args.kwargs["params"] == {"per_page": 1, "page": 2}
+
+
+def test_list_side_conversations_accepts_a_ticket_url_and_clamps_page(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"side_conversations": [], "count": 0, "next_page": None}
+        )
+    )
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(
+        zendesk.zendesk_list_side_conversations(
+            "https://acme.zendesk.com/agent/tickets/42", page=0
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["has_more"] is False
+    assert mock_request.call_args.kwargs["url"].endswith(
+        "/tickets/42/side_conversations.json"
+    )
+    assert mock_request.call_args.kwargs["params"]["page"] == 1
+
+
+def test_list_side_conversations_surfaces_a_permission_error(monkeypatch):
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"error": "Forbidden", "description": "Forbidden"},
+                status_code=403,
+            )
+        ),
+    )
+
+    result = json.loads(zendesk.zendesk_list_side_conversations(999999))
+
+    assert result["status"] == "error"
+    assert "HTTP 403" in result["message"]
+
+
+def _side_conversation_event(event_id, body):
+    return {
+        "id": event_id,
+        "side_conversation_id": "5c623337-d419-11f1-8809-7698c7f03fad",
+        "ticket_id": 1,
+        "type": "create",
+        "via": "support",
+        "created_at": "2026-10-30T04:21:21.440Z",
+        "actor": {"user_id": 7, "name": "Agent", "email": "agent@acme.com"},
+        "updates": {},
+        "message": {
+            "subject": "Shipping delay",
+            "preview_text": body[:20],
+            "from": {"user_id": 7, "name": "Agent", "email": "agent@acme.com"},
+            "to": [{"user_id": 8, "name": "Vendor", "email": "vendor@example.com"}],
+            "body": body,
+            "html_body": f"<div>{body}</div>",
+            "attachments": [],
+            "external_ids": {},
+        },
+    }
+
+
+def _side_conversation_responses(events, next_page=None):
+    """Zendesk's two responses, in request order: the side conversation,
+    then one page of its events."""
+    return [
+        MockResponse(json_data={"side_conversation": _SIDE_CONVERSATION}),
+        MockResponse(
+            json_data={
+                "events": events,
+                "count": len(events),
+                "next_page": next_page,
+                "previous_page": None,
+            }
+        ),
+    ]
+
+
+def test_get_side_conversation_returns_it_with_a_page_of_messages(monkeypatch):
+    mock_request = Mock(
+        side_effect=_side_conversation_responses(
+            [_side_conversation_event("e1", "Can you confirm the new ship date?")],
+            next_page="https://acme.zendesk.com/api/v2/next",
+        )
+    )
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(
+        zendesk.zendesk_get_side_conversation(
+            1, "5c623337-d419-11f1-8809-7698c7f03fad", limit=1, page=2
+        )
+    )
+
+    assert result == {
+        "status": "success",
+        "events": [
+            {
+                "id": "e1",
+                "type": "create",
+                "created_at": "2026-10-30T04:21:21.440Z",
+                "actor": {"user_id": 7, "name": "Agent", "email": "agent@acme.com"},
+                "updates": {},
+                "message": {
+                    "subject": "Shipping delay",
+                    "from": {"user_id": 7, "name": "Agent", "email": "agent@acme.com"},
+                    "to": [
+                        {"user_id": 8, "name": "Vendor", "email": "vendor@example.com"}
+                    ],
+                    "body": "Can you confirm the new ship date?",
+                    "body_is_html": False,
+                    "attachments": [],
+                },
+            }
+        ],
+        "side_conversation": {
+            **_SIDE_CONVERSATION_SUMMARY,
+            "state_updated_at": "2026-10-30T04:21:21.440Z",
+        },
+        "count": 1,
+        "has_more": True,
+        "truncated": False,
+    }
+    show_call, events_call = mock_request.call_args_list
+    base = "https://acme.zendesk.com/api/v2/tickets/1/side_conversations"
+    assert show_call.kwargs["url"] == (
+        f"{base}/5c623337-d419-11f1-8809-7698c7f03fad.json"
+    )
+    assert events_call.kwargs["url"] == (
+        f"{base}/5c623337-d419-11f1-8809-7698c7f03fad/events.json"
+    )
+    assert events_call.kwargs["params"] == {"per_page": 1, "page": 2}
+
+
+def test_get_side_conversation_reports_an_event_without_a_message(monkeypatch):
+    state_change = {
+        "id": "e2",
+        "type": "update",
+        "created_at": "2026-10-30T05:00:00Z",
+        "actor": {"user_id": 7, "name": "Agent", "email": "agent@acme.com"},
+        "updates": {"state": "closed"},
+    }
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(side_effect=_side_conversation_responses([state_change])),
+    )
+
+    result = json.loads(zendesk.zendesk_get_side_conversation(1, "5c62"))
+
+    assert result["events"] == [
+        {
+            "id": "e2",
+            "type": "update",
+            "created_at": "2026-10-30T05:00:00Z",
+            "actor": {"user_id": 7, "name": "Agent", "email": "agent@acme.com"},
+            "updates": {"state": "closed"},
+            "message": None,
+        }
+    ]
+
+
+@pytest.mark.parametrize("side_conversation_id", ["", "   ", None, "..", " 5c62 "])
+def test_get_side_conversation_rejects_an_unusable_id_without_calling_zendesk(
+    monkeypatch, side_conversation_id
+):
+    mock_request = Mock()
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(zendesk.zendesk_get_side_conversation(1, side_conversation_id))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_get_side_conversation_encodes_the_id_into_one_path_segment(monkeypatch):
+    mock_request = Mock(side_effect=_side_conversation_responses([]))
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    zendesk.zendesk_get_side_conversation(1, "abc/../../users")
+
+    assert mock_request.call_args_list[0].kwargs["url"] == (
+        "https://acme.zendesk.com/api/v2/tickets/1/side_conversations/"
+        "abc%2F..%2F..%2Fusers.json"
+    )
+
+
+def test_get_side_conversation_trims_events_but_keeps_the_conversation(
+    monkeypatch,
+):
+    events = [_side_conversation_event(f"e{i}", "x" * 1000) for i in range(10)]
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(side_effect=_side_conversation_responses(events)),
+    )
+    monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 4000)
+
+    raw = zendesk.zendesk_get_side_conversation(1, "5c62", limit=10)
+    result = json.loads(raw)
+
+    assert len(raw) <= 4000
+    assert result["status"] == "success"
+    assert result["side_conversation"]["subject"] == "Shipping delay"
+    assert result["truncated"] is True
+    assert result["has_more"] is True
+    assert 0 < len(result["events"]) < 10
+    kept = [e["id"] for e in result["events"]]
+    assert kept == [f"e{i}" for i in range(len(kept))]
+    assert result["count"] == 10
+    assert result["side_conversation"]["id"] == "5c623337-d419-11f1-8809-7698c7f03fad"
+
+
+def test_get_side_conversation_clamps_limit_to_100(monkeypatch):
+    mock_request = Mock(side_effect=_side_conversation_responses([]))
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    zendesk.zendesk_get_side_conversation(1, "5c62", limit=500)
+
+    _, events_call = mock_request.call_args_list
+    assert events_call.kwargs["params"] == {"per_page": 100, "page": 1}
+
+
+def test_list_side_conversations_trims_to_fit_and_keeps_count(monkeypatch):
+    side_conversations = [
+        {**_SIDE_CONVERSATION, "id": f"sc{i}", "preview_text": "x" * 1000}
+        for i in range(10)
+    ]
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "side_conversations": side_conversations,
+                    "count": 10,
+                    "next_page": None,
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 4000)
+
+    raw = zendesk.zendesk_list_side_conversations(1, limit=10)
+    result = json.loads(raw)
+
+    assert len(raw) <= 4000
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["has_more"] is True
+    assert result["count"] == 10
+    kept = [sc["id"] for sc in result["side_conversations"]]
+    assert kept == [f"sc{i}" for i in range(len(kept))]
+    assert 0 < len(kept) < 10
+
+
+def test_get_side_conversation_surfaces_a_not_found_error(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"error": "RecordNotFound", "description": "Not found"},
+            status_code=404,
+        )
+    )
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(zendesk.zendesk_get_side_conversation(1, "missing"))
+
+    assert result["status"] == "error"
+    assert "HTTP 404" in result["message"]
+    assert mock_request.call_count == 1
+
+
+def test_get_side_conversation_falls_back_to_the_html_body(monkeypatch):
+    event = _side_conversation_event("e1", "")
+    event["message"]["html_body"] = "<div>Only HTML</div>"
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(side_effect=_side_conversation_responses([event])),
+    )
+
+    result = json.loads(zendesk.zendesk_get_side_conversation(1, "5c62"))
+
+    assert result["events"][0]["message"]["body"] == "<div>Only HTML</div>"
+    assert result["events"][0]["message"]["body_is_html"] is True
+
+
+def test_get_side_conversation_accepts_a_ticket_url(monkeypatch):
+    mock_request = Mock(side_effect=_side_conversation_responses([]))
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(
+        zendesk.zendesk_get_side_conversation(
+            "https://acme.zendesk.com/agent/tickets/42", "5c62"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert (
+        mock_request.call_args_list[0]
+        .kwargs["url"]
+        .endswith("/tickets/42/side_conversations/5c62.json")
+    )
+
+
+def test_get_side_conversation_surfaces_an_events_error(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"side_conversation": _SIDE_CONVERSATION}),
+            MockResponse(
+                json_data={"error": "Forbidden", "description": "Forbidden"},
+                status_code=403,
+            ),
+        ]
+    )
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(zendesk.zendesk_get_side_conversation(1, "5c62"))
+
+    assert result["status"] == "error"
+    assert "HTTP 403" in result["message"]
+    assert mock_request.call_count == 2
