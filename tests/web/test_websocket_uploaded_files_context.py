@@ -1392,90 +1392,13 @@ async def test_shared_start_turn_with_files_traces_the_transcript_text(
     # and the file ids; no display message survives it. The scheduler resolves
     # the files, and the user_message trace event must still show the
     # transcript text with the file chips.
-    user = _create_user(db_session, 1, "owner")
-    lease = _task_lease(10)
-    _create_task(
+    captured, _, enriched = await _schedule_file_turn(
         db_session,
-        task_id=10,
-        user_id=1,
-        status=TaskStatus.RUNNING,
-        runner_id=lease.runner_id,
-        run_id=lease.run_id,
-    )
-    _create_uploaded_file(
-        db_session,
+        monkeypatch,
         tmp_path,
-        file_id="fid-notes",
-        user_id=1,
-        task_id=10,
-        filename="notes.txt",
-    )
-    db_session.commit()
-    file_infos, missing = resolve_turn_file_infos(
-        file_ids=["fid-notes"], owner_user_id=1, db=db_session, task_id=10
-    )
-    assert missing == []
-    enriched = append_uploaded_files_context(
-        "Summarize this", build_uploaded_files_context(file_infos)
-    )
-    captured: dict = {}
-
-    class BroadcastManager:
-        async def broadcast_to_task(self, event, task_id):
-            pass
-
-    class AgentManager:
-        async def get_agent_for_task(self, task_id, db, **kwargs):
-            return _NoopAgentService()
-
-        async def execute_task(self, **kwargs):
-            captured["agent_task"] = kwargs.get("task")
-            captured["agent_context"] = kwargs.get("context")
-            return {"success": True, "output": "ok", "file_outputs": []}
-
-    class BackgroundTaskManager(_NoopBackgroundTaskManager):
-        def register_task(self, task_id, task, **kwargs):
-            pass
-
-        def cancel_was_requested(self, task_id):
-            return False
-
-    async def no_heartbeat(*args, **kwargs):
-        return None
-
-    _wire_execute_task_background(monkeypatch, db_session, BroadcastManager())
-    monkeypatch.setattr(
-        task_execution_service, "background_task_manager", BackgroundTaskManager()
-    )
-    monkeypatch.setattr(
-        task_orchestrator, "get_shared_task_execution_enabled", lambda: True
-    )
-    monkeypatch.setattr(task_orchestrator, "run_task_lease_heartbeat", no_heartbeat)
-    monkeypatch.setattr(
-        task_orchestrator,
-        "load_task_setup_snapshot_sync",
-        lambda *args, **kwargs: _task_setup_snapshot(
-            task_id=10,
-            user_id=int(user.id),
-            status=TaskStatus.RUNNING,
-            run_id=lease.run_id,
-        ),
-    )
-    monkeypatch.setattr(task_orchestrator, "_get_agent_manager", AgentManager)
-
-    await task_orchestrator._schedule_bg(
-        task_id=10,
-        task_owner_user_id=int(user.id),
-        task_source=None,
-        run_id=lease.run_id,
-        task_lease=lease,
-        payload=TaskTurnPayload(
-            transcript_message="Summarize this",
-            execution_message=enriched,
-            file_ids=("fid-notes",),
-            turn_id="turn-start",
-        ),
-        force_fresh=False,
+        shared=True,
+        turn_id="turn-start",
+        transcript="Summarize this",
         context={},
     )
 
@@ -1494,19 +1417,24 @@ async def test_shared_start_turn_with_files_traces_the_transcript_text(
     assert [chip["file_id"] for chip in user_messages[0]["files"]] == ["fid-notes"]
 
 
-async def _schedule_in_process_file_turn(
+async def _schedule_file_turn(
     db_session,
     monkeypatch,
     tmp_path,
     *,
+    shared: bool,
+    turn_id: str,
     transcript: str,
     context: dict,
-) -> tuple[dict, list[list[dict]]]:
-    """Run a turn carrying ``fid-notes`` through the scheduler in-process.
+    with_attachments: bool = False,
+) -> tuple[dict, list[list[dict]], str]:
+    """Run a turn carrying ``fid-notes`` through the scheduler.
 
-    Shared task execution is off, as in a combined host without
-    ``XAGENT_WORKER_COUNT``. Returns what the agent was asked to run and
-    every file list registered with the agent service.
+    ``shared`` turns shared task execution on, as on a host consuming START
+    commands, or off, as on a combined host without ``XAGENT_WORKER_COUNT``.
+    ``with_attachments`` also carries the file chips an in-process caller
+    persists with the turn. Returns what the agent was asked to run, every
+    file list registered with the agent service, and the execution message.
     """
     user = _create_user(db_session, 1, "owner")
     lease = _task_lease(10)
@@ -1531,6 +1459,9 @@ async def _schedule_in_process_file_turn(
         file_ids=["fid-notes"], owner_user_id=1, db=db_session, task_id=10
     )
     assert missing == []
+    execution_message = append_uploaded_files_context(
+        transcript, build_uploaded_files_context(file_infos)
+    )
     captured: dict = {}
     registered: list[list[dict]] = []
 
@@ -1570,7 +1501,7 @@ async def _schedule_in_process_file_turn(
         record_registration,
     )
     monkeypatch.setattr(
-        task_orchestrator, "get_shared_task_execution_enabled", lambda: False
+        task_orchestrator, "get_shared_task_execution_enabled", lambda: shared
     )
     monkeypatch.setattr(task_orchestrator, "run_task_lease_heartbeat", no_heartbeat)
     monkeypatch.setattr(
@@ -1593,17 +1524,19 @@ async def _schedule_in_process_file_turn(
         task_lease=lease,
         payload=TaskTurnPayload(
             transcript_message=transcript,
-            execution_message=append_uploaded_files_context(
-                transcript, build_uploaded_files_context(file_infos)
+            execution_message=execution_message,
+            attachments=(
+                _normalize_attachments_for_persistence(file_infos)
+                if with_attachments
+                else None
             ),
-            attachments=_normalize_attachments_for_persistence(file_infos),
             file_ids=("fid-notes",),
-            turn_id="turn-in-process",
+            turn_id=turn_id,
         ),
         force_fresh=False,
         context=context,
     )
-    return captured, registered
+    return captured, registered, execution_message
 
 
 @pytest.mark.asyncio
@@ -1615,8 +1548,15 @@ async def test_in_process_turn_resolves_file_ids_for_agent_and_trace(
     # file ids and no file info. The agent registration and the user_message
     # trace event read only file info, so the scheduler resolves it here too.
     # A file-only turn ("") is traced only because it carries file chips.
-    captured, registered = await _schedule_in_process_file_turn(
-        db_session, monkeypatch, tmp_path, transcript=transcript, context={}
+    captured, registered, _ = await _schedule_file_turn(
+        db_session,
+        monkeypatch,
+        tmp_path,
+        shared=False,
+        turn_id="turn-in-process",
+        transcript=transcript,
+        context={},
+        with_attachments=True,
     )
     agent_context = captured["agent_context"]
 
@@ -1641,12 +1581,15 @@ async def test_in_process_turn_keeps_file_info_already_in_context(
 ):
     # The web UI path resolves files before scheduling and hands their file
     # info over in the context; the in-process run must not replace it.
-    captured, registered = await _schedule_in_process_file_turn(
+    captured, registered, _ = await _schedule_file_turn(
         db_session,
         monkeypatch,
         tmp_path,
+        shared=False,
+        turn_id="turn-in-process",
         transcript="Summarize this",
         context={"file_info": [_UPLOADED_FILE_INFO]},
+        with_attachments=True,
     )
 
     assert captured["agent_context"]["file_info"] == [_UPLOADED_FILE_INFO]
