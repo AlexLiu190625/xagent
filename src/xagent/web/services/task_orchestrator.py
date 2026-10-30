@@ -2665,10 +2665,18 @@ def _schedule_bg(
                     execution_context = _execution_context_with_turn_id(
                         context, payload.turn_id, files=payload.attachments
                     )
+                    # The agent's uploaded-file registration and the
+                    # user_message trace read only ``file_info``. A shared
+                    # run always resolves it on the executing host; an
+                    # in-process run keeps the file info a caller already
+                    # resolved (the web UI path) and resolves the rest.
                     if (
                         channel_command is None
-                        and get_shared_task_execution_enabled()
                         and payload.file_ids
+                        and (
+                            get_shared_task_execution_enabled()
+                            or not execution_context.get("file_info")
+                        )
                     ):
                         from ..models.database import get_session_local
                         from .file_turn import (
