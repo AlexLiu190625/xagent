@@ -92,14 +92,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [token])
   useEffect(() => {
     if (!projection || !session.refreshToken) return
-    const interval = setInterval(() => {
+    const refreshIfExpiring = () => {
       const current = currentProjection()
       if (!current || current.snapshot.sessionId !== session.sessionId) return
       const cache = current.cache
       const deadline = Math.min(cache.expiresAt ?? cache.timestamp + AUTH_CACHE_DURATION_MS, cache.refreshExpiresAt ?? Number.POSITIVE_INFINITY)
       if (deadline - Date.now() < 5 * 60 * 1000) void refreshRef.current(current.snapshot)
-    }, 60_000)
-    return () => clearInterval(interval)
+    }
+    // Timers stop while the device sleeps, so check again as soon as the page is usable instead of waiting for the next tick.
+    const onVisibilityChange = () => { if (document.visibilityState === "visible") refreshIfExpiring() }
+    const interval = setInterval(refreshIfExpiring, 60_000)
+    document.addEventListener("visibilitychange", onVisibilityChange)
+    window.addEventListener("focus", refreshIfExpiring); window.addEventListener("online", refreshIfExpiring)
+    return () => {
+      clearInterval(interval)
+      document.removeEventListener("visibilitychange", onVisibilityChange)
+      window.removeEventListener("focus", refreshIfExpiring); window.removeEventListener("online", refreshIfExpiring)
+    }
   }, [projection, session.sessionId, session.refreshToken])
 
   const login = useCallback(async (username: string, password: string) => {
