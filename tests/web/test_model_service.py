@@ -33,6 +33,8 @@ from xagent.web.services.model_service import (
     get_sound_effect_models,
     get_tts_models,
     get_vision_model,
+    set_model_visibility_hook,
+    set_visible_user_ids_hook,
 )
 
 # Test database setup - use in-memory database
@@ -1075,3 +1077,140 @@ class TestModelService:
 
         with pytest.raises(RuntimeError, match="session close failed"):
             get_default_rerank_model(user_id=None)
+
+
+class TestModelVisibilityHook:
+    """The model visibility hook hides individual models from individual users."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_hooks(self):
+        set_model_visibility_hook(None)
+        set_visible_user_ids_hook(None)
+        yield
+        set_model_visibility_hook(None)
+        set_visible_user_ids_hook(None)
+
+    @staticmethod
+    def _image_model(db, admin, model_id, *, shared=True, default_for=()):
+        model = Model(
+            model_id=model_id,
+            category="image",
+            model_provider="openai",
+            model_name=model_id,
+            api_key="k",
+            base_url="http://u",
+            abilities=["generate", "edit"],
+        )
+        db.add(model)
+        db.flush()
+        db.add(
+            UserModel(
+                user_id=admin.id, model_id=model.id, is_owner=True, is_shared=shared
+            )
+        )
+        for config_type in default_for:
+            db.add(
+                UserDefaultModel(
+                    user_id=admin.id, model_id=model.id, config_type=config_type
+                )
+            )
+        db.commit()
+        return model
+
+    @staticmethod
+    def _hide(model_id):
+        return lambda db, user_id, db_model: db_model.model_id != model_id
+
+    def test_hook_hides_shared_model(self, db_session, admin_user, regular_user):
+        qwen = self._image_model(db_session, admin_user, "qwen")
+        assert _is_model_visible_to_user(db_session, qwen.id, regular_user.id)
+
+        set_model_visibility_hook(self._hide("qwen"))
+
+        assert not _is_model_visible_to_user(db_session, qwen.id, regular_user.id)
+        assert "qwen" not in get_image_models(db_session, user_id=regular_user.id)
+
+    def test_hook_hides_owned_model(self, db_session, admin_user, regular_user):
+        qwen = self._image_model(db_session, admin_user, "qwen")
+        db_session.add(
+            UserModel(
+                user_id=regular_user.id,
+                model_id=qwen.id,
+                is_owner=True,
+                is_shared=False,
+            )
+        )
+        db_session.commit()
+        assert _is_model_visible_to_user(db_session, qwen.id, regular_user.id)
+
+        set_model_visibility_hook(self._hide("qwen"))
+
+        assert not _is_model_visible_to_user(db_session, qwen.id, regular_user.id)
+
+    def test_hook_only_narrows_for_the_hidden_user(
+        self, db_session, admin_user, regular_user
+    ):
+        qwen = self._image_model(db_session, admin_user, "qwen")
+        set_model_visibility_hook(
+            lambda db, user_id, m: (
+                not (user_id == regular_user.id and m.model_id == "qwen")
+            )
+        )
+
+        assert not _is_model_visible_to_user(db_session, qwen.id, regular_user.id)
+        assert _is_model_visible_to_user(db_session, qwen.id, admin_user.id)
+        assert _is_model_visible_to_user(db_session, qwen.id, None)
+
+    def test_none_hook_is_noop(self, db_session, admin_user, regular_user):
+        qwen = self._image_model(db_session, admin_user, "qwen")
+        set_model_visibility_hook(self._hide("qwen"))
+        set_model_visibility_hook(None)
+
+        assert _is_model_visible_to_user(db_session, qwen.id, regular_user.id)
+
+    def test_missing_model_row_skips_hook(self, db_session, regular_user):
+        calls = []
+        set_model_visibility_hook(lambda *a: calls.append(a) or False)
+
+        # No such Model row: the hook is not asked, the normal checks decide.
+        assert not _is_model_visible_to_user(db_session, 9999, regular_user.id)
+        assert calls == []
+
+    @pytest.mark.parametrize(
+        "config_type,getter",
+        [
+            ("image", get_default_image_generate_model),
+            ("image_edit", get_default_image_edit_model),
+        ],
+    )
+    def test_default_image_getter_skips_hidden_default(
+        self, db_session, admin_user, regular_user, config_type, getter
+    ):
+        # admin's shared default is Qwen; a second visible user shares gpt-image.
+        other = User(username="other", password_hash="x", is_admin=True)
+        db_session.add(other)
+        db_session.commit()
+        qwen = self._image_model(
+            db_session, admin_user, "qwen", default_for=[config_type]
+        )
+        gpt = self._image_model(
+            db_session, other, "gpt-image", default_for=[config_type]
+        )
+        # The user's own default is Qwen as well.
+        db_session.add(
+            UserDefaultModel(
+                user_id=regular_user.id, model_id=qwen.id, config_type=config_type
+            )
+        )
+        db_session.commit()
+        set_visible_user_ids_hook(lambda db, user_id: [admin_user.id, other.id])
+
+        with patch(
+            "xagent.core.model.image.adapter.get_image_model_instance",
+            side_effect=lambda m: MagicMock(),
+        ):
+            set_model_visibility_hook(self._hide("qwen"))
+            result = getter(regular_user.id, db=db_session)
+
+        assert result is not None
+        assert result.model_id == gpt.model_id

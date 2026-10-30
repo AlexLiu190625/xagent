@@ -61,6 +61,34 @@ def set_visible_user_ids_hook(hook: Any) -> None:
     _visible_user_ids_hook = hook
 
 
+_model_visibility_hook = None  # (db: Session, user_id: int | None, db_model) -> bool
+
+
+def set_model_visibility_hook(hook: Any) -> None:
+    """Set a hook that can hide individual models from individual users.
+
+    The hook is called as ``hook(db, user_id, db_model)`` with the ``Model``
+    row and returns ``False`` to hide that model from *user_id*. It is
+    consulted before ownership and sharing, so it also hides models the user
+    owns. It only narrows visibility; it never grants it. Pass ``None`` to
+    remove the hook (the default, which changes nothing).
+
+    Hook implementers MUST return ``True`` for ``user_id=None`` (standalone /
+    non-web context).
+    """
+    global _model_visibility_hook
+    _model_visibility_hook = hook
+
+
+def _passes_model_visibility_hook(
+    db: Session, user_id: Optional[int], db_model: Any
+) -> bool:
+    """Return False only when a registered hook hides *db_model* from *user_id*."""
+    if _model_visibility_hook is None or user_id is None or db_model is None:
+        return True
+    return bool(_model_visibility_hook(db, user_id, db_model))
+
+
 def _get_visible_user_ids(db: Session, user_id: Optional[int] = None) -> list[int]:
     """Return user IDs whose shared models are visible to *user_id*.
 
@@ -102,11 +130,19 @@ def _is_model_visible_to_user(
     Returns True when the user has an own ``is_owner`` UserModel **or**
     when a shared UserModel exists from a visible user.  In non-web /
     standalone contexts (*user_id* is None) visibility is always granted.
+    A model hidden by the model visibility hook is never visible.
     """
     if user_id is None:
         return True
     try:
+        from ..models.model import Model as DBModel
         from ..models.user import UserModel
+
+        # Step 0: per-model hook; runs first so it also hides owned models
+        if _model_visibility_hook is not None and not _passes_model_visibility_hook(
+            db, user_id, db.get(DBModel, model_id)
+        ):
+            return False
 
         # Step 1: user's own (owner) UserModel
         own = (
@@ -915,19 +951,26 @@ def get_default_image_generate_model(
                         ),
                         cast(DBModel.abilities, String).contains('"generate"'),
                     )
-                    .limit(1)
                     .all()
                 )
 
-                if admin_image_defaults:
+                # A model hidden by the visibility hook falls through to the
+                # next shared default instead of being returned.
+                shared_image_default = next(
+                    (
+                        d
+                        for d in admin_image_defaults
+                        if _passes_model_visibility_hook(model_db, user_id, d.model)
+                    ),
+                    None,
+                )
+                if shared_image_default is not None:
                     try:
-                        instance = get_image_model_instance(
-                            admin_image_defaults[0].model
-                        )
+                        instance = get_image_model_instance(shared_image_default.model)
                         setattr(
                             instance,
                             "model_id",
-                            str(admin_image_defaults[0].model.model_id),
+                            str(shared_image_default.model.model_id),
                         )
                         return instance
                     except Exception as e:
@@ -1009,19 +1052,26 @@ def get_default_image_edit_model(
                             _get_visible_user_ids(model_db, user_id)
                         ),
                     )
-                    .limit(1)
                     .all()
                 )
 
-                if admin_image_defaults:
+                # A model hidden by the visibility hook falls through to the
+                # next shared default instead of being returned.
+                shared_image_default = next(
+                    (
+                        d
+                        for d in admin_image_defaults
+                        if _passes_model_visibility_hook(model_db, user_id, d.model)
+                    ),
+                    None,
+                )
+                if shared_image_default is not None:
                     try:
-                        instance = get_image_model_instance(
-                            admin_image_defaults[0].model
-                        )
+                        instance = get_image_model_instance(shared_image_default.model)
                         setattr(
                             instance,
                             "model_id",
-                            str(admin_image_defaults[0].model.model_id),
+                            str(shared_image_default.model.model_id),
                         )
                         return instance
                     except Exception as e:
