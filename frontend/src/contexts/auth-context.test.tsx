@@ -760,4 +760,17 @@ describe("AuthProvider expiry check on page wake-up", () => {
 
     expect(refreshStoredAccessToken).not.toHaveBeenCalled()
   })
+
+  it("stops checking once the provider unmounts", async () => {
+    writeAuthCache({ id: "1", username: "alice" }, "expiring-token", "refresh-token", 60, 3600)
+    const { unmount } = render(<AuthProvider><AuthProbe /></AuthProvider>)
+    await screen.findByText("expiring-token")
+
+    unmount()
+    act(() => {
+      for (const fire of Object.values(wakeEvents)) fire()
+    })
+
+    expect(refreshStoredAccessToken).not.toHaveBeenCalled()
+  })
 })
