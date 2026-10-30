@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from typing import Any
+from uuid import uuid4
 
 from pydantic import ValidationError
 from sqlalchemy import func, update
@@ -43,6 +44,9 @@ from .connector_runtime import (
     persist_create_connector_runtime_context,
     prepare_create_connector_runtime,
     reject_ephemeral_connector_runtime_payload,
+)
+from .routine_history_provenance import (
+    TRIGGER_TURN_ID_CONFIG_KEY,
 )
 from .task_orchestrator import (
     TaskTurnError,
@@ -109,6 +113,7 @@ class _PreparedTriggerStart:
     trigger_id: int
     task_id: int
     task_owner_user_id: int
+    turn_id: str
     prompt: str
     trigger_type: str
     test: bool
@@ -1492,6 +1497,7 @@ def _trigger_execution_context(
         "trigger_run_id": int(run.id),
         "trigger_type": str(trigger.type),
         "trigger_test": test,
+        TRIGGER_TURN_ID_CONFIG_KEY: str(uuid4()),
     }
 
 
@@ -1544,10 +1550,18 @@ def _attach_workforce_task_to_trigger_run(
     # missing and never knock a run that already advanced back to PENDING.
     task = record.task
     task_id = int(task.id)
-    merged_config = {
-        **dict(task.agent_config or {}),
-        **_trigger_execution_context(trigger=trigger, run=run, test=test),
-    }
+    existing_config = dict(task.agent_config or {})
+    trigger_context = _trigger_execution_context(
+        trigger=trigger,
+        run=run,
+        test=test,
+    )
+    existing_turn_id = existing_config.get(TRIGGER_TURN_ID_CONFIG_KEY)
+    if isinstance(existing_turn_id, str) and existing_turn_id:
+        # create_workforce_run_record is idempotent. Preserve the provenance
+        # identity if an attachment retry reuses the already-created Task.
+        trigger_context[TRIGGER_TURN_ID_CONFIG_KEY] = existing_turn_id
+    merged_config = {**existing_config, **trigger_context}
     if merged_config != dict(task.agent_config or {}):
         setattr(task, "agent_config", merged_config)
         db.add(task)
@@ -1780,11 +1794,23 @@ def _load_prepared_trigger_start(run_id: int) -> _PreparedTriggerStart | None:
             return None
 
         task_config = dict(task.agent_config or {})
+        turn_id = task_config.get(TRIGGER_TURN_ID_CONFIG_KEY)
+        if not isinstance(turn_id, str) or not turn_id:
+            # A pending Task has not accepted its CREATE turn yet, so it is
+            # safe to backfill provenance for runs prepared by an older
+            # process version. Running/settled legacy Tasks return above and
+            # remain unavailable to shared history rather than being guessed.
+            turn_id = str(uuid4())
+            task_config[TRIGGER_TURN_ID_CONFIG_KEY] = turn_id
+            setattr(task, "agent_config", task_config)
+            db.add(task)
+            db.commit()
         return _PreparedTriggerStart(
             run_id=int(run.id),
             trigger_id=int(trigger.id),
             task_id=int(task.id),
             task_owner_user_id=int(task.user_id),
+            turn_id=turn_id,
             prompt=str(task.input or task.description or ""),
             trigger_type=str(trigger.type),
             test=bool(task_config.get("trigger_test")),
@@ -1800,7 +1826,8 @@ def _mark_trigger_run_started(start: _PreparedTriggerStart) -> None:
         trigger = (
             db.query(AgentTrigger).filter(AgentTrigger.id == start.trigger_id).first()
         )
-        if run is None or trigger is None:
+        task = db.query(Task).filter(Task.id == start.task_id).first()
+        if run is None or trigger is None or task is None:
             return
         started_at = run.started_at or _now()
         # The task runs in the background from begin_turn on, so it can fail
@@ -1926,7 +1953,10 @@ async def _start_prepared_trigger_run_id(
         started = await TaskTurnOrchestrator.begin_turn(
             task_id=start.task_id,
             task_owner_user_id=start.task_owner_user_id,
-            payload=TaskTurnPayload(transcript_message=start.prompt),
+            payload=TaskTurnPayload(
+                transcript_message=start.prompt,
+                turn_id=start.turn_id,
+            ),
             kind=TurnKind.CREATE,
             force_fresh=False,
             context=context,

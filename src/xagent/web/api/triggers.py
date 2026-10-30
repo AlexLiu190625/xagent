@@ -11,10 +11,13 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from ..auth_dependencies import get_current_user
+from ..models.chat_message import TaskChatMessage
 from ..models.database import get_db
+from ..models.task import Task
 from ..models.trigger import AgentTrigger, TriggerAuditOutcome, TriggerRun
 from ..models.user import User
 from ..models.workforce import Workforce
+from ..services.assistant_history_safety import client_safe_assistant_history_content
 from ..services.gmail_provisioning import reconcile_gmail_trigger_provisioning
 from ..services.trigger_providers import (
     CallbackRequestContext,
@@ -29,6 +32,7 @@ from ..services.trigger_rate_limit import (
     should_audit_rate_limited_callback,
 )
 from ..services.triggers import (
+    TRIGGER_TURN_ID_CONFIG_KEY,
     TriggerNotFoundError,
     TriggerRunPreparationError,
     TriggerSecretError,
@@ -49,6 +53,8 @@ from ..services.triggers import (
 )
 from ..services.workforce_access import ensure_workforce_access
 from ..utils.db_timezone import format_datetime_for_api
+
+_RUN_HISTORY_MESSAGE_LIMIT = 200
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +127,17 @@ class TriggerRunResponse(BaseModel):
     task_expired_at: str | None
     created_at: str | None
     updated_at: str | None
+
+
+class TriggerRunHistoryMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+
+class TriggerRunHistoryResponse(BaseModel):
+    run_id: int
+    task_id: int
+    messages: list[TriggerRunHistoryMessage]
 
 
 class TriggerFireResponse(BaseModel):
@@ -394,7 +411,7 @@ async def get_trigger_run(
         run_id=run_id,
         include_payload=include_payload,
         request=request,
-        user_id=int(current_user.id),
+        user=current_user,
     )
 
 
@@ -405,15 +422,9 @@ def _trigger_run_detail(
     run_id: int,
     include_payload: bool,
     request: Request,
-    user_id: int,
+    user: User,
 ) -> TriggerRunResponse:
-    run = (
-        db.query(TriggerRun)
-        .filter(TriggerRun.id == run_id, TriggerRun.trigger_id == int(trigger.id))
-        .first()
-    )
-    if run is None:
-        raise HTTPException(status_code=404, detail="Trigger run not found")
+    run = _run_or_404(db, trigger=trigger, run_id=run_id)
 
     payload: Any | None = None
     if include_payload:
@@ -426,37 +437,247 @@ def _trigger_run_detail(
             # payload are plain validation errors and stay unaudited.
             snapshot = run.payload_snapshot
             if isinstance(snapshot, dict) and "encrypted_payload" in snapshot:
-                record_trigger_audit_best_effort(
+                _audit_payload_read(
                     db,
-                    outcome=TriggerAuditOutcome.PAYLOAD_READ,
-                    provider=str(trigger.provider) if trigger.provider else None,
-                    callback_id=(
-                        str(trigger.callback_id) if trigger.callback_id else None
-                    ),
-                    trigger_id=int(trigger.id),
-                    detail={
-                        "trigger_run_id": int(run.id),
-                        "user_id": user_id,
-                        "success": False,
-                        "error": f"{type(exc).__name__}: {exc}",
-                    },
-                    remote_ip=request.client.host if request.client else None,
+                    trigger=trigger,
+                    run=run,
+                    request=request,
+                    user=user,
+                    success=False,
+                    error=f"{type(exc).__name__}: {exc}",
+                    best_effort=True,
                 )
             raise _handle_service_error(exc)
-        record_trigger_audit(
+        _audit_payload_read(
             db,
-            outcome=TriggerAuditOutcome.PAYLOAD_READ,
-            provider=str(trigger.provider) if trigger.provider else None,
-            callback_id=str(trigger.callback_id) if trigger.callback_id else None,
-            trigger_id=int(trigger.id),
-            detail={
-                "trigger_run_id": int(run.id),
-                "user_id": user_id,
-                "success": True,
-            },
-            remote_ip=request.client.host if request.client else None,
+            trigger=trigger,
+            run=run,
+            request=request,
+            user=user,
+            success=True,
         )
     return _serialize_run(run, payload=payload)
+
+
+def _run_or_404(
+    db: Session,
+    *,
+    trigger: AgentTrigger,
+    run_id: int,
+) -> TriggerRun:
+    run = (
+        db.query(TriggerRun)
+        .filter(TriggerRun.id == run_id, TriggerRun.trigger_id == int(trigger.id))
+        .first()
+    )
+    if run is None:
+        raise HTTPException(status_code=404, detail="Trigger run not found")
+    return run
+
+
+def _audit_payload_read(
+    db: Session,
+    *,
+    trigger: AgentTrigger,
+    run: TriggerRun,
+    request: Request,
+    user: User,
+    success: bool,
+    surface: str | None = None,
+    error: str | None = None,
+    best_effort: bool = False,
+) -> None:
+    detail: dict[str, Any] = {
+        "trigger_run_id": int(run.id),
+        "user_id": int(user.id),
+        "success": success,
+    }
+    if surface is not None:
+        detail["surface"] = surface
+    if error is not None:
+        detail["error"] = error
+    audit = record_trigger_audit_best_effort if best_effort else record_trigger_audit
+    audit(
+        db,
+        outcome=TriggerAuditOutcome.PAYLOAD_READ,
+        provider=str(trigger.provider) if trigger.provider else None,
+        callback_id=str(trigger.callback_id) if trigger.callback_id else None,
+        trigger_id=int(trigger.id),
+        detail=detail,
+        remote_ip=request.client.host if request.client else None,
+    )
+
+
+def _display_history_messages(
+    db: Session,
+    *,
+    task: Task,
+    initiating_turn_id: str,
+) -> list[TriggerRunHistoryMessage]:
+    """Read only the routine-initiated display turn.
+
+    Trigger tasks remain available to their owner for private follow-up turns.
+    Team-visible history therefore includes only rows carrying the recorded
+    initiating turn identity, while still reading the display projection so
+    model-context compaction cannot remove the original routine input.
+    """
+    rows: list[tuple[Any, Any, Any]]
+    if int(task.conversation_storage_version) == 2:
+        from ..services.task_event_display import load_event_display_messages_for_turn
+
+        rows = [
+            (row.get("role"), row.get("content"), row.get("turn_id"))
+            for row in load_event_display_messages_for_turn(
+                db,
+                int(task.id),
+                initiating_turn_id,
+                limit=_RUN_HISTORY_MESSAGE_LIMIT,
+            )
+        ]
+    else:
+        stored_rows = (
+            db.query(TaskChatMessage)
+            .filter(
+                TaskChatMessage.task_id == int(task.id),
+                TaskChatMessage.turn_id == initiating_turn_id,
+            )
+            .order_by(TaskChatMessage.id.asc())
+            .limit(_RUN_HISTORY_MESSAGE_LIMIT)
+            .all()
+        )
+        rows = []
+        for stored_row in stored_rows:
+            stored_role = str(stored_row.role)
+            stored_content = str(stored_row.content or "")
+            if stored_role == "assistant":
+                stored_content = client_safe_assistant_history_content(
+                    content=stored_content,
+                    message_type=str(stored_row.message_type or ""),
+                )
+            rows.append((stored_role, stored_content, stored_row.turn_id))
+
+    messages: list[TriggerRunHistoryMessage] = []
+    for role, content, turn_id in rows:
+        if turn_id != initiating_turn_id:
+            continue
+        if role not in {"user", "assistant"} or not isinstance(content, str):
+            continue
+        if not content.strip():
+            # Tool-only/empty assistant projections have no safe textual
+            # content on this deliberately text-only read surface.
+            continue
+        messages.append(
+            TriggerRunHistoryMessage(
+                role=cast(Literal["user", "assistant"], role),
+                content=content,
+            )
+        )
+    return messages
+
+
+def _trigger_run_history(
+    db: Session,
+    *,
+    trigger: AgentTrigger,
+    run_id: int,
+    request: Request,
+    user: User,
+) -> TriggerRunHistoryResponse:
+    """Return a run's read-only, client-safe transcript.
+
+    Authorization deliberately happens through the parent trigger route before
+    this helper is called. A routine run remains owned by the user who created
+    the routine, so authorizing against the generic Task/WebSocket endpoints
+    would wrongly reject other teammates who can already view that routine.
+    Keeping this as a dedicated read-only projection avoids widening task
+    ownership or granting access to continue somebody else's conversation.
+    """
+    run = _run_or_404(db, trigger=trigger, run_id=run_id)
+    if run.task_id is None:
+        if run.task_expired_at is not None:
+            raise HTTPException(
+                status_code=410,
+                detail="Trigger run conversation has expired",
+            )
+        raise HTTPException(
+            status_code=404,
+            detail="Trigger run conversation not found",
+        )
+
+    task_id = int(run.task_id)
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if task is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Trigger run conversation not found",
+        )
+
+    task_config = dict(task.agent_config or {})
+    recorded_run_id = task_config.get("trigger_run_id")
+    initiating_turn_id = task_config.get(TRIGGER_TURN_ID_CONFIG_KEY)
+    if (
+        not isinstance(recorded_run_id, int)
+        or recorded_run_id != int(run.id)
+        or not isinstance(initiating_turn_id, str)
+        or not initiating_turn_id
+    ):
+        # Existing Tasks may predate explicit initiating-turn provenance.
+        # Guessing from the first surviving user row can expose a later owner
+        # follow-up, so legacy or mismatched records deliberately fail closed.
+        raise HTTPException(
+            status_code=404,
+            detail="Trigger run conversation history is unavailable",
+        )
+
+    messages = _display_history_messages(
+        db,
+        task=task,
+        initiating_turn_id=initiating_turn_id,
+    )
+    # The first user turn is the rendered trigger prompt and may embed the
+    # original event payload. Treat this read like include_payload=True so it
+    # leaves the same durable forensic trail.
+    _audit_payload_read(
+        db,
+        trigger=trigger,
+        run=run,
+        request=request,
+        user=user,
+        success=True,
+        surface="run_history",
+    )
+    return TriggerRunHistoryResponse(
+        run_id=int(run.id),
+        task_id=task_id,
+        messages=messages,
+    )
+
+
+@router.get(
+    "/api/agents/{agent_id}/triggers/{trigger_id}/runs/{run_id}/history",
+    response_model=TriggerRunHistoryResponse,
+)
+def get_trigger_run_history(
+    agent_id: int,
+    trigger_id: int,
+    run_id: int,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TriggerRunHistoryResponse:
+    trigger = _trigger_or_404(
+        db,
+        user_id=int(current_user.id),
+        agent_id=agent_id,
+        trigger_id=trigger_id,
+    )
+    return _trigger_run_history(
+        db,
+        trigger=trigger,
+        run_id=run_id,
+        request=request,
+        user=current_user,
+    )
 
 
 @router.post(
@@ -687,7 +908,35 @@ def get_workforce_trigger_run_route(
         run_id=run_id,
         include_payload=include_payload,
         request=request,
-        user_id=int(current_user.id),
+        user=current_user,
+    )
+
+
+@router.get(
+    "/api/workforces/{workforce_id}/triggers/{trigger_id}/runs/{run_id}/history",
+    response_model=TriggerRunHistoryResponse,
+)
+def get_workforce_trigger_run_history_route(
+    workforce_id: int,
+    trigger_id: int,
+    run_id: int,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TriggerRunHistoryResponse:
+    trigger = _workforce_trigger_or_404(
+        db,
+        user=current_user,
+        workforce_id=workforce_id,
+        trigger_id=trigger_id,
+        action="view",
+    )
+    return _trigger_run_history(
+        db,
+        trigger=trigger,
+        run_id=run_id,
+        request=request,
+        user=current_user,
     )
 
 

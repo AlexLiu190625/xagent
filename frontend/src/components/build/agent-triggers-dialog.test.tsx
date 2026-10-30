@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const routerPushMock = vi.hoisted(() => vi.fn())
+const authState = vi.hoisted(() => ({ userId: "1", isAdmin: false }))
 const translateMock = vi.hoisted(() => {
   return (key: string, vars?: Record<string, string | number>) => {
     if (vars?.count) return `${key}:${vars.count}`
@@ -24,6 +25,12 @@ vi.mock("@/lib/utils", () => ({
 
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({ t: translateMock, locale: "en" }),
+}))
+
+vi.mock("@/contexts/auth-context", () => ({
+  useAuth: () => ({
+    user: { id: authState.userId, username: "tester", is_admin: authState.isAdmin },
+  }),
 }))
 
 vi.mock("next/navigation", () => ({
@@ -97,6 +104,8 @@ describe("AgentTriggersDialog", () => {
   beforeEach(() => {
     apiRequestMock.mockReset()
     routerPushMock.mockReset()
+    authState.userId = "1"
+    authState.isAdmin = false
     gmailAccounts = [
       { id: 7, provider: "gmail", email: "gerard.santos@gmail.com" },
     ]
@@ -516,6 +525,374 @@ describe("AgentTriggersDialog", () => {
     expect(within(deletedRow).getByText("triggers.runStatus.failed")).toBeInTheDocument()
     expect(within(deletedRow).getByText("-")).toBeInTheDocument()
     expect(within(deletedRow).queryByText("triggers.runs.taskExpired")).not.toBeInTheDocument()
+  })
+
+  it("opens routine history inline instead of navigating to the task chat", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse(gmailAccounts))
+      if (url === "http://api.local/api/agents/42/triggers") {
+        return Promise.resolve(jsonResponse([baseTrigger9]))
+      }
+      if (url === "http://api.local/api/agents/42/triggers/9/runs") {
+        return Promise.resolve(
+          jsonResponse([
+            {
+              id: 12,
+              trigger_id: 9,
+              task_id: 99,
+              background_job_id: null,
+              status: "completed",
+              source_event_id: "scheduled-report",
+              payload_snapshot: null,
+              idempotency_key: "run-12",
+              error_message: null,
+              started_at: null,
+              finished_at: null,
+              task_expired_at: null,
+              created_at: null,
+              updated_at: null,
+            },
+          ]),
+        )
+      }
+      if (url === "http://api.local/api/agents/42/triggers/9/runs/12/history") {
+        return Promise.resolve(
+          jsonResponse({
+            run_id: 12,
+            task_id: 99,
+            messages: [
+              { role: "user", content: "Prepare the daily report" },
+              { role: "assistant", content: "The daily report is ready" },
+            ],
+          }),
+        )
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: true, connectedAccount: null }}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.gmail.title"))
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
+    fireEvent.click(
+      await screen.findByRole("button", { name: "triggers.runs.viewResult #99" }),
+    )
+
+    expect(await screen.findByText("Prepare the daily report")).toBeInTheDocument()
+    expect(screen.getByText("The daily report is ready")).toBeInTheDocument()
+    expect(screen.getByText("triggers.runs.input")).toBeInTheDocument()
+    expect(screen.getByText("triggers.runs.result")).toBeInTheDocument()
+    expect(routerPushMock).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole("button", { name: "triggers.runs.openTask" }))
+    expect(routerPushMock).toHaveBeenCalledWith("/task/99")
+
+    fireEvent.click(screen.getByRole("button", { name: "common.refresh" }))
+    await waitFor(() => {
+      expect(
+        apiRequestMock.mock.calls.filter(
+          ([url]) => url === "http://api.local/api/agents/42/triggers/9/runs/12/history",
+        ),
+      ).toHaveLength(2)
+    })
+    expect(
+      screen.getByRole("button", { name: "triggers.runs.hideResult #99" }),
+    ).toHaveAttribute("aria-expanded", "true")
+    expect(screen.getByText("The daily report is ready")).toBeInTheDocument()
+  })
+
+  it("clears expanded history when refresh reports that its task expired", async () => {
+    let runRequestCount = 0
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse(gmailAccounts))
+      if (url === "http://api.local/api/agents/42/triggers") {
+        return Promise.resolve(jsonResponse([baseTrigger9]))
+      }
+      if (url === "http://api.local/api/agents/42/triggers/9/runs") {
+        runRequestCount += 1
+        return Promise.resolve(
+          jsonResponse([
+            {
+              id: 12,
+              trigger_id: 9,
+              task_id: runRequestCount === 1 ? 99 : null,
+              background_job_id: null,
+              status: "completed",
+              source_event_id: "scheduled-report",
+              payload_snapshot: null,
+              idempotency_key: "run-12",
+              error_message: null,
+              started_at: null,
+              finished_at: null,
+              task_expired_at:
+                runRequestCount === 1 ? null : "2026-09-01T08:30:00+00:00",
+              created_at: null,
+              updated_at: null,
+            },
+          ]),
+        )
+      }
+      if (url === "http://api.local/api/agents/42/triggers/9/runs/12/history") {
+        return Promise.resolve(
+          jsonResponse({
+            run_id: 12,
+            task_id: 99,
+            messages: [
+              { role: "user", content: "Prepare the daily report" },
+              { role: "assistant", content: "The daily report is ready" },
+            ],
+          }),
+        )
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: true, connectedAccount: null }}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.gmail.title"))
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
+    fireEvent.click(
+      await screen.findByRole("button", { name: "triggers.runs.viewResult #99" }),
+    )
+    expect(await screen.findByText("The daily report is ready")).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole("button", { name: "common.refresh" }))
+
+    expect(await screen.findByText("triggers.runs.taskExpired")).toBeInTheDocument()
+    expect(screen.queryByText("Prepare the daily report")).not.toBeInTheDocument()
+    expect(screen.queryByText("The daily report is ready")).not.toBeInTheDocument()
+  })
+
+  it("ignores a stale routine history response after another run is expanded", async () => {
+    let resolveFirstHistory!: (value: Response) => void
+    const firstHistory = new Promise<Response>((resolve) => {
+      resolveFirstHistory = resolve
+    })
+    const runs = [
+      {
+        id: 12, trigger_id: 9, task_id: 99, background_job_id: null,
+        status: "completed", source_event_id: "first", payload_snapshot: null,
+        idempotency_key: "run-12", error_message: null, started_at: null,
+        finished_at: null, task_expired_at: null, created_at: null, updated_at: null,
+      },
+      {
+        id: 13, trigger_id: 9, task_id: 100, background_job_id: null,
+        status: "completed", source_event_id: "second", payload_snapshot: null,
+        idempotency_key: "run-13", error_message: null, started_at: null,
+        finished_at: null, task_expired_at: null, created_at: null, updated_at: null,
+      },
+    ]
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse(gmailAccounts))
+      if (url === "http://api.local/api/agents/42/triggers") {
+        return Promise.resolve(jsonResponse([baseTrigger9]))
+      }
+      if (url === "http://api.local/api/agents/42/triggers/9/runs") {
+        return Promise.resolve(jsonResponse(runs))
+      }
+      if (url.endsWith("/runs/12/history")) return firstHistory
+      if (url.endsWith("/runs/13/history")) {
+        return Promise.resolve(jsonResponse({
+          run_id: 13,
+          task_id: 100,
+          messages: [{ role: "assistant", content: "Second run result" }],
+        }))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: true, connectedAccount: null }}
+      />,
+    )
+    fireEvent.click(await screen.findByText("triggers.cards.gmail.title"))
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.runs.viewResult #99" }))
+    fireEvent.click(screen.getByRole("button", { name: "triggers.runs.viewResult #100" }))
+    expect(await screen.findByText("Second run result")).toBeInTheDocument()
+
+    resolveFirstHistory(jsonResponse({
+      run_id: 12,
+      task_id: 99,
+      messages: [{ role: "assistant", content: "Stale first result" }],
+    }))
+    await waitFor(() => {
+      expect(screen.queryByText("Stale first result")).not.toBeInTheDocument()
+    })
+    expect(screen.getByText("Second run result")).toBeInTheDocument()
+  })
+
+  it("shows a workforce routine history authorization error inline", async () => {
+    const workforceTrigger = {
+      ...baseTrigger9,
+      agent_id: null,
+      workforce_id: 5,
+    }
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse(gmailAccounts))
+      if (url === "http://api.local/api/workforces/5/triggers") {
+        return Promise.resolve(jsonResponse([workforceTrigger]))
+      }
+      if (url === "http://api.local/api/workforces/5/triggers/9/runs") {
+        return Promise.resolve(
+          jsonResponse([
+            {
+              id: 12,
+              trigger_id: 9,
+              task_id: 99,
+              background_job_id: null,
+              status: "completed",
+              source_event_id: "scheduled-report",
+              payload_snapshot: null,
+              idempotency_key: "run-12",
+              error_message: null,
+              started_at: null,
+              finished_at: null,
+              task_expired_at: null,
+              created_at: null,
+              updated_at: null,
+            },
+          ]),
+        )
+      }
+      if (url === "http://api.local/api/workforces/5/triggers/9/runs/12/history") {
+        return Promise.resolve(
+          jsonResponse({ detail: "Trigger run is not available" }, { status: 403 }),
+        )
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={null}
+        owner={{ kind: "workforce", id: 5 }}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: true, connectedAccount: null }}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.gmail.title"))
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
+    fireEvent.click(
+      await screen.findByRole("button", { name: "triggers.runs.viewResult #99" }),
+    )
+
+    expect(await screen.findByText("triggers.runs.historyForbidden")).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "common.retry" })).not.toBeInTheDocument()
+    expect(screen.queryByText("Connection lost. Reload the page to reconnect.")).not.toBeInTheDocument()
+  })
+
+  it.each([
+    { status: 404, message: "triggers.runs.historyUnavailable", retryable: false },
+    { status: 410, message: "triggers.runs.historyExpired", retryable: false },
+    { status: 500, message: "triggers.runs.historyLoadFailed", retryable: true },
+  ])("maps a $status routine history error", async ({ status, message, retryable }) => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse(gmailAccounts))
+      if (url === "http://api.local/api/agents/42/triggers") {
+        return Promise.resolve(jsonResponse([baseTrigger9]))
+      }
+      if (url === "http://api.local/api/agents/42/triggers/9/runs") {
+        return Promise.resolve(
+          jsonResponse([
+            {
+              id: 12,
+              trigger_id: 9,
+              task_id: 99,
+              status: "completed",
+              idempotency_key: "run-12",
+            },
+          ]),
+        )
+      }
+      if (url === "http://api.local/api/agents/42/triggers/9/runs/12/history") {
+        return Promise.resolve(jsonResponse({ detail: "backend detail" }, { status }))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: true, connectedAccount: null }}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.gmail.title"))
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
+    fireEvent.click(
+      await screen.findByRole("button", { name: "triggers.runs.viewResult #99" }),
+    )
+
+    expect(await screen.findByText(message)).toBeInTheDocument()
+    const retry = screen.queryByRole("button", { name: "common.retry" })
+    if (retryable) {
+      expect(retry).toBeInTheDocument()
+    } else {
+      expect(retry).not.toBeInTheDocument()
+    }
+  })
+
+  it("does not show the interactive task link to a teammate who does not own the run", async () => {
+    authState.userId = "2"
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse(gmailAccounts))
+      if (url === "http://api.local/api/agents/42/triggers") {
+        return Promise.resolve(jsonResponse([baseTrigger9]))
+      }
+      if (url === "http://api.local/api/agents/42/triggers/9/runs") {
+        return Promise.resolve(
+          jsonResponse([
+            {
+              id: 12,
+              trigger_id: 9,
+              task_id: 99,
+              status: "completed",
+              idempotency_key: "run-12",
+            },
+          ]),
+        )
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: true, connectedAccount: null }}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.gmail.title"))
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
+    expect(
+      await screen.findByRole("button", { name: "triggers.runs.viewResult #99" }),
+    ).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "triggers.runs.openTask" })).not.toBeInTheDocument()
   })
 
   it("reconciles a card switch from the PATCH response, not just the requested value", async () => {

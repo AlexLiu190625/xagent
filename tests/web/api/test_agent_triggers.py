@@ -17,10 +17,17 @@ from xagent.core.utils.encryption import decrypt_value
 from xagent.web.models.agent import Agent, AgentOrigin
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.mcp import MCPServer, UserMCPServer
-from xagent.web.models.task import Task, TaskConnectorRuntimeContext, TaskStatus
+from xagent.web.models.task import (
+    Task,
+    TaskConnectorRuntimeContext,
+    TaskStatus,
+    TraceEvent,
+)
+from xagent.web.models.task_execution_event import TaskExecutionEvent
 from xagent.web.models.trigger import (
     AgentTrigger,
     TriggerAudit,
+    TriggerAuditOutcome,
     TriggerProvisioningStatus,
     TriggerRun,
     TriggerRunStatus,
@@ -31,10 +38,30 @@ from xagent.web.services.agent_team_scope import (
     AgentTeamScope,
     set_agent_team_scope_hook,
 )
+from xagent.web.services.chat_history_service import (
+    persist_assistant_message_no_commit,
+    persist_user_message_no_commit,
+)
+from xagent.web.services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
 from xagent.web.services.connector_runtime import (
     ConnectorRuntimeValues,
     load_connector_runtime_view,
     set_connector_runtime_resolver_for_testing,
+)
+from xagent.web.services.routine_history_provenance import (
+    TRIGGER_TASK_RUN_ID_CONFIG_KEY,
+    routine_history_turn_id,
+)
+from xagent.web.services.task_execution import (
+    _finalize_task_execution_result_isolated,
+    _persist_agent_outbound_event,
+)
+from xagent.web.services.task_lease_recovery import (
+    recover_task_lease_candidate_isolated,
+)
+from xagent.web.services.task_lease_service import (
+    get_expired_task_lease_candidates,
+    utc_now,
 )
 from xagent.web.services.task_orchestrator import (
     TurnStarted,
@@ -45,6 +72,7 @@ from xagent.web.services.task_orchestrator import (
 )
 from xagent.web.services.trigger_providers import sign_webhook_payload
 from xagent.web.services.triggers import (
+    TRIGGER_TURN_ID_CONFIG_KEY,
     _coerce_utc,
     _compute_next_run_at,
     _finish_trigger_run_after_task,
@@ -489,6 +517,17 @@ def test_trigger_test_run_mcp_setup_failure_marks_run_failed() -> None:
     assert run_finished_at is not None
     assert private_detail not in str(final_state)
 
+    history = client.get(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}/runs/{run_id}/history",
+        headers=headers,
+    )
+    assert history.status_code == 200, history.text
+    assert history.json()["messages"][-1] == {
+        "role": "assistant",
+        "content": safe_error,
+    }
+    assert private_detail not in history.text
+
 
 def _fire_test_run(headers: dict[str, str]) -> _PreparedTriggerStart:
     agent_id = _create_agent(headers)
@@ -510,6 +549,7 @@ def _fire_test_run(headers: dict[str, str]) -> _PreparedTriggerStart:
     try:
         task = db.query(Task).filter(Task.id == run_body["task_id"]).one()
         owner_user_id = int(task.user_id)
+        turn_id = str(task.agent_config[TRIGGER_TURN_ID_CONFIG_KEY])
     finally:
         db.close()
     return _PreparedTriggerStart(
@@ -517,6 +557,7 @@ def _fire_test_run(headers: dict[str, str]) -> _PreparedTriggerStart:
         trigger_id=trigger_id,
         task_id=int(run_body["task_id"]),
         task_owner_user_id=owner_user_id,
+        turn_id=turn_id,
         prompt="finalize",
         trigger_type="webhook",
         test=True,
@@ -636,6 +677,33 @@ def test_mark_trigger_run_started_keeps_a_run_the_task_already_settled() -> None
         assert run.finished_at is not None
         assert trigger.last_run_at is not None
         assert trigger.last_error is None
+    finally:
+        db.close()
+
+
+def test_delayed_started_marker_cannot_bind_a_later_private_run() -> None:
+    headers = _admin_headers()
+    start = _fire_test_run(headers)
+    routine_run_id = "accepted-routine-run"
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == start.task_id).one()
+        task.agent_config = {
+            **dict(task.agent_config or {}),
+            TRIGGER_TASK_RUN_ID_CONFIG_KEY: routine_run_id,
+        }
+        task.run_id = "later-private-run"
+        db.add(task)
+        db.commit()
+    finally:
+        db.close()
+
+    _mark_trigger_run_started(start)
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == start.task_id).one()
+        assert task.agent_config[TRIGGER_TASK_RUN_ID_CONFIG_KEY] == routine_run_id
     finally:
         db.close()
 
@@ -3601,6 +3669,907 @@ def test_trigger_runtime_visibility_uses_trigger_task_owner() -> None:
         set_agent_team_scope_hook(None)
 
 
+def test_team_member_can_read_complete_shared_trigger_run_history() -> None:
+    """Routine visibility, not Task ownership, governs the read-only history."""
+    admin_headers = _admin_headers()
+    teammate_headers = _register_second_user("routine-history-teammate")
+    outsider_headers = _register_second_user("routine-history-outsider")
+    db = _direct_db_session()
+    try:
+        admin_user_id = int(db.query(User).filter(User.username == "admin").one().id)
+        teammate_user_id = int(
+            db.query(User).filter(User.username == "routine-history-teammate").one().id
+        )
+    finally:
+        db.close()
+
+    set_agent_team_scope_hook(
+        lambda _db, user_id: (
+            AgentTeamScope(team_id=100, is_team_admin=False)
+            if user_id in {admin_user_id, teammate_user_id}
+            else None
+        )
+    )
+    try:
+        agent_id = _create_agent(admin_headers, "Shared routine history")
+        promoted = client.post(
+            f"/api/agents/{agent_id}/promote-team",
+            headers=admin_headers,
+            json={"visibility": "team"},
+        )
+        assert promoted.status_code == 200, promoted.text
+
+        created = client.post(
+            f"/api/agents/{agent_id}/triggers",
+            headers=admin_headers,
+            json={"type": "webhook", "name": "Shared history hook"},
+        )
+        assert created.status_code == 200, created.text
+        trigger_id = int(created.json()["id"])
+
+        other_trigger = client.post(
+            f"/api/agents/{agent_id}/triggers",
+            headers=admin_headers,
+            json={"type": "webhook", "name": "Other history hook"},
+        )
+        assert other_trigger.status_code == 200, other_trigger.text
+        other_trigger_id = int(other_trigger.json()["id"])
+
+        db = _direct_db_session()
+        try:
+            task = Task(
+                user_id=admin_user_id,
+                title="Shared routine history",
+                description="Prepare the daily report",
+                status=TaskStatus.RUNNING,
+                agent_id=agent_id,
+                execution_mode="balanced",
+                source="trigger",
+                is_visible=False,
+                input="Prepare the daily report",
+                run_id="routine-execution",
+            )
+            db.add(task)
+            db.flush()
+            run = TriggerRun(
+                trigger_id=trigger_id,
+                task_id=int(task.id),
+                status=TriggerRunStatus.COMPLETED.value,
+                idempotency_key="history:shared",
+            )
+            db.add(run)
+            db.flush()
+            task.agent_config = {
+                "trigger_run_id": int(run.id),
+                TRIGGER_TURN_ID_CONFIG_KEY: "routine-turn",
+            }
+            db.add(task)
+            user_message = TaskChatMessage(
+                task_id=int(task.id),
+                user_id=admin_user_id,
+                role="user",
+                content="Prepare the daily report",
+                message_type="user_message",
+                attachments=[{"file_id": "private-file", "name": "input.csv"}],
+                turn_id="routine-turn",
+            )
+            db.add(user_message)
+            db.commit()
+            task_id = int(task.id)
+            run_id = int(run.id)
+        finally:
+            db.close()
+
+        finalized = _finalize_task_execution_result_isolated(
+            task_id=task_id,
+            task_user_id=admin_user_id,
+            pre_run_status=TaskStatus.RUNNING,
+            result={
+                "success": True,
+                "output": "The daily report is ready",
+                "file_outputs": [],
+            },
+            expected_run_id="routine-execution",
+            task_lease=None,
+            resolved_scope_segments=(),
+            turn_id="routine-turn",
+        )
+        assert not finalized.late_result
+
+        db = _direct_db_session()
+        try:
+            assistant_message = (
+                db.query(TaskChatMessage)
+                .filter(
+                    TaskChatMessage.task_id == task_id,
+                    TaskChatMessage.role == "assistant",
+                    TaskChatMessage.turn_id == "routine-turn",
+                )
+                .one()
+            )
+            db.add_all(
+                [
+                    TaskChatMessage(
+                        task_id=task_id,
+                        user_id=admin_user_id,
+                        role="system",
+                        content="internal orchestration note",
+                        message_type="system_message",
+                        turn_id="routine-turn",
+                    ),
+                    TaskChatMessage(
+                        task_id=task_id,
+                        user_id=admin_user_id,
+                        role="user",
+                        content="Use my private connector for a follow-up",
+                        message_type="user_message",
+                        turn_id="private-turn",
+                    ),
+                    TaskChatMessage(
+                        task_id=task_id,
+                        user_id=admin_user_id,
+                        role="assistant",
+                        content="Private connector result",
+                        message_type="assistant_response",
+                        turn_id="private-turn",
+                    ),
+                    # Model-context reads replace everything through this
+                    # watermark with a system summary. Display-history reads
+                    # must still return the original user-visible rows.
+                    TraceEvent(
+                        task_id=task_id,
+                        event_id="routine-history-compaction",
+                        event_type="action_end_compact",
+                        timestamp=datetime.now(timezone.utc),
+                        data={
+                            "compact_type": "execution_context",
+                            "strategy": "llm_summary",
+                            "summary": "Earlier routine conversation",
+                            "watermark_message_id": int(assistant_message.id),
+                        },
+                    ),
+                ]
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        history_url = (
+            f"/api/agents/{agent_id}/triggers/{trigger_id}/runs/{run_id}/history"
+        )
+        teammate_read = client.get(history_url, headers=teammate_headers)
+        assert teammate_read.status_code == 200, teammate_read.text
+        teammate_history = teammate_read.json()
+        assert teammate_history["run_id"] == run_id
+        assert teammate_history["task_id"] == task_id
+        assert teammate_history["messages"] == [
+            {"role": "user", "content": "Prepare the daily report"},
+            {"role": "assistant", "content": "The daily report is ready"},
+        ]
+        assert "private-file" not in teammate_read.text
+        assert "internal orchestration note" not in teammate_read.text
+        assert "Earlier routine conversation" not in teammate_read.text
+        assert "private connector" not in teammate_read.text.lower()
+
+        db = _direct_db_session()
+        try:
+            audit = (
+                db.query(TriggerAudit)
+                .filter(
+                    TriggerAudit.trigger_id == trigger_id,
+                    TriggerAudit.outcome == TriggerAuditOutcome.PAYLOAD_READ.value,
+                )
+                .one()
+            )
+            assert audit.detail == {
+                "trigger_run_id": run_id,
+                "user_id": teammate_user_id,
+                "success": True,
+                "surface": "run_history",
+            }
+        finally:
+            db.close()
+
+        cross_trigger_read = client.get(
+            f"/api/agents/{agent_id}/triggers/{other_trigger_id}/runs/{run_id}/history",
+            headers=admin_headers,
+        )
+        assert cross_trigger_read.status_code == 404, cross_trigger_read.text
+
+        other_agent_id = _create_agent(admin_headers, "Other routine owner")
+        cross_agent_read = client.get(
+            f"/api/agents/{other_agent_id}/triggers/{trigger_id}/runs/{run_id}/history",
+            headers=admin_headers,
+        )
+        assert cross_agent_read.status_code == 404, cross_agent_read.text
+
+        owner_read = client.get(history_url, headers=admin_headers)
+        assert owner_read.status_code == 200, owner_read.text
+
+        outsider_read = client.get(history_url, headers=outsider_headers)
+        assert outsider_read.status_code == 404, outsider_read.text
+    finally:
+        set_agent_team_scope_hook(None)
+
+
+def test_v1_trigger_history_sanitizes_unsafe_and_omits_tool_only_assistants() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers, "V1 safe routine history")
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={"type": "webhook", "name": "V1 safe history hook"},
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = int(created.json()["id"])
+
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(User).filter(User.username == "admin").one().id)
+        runs: dict[str, tuple[int, int]] = {}
+        for case, assistant_content, message_type, interactions in [
+            (
+                "unsafe",
+                "private untrusted failure detail",
+                "assistant_message",
+                None,
+            ),
+            (
+                "tool-only",
+                "",
+                "assistant_response",
+                [{"type": "tool_calls", "secret": "do-not-leak"}],
+            ),
+        ]:
+            turn_id = f"{case}-turn"
+            task = Task(
+                user_id=owner_id,
+                title=f"V1 {case} history",
+                description=f"Run {case}",
+                status=TaskStatus.COMPLETED,
+                agent_id=agent_id,
+                execution_mode="balanced",
+                source="trigger",
+                is_visible=False,
+                input=f"Run {case}",
+            )
+            db.add(task)
+            db.flush()
+            run = TriggerRun(
+                trigger_id=trigger_id,
+                task_id=int(task.id),
+                status=TriggerRunStatus.COMPLETED.value,
+                idempotency_key=f"history:v1:{case}",
+            )
+            db.add(run)
+            db.flush()
+            task.agent_config = {
+                "trigger_run_id": int(run.id),
+                TRIGGER_TURN_ID_CONFIG_KEY: turn_id,
+            }
+            db.add_all(
+                [
+                    task,
+                    TaskChatMessage(
+                        task_id=int(task.id),
+                        user_id=owner_id,
+                        role="user",
+                        content=f"Run {case}",
+                        message_type="user_message",
+                        turn_id=turn_id,
+                    ),
+                    TaskChatMessage(
+                        task_id=int(task.id),
+                        user_id=owner_id,
+                        role="assistant",
+                        content=assistant_content,
+                        message_type=message_type,
+                        interactions=interactions,
+                        turn_id=turn_id,
+                    ),
+                ]
+            )
+            runs[case] = (int(run.id), int(task.id))
+        db.commit()
+    finally:
+        db.close()
+
+    unsafe_run_id, unsafe_task_id = runs["unsafe"]
+    unsafe = client.get(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}/runs/{unsafe_run_id}/history",
+        headers=headers,
+    )
+    assert unsafe.status_code == 200, unsafe.text
+    assert unsafe.json() == {
+        "run_id": unsafe_run_id,
+        "task_id": unsafe_task_id,
+        "messages": [
+            {"role": "user", "content": "Run unsafe"},
+            {"role": "assistant", "content": CLIENT_SAFE_TASK_FAILURE},
+        ],
+    }
+    assert "private untrusted failure detail" not in unsafe.text
+
+    tool_run_id, tool_task_id = runs["tool-only"]
+    tool_only = client.get(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}/runs/{tool_run_id}/history",
+        headers=headers,
+    )
+    assert tool_only.status_code == 200, tool_only.text
+    assert tool_only.json() == {
+        "run_id": tool_run_id,
+        "task_id": tool_task_id,
+        "messages": [{"role": "user", "content": "Run tool-only"}],
+    }
+    assert "do-not-leak" not in tool_only.text
+
+
+@pytest.mark.parametrize(
+    ("storage_version", "authoritative"),
+    [(1, False), (2, True)],
+)
+def test_trigger_history_keeps_same_turn_question_and_excludes_later_question(
+    storage_version: int,
+    authoritative: bool,
+) -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers, f"V{storage_version} routine question history")
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={"type": "webhook", "name": f"V{storage_version} question hook"},
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = int(created.json()["id"])
+
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(User).filter(User.username == "admin").one().id)
+        task = Task(
+            user_id=owner_id,
+            title=f"V{storage_version} routine question history",
+            description="Routine question prompt",
+            status=TaskStatus.WAITING_FOR_USER,
+            agent_id=agent_id,
+            execution_mode="balanced",
+            source="trigger",
+            is_visible=False,
+            input="Routine question prompt",
+            run_id=f"v{storage_version}-question-run",
+            conversation_storage_version=storage_version,
+        )
+        db.add(task)
+        db.flush()
+        run = TriggerRun(
+            trigger_id=trigger_id,
+            task_id=int(task.id),
+            status=TriggerRunStatus.RUNNING.value,
+            idempotency_key=f"history:v{storage_version}:question",
+        )
+        db.add(run)
+        db.flush()
+        task.agent_config = {
+            "trigger_run_id": int(run.id),
+            TRIGGER_TURN_ID_CONFIG_KEY: "routine-question-turn",
+            TRIGGER_TASK_RUN_ID_CONFIG_KEY: str(task.run_id),
+        }
+        persist_user_message_no_commit(
+            db,
+            task_id=int(task.id),
+            user_id=owner_id,
+            content="Routine question prompt",
+            turn_id="routine-question-turn",
+        )
+        db.add(task)
+        db.commit()
+        task_id = int(task.id)
+        run_id = int(run.id)
+    finally:
+        db.close()
+
+    def persist_question(event_id: str, question: str, turn_id: str) -> None:
+        _persist_agent_outbound_event(
+            task_id,
+            {
+                "event_type": "agent_message",
+                "event_id": event_id,
+                "data": {
+                    "event_id": event_id,
+                    "message": question,
+                    "message_type": "question",
+                    "expect_response": True,
+                    "visible": True,
+                    "metadata": {},
+                },
+            },
+            turn_id=turn_id,
+            authoritative=authoritative,
+        )
+
+    persist_question(
+        f"v{storage_version}-routine-question",
+        "Choose the report format",
+        "routine-question-turn",
+    )
+
+    db = _direct_db_session()
+    try:
+        persist_user_message_no_commit(
+            db,
+            task_id=task_id,
+            user_id=owner_id,
+            content="Owner private follow-up",
+            turn_id="private-question-turn",
+        )
+        task = db.get(Task, task_id)
+        assert task is not None
+        resumed_history_turn = routine_history_turn_id(
+            task,
+            "private-question-turn",
+            expected_run_id=str(task.run_id),
+        )
+        assert resumed_history_turn == "routine-question-turn"
+        assert (
+            routine_history_turn_id(
+                task,
+                "private-question-turn",
+                expected_run_id="later-owner-run",
+            )
+            == "private-question-turn"
+        )
+        persist_assistant_message_no_commit(
+            db,
+            task_id=task_id,
+            user_id=owner_id,
+            content="The report is ready",
+            message_type="assistant_response",
+            turn_id=resumed_history_turn,
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    persist_question(
+        f"v{storage_version}-private-question",
+        "Choose a private connector account",
+        "private-question-turn",
+    )
+
+    history = client.get(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}/runs/{run_id}/history",
+        headers=headers,
+    )
+    assert history.status_code == 200, history.text
+    assert history.json() == {
+        "run_id": run_id,
+        "task_id": task_id,
+        "messages": [
+            {"role": "user", "content": "Routine question prompt"},
+            {"role": "assistant", "content": "Choose the report format"},
+            {"role": "assistant", "content": "The report is ready"},
+        ],
+    }
+    assert "private connector" not in history.text.lower()
+
+
+def test_v2_terminal_persistence_keeps_routine_turn_provenance() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers, "V2 persisted routine history")
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={"type": "webhook", "name": "V2 persisted history hook"},
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = int(created.json()["id"])
+
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(User).filter(User.username == "admin").one().id)
+        task = Task(
+            user_id=owner_id,
+            title="V2 persisted routine history",
+            description="V2 persisted prompt",
+            status=TaskStatus.RUNNING,
+            agent_id=agent_id,
+            execution_mode="balanced",
+            source="trigger",
+            is_visible=False,
+            input="V2 persisted prompt",
+            run_id="v2-routine-execution",
+            conversation_storage_version=2,
+        )
+        db.add(task)
+        db.flush()
+        run = TriggerRun(
+            trigger_id=trigger_id,
+            task_id=int(task.id),
+            status=TriggerRunStatus.COMPLETED.value,
+            idempotency_key="history:v2:persisted",
+        )
+        db.add(run)
+        db.flush()
+        task.agent_config = {
+            "trigger_run_id": int(run.id),
+            TRIGGER_TURN_ID_CONFIG_KEY: "v2-routine-turn",
+        }
+        persist_user_message_no_commit(
+            db,
+            task_id=int(task.id),
+            user_id=owner_id,
+            content="V2 persisted prompt",
+            turn_id="v2-routine-turn",
+        )
+        db.add(task)
+        db.commit()
+        task_id = int(task.id)
+        run_id = int(run.id)
+    finally:
+        db.close()
+
+    finalized = _finalize_task_execution_result_isolated(
+        task_id=task_id,
+        task_user_id=owner_id,
+        pre_run_status=TaskStatus.RUNNING,
+        result={
+            "success": True,
+            "output": "V2 persisted result",
+            "file_outputs": [],
+        },
+        expected_run_id="v2-routine-execution",
+        task_lease=None,
+        resolved_scope_segments=(),
+        turn_id="v2-routine-turn",
+    )
+    assert not finalized.late_result
+
+    history = client.get(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}/runs/{run_id}/history",
+        headers=headers,
+    )
+    assert history.status_code == 200, history.text
+    assert history.json() == {
+        "run_id": run_id,
+        "task_id": task_id,
+        "messages": [
+            {"role": "user", "content": "V2 persisted prompt"},
+            {"role": "assistant", "content": "V2 persisted result"},
+        ],
+    }
+
+
+@pytest.mark.parametrize("storage_version", [1, 2])
+def test_trigger_history_includes_lease_expiry_failure(
+    storage_version: int,
+) -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers, f"V{storage_version} expired routine")
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={"type": "webhook", "name": f"V{storage_version} expiry hook"},
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = int(created.json()["id"])
+    task_run_id = f"v{storage_version}-expired-routine-run"
+    turn_id = f"v{storage_version}-expired-routine-turn"
+
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(User).filter(User.username == "admin").one().id)
+        task = Task(
+            user_id=owner_id,
+            title=f"V{storage_version} expired routine",
+            description="Prepare the expired report",
+            status=TaskStatus.RUNNING,
+            agent_id=agent_id,
+            execution_mode="balanced",
+            source="trigger",
+            is_visible=False,
+            input="Prepare the expired report",
+            run_id=task_run_id,
+            runner_id="expired-routine-runner",
+            lease_expires_at=utc_now() - timedelta(seconds=5),
+            last_heartbeat_at=utc_now() - timedelta(seconds=10),
+            state_version=3,
+            control_state="running",
+            conversation_storage_version=storage_version,
+        )
+        db.add(task)
+        db.flush()
+        run = TriggerRun(
+            trigger_id=trigger_id,
+            task_id=int(task.id),
+            status=TriggerRunStatus.RUNNING.value,
+            idempotency_key=f"history:v{storage_version}:lease-expiry",
+        )
+        db.add(run)
+        db.flush()
+        task.agent_config = {
+            "trigger_run_id": int(run.id),
+            TRIGGER_TURN_ID_CONFIG_KEY: turn_id,
+            TRIGGER_TASK_RUN_ID_CONFIG_KEY: task_run_id,
+        }
+        persist_user_message_no_commit(
+            db,
+            task_id=int(task.id),
+            user_id=owner_id,
+            content="Prepare the expired report",
+            turn_id=turn_id,
+        )
+        db.add(task)
+        db.commit()
+        candidate = get_expired_task_lease_candidates(
+            db,
+            cutoff=utc_now(),
+            limit=1,
+        )[0]
+        task_id = int(task.id)
+        run_id = int(run.id)
+    finally:
+        db.close()
+
+    assert (
+        recover_task_lease_candidate_isolated(candidate, recovered_at=utc_now())
+        == TaskStatus.FAILED
+    )
+
+    history = client.get(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}/runs/{run_id}/history",
+        headers=headers,
+    )
+    assert history.status_code == 200, history.text
+    assert history.json() == {
+        "run_id": run_id,
+        "task_id": task_id,
+        "messages": [
+            {"role": "user", "content": "Prepare the expired report"},
+            {"role": "assistant", "content": CLIENT_SAFE_TASK_FAILURE},
+        ],
+    }
+
+
+def test_trigger_run_history_uses_v2_display_snapshot() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers, "V2 routine history")
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={"type": "webhook", "name": "V2 history hook"},
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = int(created.json()["id"])
+
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(User).filter(User.username == "admin").one().id)
+        task = Task(
+            user_id=owner_id,
+            title="V2 routine history",
+            description="V2 prompt",
+            status=TaskStatus.COMPLETED,
+            agent_id=agent_id,
+            execution_mode="balanced",
+            source="trigger",
+            is_visible=False,
+            input="V2 prompt",
+            conversation_storage_version=2,
+            conversation_event_sequence=6,
+        )
+        db.add(task)
+        db.flush()
+        run = TriggerRun(
+            trigger_id=trigger_id,
+            task_id=int(task.id),
+            status=TriggerRunStatus.COMPLETED.value,
+            idempotency_key="history:v2",
+        )
+        db.add(run)
+        db.flush()
+        task.agent_config = {
+            "trigger_run_id": int(run.id),
+            TRIGGER_TURN_ID_CONFIG_KEY: "routine-turn",
+        }
+        db.add(task)
+        occurred_at = datetime.now(timezone.utc)
+        db.add_all(
+            [
+                TaskExecutionEvent(
+                    event_id=f"00000000-0000-0000-0000-{sequence:012d}",
+                    task_id=int(task.id),
+                    sequence=sequence,
+                    scope_id="root",
+                    run_id=run_key,
+                    turn_id=turn_id,
+                    idempotency_key=f"v2-history:{sequence}",
+                    kind=kind,
+                    payload_version=1,
+                    payload={
+                        "data": {
+                            "content": content,
+                            "message_type": message_type,
+                            "attachments": (
+                                [{"file_id": "private-v2-file"}]
+                                if kind == "input_accepted"
+                                else []
+                            ),
+                        }
+                    },
+                    occurred_at=occurred_at + timedelta(seconds=sequence),
+                )
+                for sequence, run_key, turn_id, kind, content, message_type in [
+                    (
+                        1,
+                        "routine-run",
+                        "routine-turn",
+                        "input_accepted",
+                        "V2 prompt",
+                        "user_message",
+                    ),
+                    (
+                        2,
+                        "routine-run",
+                        "routine-turn",
+                        "assistant_message",
+                        "V2 result",
+                        "assistant_response",
+                    ),
+                    (
+                        3,
+                        "routine-run",
+                        "routine-turn",
+                        "assistant_message",
+                        "",
+                        "assistant_response",
+                    ),
+                    (
+                        4,
+                        "private-run",
+                        "private-turn",
+                        "input_accepted",
+                        "Private V2 follow-up",
+                        "user_message",
+                    ),
+                    (
+                        5,
+                        "private-run",
+                        "private-turn",
+                        "assistant_message",
+                        "Private V2 result",
+                        "assistant_response",
+                    ),
+                ]
+            ]
+        )
+        # A later private turn may contain a malformed fact. The shared
+        # routine read must neither deserialize it nor fail because of it.
+        db.add(
+            TaskExecutionEvent(
+                event_id="00000000-0000-0000-0000-000000000006",
+                task_id=int(task.id),
+                sequence=6,
+                scope_id="root",
+                run_id="private-run",
+                turn_id="private-turn",
+                idempotency_key="v2-history:malformed-private",
+                kind="assistant_message",
+                payload_version=1,
+                payload="malformed-private-payload",
+                occurred_at=occurred_at + timedelta(seconds=6),
+            )
+        )
+        db.commit()
+        run_id = int(run.id)
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    history = client.get(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}/runs/{run_id}/history",
+        headers=headers,
+    )
+
+    assert history.status_code == 200, history.text
+    assert history.json() == {
+        "run_id": run_id,
+        "task_id": task_id,
+        "messages": [
+            {"role": "user", "content": "V2 prompt"},
+            {"role": "assistant", "content": "V2 result"},
+        ],
+    }
+    assert "private-v2-file" not in history.text
+    assert "Private V2" not in history.text
+
+
+def test_trigger_run_history_fails_closed_without_v1_initiating_row() -> None:
+    """A later owner turn must not replace an omitted blank routine input."""
+    headers = _admin_headers()
+    agent_id = _create_agent(headers, "Blank routine history")
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={"type": "webhook", "name": "Blank history hook"},
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = int(created.json()["id"])
+
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(User).filter(User.username == "admin").one().id)
+        task = Task(
+            user_id=owner_id,
+            title="Blank routine history",
+            description="",
+            status=TaskStatus.COMPLETED,
+            agent_id=agent_id,
+            execution_mode="balanced",
+            source="trigger",
+            is_visible=False,
+            input="",
+        )
+        db.add(task)
+        db.flush()
+        run = TriggerRun(
+            trigger_id=trigger_id,
+            task_id=int(task.id),
+            status=TriggerRunStatus.COMPLETED.value,
+            idempotency_key="history:blank-v1",
+        )
+        db.add(run)
+        db.flush()
+        task.agent_config = {
+            "trigger_run_id": int(run.id),
+            TRIGGER_TURN_ID_CONFIG_KEY: "omitted-routine-turn",
+        }
+        db.add_all(
+            [
+                task,
+                TaskChatMessage(
+                    task_id=int(task.id),
+                    user_id=owner_id,
+                    role="user",
+                    content="Use my private connector",
+                    message_type="user_message",
+                    turn_id="private-turn",
+                ),
+                TaskChatMessage(
+                    task_id=int(task.id),
+                    user_id=owner_id,
+                    role="assistant",
+                    content="Private connector result",
+                    message_type="assistant_response",
+                    turn_id="private-turn",
+                ),
+            ]
+        )
+        db.commit()
+        run_id = int(run.id)
+    finally:
+        db.close()
+
+    history_url = f"/api/agents/{agent_id}/triggers/{trigger_id}/runs/{run_id}/history"
+    history = client.get(history_url, headers=headers)
+    assert history.status_code == 200, history.text
+    assert history.json()["messages"] == []
+    assert "private connector" not in history.text.lower()
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == history.json()["task_id"]).one()
+        task.agent_config = {"trigger_run_id": run_id}
+        db.add(task)
+        db.commit()
+    finally:
+        db.close()
+
+    legacy_history = client.get(history_url, headers=headers)
+    assert legacy_history.status_code == 404, legacy_history.text
+    assert legacy_history.json()["detail"] == (
+        "Trigger run conversation history is unavailable"
+    )
+
+
 def test_scheduled_scan_fails_fast_when_required_runtime_secret_has_no_source() -> None:
     headers = _admin_headers()
     agent_id = _create_agent(headers)
@@ -3846,10 +4815,12 @@ def test_dispatch_claims_pending_trigger_run_once_under_concurrency() -> None:
         db.close()
 
     begin_calls = 0
+    accepted_turn_ids: list[str] = []
 
     async def fake_begin_turn(**kwargs):
         nonlocal begin_calls
         begin_calls += 1
+        accepted_turn_ids.append(str(kwargs["payload"].turn_id))
         await asyncio.sleep(0.05)
 
         async def done() -> None:
@@ -3879,6 +4850,13 @@ def test_dispatch_claims_pending_trigger_run_once_under_concurrency() -> None:
 
     assert results.count(True) == 1
     assert begin_calls == 1
+    db = _direct_db_session()
+    try:
+        run = db.query(TriggerRun).filter(TriggerRun.id == run_id).one()
+        task = db.query(Task).filter(Task.id == int(run.task_id)).one()
+        assert accepted_turn_ids == [str(task.agent_config[TRIGGER_TURN_ID_CONFIG_KEY])]
+    finally:
+        db.close()
 
 
 def test_scheduled_scan_disables_one_shot_trigger(mock_bg_scheduler) -> None:
@@ -4643,6 +5621,20 @@ def test_trigger_run_history_tells_an_expired_conversation_from_a_deleted_one() 
     assert detail.status_code == 200, detail.text
     assert detail.json()["status"] == "completed"
     assert detail.json()["task_expired_at"] == expired["task_expired_at"]
+
+    expired_history = client.get(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}/runs/{expired_run_id}/history",
+        headers=headers,
+    )
+    assert expired_history.status_code == 410, expired_history.text
+    assert expired_history.json()["detail"] == "Trigger run conversation has expired"
+
+    deleted_history = client.get(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}/runs/{deleted_run_id}/history",
+        headers=headers,
+    )
+    assert deleted_history.status_code == 404, deleted_history.text
+    assert deleted_history.json()["detail"] == "Trigger run conversation not found"
 
 
 # --- planned-restart hold (release_hold) -------------------------------------

@@ -838,6 +838,7 @@ async def _schedule_committed_turn(
                 lambda: settle_task_lease_isolated(
                     claimed.task_lease,
                     error_message="turn scheduling failed after claim commit",
+                    turn_id=payload.turn_id,
                 )
             )
         except Exception as terminal_error:
@@ -1529,6 +1530,29 @@ def _claim_turn_no_commit(
         payload=payload,
         kind=kind,
     )
+    if kind is TurnKind.CREATE and accepted.task_source == "trigger":
+        from .routine_history_provenance import (
+            TRIGGER_TASK_RUN_ID_CONFIG_KEY,
+            TRIGGER_TURN_ID_CONFIG_KEY,
+        )
+
+        task_config = dict(accepted.agent_config or {})
+        trigger_run_id = (context or {}).get("trigger_run_id")
+        if (
+            not isinstance(trigger_run_id, int)
+            or task_config.get("trigger_run_id") != trigger_run_id
+            or task_config.get(TRIGGER_TURN_ID_CONFIG_KEY) != payload.turn_id
+        ):
+            raise TaskTurnError("trigger_history_identity_changed")
+        recorded_run_id = task_config.get(TRIGGER_TASK_RUN_ID_CONFIG_KEY)
+        if recorded_run_id not in (None, accepted.run_id):
+            raise TaskTurnError("trigger_history_identity_changed")
+        task_config[TRIGGER_TASK_RUN_ID_CONFIG_KEY] = accepted.run_id
+        db.query(Task).filter(Task.id == task_id).update(
+            {Task.agent_config: task_config},
+            synchronize_session=False,
+        )
+        accepted = replace(accepted, agent_config=task_config)
     if enqueues_task_turns():
         from .task_runtime_secrets import bind_runtime_values_to_run
         from .task_start_protocol import TaskStartPayload, stage_task_start_command
@@ -1979,7 +2003,12 @@ async def publish_settlement_pause(task_id: int, report: SettlementReport) -> No
 
 
 def _pause_interrupted_run_no_commit(
-    db: Session, lease: TaskLease, decision: InterruptionDecision, *, error: str
+    db: Session,
+    lease: TaskLease,
+    decision: InterruptionDecision,
+    *,
+    error: str,
+    turn_id: str | None = None,
 ) -> tuple[dict[str, Any], RecordedInterruption | None] | None:
     """Pause and release an interrupted run with its projections, uncommitted.
 
@@ -1998,10 +2027,17 @@ def _pause_interrupted_run_no_commit(
         return None
     db.expire_all()
     task = db.query(Task).filter(Task.id == lease.task_id).one()
+    from .routine_history_provenance import routine_history_turn_id
+
+    turn_id = routine_history_turn_id(
+        task,
+        turn_id,
+        expected_run_id=lease.run_id,
+    )
     recorded = apply_interruption_outcome_no_commit(
         db, task=task, decision=decision, error=error
     )
-    stage_result_fact_no_commit(db, task, interruption_pause_result())
+    stage_result_fact_no_commit(db, task, interruption_pause_result(), turn_id=turn_id)
     logger.warning(
         "task_id=%s run_id=%s component=settlement paused interrupted run "
         "(reason=%s): %s",
@@ -2019,6 +2055,7 @@ def settle_task_lease_isolated(
     error_message: str | None = None,
     client_error_message: str = CLIENT_SAFE_TASK_FAILURE,
     client_message_type: str = TASK_FAILURE_MESSAGE_TYPE,
+    turn_id: str | None = None,
     classify_unknown_tool_effect: bool = False,
     interruption: InterruptionReason | None = None,
     report: SettlementReport | None = None,
@@ -2063,6 +2100,10 @@ def settle_task_lease_isolated(
     is recorded in ``task_auto_recovery``. ``report``, when supplied,
     also receives the recorded reason of a committed pause.
 
+    ``turn_id`` is the accepted current turn whose client-safe failure
+    projection is written. It is never inferred from the task's original
+    configuration because a later turn may own this settlement.
+
     On checkout or commit failure the transaction is rolled back and the lease
     is intentionally retained for TTL recovery; this function never creates an
     ownerless RUNNING task.
@@ -2083,7 +2124,11 @@ def settle_task_lease_isolated(
                 )
                 if decision is not None and decision.pause:
                     paused = _pause_interrupted_run_no_commit(
-                        settle_db, lease, decision, error=error_message
+                        settle_db,
+                        lease,
+                        decision,
+                        error=error_message,
+                        turn_id=turn_id,
                     )
                     if paused is not None:
                         paused_state, recorded = paused
@@ -2123,6 +2168,13 @@ def settle_task_lease_isolated(
                     # decision may have loaded this row before it.
                     settle_db.expire_all()
                     task = settle_db.query(Task).filter(Task.id == lease.task_id).one()
+                    from .routine_history_provenance import routine_history_turn_id
+
+                    history_turn_id = routine_history_turn_id(
+                        task,
+                        turn_id,
+                        expected_run_id=lease.run_id,
+                    )
                     unknown = (
                         unknown_tool_effect_of_run(settle_db, lease)
                         if classify_unknown_tool_effect
@@ -2156,11 +2208,15 @@ def settle_task_lease_isolated(
                             user_id=int(task.user_id),
                             content=client_error_message,
                             message_type=client_message_type,
+                            turn_id=history_turn_id,
                         )
                     from .task_execution_event_writer import stage_result_fact_no_commit
 
                     stage_result_fact_no_commit(
-                        settle_db, task, {"error": error_message}
+                        settle_db,
+                        task,
+                        {"error": error_message},
+                        turn_id=history_turn_id,
                     )
                     if get_shared_task_execution_enabled():
                         from .task_runtime_secrets import (
@@ -2576,6 +2632,7 @@ def _schedule_bg(
                         error_message=(
                             "task execution cancelled during lease acquisition"
                         ),
+                        turn_id=payload.turn_id,
                     ),
                 )
                 if lease is None:
@@ -2965,6 +3022,7 @@ def _schedule_bg(
                                     or CLIENT_SAFE_TASK_FAILURE
                                 ),
                                 client_message_type=client_history_message_type,
+                                turn_id=turn_id,
                                 classify_unknown_tool_effect=(
                                     classify_unknown_tool_effect
                                 ),

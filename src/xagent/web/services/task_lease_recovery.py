@@ -376,12 +376,39 @@ def stage_task_lease_recovery_no_commit(
         task_status=next_status,
         recovered_at=recovered_at,
     )
+    from .assistant_history_safety import TASK_FAILURE_MESSAGE_TYPE
+    from .chat_history_service import persist_assistant_message_no_commit
+    from .client_error_messages import CLIENT_SAFE_TASK_FAILURE
+    from .routine_history_provenance import routine_history_turn_id
     from .task_auto_recovery import lease_expiry_interruption_reason
     from .task_auto_resume import trigger_error_for_recorded
     from .task_execution_controller import task_control_snapshot
     from .task_execution_event_writer import stage_result_fact_no_commit
 
-    stage_result_fact_no_commit(db, task, {"error": task_error})
+    history_turn_id = routine_history_turn_id(
+        task,
+        None,
+        expected_run_id=candidate.run_id,
+    )
+    if (
+        next_status == TaskStatus.FAILED
+        and history_turn_id is not None
+        and task.user_id is not None
+    ):
+        persist_assistant_message_no_commit(
+            db,
+            task_id=candidate.task_id,
+            user_id=int(task.user_id),
+            content=CLIENT_SAFE_TASK_FAILURE,
+            message_type=TASK_FAILURE_MESSAGE_TYPE,
+            turn_id=history_turn_id,
+        )
+    stage_result_fact_no_commit(
+        db,
+        task,
+        {"error": task_error},
+        turn_id=history_turn_id,
+    )
     sync_workforce_run_status(db, task, next_status)
     # A scheduled automatic resume keeps the TriggerRun RUNNING: the resumed
     # run settles it.

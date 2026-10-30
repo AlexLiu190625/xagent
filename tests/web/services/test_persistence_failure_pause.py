@@ -759,6 +759,10 @@ async def _resume_raising(
             ".cancel_was_requested",
             return_value=explicit_cancel,
         ),
+        patch(
+            "xagent.web.services.task_execution.load_routine_history_turn_id",
+            return_value=None,
+        ),
     ]
     for item in patches:
         item.start()

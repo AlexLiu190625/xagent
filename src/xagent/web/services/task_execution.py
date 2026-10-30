@@ -96,6 +96,10 @@ from ..models.task import Task, TaskStatus, task_status_predicate
 from ..models.uploaded_file import UploadedFile
 from .llm_utils import AutoModelUnavailableError
 from .release_hold import release_hold
+from .routine_history_provenance import (
+    load_routine_history_turn_id,
+    routine_history_turn_id,
+)
 from .task_auto_recovery import (
     InterruptionDecision,
     InterruptionOutcome,
@@ -573,6 +577,7 @@ def _terminal_task_error_payload(
     event_type: str = "agent_error",
     expected_run_id: str | None = None,
     only_if_running: Literal[False] = False,
+    turn_id: str | None = None,
 ) -> dict[str, Any]: ...
 
 
@@ -584,6 +589,7 @@ def _terminal_task_error_payload(
     event_type: str = "agent_error",
     expected_run_id: str | None = None,
     only_if_running: Literal[True],
+    turn_id: str | None = None,
 ) -> dict[str, Any] | None: ...
 
 
@@ -594,6 +600,7 @@ def _terminal_task_error_payload(
     event_type: str = "agent_error",
     expected_run_id: str | None = None,
     only_if_running: bool = False,
+    turn_id: str | None = None,
 ) -> dict[str, Any] | None:
     SessionLocal = get_session_local()
     db = SessionLocal()
@@ -658,6 +665,11 @@ def _terminal_task_error_payload(
 
         task = db.query(Task).filter(Task.id == task_id).first()
         if task is not None:
+            history_turn_id = routine_history_turn_id(
+                task,
+                turn_id,
+                expected_run_id=expected_run_id or cast(str | None, task.run_id),
+            )
             sync_workforce_run_status(db, task, TaskStatus.FAILED)
             # Persist the error as an assistant message so failures that
             # happen before agent execution starts (no trace events, e.g.
@@ -676,6 +688,7 @@ def _terminal_task_error_payload(
                         user_id=int(task_user_id),
                         content=CLIENT_SAFE_TASK_FAILURE,
                         message_type=TASK_FAILURE_MESSAGE_TYPE,
+                        turn_id=history_turn_id,
                     )
                 except Exception:
                     if task.conversation_storage_version == 2:
@@ -686,7 +699,12 @@ def _terminal_task_error_payload(
                     )
             if canonical:
                 db.refresh(task)
-                stage_result_fact_no_commit(db, task, {"error": message})
+                stage_result_fact_no_commit(
+                    db,
+                    task,
+                    {"error": message},
+                    turn_id=history_turn_id,
+                )
             db.commit()
         write_settled = True
         return _task_error_payload(
@@ -807,6 +825,7 @@ def _persist_agent_outbound_event(
     task_id: int,
     event: Dict[str, Any],
     *,
+    turn_id: str | None = None,
     authoritative: bool = False,
     rerun: bool = False,
 ) -> None:
@@ -935,6 +954,7 @@ def _persist_agent_outbound_event(
                 run_id=cast(str | None, task.run_id),
                 assistant_message_id=metadata.get("assistant_message_id"),
                 tool_attempt_id=metadata.get("tool_attempt_id"),
+                turn_id=turn_id,
                 payload={"data": data, "protocol_event_id": trace_event.event_id},
                 occurred_at=event_time,
             )
@@ -993,6 +1013,7 @@ def _persist_agent_outbound_event(
                     interactions=interactions,
                     source_event_id=str(trace_event.event_id),
                     execution_event_id=execution_event_id,
+                    turn_id=turn_id,
                 )
 
         if authoritative:
@@ -1049,7 +1070,10 @@ def _reconcile_streamed_final_answer(task_id: int, content: str) -> str:
 
 
 async def _persist_authoritative_outbound_event(
-    task_id: int, event: Dict[str, Any]
+    task_id: int,
+    event: Dict[str, Any],
+    *,
+    turn_id: str | None = None,
 ) -> None:
     """Persist an authoritative outbound event, rerunning transient failures.
 
@@ -1069,7 +1093,11 @@ async def _persist_authoritative_outbound_event(
         rerun = attempts > 1
         await run_db_io_cancellation_safe(
             lambda: _persist_agent_outbound_event(
-                task_id, candidate, authoritative=True, rerun=rerun
+                task_id,
+                candidate,
+                turn_id=turn_id,
+                authoritative=True,
+                rerun=rerun,
             )
         )
         return candidate
@@ -1090,7 +1118,12 @@ async def _persist_authoritative_outbound_event(
     event.update(persisted)
 
 
-def make_agent_outbound_handler(task_id: int, *, authoritative: bool = False) -> Any:
+def make_agent_outbound_handler(
+    task_id: int,
+    *,
+    authoritative: bool = False,
+    turn_id: str | None = None,
+) -> Any:
     """Create a web bridge for agent agent-to-user messages."""
 
     async def handle_outbound_message(payload: Dict[str, Any]) -> Dict[str, Any] | None:
@@ -1114,7 +1147,9 @@ def make_agent_outbound_handler(task_id: int, *, authoritative: bool = False) ->
                 payload_type, task_id, dict(payload)
             )
             if authoritative:
-                await _persist_authoritative_outbound_event(task_id, final_answer_event)
+                await _persist_authoritative_outbound_event(
+                    task_id, final_answer_event, turn_id=turn_id
+                )
             await publish_task_event(final_answer_event, task_id)
             return None
 
@@ -1139,10 +1174,10 @@ def make_agent_outbound_handler(task_id: int, *, authoritative: bool = False) ->
             event_id=payload.get("event_id"),
         )
         if authoritative:
-            await _persist_authoritative_outbound_event(task_id, event)
+            await _persist_authoritative_outbound_event(task_id, event, turn_id=turn_id)
         else:
             await run_db_io_cancellation_safe(
-                lambda: _persist_agent_outbound_event(task_id, event)
+                lambda: _persist_agent_outbound_event(task_id, event, turn_id=turn_id)
             )
         await publish_task_event(event, task_id)
         return cast(Dict[str, Any], event["data"]) if authoritative else None
@@ -2133,6 +2168,7 @@ def _finalize_task_execution_result_isolated(
     task_lease: TaskLease | None,
     resolved_scope_segments: tuple[str, ...],
     prepared_outputs: _PreparedTaskFileOutputs | None = None,
+    turn_id: str | None = None,
 ) -> _TaskExecutionFinalization:
     """Persist one task result in a worker-owned, ownership-fenced session."""
     from .chat_history_service import persist_assistant_message_no_commit
@@ -2217,6 +2253,14 @@ def _finalize_task_execution_result_isolated(
                 broadcast_meta={},
                 late_result=True,
             )
+
+        turn_id = routine_history_turn_id(
+            task_updated,
+            turn_id,
+            expected_run_id=(
+                task_lease.run_id if task_lease is not None else expected_run_id
+            ),
+        )
 
         (
             normalized_outputs,
@@ -2458,6 +2502,7 @@ def _finalize_task_execution_result_isolated(
                         and task_updated.status != TaskStatus.FAILED
                         else None
                     ),
+                    turn_id=turn_id,
                     content_is_reconciled=True,
                 )
                 if (
@@ -2481,6 +2526,7 @@ def _finalize_task_execution_result_isolated(
                     interruption_pause_result()
                     if interruption_pause_reason is not None
                     else result,
+                    turn_id=turn_id,
                 )
                 finalize_db.flush()
                 broadcast_meta = _finalization_broadcast_meta(task_updated)
@@ -2600,6 +2646,7 @@ async def execute_task_background(
     from .task_setup_snapshot import load_task_setup_snapshot_sync
 
     terminal_state_committed = False
+    history_turn_id: str | None = None
     try:
         if resolved_execution_scope is EXECUTION_SCOPE_NOT_PROVIDED:
             execution_scope = await run_db_io_cancellation_safe(
@@ -2632,6 +2679,22 @@ async def execute_task_background(
             )
 
         context_dict = context if isinstance(context, dict) else {}
+        current_turn_id = (
+            context_dict.get("turn_id")
+            if isinstance(context_dict.get("turn_id"), str)
+            and context_dict.get("turn_id")
+            else None
+        )
+        execution_run_id = (
+            task_lease.run_id
+            if task_lease is not None
+            else expected_run_id or snapshot.task.run_id
+        )
+        history_turn_id = routine_history_turn_id(
+            snapshot.task,
+            current_turn_id,
+            expected_run_id=execution_run_id,
+        )
         mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None
         if (
             mcp_runtime_authorization_policy is not None
@@ -2696,6 +2759,7 @@ async def execute_task_background(
                             agent_service.tracer, "records_execution_events", False
                         )
                         is True,
+                        turn_id=history_turn_id,
                     )
                 )
             agent_service.set_conversation_history(
@@ -2794,6 +2858,7 @@ async def execute_task_background(
                         if execution_scope is not None
                         else ()
                     ),
+                    turn_id=history_turn_id,
                 )
             )
         )
@@ -2955,6 +3020,7 @@ async def execute_task_background(
                 event_type="task_error",
                 expected_run_id=expected_run_id,
                 only_if_running=True,
+                turn_id=history_turn_id,
             )
         )
 
@@ -3064,6 +3130,7 @@ def _acquire_resume_task_lease(
     refuse_terminal_status: bool = False,
     run_not_resumable_out: list[bool] | None = None,
     ended_status_out: list[TaskStatus] | None = None,
+    history_turn_id_out: list[str | None] | None = None,
 ) -> TaskLease | None:
     """Validate and claim a resume lease in one worker transaction.
 
@@ -3089,6 +3156,14 @@ def _acquire_resume_task_lease(
     SessionLocal = get_session_local()
     with SessionLocal() as db:
         task = db.query(Task).filter(Task.id == task_id).first()
+        if task is not None and history_turn_id_out is not None:
+            history_turn_id_out.append(
+                routine_history_turn_id(
+                    task,
+                    None,
+                    expected_run_id=expected_run_id or cast(str | None, task.run_id),
+                )
+            )
         if (
             task is not None
             and task_owner_user_id is not None
@@ -3246,6 +3321,11 @@ def _finalize_resumed_task(
         if task is None:
             finalized["late_result"] = True
             return finalized
+        result_turn_id = routine_history_turn_id(
+            task,
+            _latest_result_user_turn_id(result),
+            expected_run_id=task_lease.run_id,
+        )
         if task.status in {TaskStatus.COMPLETED, TaskStatus.FAILED}:
             # Explicit cancellation/failure already owns the terminal result,
             # whatever this run returned -- including a late interrupt, which
@@ -3339,7 +3419,7 @@ def _finalize_resumed_task(
                 user_id=task_owner_user_id,
                 content=output,
                 message_type=ASSISTANT_RESPONSE_MESSAGE_TYPE,
-                turn_id=_latest_result_user_turn_id(result),
+                turn_id=result_turn_id,
                 content_is_reconciled=True,
             )
             orm_task = cast(Any, task)
@@ -3354,7 +3434,7 @@ def _finalize_resumed_task(
                     user_id=task_owner_user_id,
                     content=CLIENT_SAFE_TASK_FAILURE,
                     message_type=TASK_FAILURE_MESSAGE_TYPE,
-                    turn_id=_latest_result_user_turn_id(result),
+                    turn_id=result_turn_id,
                     content_is_reconciled=True,
                 )
             orm_task = cast(Any, task)
@@ -3398,6 +3478,7 @@ def _finalize_resumed_task(
             db,
             task,
             interruption_pause_result() if pause_reason is not None else result,
+            turn_id=result_turn_id,
         )
         if task.channel_id is not None and final_task_status in {
             TaskStatus.COMPLETED,
@@ -3491,6 +3572,7 @@ def _settle_resumed_task_lease(
     lease: TaskLease,
     *,
     error_message: str | None,
+    turn_id: str | None = None,
     interruption: InterruptionReason | None = None,
     report: SettlementReport | None = None,
 ) -> bool:
@@ -3506,11 +3588,13 @@ def _settle_resumed_task_lease(
             error_message=error_message,
             client_error_message=error_message,
             client_message_type=CLIENT_SAFE_FAILURE_MESSAGE_TYPE,
+            turn_id=turn_id,
             report=report,
         )
     return settle_task_lease_isolated(
         lease,
         error_message=error_message,
+        turn_id=turn_id,
         interruption=interruption,
         report=report,
     )
@@ -3608,6 +3692,7 @@ async def execute_resume_background(
     lease_stop_event = preacquired_heartbeat_stop
     lease_heartbeat_task = preacquired_heartbeat_task
     lease: TaskLease | None = preacquired_lease
+    lease_was_preacquired = preacquired_lease is not None
     lease_released = False
     settlement_error: str | None = None
     settlement_interruption: InterruptionReason | None = None
@@ -3644,6 +3729,7 @@ async def execute_resume_background(
     # Set when a cancellation or lease loss lands after the deferred turn was
     # durably accepted; the handlers below record the acceptance.
     delivery_accepted_unrecorded = False
+    history_turn_id = delivery_turn_id
 
     async def notify_deferred_delivery(
         accepted: bool,
@@ -3829,6 +3915,7 @@ async def execute_resume_background(
             prior_status_box: list[TaskStatus] = []
             run_not_resumable_box: list[bool] = []
             ended_status_box: list[TaskStatus] = []
+            history_turn_id_box: list[str | None] = []
             lease = await acquire_task_lease_cancellation_safe(
                 lambda: _acquire_resume_task_lease(
                     task_id,
@@ -3838,14 +3925,18 @@ async def execute_resume_background(
                     refuse_terminal_status=refuse_terminal_status,
                     run_not_resumable_out=run_not_resumable_box,
                     ended_status_out=ended_status_box,
+                    history_turn_id_out=history_turn_id_box,
                 ),
                 lambda acquired: _settle_resumed_task_lease(
                     acquired,
                     error_message="resume cancelled during lease acquisition",
+                    turn_id=delivery_turn_id,
                 ),
             )
             if prior_status_box:
                 resume_prior_status = prior_status_box[0]
+            if history_turn_id_box:
+                history_turn_id = history_turn_id_box[0] or delivery_turn_id
             if (
                 lease is None
                 and refuse_terminal_status
@@ -4038,6 +4129,17 @@ async def execute_resume_background(
             assert lease_stop_event is not None
             assert lease_heartbeat_task is not None
 
+        if lease_was_preacquired:
+            history_turn_id = await run_db_io_cancellation_safe(
+                lambda: load_routine_history_turn_id(
+                    task_id,
+                    delivery_turn_id,
+                    expected_run_id=(
+                        lease.run_id if lease is not None else expected_run_id
+                    ),
+                )
+            )
+
         # The resumed agent may have been rebuilt from history with no
         # outbound message handler, in which case the runtime drops the
         # next question with only a warning (#1328). Install the
@@ -4052,6 +4154,7 @@ async def execute_resume_background(
                         agent_service.tracer, "records_execution_events", False
                     )
                     is True,
+                    turn_id=history_turn_id,
                 )
             )
 
@@ -4851,6 +4954,7 @@ async def execute_resume_background(
                                 lambda: _settle_resumed_task_lease(
                                     lease,
                                     error_message=settlement_error,
+                                    turn_id=history_turn_id,
                                     # An explicit cancel is not an
                                     # interruption to resume from.
                                     interruption=(

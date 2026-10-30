@@ -17,6 +17,7 @@ import pytest
 
 from xagent.web.api import triggers as trigger_api
 from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
+from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.trigger import AgentTrigger, TriggerRun, TriggerRunStatus
 from xagent.web.models.user import User
@@ -48,6 +49,9 @@ def test_workforce_trigger_run_read_routes_are_sync() -> None:
         trigger_api.list_workforce_trigger_runs_route
     )
     assert not asyncio.iscoroutinefunction(trigger_api.get_workforce_trigger_run_route)
+    assert not asyncio.iscoroutinefunction(
+        trigger_api.get_workforce_trigger_run_history_route
+    )
 
 
 def test_missing_workforce_raises_trigger_service_error() -> None:
@@ -363,6 +367,15 @@ def test_workforce_trigger_test_fire_creates_workforce_run(
     headers = _admin_headers()
     workforce_id = _create_workforce(headers, publish=True)
     trigger = _create_workforce_webhook_trigger(headers, workforce_id)
+    other_trigger = _create_workforce_webhook_trigger(
+        headers, workforce_id, name="Other workforce webhook"
+    )
+    other_workforce_id = _create_workforce(
+        headers, name="Other trigger workforce", publish=True
+    )
+    other_workforce_trigger = _create_workforce_webhook_trigger(
+        headers, other_workforce_id, name="Cross-workforce webhook"
+    )
 
     fired = client.post(
         f"/api/workforces/{workforce_id}/triggers/{trigger['id']}/test",
@@ -395,8 +408,68 @@ def test_workforce_trigger_test_fire_creates_workforce_run(
         assert config.get("trigger_id") == trigger["id"]
         assert config.get("trigger_run_id") == int(run.id)
         assert config.get("trigger_test") is True
+        turn_id = str(config[trigger_service.TRIGGER_TURN_ID_CONFIG_KEY])
+        db.add(
+            TaskChatMessage(
+                task_id=int(task.id),
+                user_id=int(task.user_id),
+                role="assistant",
+                content="Workforce routine finished",
+                message_type="assistant_response",
+                turn_id=turn_id,
+            )
+        )
+        db.commit()
+        run_id = int(run.id)
+        task_id = int(task.id)
+        task_input = str(task.input)
     finally:
         db.close()
+
+    history = client.get(
+        f"/api/workforces/{workforce_id}/triggers/{trigger['id']}"
+        f"/runs/{run_id}/history",
+        headers=headers,
+    )
+    assert history.status_code == 200, history.text
+    assert history.json()["task_id"] == task_id
+    assert history.json()["messages"] == [
+        {"role": "user", "content": task_input},
+        {"role": "assistant", "content": "Workforce routine finished"},
+    ]
+
+    outsider_headers = _register_second_user("workforce-history-outsider")
+    outsider_history = client.get(
+        f"/api/workforces/{workforce_id}/triggers/{trigger['id']}"
+        f"/runs/{run_id}/history",
+        headers=outsider_headers,
+    )
+    assert outsider_history.status_code == 403, outsider_history.text
+
+    cross_trigger_history = client.get(
+        f"/api/workforces/{workforce_id}/triggers/{other_trigger['id']}"
+        f"/runs/{run_id}/history",
+        headers=headers,
+    )
+    assert cross_trigger_history.status_code == 404, cross_trigger_history.text
+
+    cross_workforce_run_history = client.get(
+        f"/api/workforces/{other_workforce_id}/triggers/{other_workforce_trigger['id']}"
+        f"/runs/{run_id}/history",
+        headers=headers,
+    )
+    assert cross_workforce_run_history.status_code == 404, (
+        cross_workforce_run_history.text
+    )
+
+    mismatched_workforce_history = client.get(
+        f"/api/workforces/{other_workforce_id}/triggers/{trigger['id']}"
+        f"/runs/{run_id}/history",
+        headers=headers,
+    )
+    assert mismatched_workforce_history.status_code == 404, (
+        mismatched_workforce_history.text
+    )
 
 
 def test_workforce_webhook_callback_fires_and_deduplicates(

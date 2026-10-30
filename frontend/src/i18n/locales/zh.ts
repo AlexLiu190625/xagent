@@ -4572,7 +4572,18 @@ const zh = {
       task: "任务",
       created: "创建时间",
       empty: "还没有运行记录",
-      taskExpired: "会话已于 {date} 过期"
+      taskExpired: "会话已于 {date} 过期",
+      viewResult: "查看运行结果",
+      hideResult: "收起运行结果",
+      historyTitle: "运行会话",
+      historyEmpty: "此次运行没有可显示的会话记录",
+      historyLoadFailed: "加载运行会话失败",
+      historyExpired: "此次运行会话已过期",
+      historyUnavailable: "此次运行会话已不可用",
+      historyForbidden: "你没有权限查看此次运行会话",
+      openTask: "打开任务",
+      input: "Routine 输入",
+      result: "Agent 回复"
     },
     validation: {
       name: "Trigger 名称不能为空",
