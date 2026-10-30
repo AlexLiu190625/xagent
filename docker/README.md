@@ -206,15 +206,16 @@ set of paths, add this route before upgrading.
 
 ### Verification and monitoring
 
-Request
-`GET https://region-origin.example.com/api/files/external-media/<file-id>?ticket=invalid`
-using the configured base. A response of `401` from the backend means the route is reachable; a `404` or
-`409` from the ingress means it is not yet allowed.
+Request the route through the configured base with any UUID as the file ID,
+for example
+`GET https://region-origin.example.com/api/files/external-media/00000000-0000-0000-0000-000000000000?ticket=invalid`.
+A `401` from the backend means the route is reachable. Any other status from
+the ingress, such as `404`, means it is not yet allowed.
 
 ### Rollback
 
-No persistent state is changed. Restore the previous `XAGENT_S2S_API_BASE_URL`
-value, or unset it to use `XAGENT_PUBLIC_API_BASE_URL`, and redeploy the backend.
+No persistent state is changed. Redeploy the previous backend release; no
+environment variable needs to change.
 
 ### 2. Start Services
 
