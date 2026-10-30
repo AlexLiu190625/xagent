@@ -2660,8 +2660,6 @@ def _schedule_bg(
                     scope = await run_db_io_cancellation_safe(
                         lambda: resolve_execution_scope(task_id)
                     )
-                    nonlocal execution_started
-                    execution_started = True
                     execution_context = _execution_context_with_turn_id(
                         context, payload.turn_id, files=payload.attachments
                     )
@@ -2704,6 +2702,10 @@ def _schedule_bg(
                                 "files": normalize_attachments_for_persistence(infos),
                             }
                         )
+                    # Set only after file resolution: a file that no longer
+                    # binds fails the turn before the run is invoked.
+                    nonlocal execution_started
+                    execution_started = True
                     if channel_command is not None:
                         from .shared_channel_execution import execute_channel_background
 

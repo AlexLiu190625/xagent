@@ -4341,6 +4341,52 @@ async def test_runner_finalize_marks_failed_when_setup_fails_before_execute(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize(
+    ("initial_delivery", "expected_delivery"),
+    [
+        (DELIVERY_PENDING, DELIVERY_FAILED),
+        (DELIVERY_DISPATCHED, DELIVERY_DISPATCHED),
+    ],
+)
+async def test_runner_finalize_marks_failed_when_turn_files_no_longer_bind(
+    db_session, monkeypatch, shared, initial_delivery, expected_delivery
+) -> None:
+    """A turn whose files no longer resolve when the run starts fails before
+    ``execute_task_background`` is invoked, so an orphaned ``pending`` row
+    closes as ``failed``. A row the post-schedule projection already marked
+    ``dispatched`` stays ``dispatched``: delivery never regresses."""
+    user, task, _, lease = _finalize_turn_fixture(
+        db_session, turn_id="turn-e2e-unbindable"
+    )
+    payload = TaskTurnPayload(
+        "hello there", file_ids=("fid-gone",), turn_id="turn-e2e-unbindable"
+    )
+    if initial_delivery == DELIVERY_DISPATCHED:
+        mark_user_message_delivery(
+            db_session,
+            task_id=int(task.id),
+            turn_id="turn-e2e-unbindable",
+            status=DELIVERY_DISPATCHED,
+        )
+        db_session.commit()
+    monkeypatch.setattr(
+        task_orchestrator_module, "get_shared_task_execution_enabled", lambda: shared
+    )
+    execute = AsyncMock()
+
+    with _finalize_runner_patches(lease, execute=execute):
+        await _spawn_finalize_runner(task, user, payload)
+
+    execute.assert_not_called()
+    assert _delivery_status(db_session, "turn-e2e-unbindable") == expected_delivery
+    db_session.expire_all()
+    stored = db_session.query(Task).filter(Task.id == task.id).one()
+    assert stored.status == TaskStatus.FAILED
+    assert "Files are no longer bindable: fid-gone" in str(stored.error_message)
+
+
+@pytest.mark.asyncio
 async def test_runner_finalize_preserves_cancellation_from_reconcile(
     db_session,
 ) -> None:
