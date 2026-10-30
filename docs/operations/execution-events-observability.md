@@ -137,6 +137,24 @@ literal format strings.
 
 ### (4) Recovery refusals
 
+- `xagent.execution_event.recovery.refusals`, attributes `operation` (the
+  reader: `owner_check`, `checkpoint`, `tool_outcome`), `outcome` and
+  `storage="v2"`, with one line `execution_event_recovery_refused task_id=...
+  run_id=... storage=v2 component=execution-events reader=... outcome=...`
+  (plus `tool_attempt_id=...` for tool outcomes). Levels by outcome:
+  - INFO: `lease_mismatch`, `task_ended`, `task_missing`. Normal fencing:
+    another owner took over or the task already finished.
+  - WARNING: `unknown_tool_effect`, `unavailable`, `page_limit`.
+  - ERROR: `corrupt`.
+- It counts refused reads, including the classification probes made by the
+  lease-recovery sweep, settlement and auto-recovery decisions. A stuck task
+  can count once per sweep; it is neither a per-task nor a per-resume count.
+- Not reported yet: refusals raised while choosing the checkpoint partition on
+  the root read path (lease or run mismatch, `active_run`,
+  `superseded_legacy`, a missing task without a lease, stale widening, a
+  failed run-tagged probe, session checkout), and a corrupt checkpoint found
+  by the setup-time history read. The degradations and resume logs below
+  still cover most of them.
 - Degradations (names on `/health`, details in the admin endpoint on the
   process that set them): `checkpoint_load_unavailable` (an execution-event
   checkpoint read failed; cleared by the next successful read),
