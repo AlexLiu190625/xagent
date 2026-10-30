@@ -4439,13 +4439,14 @@ def task_cache():
 
 
 def _append_after_previous_turn(previous):
-    """Create a task, rest it as a finished turn, read it once, then append."""
+    """Create a task, rest it as a finished turn, check it reads as that turn,
+    then append."""
     agent_id, full_key = _create_agent_with_key()
     created = _create_with_dispatch_class(agent_id, full_key).json()
     task_id = created["task_id"]
     _settle_previous_turn(task_id, created["run_id"], **previous)
-    # Read once so the previous turn's body is cached; the append does not
-    # move ``tasks.updated_at``, the cache's freshness token.
+    # Confirm the previous turn's state before appending. The append itself
+    # clears the task's cached body.
     before = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
     assert before.json()["status"] == previous["status"].value
     appended = client.post(
@@ -4472,7 +4473,7 @@ def test_a_queued_append_reports_when_its_start_was_accepted(
 
 @pytest.mark.parametrize("previous", _PREVIOUS_TURNS, ids=["completed", "failed"])
 def test_a_queued_append_is_read_as_pending_until_its_start_is_handed_off(
-    shared_mode, task_cache, previous
+    shared_mode, task_cache, previous, monkeypatch
 ):
     from fastapi.security import HTTPAuthorizationCredentials
 
@@ -4482,6 +4483,15 @@ def test_a_queued_append_is_read_as_pending_until_its_start_is_handed_off(
 
     task_id, full_key, _ = _append_after_previous_turn(previous)
 
+    cache_writes: list[str] = []
+    original_cache_set = v1_tasks.cache_set
+
+    def recording_cache_set(key, value, *, ttl_seconds=None):
+        cache_writes.append(key)
+        original_cache_set(key, value, ttl_seconds=ttl_seconds)
+
+    monkeypatch.setattr(v1_tasks, "cache_set", recording_cache_set)
+
     during = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
     assert during.status_code == 200, during.text
     during_body = during.json()
@@ -4489,6 +4499,18 @@ def test_a_queued_append_is_read_as_pending_until_its_start_is_handed_off(
     assert during_body["output"] is None
     assert during_body["error"] is None
     assert during_body["completed_at"] is None
+    assert len(cache_writes) == 1
+    # The append clears the task cache, so the first queued read misses and
+    # stores the row's previous-turn body; the second is served from that
+    # cached body and must still read as pending.
+    cached = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert cached.status_code == 200, cached.text
+    cached_body = cached.json()
+    assert cached_body["status"] == "pending"
+    assert cached_body["output"] is None
+    assert cached_body["error"] is None
+    assert cached_body["completed_at"] is None
+    assert len(cache_writes) == 1
     # The events stream reads the task through the same snapshot, so an
     # attach now keeps streaming instead of closing on the previous turn.
     principal = _resolve_principal_from_credentials(
