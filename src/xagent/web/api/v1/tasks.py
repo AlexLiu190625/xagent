@@ -88,6 +88,7 @@ from ...services.task_orchestrator import (
     TaskTurnFileBindingError,
     TaskTurnNotFoundError,
 )
+from ...services.task_start_protocol import has_queued_start
 from ...services.uploaded_file_store import (
     UploadedFileVersionSnapshot,
     snapshot_uploaded_file_version,
@@ -447,16 +448,38 @@ class _TaskInfoSnapshot:
     # stopped for good. Every other field keeps the stored value;
     # :func:`effective_task_snapshot` and the GET response apply the view.
     view: TerminalView | None = None
+    # Set when an appended turn's START is queued and the row still holds the
+    # previous turn (see ``_QUEUED_START_STATUSES``). Applied like ``view``.
+    start_queued: bool = False
+
+
+# Terminal statuses an append is accepted from. With shared execution the row
+# keeps one of them, and the previous turn's output and error, until the
+# queued START is handed off, so a caller waiting for a terminal status would
+# take the previous turn as the new one. A PAUSED row keeps reading as paused,
+# which callers already wait on. A RUNNING or WAITING_FOR_USER row has moved
+# since the START was queued, and a PENDING row already reads as pending.
+_QUEUED_START_STATUSES = (TaskStatus.COMPLETED, TaskStatus.FAILED)
 
 
 def effective_task_snapshot(snapshot: _TaskInfoSnapshot) -> _TaskInfoSnapshot:
-    """``snapshot`` as the caller must read it: ``failed`` when it carries a
-    terminal view, the stored values otherwise.
+    """``snapshot`` as the caller must read it: ``pending`` with no output or
+    error while an appended turn's START is queued, ``failed`` when it carries
+    a terminal view, the stored values otherwise.
 
     ``run_id``, ``state_version`` and ``updated_at`` stay the stored ones, so
-    the stream's change detection compares what the task row says.
+    the stream's change detection compares what the task row says. A queued
+    START also keeps the stored ``control_state``, which is what the append
+    response reported.
     """
 
+    if snapshot.start_queued:
+        return replace(
+            snapshot,
+            status=TaskStatus.PENDING,
+            output=None,
+            error=None,
+        )
     view = snapshot.view
     if view is None:
         return snapshot
@@ -658,6 +681,12 @@ def _load_task_info_snapshot(
 
     SessionLocal = get_session_local()
     with SessionLocal() as db:
+        # Read before the row. The handoff ends the START and moves the row in
+        # one commit, so a START no longer queued here means the row read next
+        # is already the handed-off one; read in the other order, a handoff
+        # committing in between would leave the previous turn's row with no
+        # queued START. A RUNNING row read next is excluded by its status.
+        queued_before_row = has_queued_start(db, task_id)
         task = _resolve_task_or_404(task_id, principal, db)
         pending_question: str | None = None
         pending_interactions: list[dict[str, Any]] | None = None
@@ -666,6 +695,7 @@ def _load_task_info_snapshot(
                 db, task
             )
         view: TerminalView | None = None
+        start_queued = queued_before_row and task.status in _QUEUED_START_STATUSES
         # The view re-checks both inside its own statement; this only skips
         # the query for reads that cannot be terminal.
         if (
@@ -692,6 +722,7 @@ def _load_task_info_snapshot(
             pending_question=pending_question,
             pending_interactions=pending_interactions,
             view=view,
+            start_queued=start_queued,
         )
 
 
@@ -836,7 +867,8 @@ def _get_chat_task_sync(
     recovery row, and an append queues a START without touching the task
     row's ``updated_at``, so a cached body cannot prove the view is still
     current. The cached body holds the stored values; the view is applied
-    to the response after every cache read or write.
+    to the response after every cache read or write. A queued START is
+    applied the same way, for the same reason.
     """
 
     task = _load_task_info_snapshot(task_id, principal)
@@ -850,6 +882,14 @@ def _get_chat_task_sync(
         else None
     )
     overlay: dict[str, Any] = {"pending_interaction": pending_interaction}
+    if task.start_queued:
+        effective = effective_task_snapshot(task)
+        overlay.update(
+            status=effective.status.value,
+            output=effective.output,
+            error=effective.error,
+            completed_at=None,
+        )
     if task.view is not None:
         effective = effective_task_snapshot(task)
         overlay.update(

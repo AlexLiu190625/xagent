@@ -4381,6 +4381,175 @@ def test_an_append_ignores_the_field_and_follows_the_tasks_declaration(
     assert _stored_declaration(task_id) == "interactive"
 
 
+# ===== Queued append: reads before the START is handed off =====
+
+_PREVIOUS_TURN_END = datetime(2026, 1, 1, tzinfo=UTC)
+_SECOND_TURN_END = datetime(2027, 1, 1, tzinfo=UTC)
+
+
+def _settle_previous_turn(task_id, run_id, **row):
+    """Rest the created task as a finished turn that ended at a fixed time."""
+    db = _direct_db_session()
+    try:
+        db.query(TaskExecutionCommand).filter(
+            TaskExecutionCommand.task_id == task_id
+        ).update({"status": "completed"})
+        db.query(Task).filter(Task.id == task_id).update(
+            {"run_id": run_id, "updated_at": _PREVIOUS_TURN_END, **row}
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def _queued_start(task_id):
+    db = _direct_db_session()
+    try:
+        return (
+            db.query(TaskExecutionCommand.id, TaskExecutionCommand.created_at)
+            .filter(
+                TaskExecutionCommand.task_id == task_id,
+                TaskExecutionCommand.kind == "start",
+                TaskExecutionCommand.status == "pending",
+            )
+            .one()
+        )
+    finally:
+        db.close()
+
+
+def _naive(value):
+    return value.replace(tzinfo=None) if value.tzinfo is not None else value
+
+
+_PREVIOUS_TURNS = [
+    {"status": TaskStatus.COMPLETED, "control_state": "completed", "output": "first"},
+    {"status": TaskStatus.FAILED, "control_state": "failed", "error_message": "boom"},
+]
+
+
+@pytest.fixture
+def task_cache():
+    """A working cache backend: the default one stores nothing."""
+    set_cache_backend_for_testing(InMemoryTTLCache())
+    try:
+        yield
+    finally:
+        set_cache_backend_for_testing(None)
+
+
+def _append_after_previous_turn(previous):
+    """Create a task, rest it as a finished turn, check it reads as that turn,
+    then append."""
+    agent_id, full_key = _create_agent_with_key()
+    created = _create_with_dispatch_class(agent_id, full_key).json()
+    task_id = created["task_id"]
+    _settle_previous_turn(task_id, created["run_id"], **previous)
+    # Confirm the previous turn's state before appending. The append itself
+    # clears the task's cached body.
+    before = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert before.json()["status"] == previous["status"].value
+    appended = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={"agent_id": agent_id, "message": {"role": "user", "content": "second"}},
+    )
+    assert appended.status_code == 202, appended.text
+    assert appended.json()["status"] == "pending"
+    return task_id, full_key, appended.json()
+
+
+@pytest.mark.parametrize("previous", _PREVIOUS_TURNS, ids=["completed", "failed"])
+def test_a_queued_append_reports_when_its_start_was_accepted(
+    shared_mode, task_cache, previous
+):
+    task_id, _, body = _append_after_previous_turn(previous)
+
+    _, command_created_at = _queued_start(task_id)
+    accepted_at = datetime.fromisoformat(body["accepted_at"])
+    assert _naive(accepted_at) == _naive(command_created_at)
+    assert _naive(accepted_at) != _naive(_PREVIOUS_TURN_END)
+
+
+@pytest.mark.parametrize("previous", _PREVIOUS_TURNS, ids=["completed", "failed"])
+def test_a_queued_append_is_read_as_pending_until_its_start_is_handed_off(
+    shared_mode, task_cache, previous, monkeypatch
+):
+    from fastapi.security import HTTPAuthorizationCredentials
+
+    from tests.web.services.test_status_only_append_supersede import _hand_off_start
+    from xagent.web.api.v1 import _events_stream
+    from xagent.web.api.v1.deps import _resolve_principal_from_credentials
+
+    task_id, full_key, _ = _append_after_previous_turn(previous)
+
+    cache_writes: list[str] = []
+    original_cache_set = v1_tasks.cache_set
+
+    def recording_cache_set(key, value, *, ttl_seconds=None):
+        cache_writes.append(key)
+        original_cache_set(key, value, ttl_seconds=ttl_seconds)
+
+    monkeypatch.setattr(v1_tasks, "cache_set", recording_cache_set)
+
+    during = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert during.status_code == 200, during.text
+    during_body = during.json()
+    assert during_body["status"] == "pending"
+    assert during_body["output"] is None
+    assert during_body["error"] is None
+    assert during_body["completed_at"] is None
+    assert len(cache_writes) == 1
+    # The append clears the task cache, so the first queued read misses and
+    # stores the row's previous-turn body; the second is served from that
+    # cached body and must still read as pending.
+    cached = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert cached.status_code == 200, cached.text
+    cached_body = cached.json()
+    assert cached_body["status"] == "pending"
+    assert cached_body["output"] is None
+    assert cached_body["error"] is None
+    assert cached_body["completed_at"] is None
+    assert len(cache_writes) == 1
+    # The events stream reads the task through the same snapshot, so an
+    # attach now keeps streaming instead of closing on the previous turn.
+    principal = _resolve_principal_from_credentials(
+        HTTPAuthorizationCredentials(scheme="Bearer", credentials=full_key)
+    )
+    snapshot = v1_tasks.effective_task_snapshot(
+        v1_tasks._load_task_info_snapshot(task_id, principal)
+    )
+    assert snapshot.status is TaskStatus.PENDING
+    assert (
+        _events_stream._stream_close_reason(snapshot.status, snapshot.control_state)
+        is None
+    )
+
+    command_id, _ = _queued_start(task_id)
+    _hand_off_start(_direct_db_session, task_id, command_id)
+    running = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert running.json()["status"] == "running"
+
+    db = _direct_db_session()
+    try:
+        db.query(Task).filter(Task.id == task_id).update(
+            {
+                "status": TaskStatus.COMPLETED,
+                "control_state": "completed",
+                "output": "second",
+                # SQLite stamps whole seconds; the handoff may share this
+                # second, and ``updated_at`` is the cache's freshness token.
+                "updated_at": _SECOND_TURN_END,
+            }
+        )
+        db.commit()
+    finally:
+        db.close()
+    after = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert after.json()["status"] == "completed"
+    assert after.json()["output"] == "second"
+
+
 # ===== POST /v1/chat/tasks: priority =====
 
 

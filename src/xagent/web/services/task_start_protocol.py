@@ -13,7 +13,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..models.task import Task, TaskStatus
+from ..models.task_command import TaskExecutionCommand
 from .task_command_transport import (
+    COMMAND_PENDING,
+    COMMAND_PROCESSING,
     ClaimedTaskCommand,
     StagedTaskCommand,
     TaskCommandKind,
@@ -166,6 +169,28 @@ def stage_task_start_command(
         target_run_id=start.run_id,
         reply_host_id=reply_host_id,
         reply_origin=reply_origin,
+    )
+
+
+def has_queued_start(db: Session, task_id: int) -> bool:
+    """Whether an accepted START of ``task_id`` has not been handed off yet.
+
+    Until the handoff, which moves the task row to the START's run and ends
+    the command in one transaction, the row keeps what it held before the
+    turn was accepted: for an append, the previous turn's status, output and
+    error.
+    """
+    return (
+        db.execute(
+            select(TaskExecutionCommand.id)
+            .where(
+                TaskExecutionCommand.task_id == task_id,
+                TaskExecutionCommand.kind == TaskCommandKind.START.value,
+                TaskExecutionCommand.status.in_((COMMAND_PENDING, COMMAND_PROCESSING)),
+            )
+            .limit(1)
+        ).first()
+        is not None
     )
 
 

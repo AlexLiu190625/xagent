@@ -116,8 +116,9 @@ class SdkTaskScope:
 class TaskStartResult:
     """Public start state without the orchestration task handle.
 
-    accepted_at is the creation timestamp for CREATE, and the committed turn
-    update timestamp for APPEND, matching the existing protocol responses.
+    accepted_at is the creation timestamp for CREATE. For APPEND it is the
+    committed turn update timestamp, or the START command's creation timestamp
+    when the turn is queued and the task row is left unchanged.
     """
 
     task_id: int
@@ -762,7 +763,7 @@ async def append_sdk_turn(
         task_id=prepared.task_id,
         agent_id=prepared.agent_id,
         status=started.status,
-        accepted_at=started.updated_at,
+        accepted_at=started.accepted_at,
         run_id=started.run_id,
         state_version=started.state_version,
         control_state=started.control_state,

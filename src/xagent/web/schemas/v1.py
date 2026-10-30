@@ -449,9 +449,10 @@ class AppendMessageResponse(BaseModel):
     status: str = Field(
         ...,
         description=(
-            "Initial status of the new turn, 'running' in the 202 "
-            "response (the atomic claim inside POST commits the status "
-            "flip before the response is sent)."
+            "Initial status of the new turn: 'running' when the turn starts "
+            "in this process (the atomic claim inside POST commits the "
+            "status flip before the response is sent), 'pending' when it is "
+            "queued for shared task execution."
         ),
     )
     accepted_at: datetime = Field(
@@ -753,7 +754,11 @@ class TaskInfoResponse(BaseModel):
             "completed / failed. A task whose automatic resume gave up is "
             "reported as failed even though it is stored as paused; that "
             "failed can change later if the task is resumed by hand or a "
-            "message is appended."
+            "message is appended. A completed or failed task whose appended "
+            "message is queued to start is reported as pending, with output, "
+            "error and completed_at null, until the new run starts; input, "
+            "run_id, state_version and control_state stay those of the "
+            "previous run until then."
         ),
     )
     run_id: Optional[str] = Field(None, description="Current execution run identity.")
