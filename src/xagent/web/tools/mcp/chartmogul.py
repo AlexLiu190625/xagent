@@ -2,8 +2,9 @@ import json
 import logging
 import os
 from collections.abc import Callable
+from datetime import date
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal, get_args
 
 from mcp.server.fastmcp import FastMCP
 
@@ -36,6 +37,59 @@ DEFAULT_TIMEOUT_SECONDS = 30
 MAX_PER_PAGE = 200
 DEFAULT_PER_PAGE = 20
 
+MetricName = Literal[
+    "all",
+    "mrr",
+    "arr",
+    "arpa",
+    "asp",
+    "customer-count",
+    "customer-churn-rate",
+    "mrr-churn-rate",
+    "ltv",
+]
+MetricInterval = Literal["day", "week", "month", "quarter", "year"]
+
+_METRIC_NAMES = get_args(MetricName)
+_METRIC_INTERVALS = get_args(MetricInterval)
+_METRIC_INTERVALS_BY_NAME = {
+    metric: frozenset(_METRIC_INTERVALS) for metric in _METRIC_NAMES
+}
+_METRIC_INTERVALS_BY_NAME["asp"] = frozenset({"month", "quarter", "year"})
+_METRIC_INTERVALS_BY_NAME["ltv"] = frozenset({"month"})
+_METRIC_MONEY_FIELDS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "all": (
+        ("mrr", "arr", "ltv", "asp", "arpa"),
+        (
+            "current-mrr",
+            "previous-mrr",
+            "current-arr",
+            "previous-arr",
+            "current-ltv",
+            "previous-ltv",
+            "current-asp",
+            "previous-asp",
+            "current-arpa",
+            "previous-arpa",
+        ),
+    ),
+    "mrr": (
+        (
+            "mrr",
+            "mrr-new-business",
+            "mrr-expansion",
+            "mrr-contraction",
+            "mrr-churn",
+            "mrr-reactivation",
+        ),
+        ("current", "previous"),
+    ),
+    "arr": (("arr",), ("current", "previous")),
+    "arpa": (("arpa",), ("current", "previous")),
+    "asp": (("asp",), ("current", "previous")),
+    "ltv": (("ltv",), ("current", "previous")),
+}
+
 
 def _success(**payload: Any) -> str:
     return json.dumps({"status": "success", **payload}, ensure_ascii=False)
@@ -55,16 +109,39 @@ def _major_units(cents: Any, field: str) -> str:
     return f"{Decimal(cents) / Decimal(100):.2f}"
 
 
+def _with_major_units(
+    record: dict[str, Any],
+    money_fields: tuple[str, ...],
+    *,
+    allow_fractional: bool = False,
+) -> dict[str, Any]:
+    """Normalize known money fields while retaining their source cents."""
+    normalized = dict(record)
+    for field in money_fields:
+        if field not in record or record[field] is None:
+            continue
+        cents = record[field]
+        normalized[f"{field.replace('-', '_')}_cents"] = cents
+        if not allow_fractional:
+            normalized[field] = _major_units(cents, field)
+            continue
+        if isinstance(cents, bool) or not isinstance(cents, (int, float)):
+            raise TypeError(
+                f"ChartMogul returned a non-numeric value for {field}: "
+                f"{type(cents).__name__}"
+            )
+        decimal_cents = Decimal(str(cents))
+        if not decimal_cents.is_finite():
+            raise TypeError(
+                f"ChartMogul returned a non-finite value for {field}: {cents}"
+            )
+        normalized[field] = f"{decimal_cents / Decimal(100):.2f}"
+    return normalized
+
+
 def _customer_with_major_units(customer: dict[str, Any]) -> dict[str, Any]:
     """Make ChartMogul customer MRR/ARR safe for user-facing consumption."""
-    normalized = dict(customer)
-    for field in ("mrr", "arr"):
-        if field not in customer or customer[field] is None:
-            continue
-        cents = customer[field]
-        normalized[f"{field}_cents"] = cents
-        normalized[field] = _major_units(cents, field)
-    return normalized
+    return _with_major_units(customer, ("mrr", "arr"))
 
 
 def _opportunity_with_major_units(opportunity: dict[str, Any]) -> dict[str, Any]:
@@ -90,6 +167,47 @@ def _entries_with_major_units(
             )
         entries.append(normalizer(entry))
     return {**result, "entries": entries}
+
+
+def _metrics_with_major_units(
+    result: Any, metric: str, endpoint: str
+) -> dict[str, Any]:
+    """Validate a metrics response and normalize only its monetary values."""
+    if not isinstance(result, dict):
+        raise TypeError(f"ChartMogul returned an unexpected response for {endpoint}")
+    entries = result.get("entries")
+    summary = result.get("summary")
+    if not isinstance(entries, list) or not isinstance(summary, dict):
+        raise TypeError(f"ChartMogul returned an unexpected response for {endpoint}")
+    if any(not isinstance(entry, dict) for entry in entries):
+        raise TypeError(f"ChartMogul returned an unexpected response for {endpoint}")
+
+    entry_money_fields, summary_money_fields = _METRIC_MONEY_FIELDS.get(
+        metric, ((), ())
+    )
+
+    return {
+        **result,
+        "entries": [
+            _with_major_units(entry, entry_money_fields, allow_fractional=True)
+            for entry in entries
+        ],
+        "summary": _with_major_units(
+            summary, summary_money_fields, allow_fractional=True
+        ),
+    }
+
+
+def _iso_date(value: str, field: str) -> str:
+    """Require a canonical YYYY-MM-DD calendar date."""
+    normalized = value.strip()
+    try:
+        parsed = date.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ValueError(f"{field} must be a valid date in YYYY-MM-DD format") from exc
+    if parsed.isoformat() != normalized:
+        raise ValueError(f"{field} must be a valid date in YYYY-MM-DD format")
+    return normalized
 
 
 def _success_with_capped_list(list_field: str, payload: dict[str, Any]) -> str:
@@ -681,6 +799,86 @@ def chartmogul_delete_opportunity(uuid: str) -> str:
         logger.error(
             f"Error deleting ChartMogul opportunity {uuid}: {e}", exc_info=True
         )
+        return _error(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def chartmogul_get_metrics(
+    metric: MetricName,
+    start_date: str,
+    end_date: str,
+    interval: MetricInterval = "month",
+    geo: str | None = None,
+    plans: str | None = None,
+) -> str:
+    """
+    Retrieve an official ChartMogul metric time series (GET /metrics/*).
+    Use this tool for every MRR, ARR, ARPA, ASP, customer-count, churn-rate,
+    or LTV question. Never derive account MRR by summing customer records:
+    ChartMogul's metrics API applies the product's own subscription,
+    expansion, contraction, reactivation, and churn calculations.
+
+    Monetary values are two-decimal strings in the ChartMogul account's
+    selected currency. Fractional metric cents are rounded to the nearest
+    cent; exact source values are retained under explicit ``*_cents`` fields.
+    Counts, rates, and percentage-change fields remain unchanged.
+
+    metric: one of "all", "mrr", "arr", "arpa", "asp", "customer-count",
+      "customer-churn-rate", "mrr-churn-rate", or "ltv". Use "all" to
+      retrieve every key metric in one request.
+    start_date: inclusive start date in YYYY-MM-DD format.
+    end_date: inclusive end date in YYYY-MM-DD format; must be on or after
+      start_date.
+    interval: one of "day", "week", "month", "quarter", or "year" for most
+      metrics. ASP supports only "month", "quarter", and "year". Standalone
+      LTV is monthly-only, so it accepts only "month" and does not send an
+      interval parameter to ChartMogul. For long ranges, prefer a coarser
+      interval over "day" to avoid output truncation.
+    geo: optional comma-separated ISO 3166-1 alpha-2 country codes.
+    plans: optional comma-separated plan UUIDs, external IDs, or names.
+    """
+    try:
+        if metric not in _METRIC_NAMES:
+            raise ValueError(
+                "metric must be one of: " + ", ".join(sorted(_METRIC_NAMES))
+            )
+        allowed_intervals = _METRIC_INTERVALS_BY_NAME[metric]
+        if interval not in allowed_intervals:
+            raise ValueError(
+                f"interval for {metric} must be one of: "
+                + ", ".join(sorted(allowed_intervals))
+            )
+        endpoint = f"/metrics/{metric}"
+        normalized_start = _iso_date(start_date, "start_date")
+        normalized_end = _iso_date(end_date, "end_date")
+        if date.fromisoformat(normalized_start) > date.fromisoformat(normalized_end):
+            raise ValueError("end_date must be on or after start_date")
+
+        result = _request(
+            "GET",
+            endpoint,
+            params={
+                "start-date": normalized_start,
+                "end-date": normalized_end,
+                "interval": None if metric == "ltv" else interval,
+                "geo": geo,
+                "plans": plans,
+            },
+        )
+        result = _metrics_with_major_units(result, metric, endpoint)
+        return success_with_capped_dict(
+            "metrics",
+            result,
+            extra_fields={"metric": metric},
+            keep_list_tail=True,
+        )
+    except Exception as e:
+        logger.exception(f"Error fetching ChartMogul {metric} metrics")
         return _error(str(e))
 
 

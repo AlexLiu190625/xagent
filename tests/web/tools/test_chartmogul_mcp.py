@@ -4,6 +4,7 @@ from unittest.mock import Mock
 import pytest
 
 from xagent.web.tools.mcp import chartmogul
+from xagent.web.tools.mcp import utils as mcp_utils
 
 
 class MockResponse:
@@ -622,6 +623,327 @@ def test_list_contacts_passes_data_source_uuid_filter(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+
+
+def test_get_metrics_mrr_normalizes_money_and_passes_filters(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "entries": [
+                    {
+                        "date": "2026-06-30",
+                        "mrr": 2183300,
+                        "mrr-new-business": 10000,
+                        "mrr-expansion": 5000,
+                        "mrr-contraction": -2500,
+                        "mrr-churn": -1000,
+                        "mrr-reactivation": 0,
+                        "percentage-change": 1.2,
+                    },
+                    {"date": "2026-07-31", "mrr": 2190000},
+                    {"date": "2026-08-31", "mrr": 2200000},
+                    {"date": "2026-09-30", "mrr": 2210000},
+                ],
+                "summary": {
+                    "current": 2183300,
+                    "previous": 2100000,
+                    "percentage-change": 3.97,
+                },
+            }
+        )
+    )
+    monkeypatch.setattr(chartmogul.requests, "request", mock_request)
+
+    result = json.loads(
+        chartmogul.chartmogul_get_metrics(
+            "mrr",
+            "2026-06-01",
+            "2026-09-30",
+            geo="SG",
+            plans="Gold",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["metric"] == "mrr"
+    assert [entry["date"] for entry in result["metrics"]["entries"]] == [
+        "2026-06-30",
+        "2026-07-31",
+        "2026-08-31",
+        "2026-09-30",
+    ]
+    entry = result["metrics"]["entries"][0]
+    assert entry["mrr"] == "21833.00"
+    assert entry["mrr_cents"] == 2183300
+    assert entry["mrr-contraction"] == "-25.00"
+    assert entry["mrr_contraction_cents"] == -2500
+    assert entry["percentage-change"] == 1.2
+    summary = result["metrics"]["summary"]
+    assert summary["current"] == "21833.00"
+    assert summary["current_cents"] == 2183300
+    assert summary["percentage-change"] == 3.97
+
+    request = mock_request.call_args.kwargs
+    assert request["method"] == "GET"
+    assert request["url"] == "https://api.chartmogul.com/v1/metrics/mrr"
+    assert request["auth"] == ("test-api-key", "")
+    assert request["params"] == {
+        "start-date": "2026-06-01",
+        "end-date": "2026-09-30",
+        "interval": "month",
+        "geo": "SG",
+        "plans": "Gold",
+    }
+
+
+def test_get_metrics_all_normalizes_only_monetary_fields(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "entries": [
+                    {
+                        "date": "2026-09-30",
+                        "mrr": 2183300,
+                        "arr": 26199600,
+                        "ltv": 145000.25,
+                        "asp": 9900,
+                        "arpa": 545825.0,
+                        "customers": 4,
+                        "customer-churn-rate": 2.5,
+                        "mrr-churn-rate": 1.25,
+                    }
+                ],
+                "summary": {
+                    "current-mrr": 2183300,
+                    "previous-mrr": 2100000,
+                    "current-ltv": 145000.25,
+                    "current-customers": 4,
+                    "previous-customers": 3,
+                    "current-customer-churn-rate": 2.5,
+                },
+            }
+        )
+    )
+    monkeypatch.setattr(chartmogul.requests, "request", mock_request)
+
+    result = json.loads(
+        chartmogul.chartmogul_get_metrics(
+            "all", "2026-09-01", "2026-09-30", interval="day"
+        )
+    )
+
+    entry = result["metrics"]["entries"][0]
+    assert entry["mrr"] == "21833.00"
+    assert entry["mrr_cents"] == 2183300
+    assert entry["arpa"] == "5458.25"
+    assert entry["arpa_cents"] == 545825.0
+    assert entry["ltv"] == "1450.00"
+    assert entry["ltv_cents"] == 145000.25
+    assert entry["customers"] == 4
+    assert entry["customer-churn-rate"] == 2.5
+    summary = result["metrics"]["summary"]
+    assert summary["current-mrr"] == "21833.00"
+    assert summary["current_mrr_cents"] == 2183300
+    assert summary["current-ltv"] == "1450.00"
+    assert summary["current_ltv_cents"] == 145000.25
+    assert summary["current-customers"] == 4
+    assert summary["current-customer-churn-rate"] == 2.5
+    request = mock_request.call_args.kwargs
+    assert request["url"] == "https://api.chartmogul.com/v1/metrics/all"
+    assert request["params"]["interval"] == "day"
+
+
+def test_get_metrics_truncation_keeps_latest_entries(monkeypatch):
+    entries = [{"date": f"2026-01-{day:02d}", "mrr": day * 100} for day in range(1, 29)]
+    monkeypatch.setattr(
+        chartmogul.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "entries": entries,
+                    "summary": {"current": 2800, "previous": 2700},
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 800)
+
+    result = json.loads(
+        chartmogul.chartmogul_get_metrics(
+            "mrr", "2026-01-01", "2026-01-28", interval="day"
+        )
+    )
+
+    returned_dates = [entry["date"] for entry in result["metrics"]["entries"]]
+    assert result["truncated"] is True
+    assert 0 < len(returned_dates) < len(entries)
+    assert returned_dates == [
+        entry["date"] for entry in entries[-len(returned_dates) :]
+    ]
+
+
+def test_get_metrics_count_values_are_not_treated_as_money(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "entries": [{"date": "2026-09-30", "customers": 4}],
+                "summary": {"current": 4, "previous": 3},
+            }
+        )
+    )
+    monkeypatch.setattr(
+        chartmogul.requests,
+        "request",
+        mock_request,
+    )
+
+    result = json.loads(
+        chartmogul.chartmogul_get_metrics("customer-count", "2026-09-01", "2026-09-30")
+    )
+
+    assert result["metrics"]["summary"] == {"current": 4, "previous": 3}
+    assert "geo" not in mock_request.call_args.kwargs["params"]
+    assert "plans" not in mock_request.call_args.kwargs["params"]
+
+
+def test_get_metrics_asp_allows_documented_quarter_interval(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "entries": [{"date": "2026-09-30", "asp": 9900}],
+                "summary": {"current": 9900, "previous": 9500},
+            }
+        )
+    )
+    monkeypatch.setattr(chartmogul.requests, "request", mock_request)
+
+    result = json.loads(
+        chartmogul.chartmogul_get_metrics(
+            "asp", "2026-07-01", "2026-09-30", interval="quarter"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["metrics"]["entries"][0]["asp"] == "99.00"
+    assert mock_request.call_args.kwargs["params"]["interval"] == "quarter"
+
+
+def test_get_metrics_accepts_fractional_ltv_cents(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "entries": [{"date": "2026-09-30", "ltv": 1862989.7959183701}],
+                "summary": {
+                    "current": 1862989.7959183701,
+                    "previous": 1838875.5102040817,
+                },
+            }
+        )
+    )
+    monkeypatch.setattr(chartmogul.requests, "request", mock_request)
+
+    result = json.loads(
+        chartmogul.chartmogul_get_metrics("ltv", "2026-09-01", "2026-09-30")
+    )
+
+    assert result["status"] == "success"
+    entry = result["metrics"]["entries"][0]
+    assert entry["ltv"] == "18629.90"
+    assert entry["ltv_cents"] == 1862989.7959183701
+    assert result["metrics"]["summary"]["current"] == "18629.90"
+    assert result["metrics"]["summary"]["previous"] == "18388.76"
+    assert "interval" not in mock_request.call_args.kwargs["params"]
+
+
+@pytest.mark.parametrize("value", [True, "1862989.7959183701", {}, float("nan")])
+def test_get_metrics_rejects_invalid_ltv_money(monkeypatch, value):
+    monkeypatch.setattr(
+        chartmogul.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "entries": [{"date": "2026-09-30", "ltv": value}],
+                    "summary": {"current": 145000, "previous": 140000},
+                }
+            )
+        ),
+    )
+
+    result = json.loads(
+        chartmogul.chartmogul_get_metrics("ltv", "2026-09-01", "2026-09-30")
+    )
+
+    assert result["status"] == "error"
+    assert "value for ltv" in result["message"]
+
+
+@pytest.mark.parametrize(
+    ("start_date", "end_date", "expected_message"),
+    [
+        ("2026-02-30", "2026-03-01", "start_date"),
+        ("2026-W01-1", "2026-03-01", "start_date"),
+        ("2026-10-01", "2026-09-30", "end_date must be on or after"),
+    ],
+)
+def test_get_metrics_rejects_invalid_date_ranges(
+    monkeypatch, start_date, end_date, expected_message
+):
+    mock_request = Mock()
+    monkeypatch.setattr(chartmogul.requests, "request", mock_request)
+
+    result = json.loads(chartmogul.chartmogul_get_metrics("mrr", start_date, end_date))
+
+    assert result["status"] == "error"
+    assert expected_message in result["message"]
+    mock_request.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("metric", "interval", "expected_message"),
+    [
+        ("invoices", "month", "metric must be one of"),
+        ("mrr", "hour", "interval for mrr must be one of"),
+        ("asp", "day", "interval for asp must be one of"),
+        ("ltv", "year", "interval for ltv must be one of"),
+    ],
+)
+def test_get_metrics_rejects_unsupported_values(
+    monkeypatch, metric, interval, expected_message
+):
+    mock_request = Mock()
+    monkeypatch.setattr(chartmogul.requests, "request", mock_request)
+
+    result = json.loads(
+        chartmogul.chartmogul_get_metrics(
+            metric, "2026-09-01", "2026-09-30", interval=interval
+        )
+    )
+
+    assert result["status"] == "error"
+    assert expected_message in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_get_metrics_rejects_unexpected_response_shape(monkeypatch):
+    monkeypatch.setattr(
+        chartmogul.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data={"entries": []})),
+    )
+
+    result = json.loads(
+        chartmogul.chartmogul_get_metrics("mrr", "2026-09-01", "2026-09-30")
+    )
+
+    assert result["status"] == "error"
+    assert "unexpected response" in result["message"]
+
+
+# ---------------------------------------------------------------------------
 # Delete tools
 # ---------------------------------------------------------------------------
 
@@ -741,7 +1063,7 @@ def test_success_with_capped_list_drops_message_as_last_resort(monkeypatch):
     assert "message" not in result
 
 
-async def test_mcp_registers_all_fifteen_tools():
+async def test_mcp_registers_all_sixteen_tools():
     """Direct-call unit tests above exercise each tool's Python body, but
     none of them go through FastMCP's own registration/schema layer -- a
     tool whose @mcp.tool() decorator was dropped, or whose name was
@@ -765,4 +1087,5 @@ async def test_mcp_registers_all_fifteen_tools():
         "chartmogul_get_opportunity",
         "chartmogul_update_opportunity",
         "chartmogul_delete_opportunity",
+        "chartmogul_get_metrics",
     }
