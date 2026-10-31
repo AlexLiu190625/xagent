@@ -46,14 +46,12 @@ def _raise_v1_from_skill_http_error(exc: HTTPException) -> NoReturn:
     ``HTTPException``; SDK clients switch on ``error.code`` instead.
     """
     message = str(exc.detail)
-    if exc.status_code == 400:
-        raise V1ApiError(V1ErrorCode.INVALID_INPUT, 400, message) from exc
+    if exc.status_code in (400, 413):
+        raise V1ApiError(V1ErrorCode.INVALID_INPUT, exc.status_code, message) from exc
     if exc.status_code == 404:
         raise V1ApiError(V1ErrorCode.SKILL_NOT_FOUND, 404) from exc
     if exc.status_code == 409:
         raise V1ApiError(V1ErrorCode.SKILL_ALREADY_EXISTS, 409, message) from exc
-    if exc.status_code == 413:
-        raise V1ApiError(V1ErrorCode.INVALID_INPUT, 413, message) from exc
     logger.error(
         "Skill helper raised an unexpected HTTP status %s: %r",
         exc.status_code,
@@ -97,6 +95,14 @@ async def create_skill(
         get_user_from_personal_key
     ),
 ) -> V1SkillSummary:
+    """Create a personal skill from SKILL.md text.
+
+    Repeating a request that already succeeded returns 200 without writing
+    again. Only a repeat through the same creation method counts: if the name
+    already holds the same content but it was uploaded, this returns 409. A 200
+    means the name now holds exactly this content, not that this request
+    created it.
+    """
     user, key = authed
     try:
         created = await SkillManagementRuntime().create_skill(
@@ -118,6 +124,15 @@ async def upload_skill(
         get_user_from_personal_key
     ),
 ) -> V1SkillSummary:
+    """Create a personal skill from an uploaded ``.zip`` bundle or ``.md`` file.
+
+    An empty ``name`` is treated as absent and the name is derived from the
+    upload. Repeating an upload that already succeeded returns 200 without
+    writing again. Only a repeat through the same creation method counts: if
+    the name already holds the same content but it was created from SKILL.md
+    text, this returns 409. A 200 means the name now holds exactly this
+    content, not that this request created it.
+    """
     user, key = authed
     try:
         limit = min(get_max_upload_size_bytes(), _MAX_DOWNLOAD_BYTES)

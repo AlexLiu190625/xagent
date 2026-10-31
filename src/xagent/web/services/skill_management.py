@@ -27,9 +27,6 @@ from .skill_runtime import build_detached_skill_scope
 logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
-# Longest name logged for a write; the stored column is no wider.
-_LOGGED_NAME_CHARS = 100
-
 
 def is_valid_personal_skill_name(name: str) -> bool:
     """Whether ``name`` can be the name of a personal skill.
@@ -118,7 +115,7 @@ def _log_write(action: str, key_prefix: str, user_id: int, name: str) -> None:
         action,
         key_prefix,
         user_id,
-        name[:_LOGGED_NAME_CHARS],
+        name,
     )
 
 
