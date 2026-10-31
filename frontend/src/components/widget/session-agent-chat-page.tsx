@@ -34,9 +34,12 @@ import {
 import { useSessionOpenMessage } from "./use-session-open-message"
 
 const SESSION_PROTOCOL = "xagent-session-v1"
-// Asks the session server to confirm and send heartbeat frames. A server that
-// does not know the marker ignores it, and the connection then runs without
-// dead-connection detection.
+// Asks the session server to send a connection_capabilities frame, then
+// heartbeat frames. This page requires a server that honors it. A server that
+// ignores the marker sends no capabilities frame: the connection runs without
+// dead-connection detection, and sessionConversationAttachment stays
+// "pending", so neither data-initial-message (see useWidgetInitialMessage
+// below) nor a message from XagentWidget.open() is ever sent.
 const SESSION_LIVENESS_PROTOCOL = "xagent-session-liveness-v1"
 // Asks the session server to announce when attach, including any resume replay, has finished.
 const SESSION_ATTACH_PROTOCOL = "xagent-session-attach-v1"
