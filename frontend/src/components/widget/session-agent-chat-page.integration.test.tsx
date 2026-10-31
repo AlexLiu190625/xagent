@@ -1772,6 +1772,45 @@ describe("SessionAgentChatPage sends the host page's initial message", () => {
     expect(initialRequests).toBe(1)
   })
 
+  // The page requires a server that sends connection_capabilities. A missing
+  // frame is never read as a server without attach completion: on an
+  // attach-capable server whose frame is late, that guess would ask before a
+  // restored conversation arrives.
+  it("never asks while the open socket has sent no capabilities frame, however long it stays silent", async () => {
+    // Faked from before the mount, so a timer armed when the socket opens is
+    // covered too. Time still flows, so the mount's own waits work as usual.
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      const socket = await mountActive()
+
+      await act(() => vi.advanceTimersByTimeAsync(10 * 60_000))
+      await letHostAnswer()
+
+      expect(initialRequests).toBe(0)
+      expect(sentTypes(socket)).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("never asks while an attach-capable socket has not attached, however long it stays silent", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      const socket = await mountActive()
+      // Without heartbeat, so dead-connection detection does not close the
+      // silent socket after 30 seconds and hide a longer timer.
+      receive(socket, { type: "connection_capabilities", capabilities: ["conversation_attached"] })
+
+      await act(() => vi.advanceTimersByTimeAsync(10 * 60_000))
+      await letHostAnswer()
+
+      expect(initialRequests).toBe(0)
+      expect(sentTypes(socket)).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it("sends the message on the open socket when the server does not announce attach completion", async () => {
     const socket = await mountActive()
     expect(initialRequests).toBe(0)

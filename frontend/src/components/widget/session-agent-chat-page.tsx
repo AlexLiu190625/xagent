@@ -187,7 +187,14 @@ function SessionConversationContent({
     // An open socket does not yet tell whether the server is restoring a
     // conversation, because its replay arrives after the open. Attach
     // completion follows that replay, so the page knows from there on. A
-    // server that does not announce it leaves only the open socket to go on.
+    // server whose connection_capabilities frame does not list attach
+    // completion ("unsupported") leaves nothing more to wait for, so the page
+    // asks once that frame arrives. The page requires a server that sends
+    // connection_capabilities: without it the value stays "pending" and the
+    // message is never requested. No timer stands in for either frame: an
+    // attach-capable server whose frames are slow would then be taken for
+    // "unsupported", and the page could ask before a restored conversation
+    // arrives.
     // Both "attached" and "unsupported" describe the current open socket only.
     ready: status === "active" && agent !== null
       && sessionConversationAttachment !== "pending",
