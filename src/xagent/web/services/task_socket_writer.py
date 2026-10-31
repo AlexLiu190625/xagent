@@ -9,17 +9,22 @@ class TaskSocketWriter:
     def __init__(self, socket: Any, disconnect: Callable[[], None]) -> None:
         self.socket = socket
         self.disconnect = disconnect
-        self.queue: asyncio.Queue[tuple[str, asyncio.Future[None] | None]] = (
-            asyncio.Queue(maxsize=256)
-        )
+        self.queue: asyncio.Queue[
+            tuple[str, asyncio.Future[None] | None, Callable[[], None] | None]
+        ] = asyncio.Queue(maxsize=256)
         self.bytes = 0
         self.closed = False
         self.close_task: asyncio.Task[None] | None = None
         self.task = asyncio.create_task(self._run())
 
     def enqueue(
-        self, text: str, *, acknowledge: bool = False
+        self,
+        text: str,
+        *,
+        acknowledge: bool = False,
+        on_sent: Callable[[], None] | None = None,
     ) -> asyncio.Future[None] | None:
+        """Queue one frame; ``on_sent`` runs once the socket accepted it."""
         if self.closed:
             raise ConnectionError("Task connection is closed")
         if self.queue.full() or self.bytes + len(text.encode()) > 2 * 1024 * 1024:
@@ -32,7 +37,7 @@ class TaskSocketWriter:
             )
         future = asyncio.get_running_loop().create_future() if acknowledge else None
         self.bytes += len(text.encode())
-        self.queue.put_nowait((text, future))
+        self.queue.put_nowait((text, future, on_sent))
         return future
 
     async def _close_socket(self) -> None:
@@ -48,7 +53,7 @@ class TaskSocketWriter:
         if self.task is not asyncio.current_task():
             self.task.cancel()
         while not self.queue.empty():
-            _, future = self.queue.get_nowait()
+            _, future, _ = self.queue.get_nowait()
             if future is not None and not future.done():
                 future.set_exception(ConnectionError("Task connection is closed"))
         self.bytes = 0
@@ -59,9 +64,15 @@ class TaskSocketWriter:
         send_failed = False
         try:
             while True:
-                text, pending = await self.queue.get()
+                text, pending, on_sent = await self.queue.get()
                 self.bytes -= len(text.encode())
                 await asyncio.wait_for(self.socket.send_text(text), timeout=5)
+                if on_sent is not None:
+                    try:
+                        on_sent()
+                    except Exception:
+                        # Delivery bookkeeping must never stop the writer.
+                        pass
                 if pending is not None and not pending.done():
                     pending.set_result(None)
                 pending = None

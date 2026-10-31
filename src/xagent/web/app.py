@@ -2514,8 +2514,12 @@ async def shutdown_event() -> None:
         await close_task_coordinators()
         await background_task_manager.shutdown()
         await wait_for_heartbeat_manager_idle()
+        from .api.websocket import manager
+
+        # Disconnect delivery checks read the database; stop them before the
+        # database runtime closes.
+        await manager.stop_delivery_checks()
         if get_shared_task_execution_enabled():
-            from .api.websocket import manager
             from .services.task_event_bridge import stop_task_event_bridge
 
             await manager.stop_stream_reconciliation()

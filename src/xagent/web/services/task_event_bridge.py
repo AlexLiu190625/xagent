@@ -20,6 +20,7 @@ from ...core.runtime_performance import increment_counter
 from ..models.database import get_session_local
 from ..models.task_command import TaskExecutionCommand
 from .db_runtime import run_db_io_cancellation_safe
+from .execution_event_signals import report_bridge_frame, report_bridge_gap
 from .task_events import CommandReply
 
 logger = logging.getLogger(__name__)
@@ -171,6 +172,7 @@ class TaskEventBridge:
                 # Publication is observational. Even snapshot/serialization
                 # failures must not abort an accepted execution. The sequence
                 # gap and persistent-state checks trigger client recovery.
+                report_bridge_frame("publish_failed")
                 logger.warning(
                     "Task event publication failed task_id=%s; stream requires resync",
                     task_id,
@@ -217,9 +219,16 @@ class TaskEventBridge:
             host, sequence = body["host"], body["sequence"]
             previous = self._seen.get(host)
             if previous is not None and sequence <= previous:
+                report_bridge_frame("duplicate_dropped")
                 return
             if previous is not None and sequence != previous + 1:
                 await self._status("stream_resync_required")
+                report_bridge_gap(
+                    body.get("task_id"),
+                    host=host,
+                    previous_sequence=previous,
+                    sequence=sequence,
+                )
             self._seen[host] = sequence
             self._seen.move_to_end(host)
             while len(self._seen) > 4096:
