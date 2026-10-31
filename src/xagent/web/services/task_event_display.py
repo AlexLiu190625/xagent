@@ -42,6 +42,15 @@ _INTERNAL_KINDS = frozenset(
 _STREAM_KINDS = frozenset(
     {"final_answer_start", "final_answer_end", "final_answer_error"}
 )
+# Display kinds whose live frame is sent only on some paths, so a socket that
+# never got one is not missing anything. ``input_accepted`` (the user_message
+# bubble) is sent live only when the input is injected, through the
+# ``user_message`` trace event that ``load_live_display_event`` maps to it; a
+# rejected or deferred input never gets a live frame. ``assistant_message``
+# (the chat agent_message) is sent live only at settlement by
+# ``publish_task_result``; a cancellation settlement publishes none. Both
+# reach the client through the next replay.
+_CONDITIONAL_LIVE_KINDS = frozenset({"input_accepted", "assistant_message"})
 
 
 @dataclass(frozen=True)
@@ -423,6 +432,39 @@ def load_event_display_snapshot(
     return EventDisplaySnapshot(
         horizon, tuple(events), tuple(messages), tuple(compactions)
     )
+
+
+def expected_display_frames(
+    db: Session, task_id: int, *, after_sequence: int, through_sequence: int
+) -> dict[str, int]:
+    """Wire event id -> sequence of each root display frame in a sequence range.
+
+    Only facts whose frame is always sent live are expected. The range is
+    ``(after_sequence, through_sequence]``. Sequence numbers are not
+    contiguous within it: internal kinds, other scopes and facts that convert
+    to no frame are left out. So is a fact whose display cannot be built for
+    any reason; the live path sends no frame for it either (a ``ValueError``
+    is reported there as an integrity gap). Kinds whose
+    live frame is conditional are left out as well, see
+    ``_CONDITIONAL_LIVE_KINDS``.
+    """
+    frames: dict[str, int] = {}
+    for row in load_display_facts(
+        db,
+        task_id,
+        after_sequence=after_sequence,
+        through_sequence=through_sequence,
+    ):
+        if row.kind in _CONDITIONAL_LIVE_KINDS:
+            continue
+        try:
+            frame = convert_display_event(row)
+        except Exception:
+            # One unconvertible fact must not abort the whole check.
+            continue
+        if frame is not None:
+            frames[str(frame["event_id"])] = int(row.sequence)
+    return frames
 
 
 def load_event_display_messages_for_turn(

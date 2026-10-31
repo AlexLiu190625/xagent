@@ -189,6 +189,13 @@ let previewState: {
 describe("AgentBuilder preview", () => {
   const originalWebSocket = globalThis.WebSocket
 
+  const expectSectionHighlighted = (section: string, highlighted: boolean) => {
+    const label = section === "mcp" ? "tools.mcp.dialog.connector" : `builds.configForm.${section}.label`
+    const element = screen.getByText(label, { selector: "label" }).closest(".transition-all")
+    expect(element).not.toBeNull()
+    expect(element?.classList.contains("border-primary/30")).toBe(highlighted)
+  }
+
   beforeEach(() => {
     storedToolCategories = ["ssh"]
     putBody = undefined
@@ -566,12 +573,6 @@ describe("AgentBuilder preview", () => {
 
   describe("configuration completion", () => {
     const configStep = () => screen.getByRole("button", { name: /builds.editor.stepGuide.configure/ })
-    const expectSectionHighlighted = (section: string, highlighted: boolean) => {
-      const label = section === "mcp" ? "tools.mcp.dialog.connector" : `builds.configForm.${section}.label`
-      const element = screen.getByText(label, { selector: "label" }).closest(".transition-all")
-      expect(element).not.toBeNull()
-      expect(element?.classList.contains("border-primary/30")).toBe(highlighted)
-    }
 
     it("allows a model-only agent without optional tools, skills, or connections", async () => {
       storedToolCategories = []
@@ -615,10 +616,14 @@ describe("AgentBuilder preview", () => {
       })
       render(<AgentBuilder />)
       await screen.findByDisplayValue("Template agent")
+      // The name lands before the default model and MCP catalog settle; requirements are only
+      // highlighted once both have.
+      await waitFor(() => {
+        expectSectionHighlighted("model", false)
+        expectSectionHighlighted("knowledgeBase", category === "knowledge")
+        expectSectionHighlighted("mcp", category === "mcp:missing-connector")
+      })
       expect(configStep().querySelector("svg")).toBeNull()
-      expectSectionHighlighted("model", false)
-      expectSectionHighlighted("knowledgeBase", category === "knowledge")
-      expectSectionHighlighted("mcp", category === "mcp:missing-connector")
       expectSectionHighlighted("skills", false)
       expectSectionHighlighted("tools", false)
     })
@@ -1222,11 +1227,11 @@ describe("AgentBuilder preview", () => {
 
     const sendPreview = async () => {
       const button = await screen.findByText("send-preview-message")
-      // A click before the default model loads hits the no-model guard, so retry until one reaches task/create.
-      await waitFor(() => {
-        if (pendingCreates.length === 0) fireEvent.click(button)
-        expect(pendingCreates).toHaveLength(1)
-      })
+      // A click before the default model loads hits the no-model guard and rejects into
+      // previewSendErrorMock, so wait until the model section is no longer flagged.
+      await waitFor(() => expectSectionHighlighted("model", false))
+      fireEvent.click(button)
+      await waitFor(() => expect(pendingCreates).toHaveLength(1))
     }
 
     const settle = (fn: () => void) =>

@@ -132,8 +132,89 @@ literal format strings.
   fact. It comes with WARNING `Live display integrity gap task_id=%s
   event_id=%s` (with traceback) and a client-safe error event to the task's
   clients.
-- There is no counter for duplicate delivery or sequence gaps on client
-  reconnect. A client attaching later replays history from storage.
+- A client attaching later replays history from storage, up to a committed
+  sequence horizon. The connection is registered before the replay, so live
+  frames and the replay can overlap; the client de-duplicates by
+  `execution_sequence`.
+
+#### Replay and delivery consistency
+
+- INFO `execution_event_replay task_id=%s storage=v2
+  component=execution-events horizon=%s events=%s cache_hit=%s
+  duration_ms=%.1f`, once per V2 historical replay (initial attach and each
+  `status_request`), logged before the replay is sent. `horizon` is the last
+  committed sequence the replay covers, `events` the number of display events
+  the replay carries, `cache_hit` whether it came from the history cache,
+  `duration_ms` the load time.
+- `xagent.websocket.replay.consistency`, attributes `outcome` and
+  `storage=v2`, once per closed V2 connection that received a replay. From
+  the start of its first replay (before the horizon is read) each socket
+  records the display frames it was actually sent after the horizon: event
+  id, sequence and local send time, no payload, at most 5000 per socket.
+  Frames at or below the horizon are not recorded; the replay covers them.
+  On disconnect, a background check reads the committed root-scope display
+  events above the horizon and up to the end of the checked range, and
+  compares their event ids with the sent ones. That read is measured as a
+  `display` read (see (5)).
+  - The checked range ends at the highest sequence sent at least 5 seconds
+    before the disconnect, on this process's monotonic clock. Producers can
+    send frames out of sequence order (the trace handler hops to a worker
+    thread after its fact commits), so a frame sent in the last 5 seconds
+    may still have earlier-sequenced frames in flight. `occurred_at` is not
+    used: it is producer time, possibly another host's clock.
+  - Only kinds whose live frame is always sent are expected. Accepted inputs
+    (`input_accepted`, the user bubble) get a live frame only when the input
+    is injected; a rejected or deferred input never does. Assistant chat
+    messages (`assistant_message`) get one only at settlement through the
+    terminal result; a cancellation settlement sends none. The next replay
+    carries both.
+  - Only `complete`, `missing` and `duplicate` come from a comparison:
+    - `complete`: every expected event in the range was sent at least once
+      (live or by a later replay). It is not evidence that frames committed
+      after the end of the range reached the socket (tail blind spot); the
+      next attach replays those.
+    - `missing`: at least one was never sent. Comes with WARNING
+      `execution_event_delivery_gap task_id=%s storage=v2
+      component=execution-events horizon=%s missing=%s
+      first_missing_sequence=%s`.
+    - `duplicate`: nothing missing, but the same frame after the horizon was
+      sent live twice. Informational: the client drops it. Frames resent by a
+      later replay or by the shared-mode stream reconciliation (settlement
+      frames every 5 seconds), and live frames overlapping the first replay,
+      are not counted.
+  - `idle`: nothing after the horizon was sent before the last 5 seconds, so
+    there was nothing to compare (reported as `duplicate` instead if a live
+    duplicate was seen).
+  - `skipped`: more than 256 checks were pending (a mass disconnect); this
+    connection was not checked.
+  - `overflow`: the socket was sent more than 5000 display frames after the
+    horizon; recording stopped and the connection is not checked.
+  Sequence gaps are expected and never counted as missing: internal kinds,
+  child scopes, audit-only facts and facts whose display could not be built
+  (on the live path a `ValueError` there is reported as `integrity_gap`
+  above) produce no frame. A connection moved to another task drops its
+  record. If the check itself fails, for example because the database cannot
+  be read, it logs WARNING `execution_event_delivery_check_failed task_id=%s
+  storage=v2 component=execution-events horizon=%s error_type=%s` and emits
+  no outcome. Checks stop at shutdown.
+- To read them: a rising `missing` rate is the signal to act on. Take the
+  task id and `first_missing_sequence` from the WARNING and compare with the
+  admin endpoint below (the event at that sequence should be a display kind in
+  scope `root`). In shared mode, look for `task_event_bridge_gap` or
+  `publish_failed` around the same time first.
+- `xagent.task_event.bridge.frames` (shared mode, cross-process Redis
+  bridge), attribute `outcome`:
+  - `duplicate_dropped`: the receiver got a frame it had already delivered
+    and dropped it.
+  - `gap_resync`: the receiver saw a jump in a publishing host's sequence and
+    asked its clients to resync. Comes with WARNING `task_event_bridge_gap
+    task_id=%s host=%s previous_sequence=%s sequence=%s`. Bridge sequences are
+    per publishing host, so the frames in the gap may belong to other tasks.
+    Each receiving host counts the gap it sees, so one lost frame counts once
+    per receiver, and a burst right after a Redis resubscribe is expected.
+  - `publish_failed`: a frame could not be published (the existing WARNING
+    `Task event publication failed task_id=%s; stream requires resync`
+    names the task).
 
 ### (4) Recovery refusals
 
@@ -185,7 +266,10 @@ literal format strings.
   are not measured. Operations and what `rows` counts:
   - `model`: model-context events loaded;
   - `display`: display facts loaded, and for a delegated agent's detail the
-    root-scope summary rows of that agent (a read of its own);
+    root-scope summary rows of that agent (a read of its own). The background
+    delivery check run when a V2 socket closes (see (3)) is also a `display`
+    read, counting every root display fact in its range, so a `display`
+    budget can be exceeded by that check rather than by a user-facing read;
   - `reconnect`: frames replayed to a client (its duration includes cache I/O
     and projection work);
   - `checkpoint`: recovery-state rows scanned (nested tool-outcome reads add

@@ -1,5 +1,5 @@
 """Operator signals for execution-event writes, unknown outcomes, recovery
-refusals and reads.
+refusals, reads and delivery.
 
 Each write and refusal helper emits two kinds of signal for one occurrence: a
 single structured log line that locates the task (and the tool attempt where
@@ -18,6 +18,8 @@ counter must exclude it.
 ``report_recovery_refusal`` covers recovery reads that refuse to resume a task.
 Its counter counts refused reads, including classification probes, so it is
 neither a per-task nor a per-resume count; see that helper for known gaps.
+``report_replay``, ``report_delivery_consistency`` and the bridge helpers cover
+reconnect replays and live delivery of V2 display frames.
 
 Reads of the event log are measured by ``measure_execution_event_read``: the
 cost of each of the five operations (model context, display, reconnect replay,
@@ -56,6 +58,8 @@ READ_DURATION_METRIC = "xagent.execution_event.read.duration"
 READ_ROWS_METRIC = "xagent.execution_event.read.rows"
 READ_BUDGET_EXCEEDED_COUNTER = "xagent.execution_event.read.budget_exceeded"
 RECOVERY_REFUSAL_COUNTER = "xagent.execution_event.recovery.refusals"
+REPLAY_CONSISTENCY_COUNTER = "xagent.websocket.replay.consistency"
+BRIDGE_FRAMES_COUNTER = "xagent.task_event.bridge.frames"
 
 _REFUSAL_LEVELS = {
     "lease_mismatch": logging.INFO,
@@ -373,3 +377,119 @@ def report_unknown_outcome(
         )
     except Exception:
         pass
+
+
+def report_replay(
+    task_id: int,
+    *,
+    horizon: int,
+    events: int,
+    cache_hit: bool,
+    duration_ms: float,
+) -> None:
+    """Log one V2 historical replay: where it ends and how many events it sent."""
+    try:
+        logger.info(
+            "execution_event_replay task_id=%s storage=v2 "
+            "component=execution-events horizon=%s events=%s cache_hit=%s "
+            "duration_ms=%.1f",
+            task_id,
+            horizon,
+            events,
+            cache_hit,
+            duration_ms,
+        )
+    except Exception:
+        return
+
+
+def report_delivery_consistency(
+    task_id: int,
+    *,
+    horizon: int,
+    outcome: str,
+    missing: int = 0,
+    first_missing_sequence: int | None = None,
+) -> None:
+    """Report the delivery check of one closed V2 connection.
+
+    ``outcome`` is one of:
+
+    - ``complete``, ``missing``: the committed display frames after the
+      replay horizon were compared with the frames sent. Only frames whose
+      live delivery is unconditional are expected (accepted inputs and
+      assistant chat messages are not), and the range ends at the highest
+      sequence sent at least the reorder grace period before the disconnect.
+      ``complete`` says nothing about frames committed after that point.
+    - ``duplicate``: nothing missing, but the same frame after the horizon
+      was sent live twice. Replay and reconcile passes are not counted.
+    - ``idle``: nothing after the horizon was sent before the grace window,
+      so there was nothing to compare.
+    - ``skipped``: too many checks were pending; this one never ran.
+    - ``overflow``: the socket was sent more frames than the ledger keeps.
+
+    A WARNING locates the task only when committed display events were not
+    sent; duplicates are informational because clients de-duplicate them.
+    """
+    try:
+        increment_counter(
+            REPLAY_CONSISTENCY_COUNTER,
+            attributes={"outcome": outcome, "storage": "v2"},
+        )
+        if missing > 0:
+            logger.warning(
+                "execution_event_delivery_gap task_id=%s storage=v2 "
+                "component=execution-events horizon=%s missing=%s "
+                "first_missing_sequence=%s",
+                task_id,
+                horizon,
+                missing,
+                first_missing_sequence,
+            )
+    except Exception:
+        return
+
+
+def report_delivery_check_failure(
+    task_id: int, *, horizon: int, error: BaseException
+) -> None:
+    """Report a delivery check that could not run, by exception type only."""
+    try:
+        logger.warning(
+            "execution_event_delivery_check_failed task_id=%s storage=v2 "
+            "component=execution-events horizon=%s error_type=%s",
+            task_id,
+            horizon,
+            type(error).__name__,
+        )
+    except Exception:
+        return
+
+
+def report_bridge_frame(outcome: str) -> None:
+    """Count one cross-process frame outcome on the task event bridge.
+
+    ``outcome`` is ``duplicate_dropped``, ``gap_resync`` or ``publish_failed``.
+    """
+    increment_counter(BRIDGE_FRAMES_COUNTER, attributes={"outcome": outcome})
+
+
+def report_bridge_gap(
+    task_id: int | None, *, host: str, previous_sequence: int, sequence: int
+) -> None:
+    """Count and locate one bridge sequence gap that forces a client resync.
+
+    Bridge sequences are per publishing host, not per task: the frames in the
+    gap may belong to other tasks, and ``task_id`` is the first frame after it.
+    """
+    try:
+        report_bridge_frame("gap_resync")
+        logger.warning(
+            "task_event_bridge_gap task_id=%s host=%s previous_sequence=%s sequence=%s",
+            task_id,
+            host,
+            previous_sequence,
+            sequence,
+        )
+    except Exception:
+        return

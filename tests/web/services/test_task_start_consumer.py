@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT, eventually
 from tests.web.services.coordinator_command_shared import (
     claim_task_command,
     settle_command,
@@ -44,6 +44,19 @@ def owner_lease(task_id):
 
 def commit_handoff(command):
     return consumer._commit_handoff(command, owner_lease(command.task_id))
+
+
+async def wait_for_handoff(committed, execution):
+    """Wait until a START execution has committed its handoff.
+
+    Lease acquisition and the handoff are real SQLite commits, so how long
+    they take is not what these tests assert: bound the wait as a hang
+    detector, and surface an execution that ended without committing.
+    """
+    await eventually(lambda: committed.is_set() or execution.done())
+    if not committed.is_set():
+        await execution
+        pytest.fail("START execution ended without committing its handoff")
 
 
 @pytest.fixture
@@ -246,7 +259,7 @@ async def test_cancellation_after_handoff_still_registers_execution(
     monkeypatch.setattr(consumer, "_schedule_committed_turn", schedule)
     pending = asyncio.create_task(execute_durable_task_command(accepted))
     try:
-        assert await asyncio.to_thread(committed.wait, 5)
+        await wait_for_handoff(committed, pending)
         pending.cancel()
         await asyncio.sleep(0)
         assert not pending.done()
@@ -498,7 +511,7 @@ async def test_following_command_waits_for_start_registration(accepted, monkeypa
     )
     next_task = None
     try:
-        assert await asyncio.to_thread(committed.wait, 5)
+        await wait_for_handoff(committed, start)
         with get_session_local()() as db:
             task = db.get(Task, accepted.task_id)
             staged = stage_task_command(

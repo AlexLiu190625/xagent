@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -49,3 +53,46 @@ def get_personal_key_access_scope(db: Any, actor: Any) -> PersonalKeyAccessScope
         return PersonalKeyAccessScope(owner_ids, True)
     except (AttributeError, TypeError, ValueError):
         return self_scope
+
+
+_personal_key_principal_policy: Callable[[Any], object] | None = None
+
+
+def set_personal_key_principal_policy(policy: Callable[[Any], object] | None) -> None:
+    """Install or clear the application-owned personal-key principal policy.
+
+    The policy receives the authenticated user snapshot and runs in the
+    authentication worker, so it should decide from that snapshot alone.
+    """
+    global _personal_key_principal_policy
+    _personal_key_principal_policy = policy
+
+
+def check_personal_key_principal(user: Any, *, key_prefix: str) -> bool:
+    """Return whether the application policy admits an authenticated user.
+
+    Only a policy result that is literally ``True`` admits the user. Any other
+    result, and any ``Exception`` raised by the policy, denies. Both denials
+    are logged with the key prefix and user id only. With no policy installed
+    every user is admitted.
+    """
+    policy = _personal_key_principal_policy
+    if policy is None:
+        return True
+    try:
+        allowed = policy(user)
+    except Exception:
+        logger.error(
+            "Personal key principal policy raised; denying key_prefix=%s user_id=%s",
+            key_prefix,
+            int(user.id),
+        )
+        return False
+    if allowed is True:
+        return True
+    logger.warning(
+        "Personal key principal policy denied key_prefix=%s user_id=%s",
+        key_prefix,
+        int(user.id),
+    )
+    return False

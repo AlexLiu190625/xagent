@@ -6969,9 +6969,13 @@ describe("AppProvider websocket message routing", () => {
       </AppProvider>
     )
     act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(85)))
-    await expect(getSessionControls().startNewConversation()).rejects.toThrow("socket write failed")
+    await act(async () => {
+      await expect(getSessionControls().startNewConversation()).rejects.toThrow("socket write failed")
+    })
     expect(screen.getByTestId("session-conversation-state").textContent).toBe("reload_required")
-    await expect(getSessionControls().startNewConversation()).rejects.toThrow(/reload required/i)
+    await act(async () => {
+      await expect(getSessionControls().startNewConversation()).rejects.toThrow(/reload required/i)
+    })
   })
 
   it("keeps an unsent reset bound and lets the caller retry without retiring its task", async () => {
@@ -7881,7 +7885,9 @@ describe("AppProvider websocket message routing", () => {
     act(() => {
       onMessage?.(assistantMessage("Before acceptance", 76))
     })
-    await getSessionControls().sendMessage("Replacement", { clientMessageId: "replacement-buffer" })
+    await act(async () => {
+      await getSessionControls().sendMessage("Replacement", { clientMessageId: "replacement-buffer" })
+    })
     expect(screen.getByTestId("session-conversation-state").textContent).toBe("replacement_awaiting_task")
 
     act(() => {
