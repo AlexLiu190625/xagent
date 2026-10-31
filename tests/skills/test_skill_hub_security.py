@@ -532,6 +532,20 @@ class TestUploadNameOverride:
             _derive_upload_skill_name("a.zip", "root", SKILL_MD, override=bad)
         assert exc.value.status_code == 400
 
+    @pytest.mark.parametrize("name", ["abc\n", "abc\r", " abc", "pdf.tools"])
+    def test_a_name_the_pattern_does_not_match_in_full_is_refused_everywhere(
+        self, name
+    ):
+        """``$`` accepts one trailing newline under ``re.match``, so the
+        pattern has to be applied to the whole string. The writer's check and
+        the upload override check answer to the same rule."""
+        with pytest.raises(HTTPException) as writer:
+            _validate_skill_name(name)
+        with pytest.raises(HTTPException) as override:
+            _derive_upload_skill_name("a.zip", "root", SKILL_MD, override=name)
+        assert writer.value.status_code == 400
+        assert override.value.status_code == 400
+
     @pytest.mark.parametrize(
         "filename",
         [

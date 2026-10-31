@@ -661,3 +661,179 @@ class TestDeleteKeepsProviderNamespaces:
         assert exc.value.status_code == 404
         assert _rows(db) == [(1, "broken")], "the row is stuck, not lost"
         db.close()
+
+
+# ── editing a personal skill ─────────────────────────────────────────────────
+
+
+def _stored_file(db, name: str, path: str) -> bytes:
+    from xagent.web.models.skill import UserSkill
+
+    skill = db.query(UserSkill).filter(UserSkill.name == name).one()
+    return next(bytes(item.content) for item in skill.files if item.path == path)
+
+
+async def _edit(db, skill_md: str, name: str = "alpha"):
+    return await skill_hub.edit_installed(
+        name,
+        skill_hub.EditSkillRequest(skill_md=skill_md),
+        SimpleNamespace(),
+        SkillScopeContext(user_id=7, metadata={}),
+        db,
+        _user(),
+    )
+
+
+_PERSONAL_ENTRY = {
+    "name": "alpha",
+    "scope": "personal",
+    "source": "personal",
+    "path": "db://personal/1",
+}
+
+# The marker makes the frontmatter extractor blow the stack, which is what deep
+# YAML does; injecting it keeps the cell independent of the runner's recursion
+# limit.
+_UNPARSABLE_MARKER = "BOOM-unparsable"
+
+_REFUSED_EDITS = {
+    "blank": "  \n\t ",
+    "zero-width": "​ ﻿⁠",
+    "unparsable": f"# Alpha\n{_UNPARSABLE_MARKER}\n",
+}
+
+
+class TestEditValidatesBeforeItCommits:
+    """An edit is held to the bar a create is held to, before anything is
+    committed: a stored row is one the skill library can load."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", list(_REFUSED_EDITS))
+    async def test_a_refused_edit_leaves_the_stored_content_unchanged(
+        self, monkeypatch, tmp_path, kind
+    ):
+        from xagent.skills.parser import SkillParser
+
+        assert len(_REFUSED_EDITS) == 3
+        db = _factory(tmp_path)()
+        _write_personal_skill(
+            db=db, user=_user(), name="alpha", files={"SKILL.md": SKILL_MD}
+        )
+        _install_manager(monkeypatch, lambda name: dict(_PERSONAL_ENTRY))
+        real_extract = SkillParser._extract_frontmatter
+
+        def exploding_extract(content):
+            if _UNPARSABLE_MARKER in content:
+                raise RecursionError("simulated deep-YAML stack exhaustion")
+            return real_extract(content)
+
+        monkeypatch.setattr(
+            SkillParser, "_extract_frontmatter", staticmethod(exploding_extract)
+        )
+
+        with pytest.raises(HTTPException) as exc:
+            await _edit(db, _REFUSED_EDITS[kind])
+
+        assert exc.value.status_code == 400
+        assert _stored_file(db, "alpha", "SKILL.md") == SKILL_MD
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_an_edit_does_not_re_check_attachments_it_did_not_change(
+        self, monkeypatch, tmp_path
+    ):
+        """A skill stored before attachments were bounded can hold a
+        template.md that a fresh write would now refuse. Editing SKILL.md must
+        not start failing because of a file the edit never touched."""
+        from xagent.web.models.skill import UserSkill, UserSkillFile
+
+        db = _factory(tmp_path)()
+        oversized_template = b"a" * 900_000
+        skill = UserSkill(id=1, user_id=7, name="alpha", origin="custom")
+        db.add(skill)
+        db.flush()
+        for path, content in (
+            ("SKILL.md", SKILL_MD),
+            ("template.md", oversized_template),
+        ):
+            db.add(
+                UserSkillFile(
+                    skill_id=1,
+                    path=path,
+                    content=content,
+                    size_bytes=len(content),
+                    sha256="0" * 64,
+                )
+            )
+        db.commit()
+        _install_manager(monkeypatch, lambda name: dict(_PERSONAL_ENTRY))
+
+        edited = "# Alpha\n\n## Description\nChanged.\n"
+        await _edit(db, edited)
+
+        assert _stored_file(db, "alpha", "SKILL.md") == edited.encode()
+        assert _stored_file(db, "alpha", "template.md") == oversized_template
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_a_saved_edit_the_library_does_not_return_is_not_blamed_on_the_parser(
+        self, monkeypatch, tmp_path
+    ):
+        db = _factory(tmp_path)()
+        _write_personal_skill(
+            db=db, user=_user(), name="alpha", files={"SKILL.md": SKILL_MD}
+        )
+        calls: list[str] = []
+
+        def loader(name):
+            calls.append(name)
+            return dict(_PERSONAL_ENTRY) if len(calls) == 1 else None
+
+        _install_manager(monkeypatch, loader)
+
+        with pytest.raises(HTTPException) as exc:
+            await _edit(db, "# Alpha\n\n## Description\nChanged.\n")
+
+        assert exc.value.status_code == 400
+        assert exc.value.detail == (
+            "The edit was saved, but the skill library did not return it. "
+            "Reload the skill and try again."
+        )
+        db.close()
+
+
+# ── row locks on edit and delete ─────────────────────────────────────────────
+
+
+class TestWriteRowLocks:
+    """SQLite ignores ``FOR UPDATE``, so this only proves the lock is asked
+    for; the real blocking behaviour is covered against PostgreSQL."""
+
+    @pytest.mark.parametrize("operation", ["edit", "delete"])
+    def test_the_row_about_to_change_is_locked(self, monkeypatch, tmp_path, operation):
+        from sqlalchemy.orm import Query
+
+        from xagent.web.models.skill import UserSkill
+
+        db = _factory(tmp_path)()
+        _write_personal_skill(
+            db=db, user=_user(), name="alpha", files={"SKILL.md": SKILL_MD}
+        )
+        locked: list[object] = []
+        real_with_for_update = Query.with_for_update
+
+        def spy(self, *args, **kwargs):
+            locked.append(self.column_descriptions[0]["entity"])
+            return real_with_for_update(self, *args, **kwargs)
+
+        monkeypatch.setattr(Query, "with_for_update", spy)
+
+        if operation == "edit":
+            skill_hub._update_personal_skill_md(
+                db=db, user=_user(), name="alpha", skill_md="# Alpha\n\nChanged.\n"
+            )
+        else:
+            _delete_personal_skill(db=db, user=_user(), name="alpha")
+
+        assert locked == [UserSkill]
+        db.close()
