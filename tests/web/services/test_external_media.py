@@ -13,6 +13,11 @@ from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.services import external_media
 
 
+@pytest.fixture(autouse=True)
+def _isolate_s2s_base(monkeypatch):
+    monkeypatch.delenv("XAGENT_S2S_API_BASE_URL", raising=False)
+
+
 class _DB:
     """Small real SQLite session holder used by service-level tests."""
 
@@ -118,6 +123,108 @@ def test_issue_requires_public_base_for_local_storage(monkeypatch):
             task_id=11,
             purpose=external_media.ExternalMediaPurpose.INSTAGRAM_PUBLISH,
         )
+
+
+def _count_encode_calls(monkeypatch):
+    calls = []
+    real = external_media._encode_ticket
+
+    def counting(**kwargs):
+        calls.append(kwargs)
+        return real(**kwargs)
+
+    monkeypatch.setattr(external_media, "_encode_ticket", counting)
+    return calls
+
+
+@pytest.mark.parametrize(
+    "public", [None, "https://api.example.test", "http://api.example.test", "ftp://x"]
+)
+@pytest.mark.parametrize(
+    "s2s",
+    [
+        "https://s2s.example.test",
+        "https://s2s.example.test/",
+        "https://s2s.example.test/base",
+    ],
+)
+def test_issue_prefers_s2s_base(monkeypatch, s2s, public):
+    file_id = str(uuid4())
+    record = _record(file_id)
+    monkeypatch.setenv("XAGENT_S2S_API_BASE_URL", s2s)
+    if public is None:
+        monkeypatch.delenv("XAGENT_PUBLIC_API_BASE_URL", raising=False)
+    else:
+        monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", public)
+    monkeypatch.setattr(external_media, "_validate_instagram_record", Mock())
+
+    issued = external_media.issue_external_media_url(
+        _DB(record),
+        file_id=file_id,
+        user_id=7,
+        task_id=11,
+        purpose=external_media.ExternalMediaPurpose.INSTAGRAM_PUBLISH,
+    )
+
+    prefix = f"{s2s.rstrip('/')}/api/files/external-media/{file_id}?ticket="
+    assert issued.url.startswith(prefix)
+    ticket = parse_qs(urlsplit(issued.url).query)["ticket"][0]
+    redeemed = external_media.redeem_external_media_ticket(
+        _DB(record), file_id=file_id, ticket=ticket
+    )
+    assert redeemed.record.file_id == file_id
+
+
+@pytest.mark.parametrize(
+    ("s2s", "public", "message"),
+    [
+        (None, None, "is required for external media delivery"),
+        (None, "http://api.example.test", "must be HTTPS"),
+        ("http://s2s.example.test", "https://api.example.test", "must be HTTPS"),
+    ],
+)
+def test_issue_rejects_unusable_base(monkeypatch, s2s, public, message):
+    file_id = str(uuid4())
+    for name, value in (
+        ("XAGENT_S2S_API_BASE_URL", s2s),
+        ("XAGENT_PUBLIC_API_BASE_URL", public),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    monkeypatch.setattr(external_media, "_validate_instagram_record", Mock())
+    calls = _count_encode_calls(monkeypatch)
+
+    with pytest.raises(external_media.ExternalMediaUnavailable, match=message):
+        external_media.issue_external_media_url(
+            _DB(_record(file_id)),
+            file_id=file_id,
+            user_id=7,
+            task_id=11,
+            purpose=external_media.ExternalMediaPurpose.INSTAGRAM_PUBLISH,
+        )
+
+    assert calls == []
+
+
+def test_issue_rejects_invalid_s2s_value(monkeypatch):
+    file_id = str(uuid4())
+    monkeypatch.setenv("XAGENT_S2S_API_BASE_URL", "ftp://x")
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+    monkeypatch.setattr(external_media, "_validate_instagram_record", Mock())
+    calls = _count_encode_calls(monkeypatch)
+
+    with pytest.raises(ValueError, match="XAGENT_S2S_API_BASE_URL"):
+        external_media.issue_external_media_url(
+            _DB(_record(file_id)),
+            file_id=file_id,
+            user_id=7,
+            task_id=11,
+            purpose=external_media.ExternalMediaPurpose.INSTAGRAM_PUBLISH,
+        )
+
+    assert calls == []
 
 
 def test_issue_rejects_cross_task_record():

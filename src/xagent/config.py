@@ -2320,8 +2320,11 @@ def get_s2s_api_base_url() -> str | None:
 
     The separate value lets deployments send provider callbacks and A2A
     traffic directly to a regional backend while browser and MCP traffic keep
-    using the canonical public API. Trailing slashes are removed so consumers
-    can append absolute API paths without producing duplicate separators.
+    using the canonical public API. External providers that fetch
+    purpose-bound media URLs issued by this backend are consumers as well, so
+    the ingress behind this URL must let them reach the external-media route.
+    Trailing slashes are removed so consumers can append absolute API paths
+    without producing duplicate separators.
     """
     return _normalized_http_env_url(S2S_API_BASE_URL) or get_public_api_base_url()
 

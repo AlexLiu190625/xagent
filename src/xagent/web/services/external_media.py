@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 
 from ...config import (
     get_external_media_url_ttl_seconds,
-    get_public_api_base_url,
+    get_s2s_api_base_url,
     get_uploads_dir,
 )
 from ...core.file_ref import parse_file_id_ref
@@ -184,11 +184,16 @@ def issue_external_media_url(
         task_id=int(task_id),
     )
     ttl = get_external_media_url_ttl_seconds()
-    public_base_url = get_public_api_base_url()
-    if not public_base_url or urlsplit(public_base_url).scheme != "https":
+    base_url = get_s2s_api_base_url()
+    if not base_url:
         raise ExternalMediaUnavailable(
-            "A public HTTPS XAGENT_PUBLIC_API_BASE_URL is required for external "
-            "media delivery"
+            "A public HTTPS XAGENT_S2S_API_BASE_URL or XAGENT_PUBLIC_API_BASE_URL "
+            "is required for external media delivery"
+        )
+    if urlsplit(base_url).scheme != "https":
+        raise ExternalMediaUnavailable(
+            "XAGENT_S2S_API_BASE_URL (or XAGENT_PUBLIC_API_BASE_URL when S2S is "
+            "unset) must be HTTPS for external media delivery"
         )
     _validate_instagram_record(record)
     ticket = _encode_ticket(
@@ -200,7 +205,7 @@ def issue_external_media_url(
     )
     path = f"{EXTERNAL_MEDIA_ROUTE_PREFIX}/{quote(normalized_file_id, safe='')}"
     return ExternalMediaURL(
-        url=f"{public_base_url.rstrip('/')}{path}?{urlencode({'ticket': ticket})}",
+        url=f"{base_url.rstrip('/')}{path}?{urlencode({'ticket': ticket})}",
         expires_in=ttl,
         direct_object_url=False,
     )

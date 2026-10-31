@@ -73,7 +73,10 @@ Optional Gmail incoming-email trigger provisioning:
 XAGENT_PUBLIC_API_BASE_URL="https://api.example.com"
 
 # Optional server-to-server backend URL advertised to Gmail Pub/Sub and A2A
-# clients. Regional deployments should use their direct regional origin.
+# clients, and used to build the purpose-bound media URLs that external
+# providers such as Instagram fetch. Regional deployments should use their
+# direct regional origin. The ingress behind this URL must let public providers
+# GET and HEAD /api/files/external-media/{file_id}.
 # When unset, this falls back to XAGENT_PUBLIC_API_BASE_URL.
 XAGENT_S2S_API_BASE_URL="https://region-origin.example.com"
 
@@ -179,6 +182,40 @@ Retry clears it after the route becomes available.
 No persistent state is changed. Roll back the frontend and backend together;
 the previous clients resume deriving their targets directly from runtime and
 browser configuration.
+
+## 2026-10-30 — External media URLs use the server-to-server base
+
+### Deployment impact
+
+Purpose-bound media URLs that external providers fetch, such as the image URLs
+sent to Instagram when publishing from a stored file, are now built from
+`XAGENT_S2S_API_BASE_URL`. When it is unset they still use
+`XAGENT_PUBLIC_API_BASE_URL`. Previously they always used
+`XAGENT_PUBLIC_API_BASE_URL`.
+
+If `XAGENT_S2S_API_BASE_URL` is set to an `http://` URL, Instagram publishing
+from stored files now reports that external media delivery is unavailable,
+even when `XAGENT_PUBLIC_API_BASE_URL` is HTTPS. The base used for these URLs
+must be HTTPS.
+
+The ingress behind `XAGENT_S2S_API_BASE_URL` must allow anonymous `GET` and
+`HEAD` requests from public providers to
+`/api/files/external-media/{file_id}`. The URL carries a short-lived signed
+ticket, so no other credential is needed. If the ingress only forwards a narrow
+set of paths, add this route before upgrading.
+
+### Verification and monitoring
+
+Request the route through the configured base with any UUID as the file ID,
+for example
+`GET https://region-origin.example.com/api/files/external-media/00000000-0000-0000-0000-000000000000?ticket=invalid`.
+A `401` from the backend means the route is reachable. Any other status from
+the ingress, such as `404`, means it is not yet allowed.
+
+### Rollback
+
+No persistent state is changed. Redeploy the previous backend release; no
+environment variable needs to change.
 
 ### 2. Start Services
 
