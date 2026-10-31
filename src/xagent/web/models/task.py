@@ -377,6 +377,11 @@ class Task(Base):  # type: ignore
     # SQLite database with FK enforcement on (this repo's default -- see
     # apply_sqlite_concurrency_pragmas) fails mid-drop_all with a DROP TABLE
     # error on an unrelated table further down the (corrupted) drop order.
+    #
+    # Indexed because PostgreSQL checks this FK on every trace_events delete
+    # (checkpoint pruning, task deletion, retention purge) by looking tasks
+    # up on this column; without the index each deleted trace row is a full
+    # scan of tasks. Built by 20261031_task_checkpoint_pointer_index.
     last_checkpoint_trace_event_id = Column(
         Integer,
         ForeignKey(
@@ -385,6 +390,7 @@ class Task(Base):  # type: ignore
             use_alter=True,
         ),
         nullable=True,
+        index=True,
     )
     # Monotonic task-control identity. ``run_id`` changes for each new turn,
     # while pause/resume transitions retain it and advance ``state_version``.

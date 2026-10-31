@@ -428,6 +428,14 @@ class TestDowngradeSqliteOverCreateAllSchema:
         # fixture would assert nothing.
         reset_checkpoint_anchor_fk_create_rule()
         Base.metadata.create_all(bind=engine)
+        # create_all builds head, which also carries the column's index from
+        # 20261031_task_checkpoint_pointer_index. That index did not exist at
+        # TARGET_REVISION, and a real downgrade drops it before reaching this
+        # revision, so remove it to match the schema being stamped.
+        with engine.begin() as conn:
+            conn.execute(
+                text("DROP INDEX IF EXISTS ix_tasks_last_checkpoint_trace_event_id")
+            )
         command.stamp(_alembic_config(engine), TARGET_REVISION)
         assert FK_NAME in {
             fk["name"] for fk in inspect(engine).get_foreign_keys("tasks")
