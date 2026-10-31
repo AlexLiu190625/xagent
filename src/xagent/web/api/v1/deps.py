@@ -51,6 +51,7 @@ from ...models.agent_api_key import AgentApiKey
 from ...models.database import get_session_local
 from ...models.user_api_key import UserApiKey
 from ...services.db_runtime import run_db_io_cancellation_safe
+from ...services.personal_key_scope import check_personal_key_principal
 from ...utils.db_timezone import normalize_datetime_from_db
 from .errors import V1ApiError, V1ErrorCode
 
@@ -598,6 +599,10 @@ def _resolve_user_from_personal_credentials(
 
     user = record.user
     if user is None:
+        _pad_api_key_auth_failure(verification.paid_bcrypt_timing_floor)
+        raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
+
+    if not check_personal_key_principal(user, key_prefix=parsed.prefix):
         _pad_api_key_auth_failure(verification.paid_bcrypt_timing_floor)
         raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
 

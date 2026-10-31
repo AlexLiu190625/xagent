@@ -6,7 +6,9 @@ import pytest
 
 from xagent.web.services.personal_key_scope import (
     PersonalKeyAccessScope,
+    check_personal_key_principal,
     get_personal_key_access_scope,
+    set_personal_key_principal_policy,
     set_personal_key_scope_hook,
 )
 
@@ -16,6 +18,13 @@ def _clear_scope_hook():
     set_personal_key_scope_hook(None)
     yield
     set_personal_key_scope_hook(None)
+
+
+@pytest.fixture(autouse=True)
+def _clear_principal_policy():
+    set_personal_key_principal_policy(None)
+    yield
+    set_personal_key_principal_policy(None)
 
 
 def test_default_scope_is_limited_to_the_actor():
@@ -104,3 +113,17 @@ def test_unexpected_hook_errors_remain_explicit():
 
     with pytest.raises(RuntimeError, match="policy backend unavailable"):
         get_personal_key_access_scope(None, SimpleNamespace(id=17))
+
+
+def _principal_allowed(user: object) -> bool:
+    return check_personal_key_principal(user, key_prefix="xag_personal_ab")
+
+
+def test_principal_policy_does_not_swallow_base_exceptions():
+    def _interrupt(_user):
+        raise KeyboardInterrupt
+
+    set_personal_key_principal_policy(_interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        _principal_allowed(SimpleNamespace(id=17))
