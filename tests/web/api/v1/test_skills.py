@@ -236,6 +236,60 @@ def test_skill_routes_accept_only_a_live_personal_key(method, path, kind):
 # ===== the listing is the set the holder's tasks run with =====
 
 
+async def _runtime_skills(username: str = "admin") -> dict[str, dict]:
+    """The skills a task run for ``username`` loads, keyed by name."""
+    from xagent.skills.utils import create_skill_manager
+    from xagent.web.tools.config import WebToolConfig
+
+    db = _direct_db_session()
+    try:
+        holder = db.query(User).filter(User.username == username).one().id
+    finally:
+        db.close()
+    config = WebToolConfig(db=None, request=SimpleNamespace(), user_id=holder)
+    manager = create_skill_manager(context=config.get_skill_scope_context())
+    await manager.ensure_initialized()
+    return {
+        s["name"]: await manager.get_skill(s["name"])
+        for s in await manager.list_skills()
+    }
+
+
+def _v1_source(entry: dict) -> str:
+    """The ``source`` /v1 has to report for a skill manager entry."""
+    if entry["scope"] == "personal":
+        return "personal"
+    if entry["scope"] == "team":
+        return "team"
+    if entry["source"] == "builtin":
+        return "builtin"
+    return "external"
+
+
+def _assert_listing_is_the_runtime_set(key: str) -> tuple[list[dict], list[str]]:
+    """``GET /v1/skills`` lists exactly what a task run for the holder loads,
+    with the same ``source`` there and on ``GET /v1/skills/{name}``.
+
+    Returns the listing and the body of each listed skill's GET.
+    """
+    listed = client.get("/v1/skills", headers=_bearer(key))
+    assert listed.status_code == 200, listed.text
+    assert isinstance(listed.json(), list)
+    runtime = asyncio.run(_runtime_skills())
+    assert {item["name"] for item in listed.json()} == set(runtime)
+    bodies = []
+    for item in listed.json():
+        expected = _v1_source(runtime[item["name"]])
+        assert item["source"] == expected
+        viewed = client.get(
+            f"/v1/skills/{quote(item['name'], safe='')}", headers=_bearer(key)
+        )
+        assert viewed.status_code == 200, viewed.text
+        assert viewed.json()["source"] == expected
+        bodies.append(viewed.text)
+    return listed.json(), bodies
+
+
 def test_listing_is_the_set_the_holder_runs_tasks_with():
     from xagent.skills.library import (
         CompositeSkillLibraryProvider,
@@ -244,8 +298,6 @@ def test_listing_is_the_set_the_holder_runs_tasks_with():
         set_skill_library_provider,
     )
     from xagent.skills.personal_db import XagentPersonalDbSkillProvider
-    from xagent.skills.utils import create_skill_manager
-    from xagent.web.tools.config import WebToolConfig
 
     def record(name, source):
         return SkillRecord(
@@ -275,55 +327,58 @@ def test_listing_is_the_set_the_holder_runs_tasks_with():
     assert _create(key, "shared-name").status_code == 200
     assert _create(key, "mine-only").status_code == 200
 
-    listed = client.get("/v1/skills", headers=_bearer(key))
+    listed, bodies = _assert_listing_is_the_runtime_set(key)
 
-    assert listed.status_code == 200, listed.text
-    assert isinstance(listed.json(), list)
-    assert [(item["name"], item["source"]) for item in listed.json()] == [
+    assert [(item["name"], item["source"]) for item in listed] == [
         ("mine-only", "personal"),
         ("shared-name", "personal"),
         ("pdf.tools", "external"),
         ("plain-builtin", "builtin"),
         ("team-only", "team"),
     ]
-
-    async def runtime_set():
-        db = _direct_db_session()
-        try:
-            holder = db.query(User).filter(User.username == "admin").one().id
-        finally:
-            db.close()
-        config = WebToolConfig(db=None, request=SimpleNamespace(), user_id=holder)
-        manager = create_skill_manager(context=config.get_skill_scope_context())
-        await manager.ensure_initialized()
-        return {
-            s["name"]: await manager.get_skill(s["name"])
-            for s in await manager.list_skills()
-        }
-
-    runtime = asyncio.run(runtime_set())
-    assert {item["name"] for item in listed.json()} == set(runtime)
-    for item in listed.json():
-        entry = runtime[item["name"]]
-        expected = (
-            "personal"
-            if entry["scope"] == "personal"
-            else "team"
-            if entry["scope"] == "team"
-            else "builtin"
-            if entry["source"] == "builtin"
-            else "external"
-        )
-        assert item["source"] == expected
-        viewed = client.get(
-            f"/v1/skills/{quote(item['name'], safe='')}", headers=_bearer(key)
-        )
-        assert viewed.status_code == 200, viewed.text
-        assert viewed.json()["source"] == expected
-        assert "/srv/internal" not in viewed.text
-
+    assert not [body for body in bodies if "/srv/internal" in body]
     _error(
         client.get("/v1/skills/missing", headers=_bearer(key)), 404, "skill_not_found"
+    )
+
+
+def test_listing_is_the_runtime_set_on_the_default_provider_chain(
+    monkeypatch, tmp_path
+):
+    """No provider registered, as in a deployment that registers none: the
+    filesystem roots first, then the holder's personal skills."""
+    from xagent.skills import utils as skill_utils
+    from xagent.skills.library import get_skill_library_provider
+    from xagent.skills.manager import SkillManager
+
+    assert get_skill_library_provider() is None
+    host_root = tmp_path / "host-skills"
+    (host_root / "host-only").mkdir(parents=True)
+    (host_root / "host-only" / "SKILL.md").write_text("# Host only\n\nOn disk.\n")
+    monkeypatch.setattr(
+        skill_utils,
+        "_get_default_skill_dirs",
+        lambda: [SkillManager.get_builtin_root(), host_root],
+    )
+    key = _personal_key()
+    builtins = sorted(
+        name
+        for name, entry in asyncio.run(_runtime_skills()).items()
+        if entry["source"] == "builtin"
+    )
+    assert builtins, "the shipped skills are part of the default chain"
+    shadowed = builtins[0]
+    assert _create(key, shadowed).status_code == 200
+    assert _create(key, "mine-only").status_code == 200
+
+    listed, _ = _assert_listing_is_the_runtime_set(key)
+
+    sources = {item["name"]: item["source"] for item in listed}
+    assert sources[shadowed] == "personal"
+    assert sources["mine-only"] == "personal"
+    assert sources["host-only"] == "external"
+    assert {name for name, source in sources.items() if source == "builtin"} == (
+        set(builtins) - {shadowed}
     )
 
 
