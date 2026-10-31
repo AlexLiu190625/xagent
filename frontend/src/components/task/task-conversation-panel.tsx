@@ -397,12 +397,10 @@ export function TaskConversationPanel({
   const handleSend = async (message: string, config?: any, filesToSend?: File[]) => {
     const outboundFiles = filesBlocked ? [] : (filesToSend || selectedFiles)
     await (onSend ?? sendMessage)(message, config, outboundFiles)
-    // In session mode only the files this send carried leave the selection:
-    // files added while it was in flight, and files kept hidden while uploads
-    // are not offered, stay. Other modes clear the selection after a send.
-    updateFiles(filesDisabled
-      ? latestFilesRef.current.filter((file) => !outboundFiles.includes(file))
-      : [])
+    // Only the files this send carried leave the selection: files added while
+    // it was in flight, and in session mode files kept hidden while uploads
+    // are not offered, stay.
+    updateFiles(latestFilesRef.current.filter((file) => !outboundFiles.includes(file)))
   }
 
   const messageItems = useMemo<CombinedItem[]>(() => {
