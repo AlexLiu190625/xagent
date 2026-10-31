@@ -1452,6 +1452,23 @@ def _derive_upload_skill_name(
     )
 
 
+def _upload_limit_exceeded_detail(limit: int) -> str:
+    """The 413 detail for an upload larger than ``limit`` bytes.
+
+    ``XAGENT_MAX_UPLOAD_SIZE`` takes any positive byte count (``1K``,
+    ``1.5M``, ``1000``), so the limit is written in the largest unit that
+    divides it exactly: ``1.5M`` reads "1536 KiB", not "1 MiB".
+    """
+    mib, kib = 1024 * 1024, 1024
+    if limit % mib == 0:
+        size = f"{limit // mib} MiB"
+    elif limit % kib == 0:
+        size = f"{limit // kib} KiB"
+    else:
+        size = f"{limit} bytes"
+    return f"Upload exceeds {size} limit."
+
+
 @router.post("/upload", response_model=SkillSummary)
 async def upload_skill(
     request: Request,
@@ -1490,7 +1507,7 @@ async def upload_skill(
     if len(data) > limit:
         raise HTTPException(
             status_code=413,
-            detail=f"Upload exceeds {limit // (1024 * 1024)} MiB limit.",
+            detail=_upload_limit_exceeded_detail(limit),
         )
 
     filename = (file.filename or "").strip()

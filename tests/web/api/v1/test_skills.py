@@ -419,7 +419,7 @@ _TRANSLATIONS = [
         "skill_already_exists",
         "A personal skill named 'dup' already exists.",
     ),
-    ("413", 413, "invalid_input", "Upload exceeds"),
+    ("413", 413, "invalid_input", "Upload exceeds 1 KiB limit."),
     ("other", 500, "internal_error", "Internal server error."),
 ]
 
@@ -440,7 +440,7 @@ def test_every_failure_is_a_v1_envelope(case, monkeypatch, caplog):
         return
     _, status, code, message = next(row for row in _TRANSLATIONS if row[0] == case)
     error = _error(resp, status, code)
-    assert error["message"].startswith(message)
+    assert error["message"] == message
     if case == "other":
         assert "secret" not in resp.text
         assert any(

@@ -21,6 +21,7 @@ from xagent.web.api.skill_hub import (
     _safe_zip_extract,
     _safe_zip_to_files,
     _slugify_skill_name,
+    _upload_limit_exceeded_detail,
     _validate_skill_name,
 )
 
@@ -696,6 +697,46 @@ class TestUploadRoute:
             )
         assert exc.value.status_code == 413
         assert "1 MiB" in exc.value.detail, exc.value.detail
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("setting", "size", "detail"),
+        [
+            ("1K", 1025, "Upload exceeds 1 KiB limit."),
+            ("1.5M", 1536 * 1024 + 1, "Upload exceeds 1536 KiB limit."),
+            ("1000", 1001, "Upload exceeds 1000 bytes limit."),
+            ("1500", 1501, "Upload exceeds 1500 bytes limit."),
+        ],
+        ids=["whole-kib", "fractional-mib", "bytes", "fractional-kib"],
+    )
+    async def test_the_size_message_states_the_exact_limit(
+        self, monkeypatch, setting, size, detail
+    ):
+        """The limit is written in the largest unit that divides it exactly,
+        so a limit that is not a whole number of MiB is not rounded down."""
+        from xagent.web.api import skill_hub
+
+        monkeypatch.setenv("XAGENT_MAX_UPLOAD_SIZE", setting)
+        request, scope, db, user = _upload_args()
+        with pytest.raises(HTTPException) as exc:
+            await skill_hub.upload_skill(
+                request,
+                file=_make_upload("skill.md", b"x" * size),
+                scope="personal",
+                name=None,
+                context=scope,
+                db=db,
+                _user=user,
+            )
+        assert exc.value.status_code == 413
+        assert exc.value.detail == detail
+
+    def test_the_default_limit_reads_as_whole_mib(self):
+        """The 50 MiB default is written as "50 MiB", in binary megabytes."""
+        assert (
+            _upload_limit_exceeded_detail(50 * 1024 * 1024)
+            == "Upload exceeds 50 MiB limit."
+        )
 
     @pytest.mark.asyncio
     async def test_configured_limit_cannot_exceed_the_decompression_budget(

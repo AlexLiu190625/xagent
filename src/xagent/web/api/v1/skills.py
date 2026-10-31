@@ -24,6 +24,7 @@ from ..skill_hub import (
     _derive_upload_skill_name,
     _normalize_skill_files,
     _safe_zip_extract,
+    _upload_limit_exceeded_detail,
 )
 from ..skill_hub_registry import _MAX_DOWNLOAD_BYTES
 from .deps import (
@@ -124,7 +125,7 @@ async def upload_skill(
         if len(data) > limit:
             raise HTTPException(
                 status_code=413,
-                detail=f"Upload exceeds {limit // (1024 * 1024)} MiB limit.",
+                detail=_upload_limit_exceeded_detail(limit),
             )
         filename = (file.filename or "").strip()
         lower = filename.lower()
