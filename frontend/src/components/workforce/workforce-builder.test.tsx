@@ -80,6 +80,16 @@ vi.mock("sonner", () => ({
 import { toast } from "sonner"
 import { WorkforceBuilder } from "./workforce-builder"
 
+// The config panel's Save awaits onSaveDetails before closing its editor, and
+// the builder only learns the editor closed from a passive effect after that.
+// Clicking Create before both settle would hit the discard-edit confirm, so
+// let the whole save settle inside act.
+async function saveDetails() {
+  await act(async () => {
+    fireEvent.click(screen.getByText("common.save"))
+  })
+}
+
 describe("WorkforceBuilder — create mode (no workforceId)", () => {
   beforeEach(() => {
     createWorkforceMock.mockReset()
@@ -206,7 +216,7 @@ describe("WorkforceBuilder — create mode (no workforceId)", () => {
     fireEvent.click(screen.getByText("common.edit"))
     const nameInput = screen.getAllByRole("textbox")[0]
     fireEvent.change(nameInput, { target: { value: "Launch Team" } })
-    fireEvent.click(screen.getByText("common.save"))
+    await saveDetails()
 
     const createButton = screen.getByText("workforces.actions.createTeam")
     await waitFor(() => expect(createButton).not.toBeDisabled())
@@ -305,7 +315,7 @@ describe("WorkforceBuilder — create mode (no workforceId)", () => {
     fireEvent.click(screen.getByText("common.edit"))
     const nameInput = screen.getAllByRole("textbox")[0]
     fireEvent.change(nameInput, { target: { value: "Launch Team" } })
-    fireEvent.click(screen.getByText("common.save"))
+    await saveDetails()
 
     const createButton = screen.getByText("workforces.actions.createTeam")
     await waitFor(() => expect(createButton).not.toBeDisabled())
@@ -372,7 +382,7 @@ describe("WorkforceBuilder — create mode (no workforceId)", () => {
     fireEvent.click(screen.getByText("common.edit"))
     const nameInput = screen.getAllByRole("textbox")[0]
     fireEvent.change(nameInput, { target: { value: "Launch Team" } })
-    fireEvent.click(screen.getByText("common.save"))
+    await saveDetails()
 
     const panelBeforeCreate = await screen.findByTestId("task-conversation-panel")
 
@@ -531,7 +541,7 @@ describe("WorkforceBuilder — create mode (no workforceId)", () => {
     fireEvent.click(screen.getByText("common.edit"))
     const nameInput = screen.getAllByRole("textbox")[0]
     fireEvent.change(nameInput, { target: { value: "Launch Team" } })
-    fireEvent.click(screen.getByText("common.save"))
+    await saveDetails()
 
     const createButton = screen.getByText("workforces.actions.createTeam")
     await waitFor(() => expect(createButton).not.toBeDisabled())
@@ -780,7 +790,7 @@ describe("WorkforceBuilder — create mode (no workforceId)", () => {
     fireEvent.click(screen.getByText("workforces.detail.configure"))
     fireEvent.click(screen.getByText("common.edit"))
     fireEvent.change(screen.getAllByRole("textbox")[0], { target: { value: "Launch Team" } })
-    fireEvent.click(screen.getByText("common.save"))
+    await saveDetails()
 
     const createButton = screen.getByText("workforces.actions.createTeam")
     await waitFor(() => expect(createButton).not.toBeDisabled())
@@ -1071,7 +1081,7 @@ describe("WorkforceBuilder — create mode (no workforceId)", () => {
     fireEvent.click(screen.getByText("workforces.detail.configure"))
     fireEvent.click(screen.getByText("common.edit"))
     fireEvent.change(screen.getAllByRole("textbox")[0], { target: { value: "Launch Team" } })
-    fireEvent.click(screen.getByText("common.save"))
+    await saveDetails()
 
     const createButton = screen.getByText("workforces.actions.createTeam")
     await waitFor(() => expect(createButton).not.toBeDisabled())

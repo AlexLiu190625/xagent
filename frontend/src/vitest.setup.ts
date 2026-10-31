@@ -1,6 +1,19 @@
 import "@testing-library/jest-dom/vitest"
 import { beforeEach, vi } from "vitest"
 
+// Without this, the first fireEvent.click stays in window.event for the whole
+// file, and React runs later async updates as sync, hiding missing act()/waitFor().
+const jsdomWindow = (globalThis as { jsdom?: { window: Window } }).jsdom?.window
+if (jsdomWindow) {
+  Object.defineProperty(globalThis, "event", {
+    configurable: true,
+    get: () => jsdomWindow.event,
+    set: (value: unknown) => {
+      Object.defineProperty(globalThis, "event", { configurable: true, writable: true, value })
+    },
+  })
+}
+
 // jsdom does not implement blob URL APIs; InlineFilePreview authenticated image
 // previews rely on them in tests that assert blob: src values or spy on revoke.
 URL.createObjectURL = vi.fn(
