@@ -126,6 +126,31 @@ vi.mock("@/lib/utils", async () => {
 
 import { PublicAgentChatPage } from "./public-agent-chat-page"
 
+// Vitest copies jsdom's window properties onto the global through accessors
+// whose setter keeps the last assigned value for good. React 18's dev build
+// assigns window.event while it dispatches a React event handler, so the first
+// fireEvent.click otherwise stays in window.event for the rest of this file.
+// React reads window.event to prioritize updates made outside its own event
+// dispatch, and would then treat a fetch callback's setTaskId as a discrete
+// click: a sync render that runs ahead of the default-priority take/bootstrap
+// updates the open-message effect queued, sees the new task with the message
+// still pending, and ends that conversation. Read the live jsdom value instead,
+// and let an assignment replace the property the way the browser's
+// [Replaceable] window.event does, so React's restore of the saved descriptor
+// undoes it. Fail loudly if the jsdom instance is not exposed, rather than
+// silently falling back to the pinned value.
+const jsdomWindow = (globalThis as { jsdom?: { window: Window } }).jsdom?.window
+if (!jsdomWindow) {
+  throw new Error("globalThis.jsdom is missing; cannot read the live window.event")
+}
+Object.defineProperty(globalThis, "event", {
+  configurable: true,
+  get: () => jsdomWindow.event,
+  set: (value: unknown) => {
+    Object.defineProperty(globalThis, "event", { configurable: true, writable: true, value })
+  },
+})
+
 const successfulAgentAuth = {
   access_token: "public-access-token",
   token_type: "bearer",
