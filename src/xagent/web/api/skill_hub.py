@@ -800,17 +800,27 @@ def _write_personal_skill(
 def _update_personal_skill_md(*, db: Any, user: User, name: str, skill_md: str) -> None:
     """Replace the SKILL.md of one personal skill the caller owns.
 
-    The row is locked first, so on PostgreSQL a concurrent delete that commits
+    The new SKILL.md is validated before the row is looked up. The checks read
+    only the new content, and parsing a frontmatter near the size cap takes
+    about a quarter of a second, which must not be spent holding the row lock:
+    the web edit and delete routes call these helpers on the event loop, so a
+    request waiting for the lock holds up the loop. Invalid content is
+    therefore a 400 for any name, including one the caller has no personal
+    skill under; the answer depends only on the request, so it says nothing
+    about which skills exist. Attachments stored earlier are not validated
+    again, so an edit does not start failing because of a file it never
+    touched.
+
+    The row is then locked, so on PostgreSQL a concurrent delete that commits
     first leaves this call with a 404 instead of a write to a vanished row.
     SQLite takes no row locks.
-
-    Only the new SKILL.md is validated, and before anything is committed:
-    attachments stored earlier are not validated again, so an edit does not
-    start failing because of a file it never touched.
     """
     from xagent.skills.library import guess_media_type
     from xagent.web.models.skill import UserSkill, UserSkillFile
 
+    content = skill_md.encode("utf-8")
+    _check_skill_md_content(content)
+    _assert_bundle_parses({"SKILL.md": content})
     skill = (
         db.query(UserSkill)
         .filter(UserSkill.user_id == int(user.id), UserSkill.name == name)
@@ -819,9 +829,6 @@ def _update_personal_skill_md(*, db: Any, user: User, name: str, skill_md: str) 
     )
     if skill is None:
         raise HTTPException(status_code=404, detail="Personal skill not found")
-    content = skill_md.encode("utf-8")
-    _check_skill_md_content(content)
-    _assert_bundle_parses({"SKILL.md": content})
     file = next((item for item in skill.files if item.path == "SKILL.md"), None)
     if file is None:
         file = UserSkillFile(skill_id=skill.id, path="SKILL.md")

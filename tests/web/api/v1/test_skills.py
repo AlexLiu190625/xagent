@@ -360,6 +360,25 @@ def test_writes_only_touch_the_holders_own_personal_skills(operation, bob_first)
     )
 
 
+def test_an_invalid_edit_is_refused_before_the_name_is_looked_up():
+    key = _personal_key()
+    builtin = next(
+        item["name"]
+        for item in client.get("/v1/skills", headers=_bearer(key)).json()
+        if item["source"] == "builtin"
+    )
+    before = _counts()
+
+    error = _error(_update(key, builtin, "  \n"), 400, "invalid_input")
+
+    assert error["message"] == "SKILL.md is empty."
+    assert _counts() == before
+    assert (
+        client.get(f"/v1/skills/{builtin}", headers=_bearer(key)).json()["source"]
+        == "builtin"
+    )
+
+
 # ===== every failure is a /v1 envelope =====
 
 

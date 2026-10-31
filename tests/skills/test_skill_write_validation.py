@@ -806,14 +806,95 @@ class TestEditValidatesBeforeItCommits:
 
 
 class TestWriteRowLocks:
-    """SQLite ignores ``FOR UPDATE``, so this only proves the lock is asked
-    for; the real blocking behaviour is covered against PostgreSQL."""
+    """SQLite ignores ``FOR UPDATE``, so these prove which row the lock is
+    asked for and that an edit checks its content before asking; whether the
+    lock actually holds a second writer back is covered against PostgreSQL."""
 
     @pytest.mark.parametrize("operation", ["edit", "delete"])
-    def test_the_row_about_to_change_is_locked(self, monkeypatch, tmp_path, operation):
+    def test_the_lock_selects_only_the_callers_row_with_that_name(
+        self, monkeypatch, tmp_path, operation
+    ):
         from sqlalchemy.orm import Query
 
-        from xagent.web.models.skill import UserSkill
+        db = _factory(tmp_path, user_ids=(7, 8))()
+        # Rows a lock missing either condition would also select.
+        _write_personal_skill(
+            db=db, user=_user(8), name="alpha", files={"SKILL.md": SKILL_MD}
+        )
+        _write_personal_skill(
+            db=db, user=_user(), name="beta", files={"SKILL.md": SKILL_MD}
+        )
+        _write_personal_skill(
+            db=db, user=_user(), name="alpha", files={"SKILL.md": SKILL_MD}
+        )
+        locked: list[list[tuple[int, str]]] = []
+        real_with_for_update = Query.with_for_update
+
+        def spy(self, *args, **kwargs):
+            # The rows this query selects, read with the same filter.
+            locked.append(
+                sorted((int(row.user_id), str(row.name)) for row in self.all())
+            )
+            return real_with_for_update(self, *args, **kwargs)
+
+        monkeypatch.setattr(Query, "with_for_update", spy)
+
+        if operation == "edit":
+            skill_hub._update_personal_skill_md(
+                db=db, user=_user(), name="alpha", skill_md="# Alpha\n\nChanged.\n"
+            )
+        else:
+            _delete_personal_skill(db=db, user=_user(), name="alpha")
+
+        assert locked == [[(7, "alpha")]]
+        db.close()
+
+    def test_the_new_content_is_checked_before_the_row_is_locked(
+        self, monkeypatch, tmp_path
+    ):
+        from sqlalchemy.orm import Query
+
+        db = _factory(tmp_path)()
+        _write_personal_skill(
+            db=db, user=_user(), name="alpha", files={"SKILL.md": SKILL_MD}
+        )
+        events: list[str] = []
+        real_check = skill_hub._check_skill_md_content
+        real_parse = skill_hub._assert_bundle_parses
+        real_with_for_update = Query.with_for_update
+
+        def check(content):
+            events.append("check")
+            return real_check(content)
+
+        def parse(files):
+            events.append("parse")
+            return real_parse(files)
+
+        def lock(self, *args, **kwargs):
+            events.append("lock")
+            return real_with_for_update(self, *args, **kwargs)
+
+        monkeypatch.setattr(skill_hub, "_check_skill_md_content", check)
+        monkeypatch.setattr(skill_hub, "_assert_bundle_parses", parse)
+        monkeypatch.setattr(Query, "with_for_update", lock)
+        edited = "# Alpha\n\nChanged.\n"
+
+        skill_hub._update_personal_skill_md(
+            db=db, user=_user(), name="alpha", skill_md=edited
+        )
+
+        assert events == ["check", "parse", "lock"]
+        assert _stored_file(db, "alpha", "SKILL.md") == edited.encode()
+        db.close()
+
+    @pytest.mark.parametrize("name", ["alpha", "missing"], ids=["owned", "not-owned"])
+    def test_invalid_content_is_refused_without_locking_the_row(
+        self, monkeypatch, tmp_path, name
+    ):
+        """The answer depends only on the content, so a name the caller has no
+        personal skill under gets the same 400 rather than a 404."""
+        from sqlalchemy.orm import Query
 
         db = _factory(tmp_path)()
         _write_personal_skill(
@@ -828,12 +909,13 @@ class TestWriteRowLocks:
 
         monkeypatch.setattr(Query, "with_for_update", spy)
 
-        if operation == "edit":
+        with pytest.raises(HTTPException) as exc:
             skill_hub._update_personal_skill_md(
-                db=db, user=_user(), name="alpha", skill_md="# Alpha\n\nChanged.\n"
+                db=db, user=_user(), name=name, skill_md="  \n\t "
             )
-        else:
-            _delete_personal_skill(db=db, user=_user(), name="alpha")
 
-        assert locked == [UserSkill]
+        assert exc.value.status_code == 400
+        assert exc.value.detail == "SKILL.md is empty."
+        assert locked == []
+        assert _stored_file(db, "alpha", "SKILL.md") == SKILL_MD
         db.close()
