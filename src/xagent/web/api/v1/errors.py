@@ -95,6 +95,14 @@ class V1ErrorCode(str, Enum):
     # Template id is unknown or unavailable to the caller.
     TEMPLATE_NOT_FOUND = "template_not_found"
 
+    # No skill the key holder can see has this name (GET), or the name does
+    # not address a personal skill the holder owns (PUT / DELETE). 404.
+    SKILL_NOT_FOUND = "skill_not_found"
+
+    # The key holder already has a personal skill with this name and the
+    # request is not a repeat of the write that created it. 409.
+    SKILL_ALREADY_EXISTS = "skill_already_exists"
+
     # The task is currently running and cannot accept new input.
     # 409 Conflict. Client should retry after polling task status.
     TASK_BUSY = "task_busy"
@@ -192,6 +200,8 @@ _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
         "This task's conversation was removed under the retention policy."
     ),
     V1ErrorCode.TEMPLATE_NOT_FOUND: "Template not found.",
+    V1ErrorCode.SKILL_NOT_FOUND: "Skill not found.",
+    V1ErrorCode.SKILL_ALREADY_EXISTS: "A skill with this name already exists.",
     V1ErrorCode.TASK_BUSY: "Task is currently running; retry after it completes.",
     V1ErrorCode.INVALID_INPUT: "Request body failed validation.",
     V1ErrorCode.RATE_LIMITED: "Rate limit exceeded; retry later.",

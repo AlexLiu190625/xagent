@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
+from ..api.skill_hub import _MAX_SKILL_MD_CHARS, _NAME_RE
 from .agent import PromptContextFieldDeclaration, PromptContextFieldList
 
 
@@ -326,6 +327,46 @@ class V1TemplateDetail(V1TemplateSummary):
         description="Agent configuration for an 'agent'-type template. None "
         "for a 'workforce'-type template.",
     )
+
+
+class V1SkillSummary(BaseModel):
+    name: str
+    description: str
+    when_to_use: str
+    tags: list[str]
+    source: str = Field(
+        ...,
+        description=(
+            "Where the skill comes from: 'personal' (the key holder's own), "
+            "'builtin', 'team' or 'external'. Other values may be added "
+            "later, so clients should accept any string."
+        ),
+    )
+
+
+class V1SkillDetail(V1SkillSummary):
+    skill_md: str = Field(..., description="The complete SKILL.md text.")
+    files: list[str] = Field(
+        ..., description="Relative paths of the skill's files, sorted."
+    )
+
+
+class V1SkillCreateRequest(BaseModel):
+    """Body for ``POST /v1/skills``."""
+
+    # Same bound as the web create route; the stored column is wider.
+    name: str = Field(..., min_length=1, max_length=64, pattern=_NAME_RE.pattern)
+    skill_md: str = Field(..., min_length=1, max_length=_MAX_SKILL_MD_CHARS)
+
+
+class V1SkillUpdateRequest(BaseModel):
+    """Body for ``PUT /v1/skills/{name}``."""
+
+    skill_md: str = Field(..., min_length=1, max_length=_MAX_SKILL_MD_CHARS)
+
+
+class V1SkillDeleteResponse(BaseModel):
+    name: str
 
 
 class CreateTaskResponse(BaseModel):
